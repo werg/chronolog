@@ -32,16 +32,16 @@ function database(): DatabaseLike {
   return db
 }
 
-type Mode = 'local_read' | 'consensus' | 'platform'
-const ADMIN: SqlAuthorizationOptions = { schemaAdmin: true }
+type Mode = 'local_read' | 'replicated' | 'platform'
+const ADMIN: SqlAuthorizationOptions = { ddlPermissions: { create: true, alter: ['accounts', 'notes'], drop: ['notes'], index: ['accounts', 'notes'], trigger: ['accounts', 'notes'] } }
 
-function expectProfileViolation(db: DatabaseLike, sql: string, mode: Mode = 'consensus', options: SqlAuthorizationOptions = ADMIN): void {
+function expectProfileViolation(db: DatabaseLike, sql: string, mode: Mode = 'replicated', options: SqlAuthorizationOptions = ADMIN): void {
   expect(() => prepareProfiledStatement(db, sql, mode, {}, options), sql).toThrowError(
     expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_PROFILE_VIOLATION' }),
   )
 }
 
-function expectAllowed(db: DatabaseLike, sql: string, mode: Mode = 'consensus', options: SqlAuthorizationOptions = ADMIN): void {
+function expectAllowed(db: DatabaseLike, sql: string, mode: Mode = 'replicated', options: SqlAuthorizationOptions = ADMIN): void {
   expect(() => prepareProfiledStatement(db, sql, mode, {}, options), sql).not.toThrow()
 }
 
@@ -100,12 +100,12 @@ describe('SQL authorization block-list', () => {
     try {
       for (const sql of ['SELECT load_extension()', 'SELECT "LOAD_EXTENSION"(1, 2, 3)', 'SELECT sqlite_source_id(1)']) {
         expectProfileViolation(db, sql)
-        expect(() => withProfiledStatement(db, sql, 'consensus', (statement) => statement.all()))
+        expect(() => withProfiledStatement(db, sql, 'replicated', (statement) => statement.all()))
           .toThrowError(expect.objectContaining<Partial<SqlProfileError>>({ code: 'SQL_PROFILE_VIOLATION' }))
       }
       expectProfileViolation(db, 'SELECT load_extension(1, 2, 3)', 'local_read')
       for (const [sql, mode] of [
-        ['SELECT abs(1, 2)', 'consensus'],
+        ['SELECT abs(1, 2)', 'replicated'],
         ['SELECT sqlite_source_id(1)', 'local_read'],
       ] as const) {
         expect(() => prepareProfiledStatement(db, sql, mode))
@@ -115,7 +115,7 @@ describe('SQL authorization block-list', () => {
     } finally { db.close() }
   })
 
-  it('allows ordinary SQLite in consensus, including formerly gated functions', () => {
+  it('allows ordinary SQLite in replicated SQL, including formerly gated functions', () => {
     const db = database()
     try {
       for (const sql of [
@@ -136,7 +136,7 @@ describe('SQL authorization block-list', () => {
         'CREATE VIRTUAL TABLE docs USING fts5(body)',
         'WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v + 1 FROM n WHERE v < 5) SELECT count(*) FROM n',
       ]) {
-        try { prepareProfiledStatement(db, sql, 'consensus', {}, ADMIN) } catch (error) { throw new Error(`denied: ${sql}: ${(error as { code?: string }).code ?? String(error)}`, { cause: error }) }
+        try { prepareProfiledStatement(db, sql, 'replicated', {}, ADMIN) } catch (error) { throw new Error(`denied: ${sql}: ${(error as { code?: string }).code ?? String(error)}`, { cause: error }) }
       }
     } finally {
       db.close()
@@ -146,7 +146,7 @@ describe('SQL authorization block-list', () => {
   it('allows ANALYZE, which only rebuilds sqlite_stat1 from table contents', () => {
     const db = database()
     try {
-      withProfiledStatement(db, 'ANALYZE', 'consensus', (statement) => statement.run())
+      withProfiledStatement(db, 'ANALYZE', 'replicated', (statement) => statement.run())
     } finally {
       db.close()
     }
@@ -182,7 +182,7 @@ describe('SQL authorization block-list', () => {
     }
   })
 
-  it('limits DDL to schema administrators and protects platform objects', () => {
+  it('limits DDL to explicit object permissions and protects platform objects', () => {
     const db = database()
     try {
       db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, chronolog_owner BLOB);
@@ -197,10 +197,10 @@ describe('SQL authorization block-list', () => {
         'ALTER TABLE notes ADD COLUMN extra TEXT',
         'DROP TABLE notes',
       ]) {
-        expectProfileViolation(db, sql, 'consensus', {})
-        expectAllowed(db, sql, 'consensus', ADMIN)
+        expectProfileViolation(db, sql, 'replicated', {})
+        expectAllowed(db, sql, 'replicated', ADMIN)
       }
-      expectAllowed(db, 'ANALYZE', 'consensus', {})
+      expectAllowed(db, 'ANALYZE', 'replicated', {})
       for (const sql of [
         'DROP TRIGGER chronolog_k_notes_upd',
         'DROP VIEW chronolog_my_owner_ids_update',
@@ -208,9 +208,9 @@ describe('SQL authorization block-list', () => {
         'ALTER TABLE notes DROP COLUMN chronolog_owner',
         "SELECT chronolog_policy_violation('notes', 'update')",
         'UPDATE chronolog_transactions SET outcome = 1',
-      ]) expectProfileViolation(db, sql, 'consensus', ADMIN)
+      ]) expectProfileViolation(db, sql, 'replicated', ADMIN)
       // Dropping a table takes its platform triggers with it.
-      expectAllowed(db, 'DROP TABLE notes', 'consensus', ADMIN)
+      expectAllowed(db, 'DROP TABLE notes', 'replicated', ADMIN)
       // Platform code may write and create chronolog_* objects.
       expectAllowed(db, 'UPDATE chronolog_transactions SET outcome = 1', 'platform', {})
       expectAllowed(db, 'CREATE TRIGGER chronolog_k_x BEFORE INSERT ON notes BEGIN SELECT 1; END', 'platform', {})
@@ -219,7 +219,7 @@ describe('SQL authorization block-list', () => {
     }
   })
 
-  it('compiles app triggers fired by platform statements under consensus rules', () => {
+  it('compiles app triggers fired by platform statements under replicated rules', () => {
     const db = database()
     try {
       db.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, chronolog_owner BLOB);

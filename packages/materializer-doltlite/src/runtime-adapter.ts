@@ -1,7 +1,6 @@
 import {
   publicationRequestForRevision,
   type ReplayProposal,
-  type PeerExecutionControls,
   type ChronologMaterializationRuntime,
   type MaterializedApplicationSnapshot,
   type MaterializationPublicationRequest,
@@ -25,8 +24,8 @@ export interface DoltLiteMaterializerRuntimeBackend {
   readonly finalOrderLength?: number
   readonly executionManifestDigest: Uint8Array
   proposalIdAt(index: number): Uint8Array | null
-  materialize(orderedTransactions: readonly ReplayProposal[], controls?: PeerExecutionControls): Promise<MaterializedRevision | null>
-  publishFinal?(prefixLength: number, controls?: PeerExecutionControls): Promise<void>
+  materialize(orderedTransactions: readonly ReplayProposal[]): Promise<MaterializedRevision | null>
+  publishFinal?(prefixLength: number): Promise<void>
   localSql(
     sql: string,
     parameters?: readonly LocalSqlValue[],
@@ -64,10 +63,10 @@ export function createDoltLiteMaterializationRuntime(
   const publishFinal = materializer.publishFinal?.bind(materializer)
 
   return {
-    coordinator: {
+    replay: {
       ...(publishFinal === undefined ? {} : { publishFinal }),
-      async materialize(orderedTransactions, controls) {
-        const revision = await materializer.materialize(orderedTransactions, controls)
+      async materialize(orderedTransactions) {
+        const revision = await materializer.materialize(orderedTransactions)
         if (revision === null) return null
         const publication = publicationRequestForRevision(revision)
         prepared.set(publication.publicationKey, publication)

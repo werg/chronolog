@@ -3,7 +3,7 @@ import { createNativeSqlEngine } from '../../packages/materializer-doltlite/src/
 import { replayProposal, ROOT_KEY } from '../../packages/materializer-doltlite/src/test-fixtures.js'
 const path = process.argv[2]
 if (path === undefined) throw new Error('PATH_REQUIRED')
-const materializer = await DeterministicMaterializer.open({ path, engine: createNativeSqlEngine(), rootAdministrator: ROOT_KEY, checkpointEvery: 1 })
+const materializer = await DeterministicMaterializer.open({ path, engine: createNativeSqlEngine(), rootPrincipal: ROOT_KEY, checkpointEvery: 1 })
 const first = await replayProposal(1n, 'first', [
   'CREATE TABLE crash_view (id INTEGER PRIMARY KEY, value TEXT)',
   "INSERT INTO crash_view (id, value) VALUES (1, 'first')",

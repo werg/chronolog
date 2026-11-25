@@ -1,5 +1,7 @@
 # 03 — Bugs, Shortcomings & Operational Risks
 
+> **Historical evidence, not current guidance.** This review describes commit `680b70b` and the former selected-generation, coordinator-ordered architecture (`peer-generation`, `applied()`/`shared()`, recovery, takeover and handover). That architecture has been replaced by the [authored operation-set contract](../CRDT_CONTRACT.md); see the [architecture overview](../authored-operation-set.md). Its findings, status table and verification results are preserved unchanged as history. They are not a qualification of the current implementation, and its file references and fixes may no longer exist.
+
 ## Implementation status
 
 The findings below describe the reviewed implementation before these fixes.

@@ -70,7 +70,7 @@ const runtimeModules = Object.fromEntries(Object.entries(bundled.metafile.output
   inputs: Object.entries(value.inputs).filter(([, input]) => input.bytesInOutput > 0).map(([source]) => source).sort(),
   imports: value.imports.map(input => ({ path: input.external ? input.path : outputName(input.path), kind: input.kind, external: input.external === true })),
 }]));
-const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:browser-storage-selector|browser-capabilities|application-data|content|keys|projection|recovery|network-data)\.ts|packages\/peer-generation\/src\/replica\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native|celld|record-envelope|indexeddb-bytes-store)\.ts)/u.test(path);
+const durableImplementation = path => /^(?:packages\/peer-session\/src\/(?:browser-storage-selector|browser-capabilities|session|operation-store|replica|content|keys|provisioning|network-content)\.ts|packages\/materializer\/src\/(?:runtime|events|event-store)\.ts|packages\/materializer-doltlite\/|packages\/records\/src\/(?:browser|native|celld|record-envelope|indexeddb-bytes-store)\.ts)/u.test(path);
 for (const entry of ['index', 'browser', 'worker', 'tendriller', ...(sqlEnabled ? ['sql'] : [])]) {
   const output = Object.entries(bundled.metafile.outputs).find(([, value]) => value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(output, `Missing protocol entry: ${entry}`);
@@ -134,7 +134,7 @@ for (const [path, content] of declaration.files) files.set(path, content);
 for (const name of Object.keys(entries)) files.set(`${name}.d.ts`, `export * from './types/packages/peer-session/src/${name}.js';\n`);
 files.set('README.md', await readFile(join(root, 'packages/peer-session/README.md')));
 files.set('package.json', JSON.stringify({ name: '@chronolog/peer-session', version, type: 'module',
-  description: 'Authenticated movable-peer application sessions with explicit recovery and applied outcomes',
+  description: 'Signed authored operation-set CRDT sessions with reactive local materialization and optional finality',
   exports: Object.fromEntries(Object.keys(entries).map(name => [name === 'index' ? '.' : `./${name}`, { types: `./${name}.d.ts`, import: `./${name}.mjs` }])),
   files: ['*.mjs', '*.d.ts', 'chunks', 'types', 'README.md', 'provenance.json',
     ...(values['sql-native'] ? ['engine'] : []), ...(wasmEngine ? ['wasm'] : [])],
@@ -146,9 +146,10 @@ assert.equal(git(['rev-parse', 'HEAD']).trim(), source, 'Source commit changed d
 assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inputs]).trim(), changed, 'Package inputs changed during packaging');
 const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, hash(content)]));
 await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({ format: 'chronolog-peer-session-package/v1',
-  repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'peer-generation-v1',
+  repository: 'werg/chronolog-db', source, sourceTree, dirty, profile: 'chronolog-crdt-v1',
   inputs, runtimeInputs, runtimeModules, nativeRtc, sqlEngines: [
-    ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : []), ...(values['sql-wasm'] ? ['wasm-node'] : [])], nativeEngine, wasmEngine, sha256 }, null, 2) + '\n');
+    ...(values['sql-native'] ? ['native'] : []), ...(values['sql-browser'] ? ['browser'] : []),
+    ...(values['sql-wasm'] ? ['wasm-node'] : []), ...(values['sql-celld'] ? ['celld'] : [])], nativeEngine, wasmEngine, sha256 }, null, 2) + '\n');
 const packed = JSON.parse(execNpmSync(['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: packageRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];

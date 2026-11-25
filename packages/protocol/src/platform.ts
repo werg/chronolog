@@ -1,6 +1,6 @@
 import { domainSeparatedBytes, sha256 } from '@chronolog/canonical'
 
-import { bytesToHex, concatBytes, hexToBytes, utf8 } from './bytes.js'
+import { bytesToHex, concatBytes, utf8 } from './bytes.js'
 import { assertCanonicalCbor, encodeCanonicalCbor, type CborValue } from './cbor.js'
 import { protocolInvariant } from './errors.js'
 import {
@@ -31,10 +31,11 @@ export const MAX_PLATFORM_LIST_ENTRIES = 256
 export const MAX_ROW_KEY_VALUES = 64
 export const MAX_SEED_ROWS = 10_000
 
-/** The `group` collective: created at genesis; its admins are the schema administrators. */
+/** The `group` collective: created at genesis; its membership does not confer DDL rights. */
 export const GROUP_COLLECTIVE_ID: Uint8Array = new Uint8Array(PLATFORM_ID_BYTES)
-/** Durable shared-data owner for peer-generation applications; controlled by signed revisions. */
-export const APPLICATION_COLLECTIVE_ID: Uint8Array = hexToBytes('d089b2593cdd5a4a10734f1f7253cea7b72501dffebfcadfed37be1d01557608')
+
+export type DdlOperation = 'create' | 'alter' | 'drop' | 'index' | 'trigger'
+export type DdlScope = { readonly kind: 'namespace' | 'object'; readonly name: string }
 
 export type GrantOperation = 'insert' | 'update' | 'delete'
 export type CollectiveRole = 'member' | 'admin'
@@ -71,6 +72,8 @@ type OwnershipPlatformOp =
     readonly columns?: readonly string[]
   }
   | { readonly op: 'revoke_grant'; readonly grantId: Uint8Array }
+  | { readonly op: 'grant_ddl'; readonly scope: DdlScope; readonly grantee: Uint8Array; readonly operations: readonly DdlOperation[] }
+  | { readonly op: 'revoke_ddl'; readonly grantId: Uint8Array }
   | { readonly op: 'create_collective'; readonly governance: CollectiveGovernance; readonly invitees: readonly Uint8Array[] }
   | { readonly op: 'accept_membership'; readonly collectiveId: Uint8Array }
   | { readonly op: 'leave'; readonly collectiveId: Uint8Array }
@@ -102,8 +105,9 @@ type OwnershipPlatformOpName = OwnershipPlatformOp['op']
 
 const OP_CODES: readonly OwnershipPlatformOpName[] = [
   'grant', 'revoke_grant', 'create_collective', 'accept_membership',
-  'leave', 'set_members', 'transfer_offer', 'transfer_accept', 'seed_rows', 'end_seeding', 'transfer_cancel',
+  'leave', 'set_members', 'transfer_offer', 'transfer_accept', 'seed_rows', 'end_seeding', 'transfer_cancel', 'grant_ddl', 'revoke_ddl',
 ]
+const DDL_OPERATIONS: readonly DdlOperation[] = ['create', 'alter', 'drop', 'index', 'trigger']
 const OPERATION_BITS: Readonly<Record<GrantOperation, bigint>> = { insert: 1n, update: 2n, delete: 4n }
 const GRANT_OPERATIONS: readonly GrantOperation[] = ['insert', 'update', 'delete']
 
@@ -120,6 +124,9 @@ const rowKey = (values: readonly unknown[]): SqlValue[] => values.map(toSqlValue
 /** Typed builders for every platform operation; each validates its input. */
 export const platformOp = Object.freeze({
   ...sealedOp,
+  grantDdl: (input: { readonly scope: DdlScope; readonly grantee: Uint8Array; readonly operations: readonly DdlOperation[] }): PlatformOp =>
+    checked({ op: 'grant_ddl', scope: { ...input.scope }, grantee: bytes(input.grantee), operations: [...input.operations] }),
+  revokeDdl: (grantId: Uint8Array): PlatformOp => checked({ op: 'revoke_ddl', grantId: bytes(grantId) }),
   grant: (input: {
     readonly table: string
     readonly grantee: Uint8Array
@@ -232,6 +239,22 @@ export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
   protocolInvariant(code >= 0, 'SCHEMA_INVALID', 'Unknown platform operation')
   const entries: (readonly [number, CborValue | undefined])[] = [[0, BigInt(code)]]
   switch (op.op) {
+    case 'grant_ddl': {
+      protocolInvariant(op.scope.kind === 'namespace' || op.scope.kind === 'object', 'SCHEMA_INVALID', 'Unknown DDL scope')
+      protocolInvariant(op.scope.kind !== 'namespace' || op.scope.name === 'main', 'SCHEMA_INVALID', 'Only the main namespace exists')
+      protocolInvariant(isList(op.operations) && op.operations.length > 0, 'SCHEMA_INVALID', 'DDL operations cannot be empty')
+      uniqueBy(op.operations, (value) => value, 'grant_ddl.operations')
+      protocolInvariant(op.operations.every((operation) => DDL_OPERATIONS.includes(operation) &&
+        (op.scope.kind === 'namespace' ? operation === 'create' : operation !== 'create')), 'SCHEMA_INVALID', 'Invalid DDL operation for scope')
+      protocolInvariant(DDL_OPERATIONS.filter((operation) => op.operations.includes(operation)).every((operation, index) => op.operations[index] === operation),
+        'SCHEMA_INVALID', 'DDL operations must be in create, alter, drop, index, trigger order')
+      entries.push([1, [op.scope.kind === 'namespace' ? 0n : 1n, nameToCbor(op.scope.name, 'grant_ddl.scope')]],
+        [2, idToCbor(op.grantee, 'grant_ddl.grantee')], [3, op.operations.map((operation) => BigInt(DDL_OPERATIONS.indexOf(operation)))])
+      break
+    }
+    case 'revoke_ddl':
+      entries.push([1, idToCbor(op.grantId, 'revoke_ddl.grant_id')])
+      break
     case 'grant': {
       protocolInvariant(isList(op.operations) && op.operations.length > 0, 'SCHEMA_INVALID', 'grant.operations cannot be empty')
       uniqueBy(op.operations, (value) => value, 'grant.operations')
@@ -324,6 +347,8 @@ export function platformOpToCanonicalCbor(op: PlatformOp): CborValue {
 }
 
 const KNOWN_KEYS: Readonly<Record<OwnershipPlatformOpName, readonly number[]>> = {
+  grant_ddl: [0, 1, 2, 3],
+  revoke_ddl: [0, 1],
   grant: [0, 1, 2, 3, 4, 5, 6],
   revoke_grant: [0, 1],
   create_collective: [0, 1, 2],
@@ -355,6 +380,23 @@ export function platformOpFromCanonicalCbor(value: CborValue, name = 'platform_o
     expectArray(entry, field).map((item, index) => sqlValueFromCanonicalCbor(item, `${field}[${index}]`))
   let op: PlatformOp
   switch (kind) {
+    case 'grant_ddl': {
+      const scope = expectArray(required(map, 1, `${name}.scope`), `${name}.scope`)
+      protocolInvariant(scope.length === 2, 'SCHEMA_INVALID', 'Invalid DDL scope arity')
+      const scopeKind = expectUint64(scope[0] ?? null, `${name}.scope.kind`)
+      protocolInvariant(scopeKind <= 1n, 'SCHEMA_INVALID', 'Invalid DDL scope kind')
+      const operations = expectArray(required(map, 3, `${name}.operations`), `${name}.operations`).map((entry) => {
+        const code = expectUint64(entry, `${name}.operation`)
+        protocolInvariant(code < BigInt(DDL_OPERATIONS.length), 'SCHEMA_INVALID', 'Unknown DDL operation')
+        return DDL_OPERATIONS[Number(code)]!
+      })
+      op = { op: kind, scope: { kind: scopeKind === 0n ? 'namespace' : 'object', name: expectString(scope[1] ?? null, `${name}.scope.name`) },
+        grantee: id(2, 'grantee'), operations }
+      break
+    }
+    case 'revoke_ddl':
+      op = { op: kind, grantId: id(1, 'grant_id') }
+      break
     case 'grant': {
       const mask = expectUint64(required(map, 3, `${name}.operations`), `${name}.operations`)
       protocolInvariant(mask >= 1n && mask <= 7n, 'SCHEMA_INVALID', `${name}.operations is invalid`)

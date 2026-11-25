@@ -24,7 +24,7 @@ it('accounts incremental writes, replacements and failures under exclusive owner
     captured!.fill(1)
     expect(await store.get('record/0')).toEqual(new Uint8Array(7).fill(5))
     expect(store.usageBytes()).toBe(1015)
-    await expect(NativeBytesStore.open(path)).rejects.toThrow('BYTES_STORE_IN_USE')
+    await expect(NativeBytesStore.open(path)).rejects.toMatchObject({ code: 'BYTES_STORE_IN_USE', message: 'BYTES_STORE_IN_USE' })
     await store.close()
     store = await NativeBytesStore.open(path, { quotaBytes: 1024 })
     expect(store.usageBytes()).toBe(1015)
@@ -70,7 +70,7 @@ it('releases the durable SQLite fence when its owning process is killed', async 
   child.stderr?.on('data', (bytes: Buffer) => { stderr += bytes.toString() })
   try {
     await Promise.race([once(child, 'message'), once(child, 'exit').then(([code]) => { throw Error(`owner exited before acquiring storage: ${String(code)} ${stderr}`) })])
-    await expect(NativeBytesStore.open(path)).rejects.toThrow('BYTES_STORE_IN_USE')
+    await expect(NativeBytesStore.open(path)).rejects.toMatchObject({ code: 'BYTES_STORE_IN_USE', message: 'BYTES_STORE_IN_USE' })
     const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited
     const recovered = await NativeBytesStore.open(path)
     try { expect(await recovered.get('identity')).toEqual(Uint8Array.of(19)) } finally { await recovered.close() }

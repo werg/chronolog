@@ -11,11 +11,12 @@ import {
   type ReplayProposal,
 } from '@chronolog/materializer-doltlite'
 import {
+  compareTransactionOrder,
   encodeTransactionCore,
   transactionDigest,
+  transactionOrderKey,
   program,
   sqlStatement,
-  utf8,
   type ChangeProgram,
   type TransactionCore,
 } from '@chronolog/protocol'
@@ -65,7 +66,7 @@ export async function characterizeNativeRecovery(
   let materializer = await DeterministicMaterializer.open({
     path,
     engine,
-    rootAdministrator: AUTHOR,
+    rootPrincipal: AUTHOR,
     checkpointEvery: Math.max(1, options.reopenEvery),
   })
   const ordered: ReplayProposal[] = []
@@ -92,10 +93,10 @@ export async function characterizeNativeRecovery(
         ))
         lateTransactions += 1
       }
-      ordered.sort((left, right) => {
-        const difference = left.core.authorTimestampMs - right.core.authorTimestampMs
-        return difference < 0n ? -1 : difference > 0n ? 1 : 0
-      })
+      ordered.sort((left, right) => compareTransactionOrder(
+        transactionOrderKey(left.core, left.txId),
+        transactionOrderKey(right.core, right.txId),
+      ))
       replayedTransactions += (await requireRevision(materializer, ordered)).replayedTransactions
       peakRssBytes = Math.max(peakRssBytes, process.memoryUsage.rss())
       if (iteration % options.reopenEvery === 0 && iteration !== options.iterations) {
@@ -103,7 +104,7 @@ export async function characterizeNativeRecovery(
         materializer = await DeterministicMaterializer.open({
           path,
           engine,
-          rootAdministrator: AUTHOR,
+          rootPrincipal: AUTHOR,
           checkpointEvery: Math.max(1, options.reopenEvery),
         })
         reopenCount += 1
@@ -184,9 +185,10 @@ async function transaction(
     program,
   }
   const canonicalCandidate = encodeTransactionCore(core)
+  const txId = await transactionDigest(canonicalCandidate)
   return {
-    txId: utf8(`characterization-${id.toString().padStart(8, '0')}`),
-    candidateDigest: await transactionDigest(canonicalCandidate),
+    txId,
+    candidateDigest: txId,
     canonicalCandidate,
     core,
   }
@@ -214,7 +216,7 @@ function digestJson(value: unknown): string {
     typeof item === 'bigint' ? item.toString() : item), 'utf8').digest('hex')
 }
 
-/** The fixture's only author, and the group's root administrator. */
+/** The fixture's only author, and the group's initial namespace owner. */
 const AUTHOR = bytes32(4)
 
 function bytes32(seed: number): Uint8Array {

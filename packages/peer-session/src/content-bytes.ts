@@ -43,13 +43,25 @@ export async function readContentBytes(content: Pick<ByteContent, 'read'>, refer
   if (reference.bytes > options.maxBytes) throw new Error('CONTENT_READ_LIMIT_EXCEEDED')
   options.signal?.throwIfAborted()
   const result = new Uint8Array(reference.bytes)
-  let offset = 0
-  for await (const chunk of content.read(reference, options.signal === undefined ? {} : { signal: options.signal })) {
-    options.signal?.throwIfAborted()
-    if (!(chunk instanceof Uint8Array) || chunk.byteLength > CONTENT_CHUNK_BYTES || offset + chunk.byteLength > result.byteLength) throw new Error('CONTENT_CHUNK_SIZE_INVALID')
-    result.set(chunk, offset); offset += chunk.byteLength
+  const signal = options.signal ?? new AbortController().signal
+  const iterator = content.read({ ...reference }, { signal })[Symbol.asyncIterator]()
+  let offset = 0, chunks = 0
+  try {
+    for (;;) {
+      const next = await awaitOwnedTask(signal, () => iterator.next())
+      if (next.done) break
+      const chunk = next.value
+      signal.throwIfAborted()
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength === 0 || chunk.byteLength > CONTENT_CHUNK_BYTES ||
+          ++chunks > MAX_CONTENT_BYTES / CONTENT_CHUNK_BYTES || offset + chunk.byteLength > result.byteLength) throw new Error('CONTENT_CHUNK_SIZE_INVALID')
+      result.set(chunk, offset); offset += chunk.byteLength
+    }
+    signal.throwIfAborted()
+    if (offset !== result.byteLength) throw new Error('CONTENT_INCOMPLETE')
+    return result
+  } finally {
+    // A source ignoring abort cannot retain the caller or create an unhandled
+    // late rejection. Its pending next() is already observed by awaitOwnedTask.
+    void iterator.return?.().catch(() => undefined)
   }
-  options.signal?.throwIfAborted()
-  if (offset !== result.byteLength) throw new Error('CONTENT_INCOMPLETE')
-  return result
 }

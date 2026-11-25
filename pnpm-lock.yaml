@@ -13,6 +13,9 @@ importers:
 
   .:
     devDependencies:
+      '@chronolog/authority':
+        specifier: workspace:*
+        version: link:packages/authority
       '@chronolog/crypto':
         specifier: workspace:*
         version: link:packages/crypto
@@ -22,9 +25,6 @@ importers:
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:packages/materializer-doltlite
-      '@chronolog/peer-generation':
-        specifier: workspace:*
-        version: link:packages/peer-generation
       '@chronolog/peer-session':
         specifier: workspace:*
         version: link:packages/peer-session
@@ -79,6 +79,18 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@24.13.3)(tsx@4.23.1)(yaml@2.9.0)
+
+  packages/authority:
+    dependencies:
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
+      '@chronolog/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
 
   packages/canonical:
     dependencies:
@@ -138,8 +150,11 @@ importers:
         specifier: workspace:*
         version: link:../crypto
 
-  packages/peer-generation:
+  packages/peer-session:
     dependencies:
+      '@chronolog/authority':
+        specifier: workspace:*
+        version: link:../authority
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
@@ -149,27 +164,9 @@ importers:
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:../materializer
-      '@chronolog/protocol':
-        specifier: workspace:*
-        version: link:../protocol
-      '@chronolog/records':
-        specifier: workspace:*
-        version: link:../records
-
-  packages/peer-session:
-    dependencies:
-      '@chronolog/crypto':
-        specifier: workspace:*
-        version: link:../crypto
-      '@chronolog/materializer':
-        specifier: workspace:*
-        version: link:../materializer
       '@chronolog/materializer-doltlite':
         specifier: workspace:*
         version: link:../materializer-doltlite
-      '@chronolog/peer-generation':
-        specifier: workspace:*
-        version: link:../peer-generation
       '@chronolog/protocol':
         specifier: workspace:*
         version: link:../protocol

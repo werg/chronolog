@@ -10,7 +10,7 @@ import {
 } from '@chronolog/protocol'
 
 import { isReservedSchemaObjectName, OWNER_COLUMN, withProfiledStatement } from '../sql-profile.js'
-import type { DatabaseLike, SqlRuntimeLimits, StatementLike } from '../types.js'
+import type { DatabaseLike, DdlPermissions, SqlRuntimeLimits, StatementLike } from '../types.js'
 import { PLATFORM_VIEW_NAMES, ownerIdsView, type OwnerOperation } from './schema.js'
 import { SEEDABLE_SEALED_TABLES, SealedRejection, SealedSession } from './sealed.js'
 import {
@@ -91,27 +91,69 @@ export class PlatformSession {
     this.#context = context
   }
 
-  /** The signer is an active admin of the `group` collective. */
-  isSchemaAdmin(): boolean {
-    return this.#isCollectiveAdmin(GROUP_COLLECTIVE_ID, this.#context.actor)
+  /** Snapshot only protected catalog names, before authored SQL runs. */
+  reservedObjectNames(): ReadonlySet<string> {
+    return new Set(this.#all("SELECT name FROM sqlite_schema WHERE type IN ('table', 'view', 'index', 'trigger')")
+      .map((row) => String(row.name)).filter((name) => isReservedSchemaObjectName(name) &&
+        !name.toLowerCase().startsWith('sqlite_')))
+  }
+
+  /** ALTER callbacks name only the old object; do not let a rename claim protected names. */
+  assertReservedObjectsUnchanged(before: ReadonlySet<string>): void {
+    for (const name of this.reservedObjectNames()) if (!before.has(name)) throw new PlatformRejection('denied')
+  }
+
+  /** Derive from the current transaction state, never from enrollment roles or cached cookies. */
+  ddlPermissions(): DdlPermissions {
+    const permissions = { create: false, alter: [] as string[], drop: [] as string[], index: [] as string[], trigger: [] as string[] }
+    const namespace = this.#get("SELECT owner FROM chronolog_ddl_namespaces WHERE name = 'main'")
+    permissions.create = namespace !== undefined && sameBytes(asBytes(namespace.owner), this.#context.actor)
+    for (const row of this.#all('SELECT name, owner FROM chronolog_ddl_objects ORDER BY name')) {
+      if (!sameBytes(asBytes(row.owner), this.#context.actor)) continue
+      for (const operation of ['alter', 'drop', 'index', 'trigger'] as const) permissions[operation].push(String(row.name))
+    }
+    for (const row of this.#all(`SELECT scope_kind, scope_name, operations FROM chronolog_ddl_grants
+      WHERE revoked_tx IS NULL AND grantee = ? ORDER BY grant_id`, this.#context.actor)) {
+      const operations = JSON.parse(String(row.operations)) as ('create' | 'alter' | 'drop' | 'index' | 'trigger')[]
+      for (const operation of operations) {
+        if (operation === 'create') permissions.create = true
+        else if (!permissions[operation].includes(String(row.scope_name))) permissions[operation].push(String(row.scope_name))
+      }
+    }
+    return permissions
+  }
+
+  #grantDdl(op: Extract<PlatformOp, { op: 'grant_ddl' }>, stepIndex: number): void {
+    const catalog = op.scope.kind === 'namespace' ? 'chronolog_ddl_namespaces' : 'chronolog_ddl_objects'
+    const scope = this.#get(`SELECT name, owner FROM ${catalog} WHERE name = ?`, op.scope.name) ?? reject('no_such_ddl_scope')
+    if (!sameBytes(asBytes(scope.owner), this.#context.actor)) reject('not_ddl_owner')
+    this.#run(`INSERT INTO chronolog_ddl_grants
+      (grant_id, scope_kind, scope_name, grantor, grantee, operations, created_tx, revoked_tx) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+    this.#objectId(stepIndex), op.scope.kind, scope.name, this.#context.actor, op.grantee, JSON.stringify(op.operations), this.#context.txId)
+  }
+
+  #revokeDdl(grantId: Uint8Array): void {
+    const grant = this.#get('SELECT grantor, grantee, revoked_tx FROM chronolog_ddl_grants WHERE grant_id = ?', grantId) ?? reject('no_such_ddl_grant')
+    if (grant.revoked_tx !== null) reject('grant_revoked')
+    if (!sameBytes(asBytes(grant.grantor), this.#context.actor) && !sameBytes(asBytes(grant.grantee), this.#context.actor)) reject('not_ddl_owner')
+    this.#run('UPDATE chronolog_ddl_grants SET revoked_tx = ? WHERE grant_id = ?', this.#context.txId, grantId)
   }
 
   /**
    * Start a transaction: close fork seeding unless the signer is the genesis
    * root (seeding ends at the plan's EndSeeding step, or at the first
    * transaction by anyone else if that comes first),
-   * give a first-time signer its principal id, and read whether the signer is
-   * a schema admin and the schema cookie. One cached read, since it runs for
+   * give a first-time signer its principal id, and read the schema cookie. One cached read, since it runs for
    * every transaction.
    */
-  begin(): { readonly actorId: bigint; readonly schemaAdmin: boolean; readonly schemaVersion: number } {
+  begin(): { readonly actorId: bigint; readonly schemaVersion: number } {
     const row = cachedInternalStatement(this.#database, BEGIN_SQL).get(GROUP_COLLECTIVE_ID, this.#context.actor)
     if (row === undefined || Array.isArray(row)) throw new Error('MATERIALIZER_PLATFORM_STATE_MISSING')
     if (Number(row.seeding_open) === 1 && !sameBytes(asBytes(row.root_admin), this.#context.actor)) {
       this.#run('UPDATE chronolog_platform SET seeding_open = 0 WHERE singleton = 1')
     }
     const actorId = row.actor_id === null ? this.#principal(this.#context.actor) : BigInt(row.actor_id as number | bigint)
-    return { actorId, schemaAdmin: Number(row.schema_admin) === 1, schemaVersion: Number(row.schema_version) }
+    return { actorId, schemaVersion: Number(row.schema_version) }
   }
 
   execute(op: PlatformOp, stepIndex: number): void {
@@ -131,6 +173,8 @@ export class PlatformSession {
       }
     }
     switch (op.op) {
+      case 'grant_ddl': return this.#grantDdl(op, stepIndex)
+      case 'revoke_ddl': return this.#revokeDdl(op.grantId)
       case 'grant': return this.#grant(op, stepIndex)
       case 'revoke_grant': return this.#revokeGrant(op.grantId)
       case 'create_collective': return this.#createCollective(op, stepIndex)
@@ -151,7 +195,7 @@ export class PlatformSession {
    * Put a new application table under owner checks: add the owner column
    * (to an empty table), lint its foreign keys, and generate its triggers.
    * Run by reconciliation right after the statement that created the table;
-   * only schema administrators can create tables.
+   * creation requires the main namespace capability.
    */
   #registerTable(name: string): void {
     let shape = tableShape(this.#database, name)
@@ -687,6 +731,8 @@ export class PlatformSession {
         for (const event of PLATFORM_TRIGGER_EVENTS) this.#run(`DROP TRIGGER IF EXISTS ${quoteIdentifier(platformTriggerName(name, event))}`)
         for (const trigger of platformTriggers(tableShape(this.#database, renamedTo))) this.#run(trigger.sql)
         this.#run('UPDATE chronolog_tables SET name = ? WHERE name = ?', renamedTo, name)
+        this.#run('UPDATE chronolog_ddl_objects SET name = ? WHERE name = ?', renamedTo, name)
+        this.#run("UPDATE chronolog_ddl_grants SET scope_name = ? WHERE scope_kind = 'object' AND scope_name = ?", renamedTo, name)
         this.#run('UPDATE chronolog_grants SET tbl = ? WHERE tbl = ?', renamedTo, name)
         this.#run('UPDATE chronolog_transfers SET tbl = ? WHERE tbl = ?', renamedTo, name)
         this.#run('UPDATE chronolog_transfer_scope SET tbl = ? WHERE tbl = ?', renamedTo, name)
@@ -711,6 +757,32 @@ export class PlatformSession {
       this.#registerTable(name)
       registeredKeys.add(key)
     }
+
+    // Track independently owned schema objects, including views and virtual tables.
+    // Index/trigger authority is always scoped to their target object.
+    const ownedObjects = this.#all(`SELECT name, type FROM pragma_table_list WHERE schema = 'main' AND type IN ('table', 'view', 'virtual')`)
+      .filter((row) => !isReservedSchemaObjectName(String(row.name)) &&
+        !(this.#database.nativeProfile !== undefined && String(row.name).toLowerCase().startsWith('_cf_')) &&
+        !isVecChunkTable(this.#database, String(row.name), vecTables))
+    const present = new Set(ownedObjects.map((row) => String(row.name).toLowerCase()))
+    // SQLite virtual-table renames have no generated ownership triggers to
+    // identify the old name. A single statement can rename one parent only;
+    // preserve its owner and grants rather than promoting an ALTER grantee.
+    const oldVirtual = this.#all("SELECT name FROM chronolog_ddl_objects WHERE kind = 'virtual' ORDER BY name")
+      .filter((row) => !present.has(String(row.name).toLowerCase()))
+    const newVirtual = ownedObjects.filter((row) => row.type === 'virtual' &&
+      this.#get('SELECT name FROM chronolog_ddl_objects WHERE name = ?', row.name) === undefined)
+    if (oldVirtual.length === 1 && newVirtual.length === 1) {
+      this.#run('UPDATE chronolog_ddl_objects SET name = ? WHERE name = ?', newVirtual[0]!.name, oldVirtual[0]!.name)
+      this.#run("UPDATE chronolog_ddl_grants SET scope_name = ? WHERE scope_kind = 'object' AND scope_name = ?", newVirtual[0]!.name, oldVirtual[0]!.name)
+    }
+    for (const row of this.#all('SELECT name FROM chronolog_ddl_objects ORDER BY name')) {
+      if (present.has(String(row.name).toLowerCase())) continue
+      this.#run("UPDATE chronolog_ddl_grants SET revoked_tx = ? WHERE scope_kind = 'object' AND scope_name = ? AND revoked_tx IS NULL", this.#context.txId, row.name)
+      this.#run('DELETE FROM chronolog_ddl_objects WHERE name = ?', row.name)
+    }
+    for (const row of ownedObjects) this.#run(`INSERT INTO chronolog_ddl_objects (name, kind, owner, created_tx) VALUES (?, ?, ?, ?)
+      ON CONFLICT (name) DO NOTHING`, row.name, row.type, this.#context.actor, this.#context.txId)
 
     const expected = new Set<string>(PLATFORM_VIEW_NAMES)
     for (const key of registeredKeys) {
@@ -777,8 +849,6 @@ export class PlatformSession {
 
 const BEGIN_SQL = `SELECT p.root_admin, p.seeding_open,
   (SELECT id FROM chronolog_principals WHERE key = ?2) AS actor_id,
-  EXISTS (SELECT 1 FROM chronolog_collective_members
-           WHERE collective_id = ?1 AND member_key = ?2 AND role = 'admin' AND state = 'active') AS schema_admin,
   (SELECT schema_version FROM pragma_schema_version) AS schema_version
   FROM chronolog_platform AS p WHERE p.singleton = 1`
 

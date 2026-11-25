@@ -2,6 +2,7 @@ import { utf8 } from '@chronolog/protocol'
 
 import type {
   DatabaseLike,
+  DdlPermissions,
   NativeSecurityConfiguration,
   SqlRuntimeLimits,
   StatementLike,
@@ -93,7 +94,7 @@ export const DEFAULT_SQL_RUNTIME_LIMITS: Readonly<SqlRuntimeLimits> = {
 }
 
 /** Included in the execution-manifest platform digest on every runtime. */
-export const SQL_PROFILE_VERSION = 'chronolog-portable-sql-policy-v2'
+export const SQL_PROFILE_VERSION = 'chronolog-portable-sql-policy-v3'
 
 /**
  * Read-only pragmas whose answers describe replicated SQL state. Build and
@@ -112,17 +113,17 @@ const LOCAL_DIAGNOSTIC_PRAGMAS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * The consensus block-list: functions whose result depends on connection
+ * The replicated block-list: functions whose result depends on connection
  * history, physical storage, Dolt history or the host. Everything else in
  * the pinned engine is allowed; the clock and PRNG are pinned per transaction.
  */
-export const CONSENSUS_DENIED_FUNCTIONS: ReadonlySet<string> = new Set([
+export const REPLICATED_DENIED_FUNCTIONS: ReadonlySet<string> = new Set([
   'load_extension', 'total_changes', 'sqlite_offset', 'active_branch',
   'sqlite_compileoption_get', 'sqlite_compileoption_used', 'sqlite_source_id',
 ])
 
 /** Virtual-table modules that read physical storage rather than SQL state. */
-export const CONSENSUS_DENIED_MODULES: ReadonlySet<string> = new Set(['dbstat', 'sqlite_dbpage', 'sqlite_stmt'])
+export const REPLICATED_DENIED_MODULES: ReadonlySet<string> = new Set(['dbstat', 'sqlite_dbpage', 'sqlite_stmt'])
 
 /** Local SQL is not replayed, so only external effects and Dolt control are denied. */
 export const FORBIDDEN_LOCAL_READ_FUNCTIONS: ReadonlySet<string> = new Set([
@@ -132,14 +133,14 @@ export const FORBIDDEN_LOCAL_READ_FUNCTIONS: ReadonlySet<string> = new Set([
 
 export type SqlAuthorizationMode =
   | 'internal_bootstrap'
-  | 'consensus'
-  /** Trusted platform operations: may write chronolog_* objects. App triggers they fire stay under consensus rules. */
+  | 'replicated'
+  /** Trusted platform operations: may write chronolog_* objects. App triggers they fire stay under replicated rules. */
   | 'platform'
   | 'local_read'
 
 export interface SqlAuthorizationOptions {
-  /** The signer is an admin of the `group` collective and may run DDL. */
-  readonly schemaAdmin?: boolean
+  /** Fresh trusted snapshot derived from the permission catalog before this statement. */
+  readonly ddlPermissions?: DdlPermissions
   /** Exact generated trigger names; their privilege is restricted to lifecycle metadata columns. */
   readonly lifecycleTriggers?: ReadonlySet<string>
   /**
@@ -175,8 +176,8 @@ export const OWNER_COLUMN = 'chronolog_owner'
 /** Names owned by SQLite, Dolt or Chronolog rather than the application. */
 export function isReservedSchemaObjectName(value: string): boolean {
   const key = asciiLower(value)
-  return key.startsWith('chronolog_') || key.startsWith('sqlite_') || key.startsWith('dolt_') ||
-    key.startsWith('doltlite_') || key.startsWith('pragma_') || CONSENSUS_DENIED_MODULES.has(key)
+  return key.startsWith('_cf_') || key.startsWith('chronolog_') || key.startsWith('sqlite_') || key.startsWith('dolt_') ||
+    key.startsWith('doltlite_') || key.startsWith('pragma_') || REPLICATED_DENIED_MODULES.has(key)
 }
 
 export class SqlProfileError extends Error {
@@ -267,7 +268,7 @@ export function prepareProfiledStatement(
 ): StatementLike {
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
-  if (mode === 'consensus' || mode === 'local_read') assertProfilePragma(sql, mode)
+  if (mode === 'replicated' || mode === 'local_read') assertProfilePragma(sql, mode)
   return withProfileControls(database, mode, limits, authorization, () => {
     let statement: StatementLike
     try {
@@ -296,7 +297,7 @@ export function withProfiledStatement<T>(
 ): T {
   const limits = normalizeSqlRuntimeLimits(inputLimits)
   validateSqlSource(sql, limits)
-  if (mode === 'consensus' || mode === 'local_read') assertProfilePragma(sql, mode)
+  if (mode === 'replicated' || mode === 'local_read') assertProfilePragma(sql, mode)
   if (database.nativeProfile !== undefined) {
     if (mode !== 'platform' && mode !== 'local_read') throw new Error('MATERIALIZER_NATIVE_PROFILE_API_REQUIRED')
     const statement = database.nativeProfile.prepare(sql, mode, limits)
@@ -400,6 +401,19 @@ const DDL_ACTIONS: ReadonlySet<number> = new Set([
  */
 function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationOptions = {}, phase: StatementPhase = { stepping: false }) {
   const droppedTables = new Set<string>()
+  const createdTables = new Set<string>()
+  const virtualLifecycle = new Set<string>()
+  const virtualInternal = (name: string): boolean => phase.stepping && [...virtualLifecycle].some((parent) => name.startsWith(`${parent}_`))
+  const includes = (operation: 'alter' | 'drop' | 'index' | 'trigger', name: string): boolean =>
+    options.ddlPermissions?.[operation].some((entry) => asciiLower(entry) === name) === true
+  const permitted = (action: number, object: string, target: string): boolean => {
+    if (action === ACTION.CREATE_TABLE || action === ACTION.CREATE_VIEW || action === ACTION.CREATE_VTABLE) return options.ddlPermissions?.create === true || virtualInternal(object)
+    if (action === ACTION.ALTER_TABLE) return includes('alter', target) || virtualInternal(target)
+    if (action === ACTION.CREATE_INDEX || action === ACTION.DROP_INDEX) return includes('index', target) || virtualInternal(target) || droppedTables.has(target) ||
+      action === ACTION.CREATE_INDEX && object.startsWith('sqlite_autoindex_') && (createdTables.has(target) || includes('alter', target))
+    if (action === ACTION.CREATE_TRIGGER || action === ACTION.DROP_TRIGGER) return includes('trigger', target) || droppedTables.has(target)
+    return includes('drop', object) || virtualInternal(object)
+  }
   return (
     action: number,
     arg1: string | null,
@@ -416,7 +430,7 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
     }
     // Platform code is trusted, and so are the platform's own triggers and
     // views it runs. App triggers fired by a platform statement are compiled
-    // inside it; they get exactly the consensus rules.
+    // inside it; they get exactly the replicated rules.
     const platform = mode === 'platform' && (caller === '' || caller.startsWith('chronolog_'))
     if (platform) {
       return action === ACTION.ATTACH || action === ACTION.DETACH || action === ACTION.TRANSACTION ? SQLITE_DENY : SQLITE_OK
@@ -431,7 +445,7 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       if (functionName.startsWith('pragma_')) {
         return READ_ONLY_PRAGMAS.has(functionName.slice('pragma_'.length)) ? SQLITE_OK : SQLITE_DENY
       }
-      return CONSENSUS_DENIED_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
+      return REPLICATED_DENIED_FUNCTIONS.has(functionName) ? SQLITE_DENY : SQLITE_OK
     }
     if (action === ACTION.PRAGMA) {
       if (isReadOnlyPragma(objectName, mode)) return SQLITE_OK
@@ -447,7 +461,7 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       // SQLite may omit the database name on follow-on READ callbacks.
       if (database !== '' && database !== 'main' && database !== 'temp') return SQLITE_DENY
       // Dolt system tables expose per-replica history (commit hashes, times).
-      if (mode !== 'local_read' && (isDoltName(objectName) || CONSENSUS_DENIED_MODULES.has(objectName))) return SQLITE_DENY
+      if (mode !== 'local_read' && (isDoltName(objectName) || REPLICATED_DENIED_MODULES.has(objectName))) return SQLITE_DENY
       if (mode !== 'local_read' && objectName.startsWith('pragma_') && !READ_ONLY_PRAGMAS.has(objectName.slice('pragma_'.length))) return SQLITE_DENY
       return SQLITE_OK
     }
@@ -464,7 +478,7 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
           (objectName === 'chronolog_transfers' && (secondaryName === 'state' || secondaryName === 'closed_tx')) ||
           (objectName === 'chronolog_reader_policies' && (secondaryName === 'closed_tx' || secondaryName === 'row_key'))) return SQLITE_OK
     }
-    // ── consensus writes ──
+    // ── replicated writes ──
     if (action === ACTION.INSERT || action === ACTION.UPDATE || action === ACTION.DELETE) {
       // SQLite maintains its own catalogs (sqlite_schema, sqlite_sequence,
       // sqlite_stat1, the temp catalog) while executing DDL and DML.
@@ -472,7 +486,7 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       if (database !== 'main') return SQLITE_DENY
       // Tables without owner checks: app SQL writes them only from app triggers.
       // Writes their modules make while the statement runs are their own.
-      if (options.writeProtectedTables?.has(objectName) === true && !phase.stepping && (caller === '' || caller.startsWith('chronolog_'))) {
+      if (options.writeProtectedTables?.has(objectName) === true && !droppedTables.has(objectName) && !phase.stepping && (caller === '' || caller.startsWith('chronolog_'))) {
         return SQLITE_DENY
       }
       return isReservedSchemaObjectName(objectName) ? SQLITE_DENY : SQLITE_OK
@@ -482,8 +496,8 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
     if (action === ACTION.CREATE_TABLE && (objectName === 'sqlite_stat1' || objectName === 'sqlite_stat4' || objectName === 'sqlite_sequence')) {
       return database === 'main' ? SQLITE_OK : SQLITE_DENY
     }
-    // All other DDL, including triggers, is for schema administrators only.
-    if (DDL_ACTIONS.has(action) && options.schemaAdmin !== true) return SQLITE_DENY
+    // DDL uses namespace creation rights or exact object/target rights, never row ownership.
+    if (DDL_ACTIONS.has(action) && !permitted(action, objectName, secondaryName)) return SQLITE_DENY
     if (
       action === ACTION.CREATE_TABLE || action === ACTION.CREATE_INDEX ||
       action === ACTION.CREATE_VIEW || action === ACTION.CREATE_TRIGGER ||
@@ -498,20 +512,25 @@ function createAuthorizer(mode: SqlAuthorizationMode, options: SqlAuthorizationO
       // Dropping an application table drops its platform triggers with it.
       if (action === ACTION.DROP_TRIGGER && objectName.startsWith('chronolog_') && droppedTables.has(secondaryName)) return SQLITE_OK
       if (isReservedSchemaObjectName(objectName)) return SQLITE_DENY
-      if (action === ACTION.DROP_TABLE) droppedTables.add(objectName)
+      if (action === ACTION.DROP_TABLE || action === ACTION.DROP_VIEW) droppedTables.add(objectName)
+      if (action === ACTION.CREATE_TABLE) createdTables.add(objectName)
       const onTable = action === ACTION.CREATE_INDEX || action === ACTION.CREATE_TRIGGER ||
         action === ACTION.DROP_INDEX || action === ACTION.DROP_TRIGGER
       return onTable && secondaryName !== '' && isReservedSchemaObjectName(secondaryName) ? SQLITE_DENY : SQLITE_OK
     }
     if (action === ACTION.CREATE_VTABLE || action === ACTION.DROP_VTABLE) {
-      if (database !== 'main' || isReservedSchemaObjectName(objectName)) return SQLITE_DENY
-      return CONSENSUS_DENIED_MODULES.has(secondaryName) ? SQLITE_DENY : SQLITE_OK
+      if (database !== 'main' || isReservedSchemaObjectName(objectName) || REPLICATED_DENIED_MODULES.has(secondaryName)) return SQLITE_DENY
+      virtualLifecycle.add(objectName)
+      if (action === ACTION.DROP_VTABLE) droppedTables.add(objectName)
+      return SQLITE_OK
     }
     // SQLITE_ALTER_TABLE reports the database and table through arg1/arg2,
     // and DROP COLUMN reports the dropped column as the third argument.
     if (action === ACTION.ALTER_TABLE) {
       if (database === OWNER_COLUMN) return SQLITE_DENY
-      return objectName === 'main' && !isReservedSchemaObjectName(secondaryName) ? SQLITE_OK : SQLITE_DENY
+      if (objectName !== 'main' || isReservedSchemaObjectName(secondaryName)) return SQLITE_DENY
+      if (options.writeProtectedTables?.has(secondaryName) === true) virtualLifecycle.add(secondaryName)
+      return SQLITE_OK
     }
     // Both only rebuild derived structures (indexes, sqlite_stat1) from table contents.
     if (action === ACTION.REINDEX || action === ACTION.ANALYZE) return SQLITE_OK
@@ -580,13 +599,13 @@ function isDeniedFeatureError(error: unknown, mode: SqlAuthorizationMode): boole
   if (match === null) return false
   const name = asciiLower(match[2]!)
   if (match[1]!.toLowerCase() === 'function') return isDeniedFunction(name, mode)
-  return mode !== 'local_read' && (isDoltName(name) || CONSENSUS_DENIED_MODULES.has(name) ||
+  return mode !== 'local_read' && (isDoltName(name) || REPLICATED_DENIED_MODULES.has(name) ||
     name.startsWith('pragma_') && !READ_ONLY_PRAGMAS.has(name.slice('pragma_'.length)))
 }
 
 function isDeniedFunction(name: string, mode: SqlAuthorizationMode): boolean {
   if (isDoltName(name)) return true
-  return mode === 'local_read' ? FORBIDDEN_LOCAL_READ_FUNCTIONS.has(name) : CONSENSUS_DENIED_FUNCTIONS.has(name)
+  return mode === 'local_read' ? FORBIDDEN_LOCAL_READ_FUNCTIONS.has(name) : REPLICATED_DENIED_FUNCTIONS.has(name)
 }
 
 function validateSqlSource(sql: string, limits: SqlRuntimeLimits): void {

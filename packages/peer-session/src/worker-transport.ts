@@ -15,6 +15,8 @@ export interface ApplicationWorkerEndpoint {
   postMessage(message: unknown, transfer?: Transferable[]): void
   addEventListener(type: 'message', listener: (event: MessageEvent) => void): void
   removeEventListener(type: 'message', listener: (event: MessageEvent) => void): void
+  /** Owned MessagePort endpoints may release their physical handle on detach. */
+  close?(): void
 }
 export interface WorkerWebRtcConnection extends FramedPeerConnection { getRoute(): Promise<WebRtcRoute> }
 type Wire = Record<string, unknown>

@@ -1,21 +1,20 @@
-import type { AppliedResult, OperationState, SignedRetainedCoverage } from '@chronolog/peer-generation'
-import type { ApplicationSession } from './session.js'
-
-export type ApplicationSubmission = ApplicationOperation & { readonly attemptId: string }
-
-/** A saved immutable attempt. Cancelling a waiter never cancels its command. */
-export class ApplicationOperation {
-  constructor(readonly session: ApplicationSession, readonly operationId: string, readonly author?: string) {}
-  get(): Promise<OperationState | null> {
-    return this.session.operations.get(this.operationId, this.author === undefined ? {} : { author: this.author })
-  }
-  applied(options: { readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {
-    return this.session.waitFor(this.operationId, this.author === undefined ? options : { ...options, author: this.author })
-  }
-  retry(): Promise<void> { return this.session.retry(this.operationId, this.author) }
-  async shared(options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> {
-    const applied = await this.applied(options)
-    return this.session.waitForCoverage(applied, options)
-  }
+import type { ChangeProgram as InlineChangeProgram } from '@chronolog/protocol'
+import type { Signed } from '@chronolog/authority'
+import type { MaterializedRevision, WaitOptions } from './session-types.js'
+export interface MaterializedOperation { readonly proposalId: string; readonly revision: MaterializedRevision; readonly outcome: 'accepted' | 'rejected'; readonly rejectionCode: string | null; readonly failingStatementIndex: number | null }
+export interface RetentionStatement { readonly applicationId: string; readonly proposalId: string; readonly author: string; readonly envelopeDigest: string; readonly peer: string; readonly storageId: string }
+export type RetentionEvidence = Signed<RetentionStatement>
+export interface OperationInspection { readonly applicationId: string; readonly author: string; readonly authorTimestampMs: string | null; readonly proposalId: string; readonly operationId: string; readonly stored: boolean; readonly pending: 'body' | 'key' | 'authority' | 'materializer' | null; readonly materialized: MaterializedOperation | null; readonly retained: readonly RetentionEvidence[]; readonly finalized: boolean; readonly excluded: boolean }
+export interface OperationOwner {
+  inspectOperation(id: string): OperationInspection
+  waitOperation(id: string, fact: 'materialized' | 'retained' | 'finalized', options?: WaitOptions): Promise<OperationInspection>
 }
-
+export class ApplicationOperation {
+  readonly stored = true
+  constructor(readonly id: string, readonly operationId: string, private readonly owner: OperationOwner) {}
+  inspect(): OperationInspection { return this.owner.inspectOperation(this.id) }
+  async materialized(options?: WaitOptions): Promise<MaterializedOperation> { return (await this.owner.waitOperation(this.id, 'materialized', options)).materialized! }
+  async retained(options?: WaitOptions): Promise<readonly RetentionEvidence[]> { return (await this.owner.waitOperation(this.id, 'retained', options)).retained }
+  async finalized(options?: WaitOptions): Promise<MaterializedOperation> { return (await this.owner.waitOperation(this.id, 'finalized', options)).materialized! }
+}
+export interface ApplicationSubmission { readonly operationId?: string; readonly authorTimestampMs?: bigint; readonly program: InlineChangeProgram }

@@ -1,501 +1,165 @@
-import { APPLICATION_OWNER_PROTOCOL, type ApplicationOwnerHandshake, type ApplicationEndpointBinding, type ApplicationEndpointState } from './owner-types.js'
-import type { AuthorityBundle, AppliedResult, OperationState, PeerRevision, PrefixProof, RecoveryNotice, SignedAttempt, SignedRetainedCoverage } from '@chronolog/peer-generation'
-import { PEER_GENERATION_CAPABILITIES, validateApplicationDescription } from '@chronolog/peer-generation/metadata'
-import type { EphemeralSignal, Signals } from '@chronolog/signals'
-import type { EventPayload } from '@chronolog/protocol'
-import type { ApplicationCommand, ApplicationDefinition, ApplicationQuery } from './definition.js'
-import type { ContentReference, ContentRetention, ContentUpload } from './content.js'
+import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
+import type { ApplicationEndpointBinding as InlineApplicationEndpointBinding } from './owner-types.js'
+import type { ApplicationDescription as InlineApplicationDescription } from '@chronolog/authority'
+import type { ApplicationEndpointContext as InlineApplicationEndpointContext } from './owner-types.js'
+import type { ApplicationPeerDiagnostics as InlineApplicationPeerDiagnostics } from './network.js'
+import type { AuthorityBundle as InlineAuthorityBundle } from '@chronolog/authority'
+import type { FinalityProof as InlineFinalityProof } from '@chronolog/authority'
+import type { Signed as InlineSigned } from '@chronolog/authority'
+import type { FinalityStatement as InlineFinalityStatement } from '@chronolog/authority'
+import type { SignedProvisioningRequest as InlineSignedProvisioningRequest } from './provisioning.js'
+import type { SignedProvisioningPackage as InlineSignedProvisioningPackage } from './provisioning.js'
+import type { ApplicationWorkerEndpoint } from './worker-transport.js'
+import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from './worker-application-protocol.js'
+import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, QueryParameter, QueryRows, SessionStatus, WaitOptions } from './session-types.js'
+import type { ApplicationSubmission, MaterializedOperation, OperationInspection, RetentionEvidence } from './operation.js'
+import type { ContentReference, ContentUpload, ContentRetention } from './content.js'
 import { putContentBytes, readContentBytes, type ContentPutBytesOptions, type ContentReadBytesOptions } from './content-bytes.js'
-import type { ApplicationRecoveryExpectation, ApplicationTransition } from './recovery.js'
-import type { ApplicationChange, ApplicationEventBatch, ApplicationEventOptions, CommandOptions, QueryParameter, QueryRows, SessionStatus } from './session-types.js'
-import type { ApplicationParticipation, ApplicationParticipationStatus, ApplicationConnectionDiagnostic } from './participation-types.js'
-import type { ApplicationProjectionHandle, ApplicationProjectionSnapshot } from './projection-types.js'
-import { AbandonedOperationError, RecoveredViewError, type ApplicationRecoveryEvidence } from './errors.js'
-import { validateHistoryPoint } from '@chronolog/peer-generation/control'
-import { awaitOwnedTask } from './lifetime.js'
-import { PROTOCOL, MAX_REQUESTS, MAX_RELEASES, MAX_STREAMS, releasesResource, bounded,
-  type Endpoint, type Description, type Metadata, type Snapshot, type WireError, type Request, type Response } from './worker-application-protocol.js'
-
-type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
-type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
-type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface Pending { readonly bounded?: { readonly startedAt: number; readonly deadline: number }; readonly release: boolean; resolve(value: unknown): void; reject(reason: unknown): void }
-
-/** Captured SQL/events stay in the Worker until explicitly released. */
-export interface WorkerApplicationReadView {
-  readonly revision: PeerRevision
-  query(sql: string, parameters?: readonly QueryParameter[]): Promise<QueryRows>
-  readEvents(options?: ApplicationEventOptions): Promise<ApplicationEventBatch>
-  release(): Promise<void>
+export interface WorkerApplicationReadView { readonly applicationId: string; readonly revision: MaterializedRevision; query(sql: string, parameters?: readonly QueryParameter[]): Promise<QueryRows>; readEvents(options?: ApplicationEventOptions): Promise<ReturnType<ApplicationReadView['readEvents']>>; release(): Promise<void> }
+export class WorkerApplicationOperation {
+  readonly stored = true
+  constructor(readonly id: string, readonly operationId: string, private readonly session: WorkerApplicationSession) {}
+  inspect(): Promise<OperationInspection> { return this.session.request('operation.inspect', [this.id]) }
+  materialized(options?: WaitOptions): Promise<MaterializedOperation> { return this.session.wait(this.id, 'materialized', options) }
+  retained(options?: WaitOptions): Promise<readonly RetentionEvidence[]> { return this.session.wait(this.id, 'retained', options) }
+  finalized(options?: WaitOptions): Promise<MaterializedOperation> { return this.session.wait(this.id, 'finalized', options) }
 }
-
-/** A saved operation remains in the owning Worker when its page stops waiting. */
-export interface WorkerApplicationOperation {
-  readonly operationId: string
-  get(): Promise<OperationState | null>
-  applied(options?: { readonly signal?: AbortSignal }): Promise<AppliedResult>
-  retry(): Promise<void>
-  shared(options?: { readonly signal?: AbortSignal }): Promise<readonly SignedRetainedCoverage[]>
-}
-
-/** Page-facing facade; the Worker owns signing keys, durable work and projections. */
-export class WorkerApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
-  readonly applicationId: string
-  readonly historyId: string
-  readonly deviceId: string
-  readonly storageId: string
-  readonly endpoint: ApplicationEndpointBinding | undefined
-  readonly capabilities: Description['capabilities']
-  readonly participation: ApplicationParticipation | undefined
-  readonly operations = {
-    get: (id: string, options: { readonly author?: string } = {}): Promise<OperationState | null> => this.#call('operation.get', [id, options]),
-    inspect: (id: string, options: { readonly author?: string } = {}): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null> => this.#call('operation.inspect', [id, options]),
-    wait: (id: string, options: { readonly author?: string; readonly signal?: AbortSignal } = {}): Promise<AppliedResult> => {
-      const { signal, ...scope } = options
-      return this.#call('operation.wait', [id, scope], signal, true)
-    },
-  }
-  readonly recovery = {
-    inspect: (): Promise<readonly ApplicationTransition[]> => this.#call('recovery.inspect', []),
-    takeover: (options: { readonly coordinator?: string; readonly transitionId?: string; readonly expected?: ApplicationRecoveryExpectation; readonly signal?: AbortSignal } = {}): Promise<RecoveryNotice | null> => {
-      const { signal, ...request } = options
-      return this.#call('recovery.takeover', [request], signal, true)
-    },
-    handover: (options: { readonly coordinator: string; readonly transitionId?: string; readonly signal?: AbortSignal }): Promise<RecoveryNotice | null> => {
-      const { signal, ...request } = options
-      return this.#call('recovery.handover', [request], signal, true)
-    },
-  }
-  readonly signals: Signals = {
-    send: (topic, payload, options = {}) => this.#call('signals.send', [topic, payload, { ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }), ...(options.stream === undefined ? {} : { stream: options.stream }) }], options.signal),
-    subscribe: (options = {}) => this.#stream<EphemeralSignal>('signals', [{ ...(options.topics === undefined ? {} : { topics: options.topics }),
-      ...(options.mode === undefined ? {} : { mode: options.mode }), ...(options.streams === undefined ? {} : { streams: options.streams }) }], options.signal),
-  }
-  readonly content = {
-    putBytes: (bytes: Uint8Array, options: ContentPutBytesOptions = {}): Promise<ContentReference> =>
-      putContentBytes(this.content, bytes, { ...options, signal: options.signal === undefined ? this.signal : AbortSignal.any([this.signal, options.signal]) }),
-    readBytes: (reference: ContentReference, options: ContentReadBytesOptions): Promise<Uint8Array> => readContentBytes(this.content, reference, options),
-    prune: (reference: ContentReference): Promise<void> => this.#call('content.prune', [reference]),
-    stage: async (options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload> => this.#upload(await this.#call('content.stage', [options])),
-    resume: async (id: string): Promise<ContentUpload> => this.#upload(await this.#call('content.resume', [id])),
-    discard: (id: string): Promise<void> => this.#call('content.discard', [id]),
-    read: (reference: ContentReference, options: { readonly offset?: number; readonly length?: number; readonly signal?: AbortSignal } = {}): AsyncIterable<Uint8Array> =>
-      this.#stream('content', [reference, { ...(options.offset === undefined ? {} : { offset: options.offset }), ...(options.length === undefined ? {} : { length: options.length }) }], options.signal),
-    retain: (reference: ContentReference, options: { readonly signal?: AbortSignal } = {}): Promise<ContentRetention> => this.#call('content.retain', [reference], options.signal),
-    retained: (reference: ContentReference): Promise<ContentRetention> => this.#call('content.retained', [reference]),
-    retention: (reference: ContentReference): Promise<readonly ContentRetention[]> => this.#call('content.retention', [reference]),
-  }
-  readonly #port: MessagePort
-  readonly #description: Description
-  readonly #timeoutMs: number
+/** Page facade owns bounded RPC and local UI state, never keys, SQL or ordering. */
+export class WorkerApplicationSession {
+  readonly #endpoint: ApplicationWorkerEndpoint
+  readonly #attachment = crypto.randomUUID()
   readonly #lifetime = new AbortController()
-  readonly #pending = new Map<number, Pending>()
-  readonly #streams = new Set<AbortController>()
-  readonly #statusListeners = new Set<(status: SessionStatus) => void>()
-  readonly #recoveryListeners = new Set<(notice: RecoveryNotice) => void>()
-  readonly #participationListeners = new Set<(status: ApplicationParticipationStatus) => void>()
-  readonly #participationLifetime = new AbortController()
-  #snapshot: Snapshot
-  #nextId = 0
-  #closing: Promise<void> | undefined
-  #stopExternal: (() => void) | undefined
-
-  /** Construct through connectApplicationWorker so readiness is authenticated to the owned port. */
-  constructor(port: MessagePort, metadata: Metadata, timeoutMs: number, signal?: AbortSignal) {
-    this.#port = port; this.#timeoutMs = timeoutMs; this.#snapshot = metadata
-    this.applicationId = metadata.applicationId; this.historyId = metadata.historyId; this.deviceId = metadata.deviceId; this.storageId = metadata.storageId
-    this.endpoint = metadata.endpoint === undefined ? undefined : Object.freeze({ ...metadata.endpoint,
-      context: Object.freeze({ ...metadata.endpoint.context }), capabilities: Object.freeze([...metadata.endpoint.capabilities]),
-      ...(metadata.endpoint.identity === undefined ? {} : { identity: Object.freeze({ ...metadata.endpoint.identity }) }) })
-    Object.defineProperty(this.signals, 'delivery', { value: metadata.signalDelivery ?? 'neighbors', enumerable: true })
-    this.capabilities = Object.freeze({ ...metadata.description.capabilities })
-    this.#description = { ...metadata.description, capabilities: this.capabilities }
-    if (metadata.participation !== null) {
-      const owner = this
-      this.participation = {
-        get status() { return structuredClone(owner.#snapshot.participation!) },
-        signal: this.#participationLifetime.signal,
-        onStatus(listener) {
-          owner.#participationListeners.add(listener)
-          try { listener(structuredClone(owner.#snapshot.participation!)) } catch { /* Observation does not own participation. */ }
-          return () => { owner.#participationListeners.delete(listener) }
-        },
-        diagnostics: async () => {
-          const value: unknown = await this.#call('participation.diagnostics', [])
-          validateConnectionDiagnostics(value); return value
-        },
-        reconsiderConnections: () => this.#call('participation.reconsider', []),
-        approveRecovery: id => this.#call('participation.approve', [id]),
-        close: () => this.#call('participation.close', []),
-      }
-      if (metadata.participation.phase === 'closed') this.#participationLifetime.abort(new Error('APPLICATION_PARTICIPATION_CLOSED'))
-    }
-    port.addEventListener('message', this.#receive); port.addEventListener('messageerror', this.#messageError); port.start()
-    if (signal !== undefined) {
-      const abort = (): void => { void this.close().catch(() => undefined) }
-      signal.addEventListener('abort', abort, { once: true }); this.#stopExternal = () => signal.removeEventListener('abort', abort)
-      if (signal.aborted) abort()
-    }
-    // Every response carries the current coherent snapshot; an older coalesced
-    // callback value must not replace that newer observed status.
-    if (this.endpoint === undefined || this.endpoint.capabilities.includes('diagnostics')) {
-    void this.#observe('status', () => {}).catch(error => this.#fail(error))
-    void this.#observe('recovery', notice => {
-      for (const listener of this.#recoveryListeners) { try { listener(notice as RecoveryNotice) } catch { /* Observers cannot change application progress. */ } }
-    }).catch(error => this.#fail(error))
-    if (this.participation !== undefined) void this.#observe('participation', () => {}).catch(error => this.#fail(error))
-    }
-  }
-  /** Oldest finite facade call, in this realm's performance.now() clock.
-   * Passive stream/operation waits never count. This is a caller deadline,
-   * not evidence that the owner received or began executing the request.
-   */
-  get boundedRequest(): { readonly startedAt: number; readonly deadline: number } | null {
-    let oldest: Pending['bounded']
-    for (const request of this.#pending.values()) {
-      if (request.bounded !== undefined && (oldest === undefined || request.bounded.startedAt < oldest.startedAt)) oldest = request.bounded
-    }
-    return oldest === undefined ? null : { ...oldest }
-  }
+  readonly #pending = new Map<number, { method: string; startedAt: number; deadline: number; resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; cleanup(): void }>()
+  readonly #statuses = new Set<(value: SessionStatus) => void>()
+  readonly #changes = new Set<(value: ApplicationChange) => void>()
+  readonly #ownedViews = new Set<string>()
+  #next = 0
+  #binding: InlineApplicationEndpointBinding | undefined
+  #attachmentState: 'active' | 'suspended' | 'detached' = 'active'
+  #heartbeat: ReturnType<typeof setInterval> | undefined
+  #pinging = false
+  #description: InlineApplicationDescription | undefined
+  #status: SessionStatus = { canAuthor: false, phase: 'ready', database: 'idle', connectedPeers: 0, pendingOperations: 0, materializationError: null }
+  applicationId = ''
+  identity: { readonly publicKey: string } = { publicKey: '' }
+  constructor(endpoint: ApplicationWorkerEndpoint) { this.#endpoint = endpoint; endpoint.addEventListener('message', this.#receive); const physical = endpoint as unknown as EventTarget & { on?(type: string, listener: () => void): void }; physical.addEventListener('close', this.#physicalClose); physical.addEventListener('messageerror', this.#physicalClose); physical.on?.('close', this.#physicalClose); physical.on?.('messageerror', this.#physicalClose) }
+  readonly #physicalClose = (): void => { this.#detach(Object.assign(new Error('OWNER_UNREACHABLE'), { code: 'OWNER_UNREACHABLE' })) }
   get signal(): AbortSignal { return this.#lifetime.signal }
-  get status(): SessionStatus { return { ...this.#snapshot.status } }
-  get revision(): PeerRevision | null { return structuredClone(this.#snapshot.revision) }
-  describe(): Description { return structuredClone(this.#description) }
-  authority(): Promise<AuthorityBundle> { return this.#call('authority', []) }
-  onStatus(listener: (status: SessionStatus) => void): () => void {
-    this.#statusListeners.add(listener)
-    try { listener(this.status) } catch { /* Observation does not own the session. */ }
-    return () => { this.#statusListeners.delete(listener) }
+  get status(): SessionStatus { return { ...this.#status, canAuthor: this.#status.canAuthor && this.#attachmentState === 'active' && this.#binding?.capabilities.includes('commands') === true } }
+  get endpoint(): InlineApplicationEndpointBinding | undefined { return this.#binding === undefined ? undefined : structuredClone(this.#binding) }
+  get attachmentState(): 'active' | 'suspended' | 'detached' { return this.#attachmentState }
+  describe(): InlineApplicationDescription { if (this.#description === undefined) throw new Error('ENDPOINT_HANDSHAKE_REQUIRED'); return structuredClone(this.#description) }
+  get boundedRequest(): { readonly startedAt: number; readonly deadline: number } | null {
+    const requests = [...this.#pending.values()].filter(request => request.method !== 'operation.wait' && request.method !== 'signals.next').sort((a, b) => a.startedAt - b.startedAt)
+    const request = requests[0]; return request === undefined ? null : { startedAt: request.startedAt, deadline: request.deadline }
   }
-  onRecovery(listener: (notice: RecoveryNotice) => void): () => void {
-    this.signal.throwIfAborted(); this.#recoveryListeners.add(listener)
-    return () => { this.#recoveryListeners.delete(listener) }
-  }
-  async command<Name extends keyof D['commands'] & string>(name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions): Promise<WorkerApplicationOperation> {
-    return this.#operation(await this.#call('command', [name, input, options]))
-  }
-  async reapply<Name extends keyof D['commands'] & string>(id: string, name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions & { readonly originalAuthor?: string }): Promise<WorkerApplicationOperation> {
-    return this.#operation(await this.#call('reapply', [id, name, input, options]))
-  }
-  query<Name extends keyof D['queries'] & string>(name: Name, input: QueryArguments<D['queries'][Name]>): Promise<{ readonly revision: PeerRevision; readonly value: QueryResult<D['queries'][Name]> }> {
-    return this.#call('query', [name, input])
-  }
-  retry(id: string): Promise<void> { return this.#call('retry', [id]) }
-  resume(): Promise<void> { return this.#call('resume', []) }
-  inspectRecovery(): Promise<readonly RecoveryNotice[]> { return this.#call('inspectRecovery', []) }
-  recoveryPoint(): Promise<PrefixProof> { return this.#call('recoveryPoint', []) }
-  adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> { return this.#call('adopt', [authority]) }
-  changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> { return this.#stream('changes', [], options.signal) }
-  projection<State extends EventPayload = EventPayload>(id: string): ApplicationProjectionHandle<State> {
-    const captured = this.#call<number>('projection.open', [id]), lifetime = new AbortController()
-    // An unused facade may outlive a failed remote lookup without an unhandled rejection.
-    void captured.catch(() => undefined)
-    let closing: Promise<void> | undefined
-    const signal = (external?: AbortSignal): AbortSignal => AbortSignal.any([this.signal, lifetime.signal,
-      ...(external === undefined ? [] : [external])])
-    return Object.freeze({ id,
-      read: async (options: { readonly signal?: AbortSignal } = {}): Promise<ApplicationProjectionSnapshot<State>> => {
-        const owned = signal(options.signal), token = await awaitOwnedTask(owned, () => captured)
-        return this.#call('projection.read', [token], owned)
-      },
-      changes: (options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationProjectionSnapshot<State>> =>
-        this.#stream('projection', async () => [await captured], signal(options.signal)),
-      close: (): Promise<void> => {
-        if (closing !== undefined) return closing
-        closing = captured.then(token => this.signal.aborted ? undefined : this.#call<void>('projection.close', [token]))
-          .catch(error => { closing = undefined; if (!this.signal.aborted) throw error })
-        lifetime.abort(new Error('APPLICATION_PROJECTION_CLOSED'))
-        return closing
-      },
-    })
-  }
-  async readView(): Promise<WorkerApplicationReadView> {
-    const captured = await this.#call<{ id: number; revision: PeerRevision }>('view.open', [])
-    let released = false
-    const held = (): void => { if (released) throw new Error('APPLICATION_VIEW_RELEASED') }
-    return { revision: captured.revision,
-      query: (sql, parameters = []) => { held(); return this.#call('view.query', [captured.id, sql, parameters]) },
-      readEvents: (options = {}) => { held(); return this.#call('view.events', [captured.id, options]) },
-      release: async () => { if (released) return; released = true; await this.#call('view.release', [captured.id]) },
+  readonly #receive = (event: MessageEvent): void => {
+    const message = event.data as Partial<OwnerResponse> | Partial<OwnerNotice>
+    if (message?.protocol !== APPLICATION_OWNER_PROTOCOL || message.attachment !== this.#attachment) return
+    if (message.kind === 'response') {
+      const response = message as OwnerResponse, pending = this.#pending.get(response.id); if (pending === undefined) return
+      this.#pending.delete(response.id); clearTimeout(pending.timer); pending.cleanup(); if (response.error !== undefined) pending.reject(Object.assign(new Error(response.error), { code: response.error })); else pending.resolve(response.value)
+    } else if (message.kind === 'notice') {
+      const notice = message as OwnerNotice
+      if (notice.topic === 'closed') { this.#detach(new Error(String(notice.value))); return }
+      if (notice.topic === 'status') { this.#status = notice.value as SessionStatus; for (const listener of this.#statuses) { try { listener(this.status) } catch { /* Isolated observers. */ } } }
+      if (notice.topic === 'change') for (const listener of this.#changes) { try { listener(notice.value as ApplicationChange) } catch { /* Isolated observers. */ } }
     }
   }
-  /** Detach cancels this endpoint's observation only; the owner's journal survives. */
-  detach(): Promise<void> { return this.close() }
-  suspend(): Promise<void> { return this.#call('endpoint.suspend', []) }
-  resumeAttachment(): Promise<ApplicationEndpointBinding | null> { return this.#call('endpoint.resume', []) }
-  endpoints(): Promise<readonly (ApplicationEndpointBinding & { readonly state: ApplicationEndpointState })[]> { return this.#call('endpoints.list', []) }
-  close(): Promise<void> {
-    if (this.#closing !== undefined) return this.#closing
-    this.#closing = (async () => {
-      try { if (!this.signal.aborted) await this.#call('close', []) }
-      catch (error) { if (!this.signal.aborted) throw error }
-      finally { this.#fail(new Error('APPLICATION_SESSION_CLOSED')) }
-    })()
-    return this.#closing
-  }
-  #call<T>(method: string, args: readonly unknown[], signal?: AbortSignal, passive = false): Promise<T> {
+  request<T>(method: string, args: readonly unknown[], options: WaitOptions = {}): Promise<T> {
     if (this.signal.aborted) return Promise.reject(this.signal.reason)
-    if (signal?.aborted) return Promise.reject(signal.reason)
-    const release = releasesResource(method)
-    if (method !== 'close' && [...this.#pending.values()].filter(call => call.release === release).length >= (release ? MAX_RELEASES : MAX_REQUESTS)) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_LIMIT'))
-    const id = ++this.#nextId
-    if (!Number.isSafeInteger(id)) return Promise.reject(new Error('APPLICATION_WORKER_REQUEST_ID_EXHAUSTED'))
-    const request: Request = { id, method, args }
-    try { bounded(request) } catch (error) { return Promise.reject(error) }
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
+    const control = ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'signals.close', 'upload.discard'].includes(method)
+    if ([...this.#pending.values()].filter(request => ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'signals.close', 'upload.discard'].includes(request.method) === control).length >= (control ? 8 : 32)) return Promise.reject(new Error('ENDPOINT_REQUEST_LIMIT'))
+    const timeoutMs = options.timeoutMs ?? 30_000
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) return Promise.reject(new Error('ENDPOINT_TIMEOUT_LIMIT'))
+    const id = ++this.#next, startedAt = performance.now()
     return new Promise<T>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const clean = (): void => { signal?.removeEventListener('abort', abort); if (timer !== undefined) clearTimeout(timer) }
-      const abort = (): void => {
-        clean(); this.#pending.delete(id); this.#cancel(id); reject(signal?.reason ?? new Error('APPLICATION_WORKER_TIMEOUT'))
-      }
-      const startedAt = performance.now()
-      this.#pending.set(id, { ...(passive ? {} : { bounded: { startedAt, deadline: startedAt + this.#timeoutMs } }), release, resolve: value => { clean(); resolve(value as T) }, reject: error => { clean(); reject(error) } })
-      signal?.addEventListener('abort', abort, { once: true })
-      if (!passive) timer = setTimeout(abort, this.#timeoutMs)
-      try { this.#port.postMessage(request) } catch (error) { this.#pending.delete(id); clean(); reject(error) }
+      const cancel = (): void => { try { this.#endpoint.postMessage({ protocol: APPLICATION_OWNER_PROTOCOL, attachment: this.#attachment, kind: 'cancel', id }) } catch { /* A dead owner cannot retain this request's resources. */ } }
+      const abort = (): void => { const pending = this.#pending.get(id); if (pending === undefined) return; this.#pending.delete(id); clearTimeout(pending.timer); pending.cleanup(); cancel(); reject(options.signal?.reason) }
+      const cleanup = (): void => options.signal?.removeEventListener('abort', abort)
+      const timer = setTimeout(() => { this.#pending.delete(id); cleanup(); cancel(); reject(Object.assign(new Error('ENDPOINT_REQUEST_TIMEOUT'), { code: 'ENDPOINT_REQUEST_TIMEOUT' })) }, timeoutMs)
+      this.#pending.set(id, { method, startedAt, deadline: startedAt + timeoutMs, resolve: value => resolve(value as T), reject, timer, cleanup }); options.signal?.addEventListener('abort', abort, { once: true })
+      try { this.#endpoint.postMessage({ protocol: APPLICATION_OWNER_PROTOCOL, attachment: this.#attachment, kind: 'request', id, method, args }) } catch (error) { this.#pending.delete(id); clearTimeout(timer); cleanup(); reject(error) }
     })
   }
-  #stream<T>(name: string, args: readonly unknown[] | (() => Promise<readonly unknown[]>), signal?: AbortSignal): AsyncIterable<T> {
-    const client = this
-    return { [Symbol.asyncIterator]() {
-      if (name !== 'content' && (client.signal.aborted || signal?.aborted)) {
-        const ended = async (): Promise<IteratorResult<T>> => ({ done: true, value: undefined })
-        return { next: ended, return: ended }
-      }
-      if (client.#streams.size >= MAX_STREAMS) throw new Error('APPLICATION_WORKER_STREAM_LIMIT')
-      const controller = new AbortController(); client.#streams.add(controller)
-      const lifetime = AbortSignal.any([client.signal, controller.signal, ...(signal === undefined ? [] : [signal])])
-      let opened: Promise<number> | undefined, id: number | undefined, done = false, pulling = false
-      const finish = (): void => {
-        if (done) return
-        done = true; controller.abort(new Error('APPLICATION_WORKER_STREAM_CLOSED')); client.#streams.delete(controller)
-        if (id !== undefined) client.#cancel(id)
-        else void opened?.then(value => client.#cancel(value), () => undefined)
-      }
-      lifetime.addEventListener('abort', finish, { once: true })
-      return {
-        async next(): Promise<IteratorResult<T>> {
-          if (done) return { done: true, value: undefined }
-          if (pulling) throw new Error('APPLICATION_WORKER_STREAM_BUSY')
-          pulling = true
-          try {
-            opened ??= typeof args === 'function'
-              ? awaitOwnedTask(lifetime, args).then(values => client.#call<number>('stream.open', [name, ...values], lifetime))
-              : client.#call<number>('stream.open', [name, ...args], lifetime)
-            id = await opened
-            const result = await client.#call<IteratorResult<T>>('stream.next', [id], lifetime, true)
-            if (result.done) finish()
-            return result
-          } catch (error) {
-            const cancelled = lifetime.aborted; finish()
-            // Observation closes normally; interrupted byte reads must still
-            // report failure instead of appearing to be complete content.
-            if (cancelled && name !== 'content') return { done: true, value: undefined }
-            throw error
-          }
-          finally { pulling = false }
-        },
-        async return(): Promise<IteratorResult<T>> { finish(); lifetime.removeEventListener('abort', finish); return { done: true, value: undefined } },
-      }
+  async initialize(options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext }): Promise<void> {
+    const value = await this.request<{ applicationId: string; identity: { publicKey: string }; status: SessionStatus; binding: InlineApplicationEndpointBinding; definition: InlineApplicationDescription }>('hello', [options]); this.applicationId = value.applicationId; this.identity = value.identity; this.#status = value.status; this.#binding = value.binding; this.#description = value.definition
+    this.#heartbeat = setInterval(() => { if (this.#pinging || this.signal.aborted || this.#attachmentState === 'suspended') return; this.#pinging = true; void this.request('attachment.ping', [], { timeoutMs: 20_000 }).catch(error => this.#detach(error)).finally(() => { this.#pinging = false }) }, 5000)
+    this.#heartbeat.unref?.()
+  }
+  async suspendAttachment(): Promise<void> { await this.request('attachment.suspend', []); this.#attachmentState = 'suspended'; this.#ownedViews.clear() }
+  suspend(): Promise<void> { return this.suspendAttachment() }
+  async resumeAttachment(): Promise<InlineApplicationEndpointBinding | null> { this.#status = await this.request('attachment.resume', []); this.#attachmentState = 'active'; return this.endpoint ?? null }
+  detach(): Promise<void> { return this.close() }
+  async submit(input: ApplicationSubmission): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('submit', [input]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
+  async command(name: string, input: unknown, options: CommandOptions = {}): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('command', [name, input, options]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
+  query(name: string, input: unknown): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly value: unknown }> { return this.request('query', [name, input]) }
+  wait<T>(id: string, fact: string, options: WaitOptions = {}): Promise<T> { const timeoutMs = options.timeoutMs ?? 30_000; return this.request('operation.wait', [id, fact, timeoutMs], { ...options, timeoutMs: Math.min(120_000, timeoutMs + 1000) }) }
+  async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<WorkerApplicationReadView> {
+    const captured = await this.request<{ id: string; revision: MaterializedRevision }>('readView', [options]); this.#ownedViews.add(captured.id); let released = false, releasing: Promise<void> | undefined
+    return { applicationId: this.applicationId, revision: captured.revision, query: (sql, parameters = []) => { if (released) return Promise.reject(new Error('READ_VIEW_RELEASED')); return this.request('view.query', [captured.id, sql, parameters]) }, readEvents: options => { if (released) return Promise.reject(new Error('READ_VIEW_RELEASED')); return this.request('view.events', [captured.id, options ?? {}]) }, release: () => { if (releasing !== undefined) return releasing; released = true; this.#ownedViews.delete(captured.id); return releasing = this.request<void>('view.release', [captured.id]) } }
+  }
+  get operations() {
+    const session = this
+    return { async retry(id: string): Promise<WorkerApplicationOperation> { const value = await session.request<{ id: string; operationId: string }>('operation.retry', [id]); return new WorkerApplicationOperation(value.id, value.operationId, session) }, async get(id: string): Promise<WorkerApplicationOperation | null> { const value = await session.request<{ id: string; operationId: string } | null>('operation.get', [id]); return value === null ? null : new WorkerApplicationOperation(value.id, value.operationId, session) }, async *subscribe(options: { readonly operationId: string; readonly signal?: AbortSignal }): AsyncIterable<OperationInspection> {
+      const signal = options.signal === undefined ? session.signal : AbortSignal.any([session.signal, options.signal]); let dirty = true, wake: (() => void) | undefined
+      const invalidate = (): void => { dirty = true; wake?.() }; const stop = session.onChange(invalidate), stopStatus = session.onStatus(invalidate); signal.addEventListener('abort', invalidate)
+      try { while (!signal.aborted) { if (!dirty) await new Promise<void>(resolve => { wake = resolve }); if (signal.aborted) break; dirty = false; const operation = await session.operations.get(options.operationId); if (operation !== null) yield await operation.inspect() } } finally { stop(); stopStatus(); signal.removeEventListener('abort', invalidate) }
     } }
   }
-  #operation(id: string): WorkerApplicationOperation {
-    return Object.freeze({ operationId: id, get: () => this.operations.get(id),
-      applied: (options: { readonly signal?: AbortSignal } = {}) => this.operations.wait(id, options),
-      retry: () => this.retry(id), shared: (options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> => this.#call('operation.shared', [id], options.signal, true) })
+  onStatus(listener: (status: SessionStatus) => void): () => void { this.#statuses.add(listener); listener(this.status); return () => { this.#statuses.delete(listener) } }
+  onChange(listener: (change: ApplicationChange) => void): () => void { this.#changes.add(listener); return () => { this.#changes.delete(listener) } }
+  async *changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
+    const signal = options.signal === undefined ? this.signal : AbortSignal.any([this.signal, options.signal]), queue: ApplicationChange[] = []; let wake: (() => void) | undefined
+    const stop = this.onChange(value => { queue.splice(0, queue.length, value); wake?.() }), abort = (): void => { wake?.() }; signal.addEventListener('abort', abort)
+    try { while (!signal.aborted) { if (queue.length === 0) await new Promise<void>(resolve => { wake = resolve }); while (queue.length > 0 && !signal.aborted) yield queue.shift()! } } finally { stop(); signal.removeEventListener('abort', abort) }
   }
-  #upload(id: string): ContentUpload {
-    return { id, write: (index, bytes) => this.#call('content.write', [id, index, bytes]),
-      progress: () => this.#call('content.progress', [id]), commit: () => this.#call('content.commit', [id]), discard: () => this.#call('content.discard', [id]) }
+  diagnostics(): Promise<readonly InlineApplicationPeerDiagnostics[]> { return this.request('diagnostics.peers', []) }
+  readAuthority(): Promise<InlineAuthorityBundle> { return this.request('authority.read', []) }
+  endpoints(): Promise<readonly (InlineApplicationEndpointBinding & { readonly state: 'active' | 'suspended' })[]> { return this.request('endpoints.list', []) }
+  mergeAuthority(bundle: InlineAuthorityBundle): Promise<void> { return this.request('authority.merge', [bundle]) }
+  readonly finality = {
+    closeAuthorTime: (options: { readonly throughMs: bigint }): Promise<{ readonly closedThroughMs: bigint | null; readonly proofs: readonly InlineFinalityProof[] }> => this.request('finality.closeAuthorTime', [options]),
+    voteAuthorTime: (options: { readonly throughMs: bigint }): Promise<readonly InlineSigned<InlineFinalityStatement>[]> => this.request('finality.voteAuthorTime', [options]),
+    submitProofs: (proofs: readonly InlineFinalityProof[]): Promise<void> => this.request('finality.submitProofs', [proofs]),
   }
-  async #observe(name: string, listener: (value: unknown) => void): Promise<void> {
-    try { for await (const value of this.#stream(name, [], this.signal)) listener(value) }
-    catch (error) { if (!this.signal.aborted) throw error }
+  readonly provisioning = {
+    createProvisioningRequest: (): Promise<InlineSignedProvisioningRequest> => this.request('provisioning.createProvisioningRequest', []),
+    exportProvisioning: (request: InlineSignedProvisioningRequest): Promise<InlineSignedProvisioningPackage> => this.request('provisioning.exportProvisioning', [request]),
+    importProvisioning: (value: InlineSignedProvisioningPackage): Promise<void> => this.request('provisioning.importProvisioning', [value]),
   }
-  #cancel(id: number): void { try { this.#port.postMessage({ cancel: id }) } catch { /* Cancellation never replaces durable work. */ } }
-  readonly #receive = (event: MessageEvent): void => {
-    try {
-      bounded(event.data)
-      const response = event.data as Response & { ended?: WireError }
-      if (response.ended !== undefined) { this.#fail(fromError(response.ended), false); return }
-      if (!Number.isSafeInteger(response.id)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
-      const pending = this.#pending.get(response.id)
-      if (pending === undefined) return // A cancelled waiter can have an already posted result.
-      // Validate and publish the response snapshot while this waiter is still
-      // owned. A malformed reply must reject it immediately when the port ends.
-      this.#update(response.snapshot)
-      const error = response.error === undefined ? undefined : fromError(response.error)
-      this.#pending.delete(response.id)
-      if (error === undefined) pending.resolve(response.value)
-      else pending.reject(error)
-    } catch (error) { this.#fail(error) }
+  readonly signals = {
+    delivery: 'application' as const,
+    send: (topic: string, payload: SignalPayload, options: SignalSendOptions = {}): Promise<EphemeralSignal> => { const { signal, ...rest } = options; return this.request('signals.send', [topic, payload, rest], signal === undefined ? {} : { signal }) },
+    subscribe: (options: SignalSubscribeOptions = {}): AsyncIterable<EphemeralSignal> => {
+      const session = this, { signal: external, ...rest } = options, signal = external === undefined ? this.signal : AbortSignal.any([this.signal, external])
+      return { async *[Symbol.asyncIterator]() {
+        const id = await session.request<string>('signals.open', [rest], { signal })
+        try { while (!signal.aborted) { const next = await session.request<{ idle?: true; done?: true; value?: EphemeralSignal }>('signals.next', [id], { signal, timeoutMs: 25_000 }); if (next.done) return; if (next.value !== undefined) yield next.value } }
+        finally { if (!session.signal.aborted) await session.request('signals.close', [id]).catch(() => undefined) }
+      } }
+    },
   }
-  readonly #messageError = (): void => { this.#fail(new Error('APPLICATION_WORKER_MESSAGE_INVALID')) }
-  #update(value: Snapshot): void {
-    validateStatus(value.status); validateParticipation(value.participation)
-    if ((value.participation === null) !== (this.participation === undefined)) throw new Error('APPLICATION_WORKER_PARTICIPATION_CHANGED')
-    const changed = JSON.stringify(value.status) !== JSON.stringify(this.#snapshot.status)
-    const participationChanged = JSON.stringify(value.participation) !== JSON.stringify(this.#snapshot.participation)
-    this.#snapshot = value
-    if (changed) for (const listener of this.#statusListeners) { try { listener(this.status) } catch { /* Observation cannot change state. */ } }
-    if (value.participation?.phase === 'closed') this.#participationLifetime.abort(new Error('APPLICATION_PARTICIPATION_CLOSED'))
-    if (participationChanged) for (const listener of this.#participationListeners) {
-      try { listener(structuredClone(value.participation!)) } catch { /* Observation cannot choose recovery. */ }
-    }
+  readonly content = {
+    retain: (reference: ContentReference): Promise<ContentRetention> => this.request('content.retain', [reference]),
+    retention: (reference: ContentReference): Promise<readonly ContentRetention[]> => this.request('content.retention', [reference]),
+    retained: (reference: ContentReference): Promise<readonly ContentRetention[]> => this.request('content.retained', [reference]),
+    discard: (reference: ContentReference): Promise<void> => this.request('content.discard', [reference]),
+    stage: async (options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload> => {
+      const id = await this.request<string>('content.stage', [options]); return { id, write: (index, bytes) => this.request('upload.write', [id, index, bytes]), progress: () => this.request('upload.progress', [id]), commit: () => this.request('upload.commit', [id]), discard: () => this.request('upload.discard', [id]) }
+    },
+    read: (reference: ContentReference, options: { readonly signal?: AbortSignal } = {}): AsyncIterable<Uint8Array> => {
+      const session = this
+      return { async *[Symbol.asyncIterator]() { const id = await session.request<string>('content.openRead', [reference], options); try { while (!options.signal?.aborted) { const chunk = await session.request<Uint8Array | null>('content.next', [id], options); if (chunk === null) return; yield chunk } } finally { void session.request('content.cancel', [id]).catch(() => undefined) } } }
+    },
+    putBytes: (bytes: Uint8Array, options?: ContentPutBytesOptions) => putContentBytes(this.content, bytes, options),
+    readBytes: (reference: ContentReference, options: ContentReadBytesOptions) => readContentBytes(this.content, reference, options),
   }
-  #fail(reason: unknown, notifyOwner = true): void {
-    if (this.signal.aborted) return
-    if (notifyOwner) {
-      try { this.#port.postMessage({ id: ++this.#nextId, method: 'close', args: [] } satisfies Request) }
-      catch { /* A failed port cannot acknowledge cleanup; the Worker lifetime still fences all work. */ }
-    }
-    this.#lifetime.abort(reason); this.#stopExternal?.()
-    this.#participationLifetime.abort(reason)
-    this.#snapshot = { ...this.#snapshot, status: { ...this.#snapshot.status, phase: 'closed', database: 'closed' },
-      participation: this.#snapshot.participation === null ? null : { ...this.#snapshot.participation, phase: 'closed' } }
-    for (const listener of this.#statusListeners) { try { listener(this.status) } catch { /* Observe closure independently. */ } }
-    this.#statusListeners.clear(); this.#recoveryListeners.clear()
-    for (const listener of this.#participationListeners) {
-      try { listener(structuredClone(this.#snapshot.participation!)) } catch { /* Observe closure independently. */ }
-    }
-    this.#participationListeners.clear()
-    for (const pending of this.#pending.values()) pending.reject(reason)
-    this.#pending.clear()
-    for (const controller of this.#streams) controller.abort(reason)
-    this.#streams.clear()
-    this.#port.removeEventListener('message', this.#receive); this.#port.removeEventListener('messageerror', this.#messageError); this.#port.close()
-  }
+  readEvents(options: ApplicationEventOptions = {}): Promise<ReturnType<ApplicationReadView['readEvents']>> { return this.request('events.read', [options]) }
+  #detach(reason: unknown): void { if (this.signal.aborted) return; this.#attachmentState = 'detached'; clearInterval(this.#heartbeat); this.#status = { ...this.#status, phase: 'closed', database: 'closed', canAuthor: false }; for (const listener of this.#statuses) { try { listener(this.status) } catch { /* Isolated observers. */ } }; this.#lifetime.abort(reason); this.#endpoint.removeEventListener('message', this.#receive); const physical = this.#endpoint as unknown as EventTarget & { off?(type: string, listener: () => void): void }; physical.removeEventListener('close', this.#physicalClose); physical.removeEventListener('messageerror', this.#physicalClose); physical.off?.('close', this.#physicalClose); physical.off?.('messageerror', this.#physicalClose); for (const pending of this.#pending.values()) { clearTimeout(pending.timer); pending.cleanup(); pending.reject(reason) }; this.#pending.clear(); this.#statuses.clear(); this.#changes.clear(); this.#endpoint.close?.() }
+  async close(): Promise<void> { if (this.signal.aborted) return; for (const id of this.#ownedViews) void this.request('view.release', [id]).catch(() => undefined); try { await this.request('close', [], { timeoutMs: 1000 }) } finally { this.#detach(new Error('ENDPOINT_CLOSED')) } }
 }
-
-/** Connect to a ready Worker without exposing or transferring its signing keys. */
-export function connectApplicationWorker<D extends ApplicationDefinition = ApplicationDefinition>(endpoint: Endpoint, options: {
-  readonly signal?: AbortSignal; readonly timeoutMs?: number
-} = {}): Promise<WorkerApplicationSession<D>> {
-  return connect<D>(endpoint, options, PROTOCOL)
-}
-/** Attach to an existing owner without opening a signer store or creating a session. */
-export function connectApplicationOwner<D extends ApplicationDefinition = ApplicationDefinition>(endpoint: Endpoint,
-  options: ApplicationOwnerHandshake & { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<WorkerApplicationSession<D>> {
-  const { signal, timeoutMs, ...handshake } = options
-  return connect<D>(endpoint, { ...(signal === undefined ? {} : { signal }), ...(timeoutMs === undefined ? {} : { timeoutMs }) }, APPLICATION_OWNER_PROTOCOL, handshake)
-}
-function connect<D extends ApplicationDefinition>(endpoint: Endpoint, options: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
-  protocol: Metadata['protocol'], handshake?: ApplicationOwnerHandshake): Promise<WorkerApplicationSession<D>> {
-  const timeoutMs = options.timeoutMs ?? 30_000
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) return Promise.reject(new Error('APPLICATION_WORKER_TIMEOUT_INVALID'))
-  if (options.signal?.aborted) return Promise.reject(options.signal.reason)
-  const channel = new MessageChannel(), port = channel.port1
-  return new Promise((resolve, reject) => {
-    const clean = (): void => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); port.removeEventListener('message', ready) }
-    const fail = (reason: unknown): void => {
-      clean()
-      try { port.postMessage({ id: 1, method: 'close', args: [] } satisfies Request) } catch { /* The handoff may not have reached the Worker. */ }
-      port.close(); channel.port2.close(); reject(reason)
-    }
-    const abort = (): void => { fail(options.signal?.reason) }
-    const ready = (event: MessageEvent): void => {
-      try {
-        bounded(event.data)
-        const value = event.data as { ready?: Metadata; ended?: WireError }
-        if (value.ended !== undefined) { fail(fromError(value.ended)); return }
-        const metadata = value.ready
-        if (metadata === undefined || metadata.protocol !== protocol || !/^[0-9a-f]{64}$/u.test(metadata.applicationId) || !/^[0-9a-f]{64}$/u.test(metadata.deviceId) ||
-            typeof metadata.storageId !== 'string' || typeof metadata.historyId !== 'string') {
-          throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-        }
-        const { capabilities, ...description } = metadata.description
-        if (capabilities === null || typeof capabilities !== 'object' || typeof capabilities.sql !== 'boolean' ||
-            Object.keys(capabilities).length !== Object.keys(PEER_GENERATION_CAPABILITIES).length + 1 ||
-            Object.entries(PEER_GENERATION_CAPABILITIES).some(([key, expected]) => capabilities[key as keyof typeof PEER_GENERATION_CAPABILITIES] !== expected)) {
-          throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-        }
-        validateApplicationDescription(description)
-        if (handshake !== undefined && (metadata.applicationId !== handshake.applicationId || description.id !== handshake.definitionId || description.version !== handshake.definitionVersion || !validEndpoint(metadata.endpoint))) throw new Error('CONTRACT_INCOMPATIBLE')
-        validateStatus(metadata.status); validateParticipation(metadata.participation)
-        clean(); resolve(new WorkerApplicationSession<D>(port, metadata, timeoutMs, options.signal))
-      } catch (error) { fail(error) }
-    }
-    const timer = setTimeout(() => fail(new Error('APPLICATION_WORKER_READY_TIMEOUT')), timeoutMs)
-    options.signal?.addEventListener('abort', abort, { once: true }); port.addEventListener('message', ready); port.start()
-    try { endpoint.postMessage({ protocol, port: channel.port2, ...(handshake === undefined ? {} : { handshake }) }, [channel.port2]) }
-    catch (error) { fail(error) }
-  })
-}
-
-function validateParticipation(value: unknown): asserts value is ApplicationParticipationStatus | null {
-  if (value === null) return
-  if (value === undefined || typeof value !== 'object') throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-  const status = value as ApplicationParticipationStatus
-  if (!Number.isSafeInteger(status.connectionRevision) || status.connectionRevision < 0) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-  if (!['connecting', 'connected', 'following', 'coordinating', 'recovering', 'approval-required', 'unavailable', 'closed'].includes(status.phase) ||
-      !Array.isArray(status.connectedPeers) || status.connectedPeers.length > 8 ||
-      status.connectedPeers.some(peer => typeof peer !== 'string' || !/^[0-9a-f]{64}$/u.test(peer)) ||
-      status.error !== null && typeof status.error !== 'string' || status.recovery === undefined ||
-      status.recovery !== null && (typeof status.recovery !== 'object' || typeof status.recovery.id !== 'string' ||
-        !['freshness-unknown', 'older-than-budget'].includes(status.recovery.reason) ||
-        status.recovery.observedAt !== null && (!Number.isSafeInteger(status.recovery.observedAt) || status.recovery.observedAt < 0) ||
-        status.recovery.ageMs !== null && (!Number.isSafeInteger(status.recovery.ageMs) || status.recovery.ageMs < 0))) {
-    throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-  }
-}
-function fromError(error: WireError): Error {
-  if (error.name === 'AbandonedOperationError' && error.operation && (error.operation.status === 'abandoned' || error.operation.status === 'needsReapply')) return new AbandonedOperationError(error.operation)
-  if (error.name === 'RecoveredViewError' && error.revision) return new RecoveredViewError(error.revision, recoveryEvidence(error.recovery))
-  return Object.assign(new Error(error.message), { name: error.name, ...(error.code === undefined ? {} : { code: error.code }) })
-}
-
-function recoveryEvidence(value: unknown): ApplicationRecoveryEvidence | null {
-  // An older owner omits the field. Missing evidence is never a continuity proof.
-  if (value === undefined || value === null) return null
-  if (typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
-  const evidence = value as ApplicationRecoveryEvidence
-  if (evidence.reason !== null && !['create', 'handover', 'takeover', 'control-change'].includes(evidence.reason) ||
-      typeof evidence.unknownLoss !== 'boolean' || !('adopted' in evidence)) throw new Error('APPLICATION_WORKER_MESSAGE_INVALID')
-  if (evidence.adopted !== null) validateHistoryPoint(evidence.adopted)
-  return evidence
-}
-
-function validateStatus(value: unknown): asserts value is SessionStatus {
-  if (value === null || typeof value !== 'object') throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-  const status = value as SessionStatus
-  if (!['ready', 'waiting', 'recovering', 'awaiting-keys', 'closed'].includes(status.phase) ||
-      !['idle', 'opening', 'ready', 'failed', 'closed'].includes(status.database) ||
-      !['coordinator', 'follower'].includes(status.role) || typeof status.generation !== 'string' ||
-      !/^[0-9a-f]{64}$/u.test(status.generation) || typeof status.coordinator !== 'string' ||
-      !/^[0-9a-f]{64}$/u.test(status.coordinator) || !Number.isSafeInteger(status.connectedPeers) ||
-      status.connectedPeers < 0 || status.connectedPeers > 8) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-}
-
-function validEndpoint(value: ApplicationEndpointBinding | undefined): value is ApplicationEndpointBinding {
-  return value !== undefined && ['ownerInstanceId', 'endpointId', 'endpointIncarnation'].every(key =>
-    typeof value[key as keyof ApplicationEndpointBinding] === 'string' && /^[A-Za-z0-9-]{1,128}$/u.test(value[key as keyof ApplicationEndpointBinding] as string)) &&
-    value.evidence === 'owner-bound' && ['caller-asserted', 'owner-validated'].includes(value.contextEvidence) &&
-    value.context !== null && typeof value.context === 'object' && Array.isArray(value.capabilities) &&
-    value.capabilities.length <= 8 && value.capabilities.every((item: unknown) => typeof item === 'string' && ['commands', 'queries', 'events', 'content', 'signals', 'operations', 'diagnostics', 'ownerAdmin'].includes(item))
-}
-
-function validateConnectionDiagnostics(value: unknown): asserts value is readonly ApplicationConnectionDiagnostic[] {
-  if (!Array.isArray(value) || value.length > 8) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-  const peers = new Set<string>()
-  for (const item of value as unknown[]) {
-    if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-    const record = item as Record<string, unknown>
-    const counts = ['sentBytes', 'receivedBytes', 'sentReliableBytes', 'receivedReliableBytes', 'sentLiveBytes', 'receivedLiveBytes', 'sentRequests', 'receivedRequests']
-    if (Object.keys(record).some(key => !['peerId', 'kind', 'reason', 'signalRejections', ...counts].includes(key)) ||
-        typeof record.peerId !== 'string' || !/^[0-9a-f]{64}$/u.test(record.peerId) || peers.has(record.peerId) ||
-        !['direct', 'relay', 'unknown'].includes(record.kind as string) ||
-        record.reason !== undefined && !['direct_failed', 'direct_timeout'].includes(record.reason as string) ||
-        counts.some(key => !Number.isSafeInteger(record[key]) || (record[key] as number) < 0) ||
-        record.sentBytes !== (record.sentReliableBytes as number) + (record.sentLiveBytes as number) ||
-        record.receivedBytes !== (record.receivedReliableBytes as number) + (record.receivedLiveBytes as number)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-    if (record.signalRejections !== undefined) {
-      const fields = ['total', 'clockSkew', 'expired', 'unauthorized', 'duplicate', 'capacity']
-      const rejected = record.signalRejections
-      if (rejected === null || typeof rejected !== 'object' || Array.isArray(rejected) ||
-          Object.keys(rejected).length !== fields.length ||
-          fields.some(key => !Number.isSafeInteger((rejected as Record<string, unknown>)[key]) ||
-            ((rejected as Record<string, unknown>)[key] as number) < 0)) throw new Error('APPLICATION_WORKER_METADATA_INVALID')
-    }
-    peers.add(record.peerId)
-  }
+export async function connectApplicationOwner(endpoint: ApplicationWorkerEndpoint & { start?(): void }, options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext }): Promise<WorkerApplicationSession> {
+  const session = new WorkerApplicationSession(endpoint); endpoint.start?.(); try { await session.initialize(options); return session } catch (error) { await session.close().catch(() => undefined); throw error }
 }

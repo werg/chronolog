@@ -6,8 +6,8 @@ import { MemoryBytesStore } from '@chronolog/records'
 import { NativeBytesStore, type NativeBytesStoreOptions } from '@chronolog/records/native'
 
 import { openApplicationDevice, type ApplicationDevice } from './device.js'
-export { openPeerApplication as openNativeApplication } from './runtime.js'
-export type { OpenPeerApplicationOptions } from './runtime.js'
+export { createApplicationSession } from './index.js'
+export type { CreateApplicationSessionOptions } from './runtime.js'
 export { NativeBytesStore } from '@chronolog/records/native'
 
 export interface DisposableNativeDevice extends ApplicationDevice {

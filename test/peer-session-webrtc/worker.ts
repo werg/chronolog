@@ -1,6 +1,6 @@
 import { sha256 } from '@chronolog/canonical'
 import { bytesToHex, hexToBytes } from '@chronolog/protocol'
-import { openBrowserApplication, openBrowserDevice } from '@chronolog/peer-session/worker'
+import { createApplicationSession, openBrowserDevice } from '@chronolog/peer-session/worker'
 import { openWorkerWebRtcConnection, type WorkerWebRtcConnection } from '@chronolog/peer-session/webrtc'
 import { createHttpWebRtcSignaling } from '@chronolog/transport-webrtc'
 import type { ApplicationDevice, ApplicationSession, ApplicationPeerLink, ContentReference } from '@chronolog/peer-session'
@@ -18,10 +18,9 @@ const introductions: Array<ReturnType<typeof createHttpWebRtcSignaling>> = []
 let name = '', bootstrap: Bootstrap | undefined, signalFailure: Error | undefined
 const observed: EphemeralSignal[] = []
 
-async function open(): Promise<void> {
-  if (device === undefined || bootstrap === undefined) throw new Error('GENERATION_RTC_BOOTSTRAP_REQUIRED')
-  session = await openBrowserApplication({ device, definition, authority: bootstrap.authority,
-    epochKeys: new Map([[bootstrap.epoch, hexToBytes(bootstrap.epochKey)]]) })
+async function open(cached = false): Promise<void> {
+  if (device === undefined || bootstrap === undefined) throw new Error('AUTHORED_RTC_BOOTSTRAP_REQUIRED')
+  session = await createApplicationSession({ device, definition, ...(cached ? { applicationId: bootstrap.authority.descriptor.payload.applicationId } : { authority: bootstrap.authority, epochKeys: new Map([[bootstrap.epoch, hexToBytes(bootstrap.epochKey)]]) }) })
   const owned = session
   void (async () => {
     try {
@@ -35,9 +34,9 @@ async function disconnect(): Promise<void> { await link?.close(); await connecti
 async function close(): Promise<void> { await disconnect(); await session?.close(); await device?.close() }
 async function state(): Promise<BrowserState> {
   if (signalFailure !== undefined) throw signalFailure
-  if (session === undefined || device === undefined) throw new Error('GENERATION_RTC_SESSION_REQUIRED')
+  if (session === undefined || device === undefined) throw new Error('AUTHORED_RTC_SESSION_REQUIRED')
   const view = await session.readView()
-  try { return { deviceId: session.deviceId, storageId: device.storageId, workerOwnsSession: typeof document === 'undefined',
+  try { return { publicKey: session.identity.publicKey, storageId: device.storageId, workerOwnsSession: typeof document === 'undefined',
     revision: view.revision, events: view.readEvents().events, signals: structuredClone(observed), status: session.status } }
   finally { view.release() }
 }
@@ -45,7 +44,7 @@ async function state(): Promise<BrowserState> {
 endpoint.addEventListener('message', event => {
   const input = event.data as { type?: string; id: number; method: string; name?: string; bootstrap?: Bootstrap;
     operationId?: string; text?: string; reference?: ContentReference; options?: { url: string; token: string; peerIdentity: string } }
-  if (input.type !== 'generation-rtc-fixture') return
+  if (input.type !== 'authored-rtc-fixture') return
   const run = async (): Promise<unknown> => {
     switch (input.method) {
       case 'prepare':
@@ -61,7 +60,7 @@ endpoint.addEventListener('message', event => {
         try {
           link = await owned.connectPeer({ connection, peerIdentity: options.peerIdentity })
           await link.synchronize()
-          return { peerId: link.peerId, route: await connection.getRoute(), stats: link.stats, signaling: signaling.stats, state: await state() }
+          return { peerIdentity: link.peerIdentity, route: await connection.getRoute(), stats: link.stats, signaling: signaling.stats, state: await state() }
         } catch (error) { await connection.close(); throw error }
       }
       case 'disconnect': await disconnect(); return null
@@ -69,17 +68,16 @@ endpoint.addEventListener('message', event => {
         await link!.synchronize()
         return { stats: link!.stats, signaling: introductions.map(value => value.stats), route: await connection!.getRoute() }
       case 'save': {
-        await session!.command('say', input.text!, { operationId: input.operationId! })
-        return session!.operations.inspect(input.operationId!)
+        const operation = await session!.command('say', input.text!, { operationId: input.operationId! })
+        return { state: operation.inspect(), intent: session!.exportFacts().envelopes.find(envelope => envelope.payload.proposalId === operation.id)! }
       }
       case 'publish': {
         const operation = await session!.command('say', input.text!, { operationId: input.operationId! })
-        const applied = await operation.applied({ signal: AbortSignal.timeout(20_000) })
-        const original = await session!.operations.inspect(input.operationId!)
-        return { applied, attempt: original!.attempt }
+        const materialized = await operation.materialized({ signal: AbortSignal.timeout(20_000) })
+        await link?.synchronize()
+        return { materialized, intent: session!.exportFacts().envelopes.find(envelope => envelope.payload.proposalId === operation.id)! }
       }
-      case 'shared': return session!.operations.wait(input.operationId!, { signal: AbortSignal.timeout(20_000) })
-        .then(async applied => session!.waitForCoverage(applied, { signal: AbortSignal.timeout(20_000) }))
+      case 'retained': { await link!.synchronize(); return session!.operations.get(input.operationId!)!.retained({ signal: AbortSignal.timeout(20_000) }) }
       case 'signal': return session!.signals.send('typing', { text: input.text! })
       case 'content': {
         const reference = input.reference!, bytes = new Uint8Array(reference.bytes)
@@ -87,17 +85,22 @@ endpoint.addEventListener('message', event => {
         for await (const chunk of session!.content.read(reference, { signal: AbortSignal.timeout(30_000) })) {
           bytes.set(chunk, offset); offset += chunk.length
         }
-        if (offset !== bytes.length) throw new Error('GENERATION_RTC_CONTENT_LENGTH')
+        if (offset !== bytes.length) throw new Error('AUTHORED_RTC_CONTENT_LENGTH')
         const retained = await session!.content.retain(reference, { signal: AbortSignal.timeout(30_000) })
         return { bytes: offset, sha256: bytesToHex(await sha256(bytes)), retained }
       }
+      case 'finalize': {
+        const current = await state(), throughMs = current.events.reduce((time, event) => BigInt(event.authorTimestampMs) > time ? BigInt(event.authorTimestampMs) : time, 0n)
+        const proof = await session!.finality.closeAuthorTime({ throughMs }), final = await session!.readView({ view: 'final' })
+        try { return { closedThroughMs: proof.closedThroughMs?.toString() ?? null, events: final.readEvents().events, revision: final.revision, signer: session!.identity.publicKey } } finally { final.release() }
+      }
       case 'state': return state()
       case 'reopen':
-        await close(); device = await openBrowserDevice({ name }); await open(); return state()
+        await close(); device = await openBrowserDevice({ name }); await open(true); return state()
       case 'close': await close(); return null
-      default: throw new Error('GENERATION_RTC_FIXTURE_COMMAND_INVALID')
+      default: throw new Error('AUTHORED_RTC_FIXTURE_COMMAND_INVALID')
     }
   }
-  void run().then(value => endpoint.postMessage({ type: 'generation-rtc-fixture-reply', id: input.id, value }),
-    (error: unknown) => endpoint.postMessage({ type: 'generation-rtc-fixture-reply', id: input.id, error: error instanceof Error ? error.stack : String(error) }))
+  void run().then(value => endpoint.postMessage({ type: 'authored-rtc-fixture-reply', id: input.id, value }),
+    (error: unknown) => endpoint.postMessage({ type: 'authored-rtc-fixture-reply', id: input.id, error: error instanceof Error ? error.stack : String(error) }))
 })

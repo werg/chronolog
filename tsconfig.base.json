@@ -55,11 +55,11 @@
       "@chronolog/transport-webrtc/native": [
         "packages/transport-webrtc/src/native.ts"
       ],
-      "@chronolog/peer-generation": [
-        "packages/peer-generation/src/index.ts"
+      "@chronolog/authority": [
+        "packages/authority/src/index.ts"
       ],
-      "@chronolog/peer-generation/control": [
-        "packages/peer-generation/src/control.ts"
+      "@chronolog/authority/control": [
+        "packages/authority/src/control.ts"
       ],
       "@chronolog/peer-session": [
         "packages/peer-session/src/index.ts"
@@ -121,8 +121,17 @@
       "@chronolog/peer-session/worker": [
         "packages/peer-session/src/worker.ts"
       ],
-      "@chronolog/peer-generation/metadata": [
-        "packages/peer-generation/src/metadata.ts"
+      "@chronolog/authority/metadata": [
+        "packages/authority/src/metadata.ts"
+      ],
+      "@chronolog/authority/participant": [
+        "packages/authority/src/participant.ts"
+      ],
+      "@chronolog/authority/publication": [
+        "packages/authority/src/publication.ts"
+      ],
+      "@chronolog/authority/finality": [
+        "packages/authority/src/finality.ts"
       ]
     }
   }

@@ -72,8 +72,8 @@ describe('replicated SQL materialization', () => {
     const deposit = await transaction(3n, 'deposit', [sqlStatement('UPDATE accounts SET balance = balance + 100 WHERE id = 1')], digest)
     try {
       const revision = await materializer.materialize([setup, deposit, withdraw])
-      expect(revision?.outcomeChanges.map((change) => [new TextDecoder().decode(change.txId), change.previous, change.current]))
-        .toEqual([['deposit', null, 'accepted'], ['withdraw', 'rejected', 'accepted']])
+      expect(revision?.outcomeChanges.map((change) => [change.txId, change.previous, change.current]))
+        .toEqual([[deposit.txId, null, 'accepted'], [withdraw.txId, 'rejected', 'accepted']])
       expect(rows(materializer, 'SELECT balance FROM accounts')).toEqual([['60']])
       expect(snapshotData(held)).toEqual(snapshotData(before))
       expect(held.query('SELECT balance FROM accounts')).toMatchObject({
@@ -193,7 +193,7 @@ describe('replicated SQL materialization', () => {
     const digest = materializer.executionManifestDigest
     const first = await transaction(1n, 'first', [sqlStatement('CREATE TABLE t (id INTEGER PRIMARY KEY)')], digest)
     const second = await transaction(2n, 'second', [
-      sqlStatement("SELECT chronolog_assert(EXISTS (SELECT 1 FROM chronolog_transactions WHERE tx_id = ? AND outcome = 'accepted'), 'needs_first')", [utf8('first')]),
+      sqlStatement("SELECT chronolog_assert(EXISTS (SELECT 1 FROM chronolog_transactions WHERE tx_id = ? AND outcome = 'accepted'), 'needs_first')", [first.txId]),
       sqlStatement('INSERT INTO t (id) VALUES (1)'),
     ], digest)
     const orphan = await transaction(3n, 'orphan', [
@@ -229,16 +229,13 @@ describe('replicated SQL materialization', () => {
     materializer.close()
   })
 
-  it('executes the verified supplied order without rewriting original author timestamps', async () => {
+  it('rejects supplied dependency sorting and preserves original author timestamps', async () => {
     const { path, engine } = await fixture()
     const materializer = await open(path, engine)
     const digest = materializer.executionManifestDigest
     const create = await transaction(50n, 'create', [sqlStatement('CREATE TABLE ordered (id INTEGER PRIMARY KEY)')], digest)
     const insert = await transaction(1n, 'insert', [sqlStatement('INSERT INTO ordered (id) VALUES (1)')], digest)
-    await materializer.materialize([create, insert])
-    expect(materializer.outcome(create.txId)?.outcome).toBe('accepted')
-    expect(materializer.outcome(insert.txId)?.outcome).toBe('accepted')
-    expect(rows(materializer, 'SELECT id FROM ordered')).toEqual([['1']])
+    await expect(materializer.materialize([create, insert])).rejects.toThrow('MATERIALIZER_ORDER_INVALID')
     expect([create.core.authorTimestampMs, insert.core.authorTimestampMs]).toEqual([50n, 1n])
     await materializer.materialize([insert, create])
     expect(materializer.outcome(insert.txId)?.outcome).toBe('rejected')
@@ -271,9 +268,7 @@ describe('replicated SQL materialization', () => {
     await materializer.materialize([setup, first, second])
     expect(materializer.outcome(first.txId)?.outcome).toBe('accepted')
     expect(materializer.outcome(second.txId)?.outcome).toBe('rejected')
-    await materializer.materialize([setup, second, first])
-    expect(materializer.outcome(second.txId)?.outcome).toBe('accepted')
-    expect(materializer.outcome(first.txId)?.outcome).toBe('rejected')
+    await expect(materializer.materialize([setup, second, first])).rejects.toThrow('MATERIALIZER_ORDER_INVALID')
     await materializer.materialize([setup, second])
     await materializer.publishFinal(2)
     materializer.close()
@@ -292,16 +287,16 @@ describe('replicated SQL materialization', () => {
     const digest = materializer.executionManifestDigest
     const setup = await transaction(1n, 'setup', [sqlStatement('CREATE TABLE rollback (id INTEGER PRIMARY KEY)')], digest)
     const insert = await transaction(2n, 'insert', [sqlStatement('INSERT INTO rollback (id) VALUES (1)')], digest)
-    const initial = (await runtime.coordinator.materialize([setup]))!
+    const initial = (await runtime.replay.materialize([setup]))!
     await runtime.publications.publish(initial.publication)
     await materializer.publishFinal(1)
     const checkpointHash = materializer.databaseContentHash
-    const extended = (await runtime.coordinator.materialize([setup, insert]))!
+    const extended = (await runtime.replay.materialize([setup, insert]))!
     await runtime.publications.publish(extended.publication)
     const previousRevision = materializer.revision
     const held = materializer.captureRead({ view: 'local' })
     try {
-      const rollback = (await runtime.coordinator.materialize([setup]))!
+      const rollback = (await runtime.replay.materialize([setup]))!
       expect(rollback.revision).toMatchObject({ previousRevision, revision: previousRevision + 1n,
         orderLength: 1, replayedTransactions: 0, checkpointPrefix: 1, contentHash: checkpointHash })
       expect(rollback.publication.publicationKey).not.toBe(initial.publication.publicationKey)
@@ -353,7 +348,7 @@ async function fixture(limits: Partial<ExecutionLimits> = {}) {
 
 function open(path: string, engine: Awaited<ReturnType<typeof fixture>>['engine'], checkpointEvery?: number): Promise<DeterministicMaterializer> {
   return DeterministicMaterializer.open({
-    path, engine, rootAdministrator: ROOT_KEY, ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
+    path, engine, rootPrincipal: ROOT_KEY, ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
   })
 }
 

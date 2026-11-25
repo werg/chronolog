@@ -4,7 +4,7 @@ import { SqlProfileError, withProfiledStatement } from './sql-profile.js'
 import type { DatabaseLike, LocalSqlValue, SqlRuntimeLimits } from './types.js'
 
 /**
- * Execute explicitly local, non-consensus SQL against an immutable reader.
+ * Execute explicitly local, non-replicated SQL against an immutable reader.
  * These tagged values deliberately have no canonical transaction encoding.
  */
 export function executeLocalSql(

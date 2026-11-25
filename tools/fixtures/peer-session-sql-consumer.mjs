@@ -1,17 +1,15 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import process from 'node:process';
-import { webcrypto as crypto } from 'node:crypto';
 import {
-  APPLICATION_COLLECTIVE_ID, bytesDigest, bytesToHex, connectApplications, controlParticipantGrant,
-  createGenerationRegistry, createPeerIdentity, defineApplication, defineCommand, defineQuery, emit,
-  MemoryBytesStore, participantGrant, program, signApplicationDescriptor, signControlRevision, signTransitionRequest, sqlStatement,
+  createApplicationSession, createSigningIdentity, signAppDescriptor, signMembership,
+  epochKeyCommitment, executionManifestArtifacts, bytesToHex, defineApplication,
+  defineCommand, defineQuery, emit, program, sqlStatement,
 } from '@chronolog/peer-session';
 import { openNativeDevice } from '@chronolog/peer-session/native';
-import { openSqlApplication, prepareSqlApplication } from '@chronolog/peer-session/sql';
+import { createSqlMaterializationRuntime } from '@chronolog/peer-session/sql';
 
-
-const directory = process.argv[2], sessions = [], links = [];
+const directory = process.argv[2], sessions = [];
 let engine;
 if (process.argv[3]) {
   const { loadNodeWasmEngine, createNodeWasmSqlEngine } = await import('@chronolog/peer-session/sql-wasm');
@@ -21,62 +19,104 @@ if (process.argv[3]) {
   const { createNativeSqlEngine } = await import('@chronolog/peer-session/sql-native');
   engine = createNativeSqlEngine();
 }
-const team = bytesToHex(APPLICATION_COLLECTIVE_ID);
-const definition = defineApplication({ id: 'packed-shared-board', version: '1',
-  schema: program('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE)'),
-  commands: {
-    create: defineCommand({ description: 'Create a shared task', input: { type: 'object', properties: {
-      id: { type: 'integer' }, title: { type: 'string', minLength: 1, maxLength: 100 },
-    }, required: ['id', 'title'] }, prepare: ({ id, title }) => program(sqlStatement(
-      `INSERT INTO tasks (id,title,chronolog_owner) VALUES (?, ?, (SELECT id FROM chronolog_principals WHERE key=X'${team}'))`, [id, title]), emit('task.created', { id, title })) }),
-    rename: defineCommand({ description: 'Rename a shared task', input: { type: 'string', minLength: 1, maxLength: 100 },
-      prepare: title => program(sqlStatement('UPDATE tasks SET title=? WHERE id=1', [title]), emit('task.renamed', { title })) }),
-  },
-  queries: { tasks: defineQuery({ description: 'Read current tasks', input: { type: 'null' }, read: view => view.query('SELECT id,title FROM tasks ORDER BY id') }) },
-});
+const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
+const title = { type: 'string', minLength: 1, maxLength: 100 };
+const definition = defineApplication({ id: 'packed-shared-board', version: '1', commands: {
+  create: defineCommand({ description: 'Create a signer-owned task', input: object({ id: { type: 'integer' }, title }),
+    prepare: ({ id, title }) => program(sqlStatement('INSERT INTO tasks(id,title) VALUES(?,?)', [id, title]), emit('task.created', { id, title })) }),
+  rename: defineCommand({ description: 'Review and rename an owned task', input: object({ id: { type: 'integer' }, expected: title, title }),
+    prepare: ({ id, expected, title }) => program(
+      sqlStatement("SELECT chronolog_assert((SELECT title FROM tasks WHERE id=?)=?, 'title_changed')", [id, expected]),
+      sqlStatement('UPDATE tasks SET title=? WHERE id=?', [title, id]), emit('task.renamed', { id, title })) }),
+}, queries: { tasks: defineQuery({ description: 'Read current tasks', input: { type: 'null' },
+  read: view => view.query('SELECT id,title FROM tasks ORDER BY id') }) } });
+const initialization = program(sqlStatement('CREATE TABLE tasks(id INTEGER PRIMARY KEY,title TEXT NOT NULL UNIQUE)'));
+let captured;
 try {
-  const host = await createPeerIdentity(), aDevice = await openNativeDevice({ path: join(directory, 'a.sqlite'), create: true });
+  const issuer = await createSigningIdentity();
+  const aDevice = await openNativeDevice({ path: join(directory, 'a.sqlite'), create: true });
   const bDevice = await openNativeDevice({ path: join(directory, 'b.sqlite'), create: true });
-  const applicationId = 'db'.repeat(32), key = crypto.getRandomValues(new Uint8Array(32));
-  const prepared = await prepareSqlApplication({ engine, applicationId, definition, schemaAdministrator: aDevice.identity });
-  const descriptor = await signApplicationDescriptor({ applicationId, historyId: 'packed-sql', profile: 'peer-generation-v1', policy: 'eligible-members-v1',
-    controlPublicKey: host.publicKey, ...prepared.binding }, host);
-  const control = await signControlRevision({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
-    revision: 0, previous: null, epoch: 0, keyDigest: await bytesDigest(key), recoveryFloor: null,
-    grants: [controlParticipantGrant(host.publicKey), participantGrant(aDevice.identity.publicKey), participantGrant(bDevice.identity.publicKey)] }, host);
-  const registry = await createGenerationRegistry({ store: new MemoryBytesStore(), descriptor, controls: [control], signer: host });
-  await registry.select(await signTransitionRequest({ applicationId, profile: descriptor.payload.profile, policy: descriptor.payload.policy,
-    expectedGeneration: null, requester: aDevice.identity.publicKey, coordinator: aDevice.identity.publicKey,
-    controlRevision: 0, base: null, reason: 'create', transitionId: 'initial' }, aDevice.identity));
-  const open = async (device, name) => {
-    const app = await openSqlApplication({ createEngine: () => engine, device, databasePath: join(directory, `${name}-materialized.sqlite`), definition,
-      authority: await registry.read(), epochKeys: new Map([[0, key]]), schema: prepared.schema });
-    sessions.push(app); return app;
-  };
+  const applicationId = 'db'.repeat(32), key = globalThis.crypto.getRandomValues(new Uint8Array(32));
+  const { executionManifestDigest } = await executionManifestArtifacts(engine.executionManifest);
+  const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: aDevice.identity.publicKey,
+    authorityPublicKey: issuer.publicKey, executionManifestDigest: bytesToHex(executionManifestDigest), finalityPolicy: { kind: 'none' } }, issuer);
+  const membership = await signMembership({ applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n,
+    epoch: 0, epochKeyDigest: await epochKeyCommitment(applicationId, 0, key), members: [aDevice, bDevice].map((device, index) => ({
+      publicKey: device.identity.publicKey, reader: true, writer: true, administrator: index === 0, publisher: index === 0, finalizer: false,
+    })) }, issuer);
+  const bundle = { descriptor, memberships: [membership] };
+  async function open(device, name, fresh = true) {
+    const session = await createApplicationSession({ device, definition,
+      ...(fresh ? { authority: bundle, epochKeys: new Map([[0, key]]) } : { applicationId }),
+      createMaterializer: ({ rootPrincipal }) => createSqlMaterializationRuntime({ engine, path: join(directory, `${name}-materialized.sqlite`), rootPrincipal }),
+    });
+    sessions.push(session); return session;
+  }
+  async function exchange(a, b) {
+    const left = a.exportFacts(), right = b.exportFacts();
+    await Promise.all([a.mergeFacts(right), b.mergeFacts(left)]);
+    await Promise.all([a.retryMaterialization(), b.retryMaterialization()]);
+  }
+  const accepted = async operation => assert.equal((await operation.materialized({ timeoutMs: 15_000 })).outcome, 'accepted');
   const a = await open(aDevice, 'a'), b = await open(bDevice, 'b');
-  const link = await connectApplications(a, b); links.push(link);
-  assert.equal((await (await a.command('create', { id: 1, title: 'retained' }, { operationId: 'create-once' })).applied()).outcome, 'accepted');
-  assert.equal(b.status.database, 'idle');
-  assert.deepEqual((await b.query('tasks', null)).value.rows, [[1, 'retained']]);
-  await link.synchronize(); link.close();
-  const rejected = await (await a.command('create', { id: 2, title: 'retained' }, { operationId: 'duplicate' })).applied();
-  assert.equal(rejected.outcome, 'rejected');
-  assert.equal(rejected.rejectionCode, 'constraint');
-  const controlHost = { application: () => registry.read(), selectGeneration: request => registry.select(request) };
-  await b.recovery.takeover(controlHost, { transitionId: 'creator-offline' });
-  const recovered = await connectApplications(a, b); links.push(recovered);
-  assert.equal((await a.operations.get('duplicate')).status, 'abandoned');
-  recovered.close(); await a.close();
-  assert.equal((await (await b.command('rename', 'edited after creator closed', { operationId: 'rename-once' })).applied()).outcome, 'accepted');
-  assert.deepEqual((await b.query('tasks', null)).value.rows, [[1, 'edited after creator closed']]);
-  const bId = b.deviceId; await b.close();
-  const reopened = await open(await openNativeDevice({ path: join(directory, 'b.sqlite') }), 'b');
-  assert.equal(reopened.deviceId, bId);
-  assert.deepEqual((await reopened.query('tasks', null)).value.rows, [[1, 'edited after creator closed']]);
-  assert.equal((await reopened.operations.get('rename-once')).outcome, 'accepted');
-  process.stdout.write(JSON.stringify({ status: 'passed', profile: 'peer-generation-v1', application: definition.id,
-    checks: ['signed schema bootstrap', 'real SQL constraints', 'earlier prefix recovery', 'shared rows after creator closes', 'native reopen identity and outcomes'] }) + '\n');
+  await accepted(await a.submit({ operationId: 'ordinary-schema', authorTimestampMs: 1n, program: initialization }));
+  await exchange(a, b);
+
+  // Both stores author and materialize with no connection or external participant.
+  const first = await a.command('create', { id: 1, title: 'retained' }, { operationId: 'create-once', authorTimestampMs: 20n });
+  const second = await b.command('create', { id: 2, title: 'other' }, { operationId: 'independent', authorTimestampMs: 10n });
+  assert.equal(first.stored, true); await accepted(first); await accepted(second);
+  await exchange(a, b);
+  assert.deepEqual((await a.query('tasks', null)).value.rows, [[1, 'retained'], [2, 'other']]);
+  assert.deepEqual((await b.query('tasks', null)).value.rows, [[1, 'retained'], [2, 'other']]);
+  captured = await a.readView();
+
+  const duplicate = await a.command('create', { id: 3, title: 'other' }, { operationId: 'constraint-revises', authorTimestampMs: 40n });
+  assert.equal((await duplicate.materialized({ timeoutMs: 15_000 })).outcome, 'rejected');
+  const originalReference = duplicate.id;
+  const earlier = await b.command('rename', { id: 2, expected: 'other', title: 'renamed' }, { operationId: 'late-earlier', authorTimestampMs: 15n });
+  await accepted(earlier); await exchange(a, b);
+  assert.equal((await duplicate.inspect()).materialized.outcome, 'accepted');
+  assert.equal((await a.operations.retry('constraint-revises')).id, originalReference);
+  assert.deepEqual(captured.query('SELECT id,title FROM tasks ORDER BY id').rows, [[1, 'retained'], [2, 'other']]);
+  await captured.release(); captured = null;
+
+  // A normal DDL proposal arrives after SQL which needs it; replay revises rejection.
+  const needsColumn = await b.submit({ operationId: 'needs-column', authorTimestampMs: 60n,
+    program: program(sqlStatement("UPDATE tasks SET detail='qualified' WHERE id=2")) });
+  assert.equal((await needsColumn.materialized({ timeoutMs: 15_000 })).outcome, 'rejected');
+  const ddl = await a.submit({ operationId: 'ordinary-alter', authorTimestampMs: 50n,
+    program: program(sqlStatement('ALTER TABLE tasks ADD COLUMN detail TEXT')) });
+  await accepted(ddl); await exchange(a, b);
+  assert.equal((await needsColumn.inspect()).materialized.outcome, 'accepted');
+  const read = await b.readView();
+  try { assert.deepEqual(read.query('SELECT id,title,detail FROM tasks ORDER BY id').rows,
+    [[1, 'retained', null], [2, 'renamed', 'qualified'], [3, 'other', null]]); } finally { await read.release(); }
+
+  const denied = await b.submit({ operationId: 'cross-object-ddl', authorTimestampMs: 70n,
+    program: program(sqlStatement('DROP TABLE tasks')) });
+  assert.equal((await denied.materialized({ timeoutMs: 15_000 })).outcome, 'rejected');
+  const rollback = await a.submit({ operationId: 'atomic-ddl', authorTimestampMs: 80n,
+    program: program(sqlStatement('CREATE TABLE must_rollback(id INTEGER PRIMARY KEY)'), sqlStatement("SELECT chronolog_assert(0,'rollback')")) });
+  assert.equal((await rollback.materialized({ timeoutMs: 15_000 })).outcome, 'rejected');
+  const check = await a.readView();
+  try { assert.deepEqual(check.query("SELECT name FROM sqlite_schema WHERE name='must_rollback'").rows, []); } finally { await check.release(); }
+
+  const identity = b.identity.publicKey;
+  await a.close(); await b.close();
+  const reopened = await open(await openNativeDevice({ path: join(directory, 'b.sqlite') }), 'b', false);
+  assert.equal(reopened.identity.publicKey, identity);
+  const restored = await reopened.operations.get('needs-column');
+  assert.equal((await restored.inspect()).proposalId, needsColumn.id);
+  await accepted(restored);
+  assert.equal((await restored.inspect()).materialized.outcome, 'accepted');
+  assert.deepEqual((await reopened.query('tasks', null)).value.rows, [[1, 'retained'], [2, 'renamed'], [3, 'other']]);
+  await assert.rejects((await reopened.operations.get('needs-column')).finalized(), { code: 'FINALITY_UNSUPPORTED' });
+  process.stdout.write(JSON.stringify({ status: 'passed', profile: 'chronolog-crdt-v1', application: definition.id,
+    transport: 'explicit-authenticated-fact-union', checks: ['ordinary authored schema', 'independent offline materialization',
+      'deterministic fact union', 'late predecessor revises rejection', 'exact retry identity', 'captured read stability',
+      'ordinary late DDL revises SQL', 'scoped DDL denial', 'mixed DDL rollback', 'cached keys and identity reopen', 'no-finality unsupported wait'] }) + '\n');
 } finally {
-  for (const link of links) link.close();
+  await captured?.release();
   for (const session of sessions.reverse()) await session.close();
 }

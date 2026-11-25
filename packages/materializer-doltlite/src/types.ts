@@ -1,4 +1,4 @@
-import type { ChangeProgram, ExecutionManifest, SqlStatement, TransactionOrderKey } from '@chronolog/protocol'
+import type { ExecutionManifest, SqlStatement, TransactionOrderKey } from '@chronolog/protocol'
 export type { ReplayProposal } from '@chronolog/materializer'
 
 export type TransactionOutcomeKind = 'accepted' | 'rejected'
@@ -156,10 +156,19 @@ export interface StatementLike {
   parameterIndex(name: string): number
 }
 
+/** Trusted per-statement snapshot; absence denies every application DDL action. */
+export interface DdlPermissions {
+  readonly create: boolean
+  readonly alter: readonly string[]
+  readonly drop: readonly string[]
+  readonly index: readonly string[]
+  readonly trigger: readonly string[]
+}
+
 export interface DatabaseLike {
   /** The host enforces the SQL profile in-process when callbacks belong to another runtime. */
   readonly nativeProfile?: {
-    executeConsensus(statement: SqlStatement, schemaAdmin: boolean): string | null
+    executeReplicated(statement: SqlStatement, ddlPermissions: DdlPermissions): string | null
     prepare(sql: string, mode: 'platform' | 'local_read', limits: SqlRuntimeLimits): StatementLike
   }
   /** Engine tokenizer inspection, identical in native and WASM profiles. */
@@ -210,17 +219,11 @@ export interface SqlEngine {
 }
 
 export interface MaterializerOptions {
-  /** Verified schema-author program, executed once before the genesis checkpoint. */
-  readonly bootstrapProgram?: ChangeProgram
-  readonly bootstrapGroupId?: Uint8Array
   /** Native and browser supply the same explicit capability to the sole reducer. */
   readonly engine: SqlEngine
   readonly path: string
-  /**
-   * The genesis schemaAdminPublicKey: the first SQL admin of the
-   * `group` collective, and the only key that may seed rows into a fork.
-   */
-  readonly rootAdministrator: Uint8Array
+  /** Trusted genesis principal; owns the system collective and main creation namespace. */
+  readonly rootPrincipal: Uint8Array
   /**
    * The group is a fork (its genesis names a source group): the new database
    * starts with fork seeding open, so the root may `SeedRows` until another
@@ -245,7 +248,6 @@ export type MaterializerPublicationFaultPoint =
   | 'after_reader_swap'
 
 export interface StoredExecutionManifest {
-  readonly bootstrapProgram: Uint8Array
   readonly manifestDigest: Uint8Array
   readonly canonicalManifest: Uint8Array
 }

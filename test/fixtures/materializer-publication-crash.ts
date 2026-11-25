@@ -7,7 +7,6 @@ import {
 import {
   encodeTransactionCore,
   transactionDigest,
-  utf8,
   type TransactionCore,
 } from '@chronolog/protocol'
 
@@ -18,8 +17,8 @@ const engine = createNativeSqlEngine()
 const materializer = await DeterministicMaterializer.open({
   path,
   engine,
-  // The probe's author is the root administrator, so it may create the table.
-  rootAdministrator: bytes32(4),
+  // The probe's author is the initial namespace owner, so it may create the table.
+  rootPrincipal: bytes32(4),
   checkpointEvery: 1,
   publicationFaultInjector(candidate) {
     if (candidate === point) process.kill(process.pid, 'SIGKILL')
@@ -40,9 +39,10 @@ const core: TransactionCore = {
   },
 }
 const canonicalCandidate = encodeTransactionCore(core)
+const txId = await transactionDigest(canonicalCandidate)
 const transaction: ReplayProposal = {
-  txId: utf8('crash-probe'),
-  candidateDigest: await transactionDigest(canonicalCandidate),
+  txId,
+  candidateDigest: txId,
   canonicalCandidate,
   core,
 }

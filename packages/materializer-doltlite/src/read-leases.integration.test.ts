@@ -31,7 +31,7 @@ async function fixture() {
     } }) }
   } }
   const options: MaterializerOptions = { engine, path: join(await fixtures.directory(), 'leases.db'),
-    rootAdministrator: ROOT_KEY, checkpointEvery: 1, retainCheckpoints: 1 }
+    rootPrincipal: ROOT_KEY, checkpointEvery: 1, retainCheckpoints: 1 }
   const materializer = await DeterministicMaterializer.open(options)
   const proposal = (id: number, sql: string) => replayProposal(BigInt(id), String(id), [sql], materializer.executionManifestDigest)
   const setup = await proposal(1, 'CREATE TABLE drafts (id INTEGER PRIMARY KEY, value TEXT)')
@@ -199,7 +199,7 @@ describe('publication-owned SQL reader leases', () => {
     const child = spawnSync(process.execPath, ['--import', 'tsx', resolve('test/fixtures/materializer-reader-lease-crash.ts'), path],
       { encoding: 'utf8', timeout: 20_000 })
     expect(child.signal === 'SIGKILL' || child.status === 137, `${child.stdout}\n${child.stderr}`).toBe(true)
-    const m = await DeterministicMaterializer.open({ path, engine: createNativeSqlEngine(), rootAdministrator: ROOT_KEY, checkpointEvery: 1 })
+    const m = await DeterministicMaterializer.open({ path, engine: createNativeSqlEngine(), rootPrincipal: ROOT_KEY, checkpointEvery: 1 })
     try {
       expect(m.revision).toBe(3n)
       expect(m.orderLength).toBe(1)

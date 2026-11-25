@@ -16,7 +16,6 @@ import {
   executionManifestArtifacts,
   sqlStatement,
   transactionDigest,
-  utf8,
   type ProgramStep,
   type TransactionCore,
 } from '@chronolog/protocol'
@@ -158,7 +157,7 @@ async function runReplayFixture(
   const directory = await mkdtemp(join(tmpdir(), 'chronolog-conformance-'))
   const path = join(directory, 'application.db')
   try {
-    const materializer = await DeterministicMaterializer.open({ path, engine, rootAdministrator: AUTHOR, checkpointEvery: 1 })
+    const materializer = await DeterministicMaterializer.open({ path, engine, rootPrincipal: AUTHOR, checkpointEvery: 1 })
     const runtime = pathKind === 'runtime'
       ? createDoltLiteMaterializationRuntime(materializer)
       : null
@@ -183,7 +182,8 @@ async function runReplayFixture(
         outcomes: [bootstrap, predecessor, later, probe].map((candidate) => {
           const outcome = materializer.outcome(candidate.txId)
           return {
-            id: new TextDecoder().decode(candidate.txId),
+            id: candidate.core.operationId,
+            proposalId: hex(candidate.txId),
             outcome: outcome?.outcome ?? null,
             rejectionCode: outcome?.rejectionCode ?? null,
             failingStatementIndex: outcome?.failingStatementIndex ?? null,
@@ -210,7 +210,7 @@ async function applyConformanceOrder(
     await materializer.materialize(transactions)
     return
   }
-  const prepared = await runtime.coordinator.materialize(transactions)
+  const prepared = await runtime.replay.materialize(transactions)
   if (prepared === null) throw new Error('CONFORMANCE_NATIVE_DAEMON_REVISION_MISSING')
   const publication = await runtime.publications.publish(prepared.publication)
   if (publication.status !== 'already_current') {
@@ -243,15 +243,16 @@ async function transaction(
     program: { version: 3, steps },
   }
   const canonicalCandidate = encodeTransactionCore(core)
+  const txId = await transactionDigest(canonicalCandidate)
   return {
-    txId: utf8(id),
-    candidateDigest: await transactionDigest(canonicalCandidate),
+    txId,
+    candidateDigest: txId,
     canonicalCandidate,
     core,
   }
 }
 
-/** The fixture's only author, and the group's root administrator. */
+/** The fixture's only author, and the group's initial namespace owner. */
 const AUTHOR = bytes32(4)
 
 function bytes32(seed: number): Uint8Array {

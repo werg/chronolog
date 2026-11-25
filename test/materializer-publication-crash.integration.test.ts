@@ -47,7 +47,7 @@ describe('native publication crash recovery', () => {
       const reopened = await DeterministicMaterializer.open({
         path,
         engine,
-        rootAdministrator: Uint8Array.from({ length: 32 }, (_value, index) => (4 + index) & 0xff),
+        rootPrincipal: Uint8Array.from({ length: 32 }, (_value, index) => (4 + index) & 0xff),
         checkpointEvery: 1,
       })
       try {

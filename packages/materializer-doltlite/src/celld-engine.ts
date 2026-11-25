@@ -4,7 +4,7 @@ import { digestEngineManifest, normalizeEngineManifest } from './engine-manifest
 import { createDoltLiteExecutionManifest } from './manifest.js'
 import { toDatabaseValue } from './platform/session.js'
 import { NativeSqlRejection, SqlProfileError, normalizeSqlRuntimeLimits } from './sql-profile.js'
-import type { DatabaseLike, MaterializerBackendInfo, SqlEngine, SqlRuntimeLimits, StatementLike } from './types.js'
+import type { DatabaseLike, DdlPermissions, MaterializerBackendInfo, SqlEngine, SqlRuntimeLimits, StatementLike } from './types.js'
 
 type SqlValue = bigint | number | string | Uint8Array | Float64Array | null
 type Binding = ({ readonly index: number } | { readonly name: string }) & { readonly value: SqlValue }
@@ -20,7 +20,7 @@ type StepResult = {
 type StorageTransaction = { commit(): void; rollback(): void }
 type Snapshot = { readonly ref: string; readonly hash: string }
 type PinnedProgram = {
-  step(statement: Statement, options: { readonly mode: 'consensus' | 'platform'; readonly schemaAdmin?: boolean }): StepResult
+  step(statement: Statement, options: { readonly mode: 'replicated' | 'platform'; readonly ddlPermissions?: DdlPermissions }): StepResult
   close(): void
 }
 
@@ -77,7 +77,7 @@ export function createCelldSqlEngine(storage: CelldSqlStorage, options: {
   const readBackend = (): MaterializerBackendInfo => {
     if (typeof storage.dolt.programEngineProfile !== 'function') throw new Error('MATERIALIZER_CELLD_PROFILE_UNAVAILABLE')
     const { engineDigest, sqliteVec, manifest } = storage.dolt.programEngineProfile()
-    if (!/^[0-9a-f]{64}$/u.test(engineDigest) || manifest?.execProfile !== 'celld-spec10-v6' ||
+    if (!/^[0-9a-f]{64}$/u.test(engineDigest) || manifest?.execProfile !== 'celld-spec10-v7' ||
         !manifest.fts5 || !manifest.json1 || !manifest.rtree || manifest.dynamicExtensions || !sqliteVec) {
       throw new Error('MATERIALIZER_CELLD_PROFILE_UNAVAILABLE')
     }
@@ -125,14 +125,14 @@ class CelldDatabase implements DatabaseLike {
   ) {}
 
   readonly nativeProfile: NonNullable<DatabaseLike['nativeProfile']> = {
-    executeConsensus: (source: SqlStatement, schemaAdmin: boolean) => {
+    executeReplicated: (source: SqlStatement, ddlPermissions: DdlPermissions) => {
       const program = this.#program
       if (!program) throw new Error('MATERIALIZER_CELLD_CONTEXT_REQUIRED')
       const bindings = source.bindings.map(({ parameter, value }) => ({
         ...(parameter.kind === 'index' ? { index: parameter.index } : { name: parameter.name }),
         value: sqlValue(toDatabaseValue(value)),
       }))
-      const result = this.#step(program.step({ sql: source.sql, bindings }, { mode: 'consensus', schemaAdmin }))
+      const result = this.#step(program.step({ sql: source.sql, bindings }, { mode: 'replicated', ddlPermissions }))
       return result.result.outcome === 'rejected' ? result.result.code : null
     },
     prepare: (sql, mode, limits) => this.#statement(sql, mode, limits),

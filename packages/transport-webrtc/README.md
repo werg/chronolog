@@ -36,4 +36,4 @@ In browsers, the Window owns `RTCPeerConnection` while the Worker owns keys, sto
 - **Live lane**: `live.trySend()` returns `false` on congestion rather than queuing retries.
 - **Route inspection**: `connection.getRoute()` reports `direct`, `relay`, or `unknown` without exposing IP addresses.
 
-Use `session.participate()` in `@chronolog/peer-session` for discovery, reconnect, fallback to WebSocket relay, and recovery. See [owned participation](../peer-session/README.md#owned-participation-and-recovery).
+Use the maintained `session.connectPeer()` and browser/native RTC adapters from `@chronolog/peer-session`. Product-owned discovery/residency code chooses reconnects and an explicit WebSocket relay fallback; those choices do not assign application operation order. See [attachment boundaries and lifetime](../peer-session/README.md#attachment-boundaries-and-lifetime).

@@ -1,7 +1,8 @@
 # Chronolog documentation
 
-- [Session API reference](../packages/peer-session/README.md): definitions, devices, commands, queries, participation, recovery, browser Workers, content, and tools.
-- [Architecture and authority](peer-generation-v1.md): generations, participant roles, controls, publications, ancestry, and storage bounds.
+- [Session API reference](../packages/peer-session/README.md): definitions, devices, commands, queries, operation observations, participation, browser Workers, content, and tools.
+- [Authored operation-set contract](CRDT_CONTRACT.md): immutable signed proposals, canonical author-time order, observations, optional finality, ordinary schema and permission transactions.
+- [Architecture and authority](authored-operation-set.md): execution model, observations, authority separation, finality, transports, and storage bounds.
 - [Deterministic SQL](implementation-specs/10-deterministic-sql-transactions.md): change programs, limits, execution identity, and atomic outcomes.
 - [Row ownership](design-owner-rows.md): SQL data ownership and collective membership.
 - [Sealed values](sealed-data.md): explicit recipient encryption for private fields.

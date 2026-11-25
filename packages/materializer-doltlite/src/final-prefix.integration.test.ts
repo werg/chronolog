@@ -145,7 +145,7 @@ async function instrumented(checkpointEvery: number) {
             doltVersion: native.doltVersion.bind(native), doltBranches: native.doltBranches.bind(native),
             doltActiveBranch: native.doltActiveBranch.bind(native),
             setDeterministicContext(timestamp, seed, actor, actorId, transactionId) {
-              if (transactionId !== undefined && transactionId !== null) executions.push(new TextDecoder().decode(transactionId))
+              if (transactionId !== undefined && transactionId !== null) executions.push(['schema', 'first', 'duplicate', 'second', 'tentative'][Number(timestamp) - 1]!)
               native.setDeterministicContext(timestamp, seed, actor, actorId, transactionId)
             },
             doltCommit(message) {
@@ -156,7 +156,7 @@ async function instrumented(checkpointEvery: number) {
               return native.doltCommit(message)
             },
             prepare(sql) {
-              if (!isWriter && fault === 'reader-validation' && sql.includes('SELECT manifest_digest, canonical_manifest, bootstrap_program') &&
+              if (!isWriter && fault === 'reader-validation' && sql.includes('SELECT manifest_digest, canonical_manifest') &&
                   native.doltActiveBranch().startsWith('chronolog_read_')) {
                 fault = undefined
                 throw new Error('FINAL_REPLAY_reader-validation')
@@ -166,7 +166,7 @@ async function instrumented(checkpointEvery: number) {
           }
           if (isWriter) writer = database
           return { ...opened, database }
-        } }, rootAdministrator: ROOT_KEY, checkpointEvery,
+        } }, rootPrincipal: ROOT_KEY, checkpointEvery,
       })
     },
   }

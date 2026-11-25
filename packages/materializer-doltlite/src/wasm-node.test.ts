@@ -44,7 +44,7 @@ describe('Node WASM SQL adapter contracts', () => {
     const dir = mkdtempSync(join(tmpdir(), 'chronolog-wasm-node-persist-'))
     const dbPath = join(dir, 'app.db')
     try {
-      const first = await DeterministicMaterializer.open({ engine, path: dbPath, rootAdministrator: ROOT_KEY, checkpointEvery: 1 })
+      const first = await DeterministicMaterializer.open({ engine, path: dbPath, rootPrincipal: ROOT_KEY, checkpointEvery: 1 })
       const digest = first.executionManifestDigest
       const p1 = await replayProposal(1n, 'init', [
         'CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
@@ -68,7 +68,7 @@ describe('Node WASM SQL adapter contracts', () => {
       expect(statSync(dbPath).size).toBeGreaterThan(0)
 
       // Reopen a brand-new materializer instance against the persisted host file.
-      const reopened = await DeterministicMaterializer.open({ engine, path: dbPath, rootAdministrator: ROOT_KEY, checkpointEvery: 1 })
+      const reopened = await DeterministicMaterializer.open({ engine, path: dbPath, rootPrincipal: ROOT_KEY, checkpointEvery: 1 })
       try {
         const reopenedRows = reopened.localSql('SELECT id, body FROM notes ORDER BY id')
         expect(reopenedRows.rows).toEqual(firstRows.rows)

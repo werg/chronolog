@@ -1,7 +1,7 @@
 import type { BytesStore } from '@chronolog/records'
 import { bytesToHex } from '@chronolog/canonical'
 import {
-  assertValidChangeProgram,
+  assertValidChangeProgram, compareTransactionOrder,
   encodeTransactionCore, equalBytes, executionManifestArtifacts,
   isEmitStep, transactionDigest, transactionOrderKey,
 } from '@chronolog/protocol'
@@ -67,7 +67,8 @@ export async function createEventMaterializationRuntime(options: {
     for (let index = start; index < next.length; index++) {
       const entry = next[index]!
       const core = entry.core
-      if (entry.txId.length === 0) {
+      if (index > 0 && compareTransactionOrder(transactionOrderKey(next[index - 1]!.core, next[index - 1]!.txId), transactionOrderKey(core, entry.txId)) >= 0) throw new Error('EVENT_EXECUTION_ORDER_INVALID')
+      if (!equalBytes(entry.txId, entry.candidateDigest)) {
         throw new Error('EVENT_EXECUTION_INPUT_INVALID')
       }
       if (!equalBytes(core.executionManifestDigest, digest)) throw new Error('EVENT_EXECUTION_PROFILE_UNAVAILABLE')
@@ -122,12 +123,18 @@ export async function createEventMaterializationRuntime(options: {
     }
   }
   return {
-    coordinator: {
+    replay: {
       materialize: async (input) => {
         // Own unverified suffix inputs synchronously before queuing, while keeping
         // already-verified prefix references O(1) without cloning the whole history.
         const snapshotInput = input.map(entry => verifiedInputs.has(entry) ? entry : structuredClone(entry))
         return serial(async () => {
+          for (let index = 0; index < snapshotInput.length; index++) {
+            const current = snapshotInput[index]!
+            if (!equalBytes(current.txId, current.candidateDigest)) throw new Error('EVENT_EXECUTION_INPUT_INVALID')
+            const previous = snapshotInput[index - 1]
+            if (previous !== undefined && compareTransactionOrder(transactionOrderKey(previous.core, previous.txId), transactionOrderKey(current.core, current.txId)) >= 0) throw new Error('EVENT_EXECUTION_ORDER_INVALID')
+          }
           let difference = 0
           while (difference < order.length && difference < snapshotInput.length) {
             const incoming = snapshotInput[difference]!, retained = order[difference]!

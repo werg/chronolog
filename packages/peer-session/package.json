@@ -20,7 +20,7 @@
     "./worker": "./src/worker.ts"
   },
   "dependencies": {
-    "@chronolog/peer-generation": "workspace:*",
+    "@chronolog/authority": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/materializer": "workspace:*",
     "@chronolog/records": "workspace:*",
@@ -28,6 +28,7 @@
     "@chronolog/materializer-doltlite": "workspace:*",
     "@chronolog/transport-webrtc": "workspace:*",
     "@chronolog/crypto": "workspace:*",
-    "@chronolog/transport-websocket": "workspace:*"
+    "@chronolog/transport-websocket": "workspace:*",
+    "@chronolog/canonical": "workspace:*"
   }
 }

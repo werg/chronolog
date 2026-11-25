@@ -10,7 +10,7 @@ no legacy decoder, compatibility profile or migration path is kept.
 ## 1. Principle
 
 A replicated transaction is **ordinary SQLite SQL**, plus typed **platform
-operations** that change who owns and may write which rows. Chronolog does
+operations** that change row ownership, collective membership and namespace/object DDL permissions. Chronolog does
 not define a dialect, prove query semantics, or attach meaning to schemas.
 Replay determinism comes from four facts:
 
@@ -58,6 +58,8 @@ SqlStatement          { sql: text, bindings: SqlBinding[] }
 SqlBinding            { parameter: index (1-based) | name, value: SqlValue }
 PlatformOp            = Grant { table, grantee, grantor?, rowKey?, operations, columns? }
                       | RevokeGrant { grantId }
+                      | GrantDdl { scope: namespace(main) | object(name), grantee, operations }
+                      | RevokeDdl { grantId }
                       | CreateCollective { governance, invitees } | AcceptMembership { collectiveId }
                       | Leave { collectiveId } | SetMembers { collectiveId, changes }
                       | TransferOffer { scope: row(table, rowKey) | all, fromOwner?, toOwner, carry }
@@ -73,7 +75,7 @@ encoded as canonical CBOR inside `TransactionCore.program`: a step is
 
 `EmitStep { op: 'emit', topic, payload }` carries JSON data, never executable application code. A program has at most 256 steps, 64 emits and 262,144 canonical bytes; each payload is at most 16,384 UTF-8 bytes. Topics are bounded application labels. Event payloads use sorted object keys and finite JSON numbers; sparse arrays, accessors and non-JSON values are rejected.
 
-The transaction core is version 2 and signs `operationId` alongside author, exact writer grant, membership revision, execution profile and program. Different proposals reusing one author/operation identity deterministically reject as `operation_conflict`. SQL/platform failure rolls back the whole program and exposes no effective emit. Accepted events are reconstructed from the canonical program and its durable outcome anchor; final readers never advance beyond missing or unresolved outcomes.
+The transaction core signs `operationId` alongside author, exact membership/policy references, execution profile and program. Its domain-separated canonical core digest is both `candidateDigest` and stable proposal `txId`, independently of encryption wrappers. Different proposals reusing one author/operation identity deterministically reject as `operation_conflict`. SQL/platform failure rolls back the whole program and exposes no effective emit. Accepted events are reconstructed from the canonical program and its durable outcome anchor; final readers never advance beyond missing or unresolved outcomes.
 
 An application without a SQL engine accepts only emits. SQL/platform steps are rejected deterministically when that explicit engine capability is absent. All applications use the same session and execution pipeline. See [public application session](../../packages/peer-session/README.md) for cursors, coherent views and application consumers.
 
@@ -98,8 +100,7 @@ triggers) reject the same way.
 
 ## 4. Execution
 
-For each admitted transaction `T` at its position in the history policy's
-local order:
+For each eligible transaction `T` at its canonical authored-time position:
 
 1. Open a savepoint.
 2. Fix the engine inputs for the duration of `T`:
@@ -110,23 +111,29 @@ local order:
    - the `localtime` modifier converts to UTC;
    - `last_insert_rowid()` and `changes()` start at 0;
    - `chronolog_actor()` returns `T.authorId`, the signing key, and
-     `chronolog_actor_id()` its principal id (§6). Outside consensus
+     `chronolog_actor_id()` its principal id (§6). Outside replicated
      execution both return NULL.
-3. Execute each step in order. A SQL statement runs under the consensus
+3. Execute each step in order. A SQL statement runs under the replicated
    authorizer and the deterministic step budget and is stepped to completion;
    returned rows are discarded. A platform operation runs as trusted platform
    code (section 7). Both act as `T.authorId`.
-4. If the schema changed (`PRAGMA schema_version`), reconcile (section 6).
+4. After each schema-changing statement (`PRAGMA schema_version`), reconcile
+   (section 6), so new ownership and DDL authority apply to its next step.
 5. If every step succeeds, release the savepoint: outcome `accepted`.
    Otherwise roll back to the savepoint: outcome `rejected` with a rejection
    code and the index of the failing step (null for reconciliation).
 6. Append the log row (section 8) and clear the fixed engine inputs.
 
-The application owner supplies one verified selected order. A generation change
-can replace its recoverable suffix, while an explicitly protected prefix cannot
-regress. The materializer does not independently select or sort history, and
-author timestamps remain original provenance and deterministic clock inputs.
-Native and browser engines execute this same pipeline.
+The materializer accepts only a strictly ordered operation set under
+`compareTransactionOrder`: `(authorTimestampMs: bigint, author key bytes,
+stable proposal-ID bytes)`. It validates every input, including retained
+prefixes. It never dependency-sorts DDL or accepts a caller-selected permutation.
+A late predecessor can revise subsequent provisional rejections, effective
+events, schema and data. Replay rewinds to a matching checkpoint and publishes
+one coherent immutable revision. A verified finalized prefix cannot be replaced;
+optional finality closes inclusion, never assigns application order. Native and
+browser engines execute this same pipeline. External membership/control heads
+are not applied before, between or after authored transactions.
 
 `PRAGMA foreign_keys` and `PRAGMA recursive_triggers` are on. With
 `recursive_triggers`, the deletion by `REPLACE` fires delete triggers, so the
@@ -145,6 +152,7 @@ Rejection codes:
 | `schema_unregistered` | reconciliation found an unregistered table or a foreign `chronolog_*` trigger or view |
 | `trigger_ignore` | an app trigger uses `RAISE(IGNORE)` |
 | `constraint` | `CHECK`, `UNIQUE`, `NOT NULL`, foreign key, or an app `RAISE(ABORT, …)` |
+| `profile:timestamp-range` | author timestamp exceeds the pinned SQLite calendar range (0 through 253402300799999 ms); original int64 order key is retained |
 | `step_limit`, `denied`, `prepare`, `binding`, `too_large`, `mismatch`, `error` | step budget, authorizer, syntax or unknown object, bindings, size, datatype, any other deterministic SQLite error (including trigger recursion) |
 
 An unavailable engine or execution profile is **blocked replay**, not a SQL
@@ -156,9 +164,9 @@ Operational failures (I/O, corruption, out of memory) likewise stop replay
 on that replica without producing an application outcome. Missing history
 or an unavailable decryption key blocks progress before SQL execution.
 
-## 5. Block-list and schema administration
+## 5. Block-list and namespace/object DDL authority
 
-The consensus authorizer denies:
+The replicated authorizer denies:
 
 - `ATTACH`/`DETACH`, `load_extension`, and temporary schema objects;
 - transaction control (`BEGIN`, `COMMIT`, `SAVEPOINT`, …) inside a program;
@@ -180,9 +188,21 @@ The consensus authorizer denies:
   `collation_list` pragmas, including their table-valued forms;
 - physical-storage or connection introspection through the `dbstat`,
   `sqlite_dbpage` and `sqlite_stmt` virtual-table modules or eponymous tables;
-- **all DDL** (`CREATE`/`DROP` of tables, indexes, views, triggers and virtual
-  tables, `ALTER TABLE`) unless the signer is an active admin of the `group`
-  collective. `ANALYZE` and `REINDEX` are open to every writer.
+- DDL without the applicable namespace/object permission: namespace `create`
+  for tables/views/virtual objects; object `alter` or `drop`; target-object
+  `index` or `trigger` for index/trigger create and standalone drop.
+  `ANALYZE` and `REINDEX` are open to every writer.
+
+Trusted platform code reads the permission catalog afresh before **each** SQL
+statement and supplies `{ create, alter, drop, index, trigger }` to both the
+TypeScript/WASM authorizer and Celld's `mode: 'replicated', ddlPermissions` ABI.
+Missing permissions deny DDL; there is no global admin fallback. Names in object
+lists are compared using SQLite's ASCII case-insensitive identifier rules.
+An authorized parent table/view drop includes its implicit indexes and triggers.
+Module-internal shadow DDL is permitted only while stepping an authorized
+virtual-table lifecycle statement; naming a shadow-looking object in authored
+SQL gains no parent capability. Reserved object protection also applies to
+ALTER rename destinations, which SQLite's authorizer does not directly name.
 
 Everything else the pinned engine accepts is allowed, including triggers,
 views, generated columns, window functions, JSON, FTS5, R-tree and sqlite-vec.
@@ -292,7 +312,8 @@ never an elevated actor: `chronolog_actor()` stays the signer, and every app
 trigger they fire is checked as the signer.
 
 Platform tables (readable by transactions, written only by platform
-operations): `chronolog_platform` (root administrator, seeding window),
+operations): `chronolog_platform` (initial root principal, seeding window),
+`chronolog_ddl_namespaces`, `chronolog_ddl_objects`, `chronolog_ddl_grants`,
 `chronolog_tables`, `chronolog_collectives`, `chronolog_collective_members`,
 `chronolog_grants`, `chronolog_transfers`, `chronolog_transfer_scope`,
 `chronolog_reader_keys`, `chronolog_reader_policies`,
@@ -320,6 +341,8 @@ cached authorization results; fixed prepared statements may still be reused.
 
 | Operation | Authority and effect | Refusals (`platform:…`) |
 | --- | --- | --- |
+| `GrantDdl` | Only the namespace/object owner. Namespace `main` accepts `create`; object scopes accept an ordered subset of `alter`, `drop`, `index`, `trigger`. The grantee is a signing key; no delegation authority is inferred. | `no_such_ddl_scope`, `not_ddl_owner` |
+| `RevokeDdl` | The granting owner or the recipient (renunciation). Visible to the next step, with the entire program rolled back if a later step fails. | `no_such_ddl_grant`, `grant_revoked`, `not_ddl_owner` |
 | `Grant` | The grantor (default: the signer; for a row grant, the row's owner) is the signer or a collective it administers. `columns` require `update`; row grants cannot include `insert`. | `unregistered_table`, `no_such_row`, `row_key_arity`, `unknown_column`, `invalid_grant`, `not_owner` |
 | `RevokeGrant` | The grantor (or an admin of a grantor collective), or the grantee. Effective from the next step in the order. | `no_such_grant`, `grant_revoked`, `not_owner` |
 | `CreateCollective` | Any writer; creates a `team` with the signer as active admin and invitees invited. Governance names the least role (`member` or `admin`) for insert, update and delete. | `invalid_member` |
@@ -332,15 +355,25 @@ cached authorization results; fixed prepared statements may still be reused.
 | `RegisterReaderKey` | The signer registers/replaces its own public X25519 key. Existing reader-policy snapshots do not change. | Normal writer admission applies |
 | `ReaderPolicy` | The row owner or owning collective's admin creates or replaces the explicit reader list with generation/version CAS; keys must already be registered. | `not_owner`, `no_such_row`, `reader_key_missing`, `reader_policy_stale`, `reader_policy_version_exhausted` |
 | `SealedPut` | Ordinary row/column update authority; policy/data CAS, exact recipient/key set and authenticated group/policy/column/version context. Writes an actual mutable BLOB column and verifies the result after app triggers. | `reader_policy_closed`, `reader_policy_stale`, `sealed_value_stale`, `sealed_column_invalid`, `sealed_context_mismatch`, `sealed_readers_mismatch`, `sealed_no_readers`, `sealed_write_changed`, `sealed_value_version_exhausted`, plus ordinary row/app-trigger rejections |
-| `SeedRows` | The initial schema administrator of a fork (the signed genesis `schemaAdminPublicKey`, with `forkedFrom`), before the first accepted transaction by any other author; never in other groups. Writes rows with their owners verbatim, without app triggers; also seeds `chronolog_collectives`, `_collective_members`, `_grants` and `_transfers` (never the `group` collective). | `not_root`, `seed_closed`, `unregistered_table`, `unknown_column`, `invalid_seed` |
+| `SeedRows` | The trusted initial `rootPrincipal` of a fork, before the first accepted transaction by any other author; never in other groups. Writes rows with their owners verbatim, without app triggers; also seeds `chronolog_collectives`, `_collective_members`, `_grants` and `_transfers` (never the `group` collective). | `not_root`, `seed_closed`, `unregistered_table`, `unknown_column`, `invalid_seed` |
 
-The `group` collective (all-zero id) exists from genesis with the explicit
-`schemaAdminPublicKey` as its admin and admin-only governance. Its active admins
-are the schema administrators. The roster issuer `rootAdminPublicKey` grants
-no implicit SQL membership, schema privilege or row ownership.
+The `group` collective (all-zero id) exists from deterministic internal genesis
+with `rootPrincipal` as its first admin and admin-only row governance. Group
+administration does **not** confer DDL rights. The same root owns the `main`
+creation namespace; new application tables/views/virtual objects belong to their
+creating signer. Its object rights do not follow from row ownership or hosting,
+enrollment, publishing or finality roles. Only the scope owner may issue DDL
+grants. Rename preserves owners/grants, while drop revokes grants before a name
+can be reused. The protected catalogs and initial trust root are initialized
+only on an empty application store. All application schema is ordinary authored
+SQL; no bootstrap application program or immutable application-DDL digest exists.
 
-Sealed operation codes are 64–66; ownership codes retain their positions and
-`TransferCancel` appends code 10. Reader-policy and value versions are positive
+Sealed operation codes are 64–66; `TransferCancel` is code 10, `GrantDdl` code 11
+and `RevokeDdl` code 12. A DDL scope is `[0, 'main']` or `[1, objectName]` at map
+key 1; the grantee is key 2 and the ordered operation codes (`create` = 0,
+`alter` = 1, `drop` = 2, `index` = 3, `trigger` = 4) are at key 3. Revoke stores
+the grant id at key 1. Existing ordinary SQL/program block-list rules remain.
+Reader-policy and value versions are positive
 signed-int64 values. Policy IDs derive from the creating transaction ID and
 step index. DELETE/rekey closes a policy generation; an ownership-only transfer
 preserves its ID and explicit readers, including when the owner is part of the
@@ -359,7 +392,8 @@ candidate_digest, canonical_candidate,
 outcome ('accepted' | 'rejected'), rejection_code, failing_statement_index
 ```
 
-`failing_statement_index` is the index of the failing step.
+`failing_statement_index` is the index of the failing step. `order_index` is
+a derived local replay position, not a global receipt or application-order input.
 
 A transaction may depend on an earlier one, for example
 `SELECT chronolog_assert(EXISTS (SELECT 1 FROM chronolog_transactions WHERE
@@ -368,9 +402,12 @@ tx_id = :earlier AND outcome = 'accepted'), 'needs_earlier')`.
 ## 9. Local reads
 
 Local query SQL runs on an immutable materialized revision, is not signed or
-replayed, and returns plain SQLite values. The application captures the current applied view. A separately protected
-checkpoint is an explicit materializer capability, not a second application path. Read-only host diagnostics, including the real clock and
-the build and function catalogs denied during consensus execution, may be
+replayed, and returns plain SQLite values. The application captures the current
+provisional or verified final-prefix view. Captured leases retain the exact
+schema and data of their original snapshot across later schema publications.
+Subsequent views rederive against the new catalog; an invalidated query reports
+an explicit local error without changing drafts or disabling offline authoring. Read-only host diagnostics, including the real clock and
+the build and function catalogs denied during replicated execution, may be
 queried locally. External effects and Dolt control functions remain denied.
 There is no SELECT filtering: every reader node holds every row's stored
 public fields and ciphertext. Explicit sealed-data policies control access
@@ -392,5 +429,6 @@ A replica only executes transactions whose manifest it runs. An unavailable
 manifest blocks replay without creating a SQL outcome (section 4). The
 execution identity is fixed in the signed application descriptor; a new engine
 requires an explicit authenticated activation. The materialized
-database also records its initial schema administrator, and a replica refuses
-to open it with another.
+database also records its trusted initial `rootPrincipal`, and a replica refuses
+to open it with another. Reopen checks deterministic internal initialization and
+this execution manifest, never a fixed application schema or application-DDL digest.

@@ -4,7 +4,7 @@
  *   TXS=300 ROWS=20 pnpm exec tsx tools/bench-materialize.ts
  *
  * Three phases, each materialized as one appended batch of TXS transactions
- * by a writer that is not the root administrator: each transaction inserts,
+ * by a writer that is not the initial namespace owner: each transaction inserts,
  * then updates, then deletes ROWS rows it owns. Reports process CPU ms per
  * phase (wall time on a loaded machine is mostly fsync noise).
  */
@@ -18,7 +18,7 @@ const ROOT = testKey(0xa0)
 const WRITER = testKey(0x10)
 
 const fixtures = new MaterializerFixture()
-const { materializer } = await fixtures.open({ rootAdministrator: ROOT })
+const { materializer } = await fixtures.open({ rootPrincipal: ROOT })
 const transactions: ReplayProposal[] = []
 let clock = 1n
 async function add(author: Uint8Array, ...steps: Parameters<typeof replayProposal>[2]): Promise<void> {

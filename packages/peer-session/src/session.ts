@@ -1,399 +1,413 @@
-import {
-  PEER_GENERATION_CAPABILITIES, assertAuthorityExtension, verifyAuthorityBundle,
-  type AuthorityBundle, type PeerAuthority, type PeerGrant, type PeerIdentity,
-} from '@chronolog/peer-generation/control'
-import type { PeerRevision, AppliedResult, OperationState, RecoveryNotice, SignedAttempt, SignedRetainedCoverage, PeerOrderingPause, PrefixProof, HistoryCompactionOptions, HistoryCompactionResult } from '@chronolog/peer-generation'
-import { bytesToHex, hexToBytes, type ChangeProgram, type EventPayload } from '@chronolog/protocol'
-import { SignalChannel, type Signals } from '@chronolog/signals'
-import { describeApplication, type ApplicationCommand, type ApplicationDefinition, type ApplicationQuery } from './definition.js'
-import type { OpenPeerApplicationOptions } from './runtime.js'
-import type { ApplicationData } from './application-data.js'
-import type { ApplicationParticipant } from './participant-types.js'
-import type { ApplicationContent } from './content.js'
-import type { ApplicationKeyring } from './keys.js'
-import type { ApplicationRecovery } from './recovery.js'
-import { APPLICATION_PROJECTION_LIMITS, type ApplicationProjectionDefinition, type ApplicationProjectionHandle } from './projection-types.js'
-import { ApplicationControlParticipant, type ControlParticipantOptions } from './control-participant.js'
-import { OwnedApplicationParticipation } from './participation.js'
-import type { ApplicationParticipation, ApplicationParticipationOptions } from './participation-types.js'
-import { connectApplicationPeer, connectApplicationPeerPair, connectedApplicationPeers,
-  type ApplicationPeerConnectOptions, type ApplicationPeerLink, type ApplicationPeerPort } from './network.js'
-import type { ApplicationChange, ApplicationEvent, ApplicationReadView, CommandOptions, SessionStatus } from './session-types.js'
-import type { ApplicationOperation, ApplicationSubmission } from './operation.js'
+import type { AuthorityBundle as InlineAuthorityBundle } from '@chronolog/authority'
+import type { ApplicationPeerConnectOptions as InlineApplicationPeerConnectOptions } from './network.js'
+import type { ApplicationPeerDiagnostics as InlineApplicationPeerDiagnostics } from './network.js'
+import type { ApplicationPeerLink as InlineApplicationPeerLink } from './network.js'
+import { createEventMaterializationRuntime, type ChronologMaterializationRuntime, type ReplayProposal, type MaterializedLocalSqlValue } from '@chronolog/materializer'
+import { bytesToHex, hexToBytes, check, decodeRecord, encodeRecord, recordDigest, signRecord, verifyRecord, finalityPolicyDigest, verifyFinalityProofs, mergeFinalityProofs, finalityAdmissionScopes, signFinalityStatement, type FinalityStatement, type Signed, type AuthorityProvider, type FinalityProof, type VerifiedFinality } from '@chronolog/authority'
+import { compareTransactionOrder, encodeChangeProgram, decodeTransactionCore, isEmitStep, transactionOrderKey, type TransactionCore } from '@chronolog/protocol'
+import { createApplicationProvisioning, type ApplicationProvisioning } from './provisioning.js'
 import { awaitOwnedTask } from './lifetime.js'
-import { deferredStream } from './deferred-stream.js'
-import { retainApplicationAuthority } from './session-authority.js'
-
-export * from './session-types.js'
-export * from './errors.js'
-export { ApplicationOperation, type ApplicationSubmission } from './operation.js'
-
-type CommandArguments<T> = T extends ApplicationCommand<infer I> ? I : never
-type QueryArguments<T> = T extends ApplicationQuery<infer I, unknown, never> ? I : never
-type QueryResult<T> = T extends ApplicationQuery<never, infer R, never> ? Awaited<R> : never
-interface PeerEndpoint { submit(attempt: SignedAttempt): Promise<void>; readonly link: { close(): Promise<void> } }
-const internals = new WeakMap<ApplicationSession, ApplicationPeerPort>()
-export type ApplicationContentAccess = Pick<ApplicationContent, 'stage' | 'resume' | 'discard' | 'putBytes' | 'readBytes' | 'prune' | 'read' | 'retain' | 'retained' | 'retention' | 'observeRetention'>
-export type ApplicationRecoveryAccess = Pick<ApplicationRecovery, 'inspect' | 'takeover' | 'handover'>
-export type ApplicationKeyAccess = Pick<ApplicationKeyring, 'install' | 'ensure' | 'request' | 'offer' | 'validate'> & {
-  missing(requiredEpochs?: readonly number[]): Promise<readonly number[]>
-}
-
-/** One protocol owner, with a single durable facet loaded by actual data demand. */
+import { ApplicationContent } from './content.js'
+import { SignalChannel } from '@chronolog/signals'
+import type { BytesStore } from '@chronolog/records'
+import type { ApplicationDefinition } from './definition.js'
+import type { CreateApplicationSessionOptions } from './runtime.js'
+import { ApplicationOperation, type ApplicationSubmission, type OperationInspection, type RetentionEvidence, type MaterializedOperation } from './operation.js'
+import { signOperation, wrapOperation, unwrapOperation, verifyEnvelope, type SignedOperationEnvelope } from './operation-codec.js'
+import type { ApplicationChange, ApplicationEvent, ApplicationEventBatch, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, QueryParameter, SessionStatus, WaitOptions } from './session-types.js'
+interface StoredRequest { readonly operationId: string; readonly requestDigest: string; readonly proposalId: string; readonly suppliedTimestamp: bigint | null; readonly authorTimestampMs: bigint }
+interface PreparedIntent { readonly request: StoredRequest; readonly envelope: SignedOperationEnvelope }
+interface Journal { readonly format: 'authored-operation-set-v1'; readonly applicationId: string; readonly envelopes: readonly SignedOperationEnvelope[]; readonly requests: readonly StoredRequest[]; readonly retentions: readonly RetentionEvidence[]; readonly finality: readonly FinalityProof[] }
+export interface SessionFacts { readonly authority?: InlineAuthorityBundle; readonly envelopes: readonly SignedOperationEnvelope[]; readonly retentions: readonly RetentionEvidence[]; readonly finality: readonly FinalityProof[] }
+type SessionOptions<D extends ApplicationDefinition> = CreateApplicationSessionOptions<D> & { readonly authority: AuthorityProvider; readonly store: BytesStore; readonly release: () => Promise<void> }
+interface ResolvedOperation { readonly envelope: SignedOperationEnvelope; readonly core: TransactionCore; readonly proposal: ReplayProposal }
+/** The signed operation set owns facts; execution is a replaceable deterministic projection. */
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
-  readonly capabilities: typeof PEER_GENERATION_CAPABILITIES & { readonly sql: boolean }
-  readonly signals: Signals
-  readonly content: ApplicationContentAccess
-  readonly recovery: ApplicationRecoveryAccess
-  readonly keys: ApplicationKeyAccess
-  readonly operations: {
-    get(operationId: string, options?: { readonly author?: string }): Promise<OperationState | null>
-    inspect(operationId: string, options?: { readonly author?: string }): Promise<{ readonly state: OperationState; readonly attempt: SignedAttempt } | null>
-    wait(operationId: string, options?: { readonly author?: string; readonly signal?: AbortSignal }): Promise<AppliedResult>
-  }
-  readonly #options: OpenPeerApplicationOptions<D>
-  readonly #closing: () => Promise<void>
+  readonly authority: AuthorityProvider
+  readonly definition: D
+  readonly device: CreateApplicationSessionOptions<D>['device']
+  readonly content: ApplicationContent
+  readonly provisioning: ApplicationProvisioning
+  readonly signals: SignalChannel
+  readonly #options: SessionOptions<D>
+  readonly #key: string
+  #journal: Journal
+  readonly #prepared = new Map<string, PreparedIntent>()
+  #tail: Promise<unknown> = Promise.resolve()
+  #replayTail: Promise<void> = Promise.resolve()
+  #runtime: ChronologMaterializationRuntime | null = null
+  #openingRuntime: Promise<ChronologMaterializationRuntime> | null = null
   readonly #lifetime = new AbortController()
-  readonly #participant: ApplicationParticipant
-  readonly #peers = new Map<string, PeerEndpoint>()
-  readonly #links = new Set<{ close(): Promise<void> }>()
-  readonly #projections = new Map<string, ApplicationProjectionHandle>()
+  #closed = false
+  #closing: Promise<void> | undefined
+  #database: SessionStatus['database'] = 'idle'
+  #error: Error | null = null
+  #connectedPeers = 0
+  #connectionRevision = 0
+  #pending = new Map<string, OperationInspection['pending']>()
+  #invalid = new Set<string>()
+  #invalidEnvelopes = new Set<string>()
+  readonly #envelopeDigests = new WeakMap<SignedOperationEnvelope, string>()
+  #envelopesByDigest = new Map<string, SignedOperationEnvelope>()
+  #resolved = new Map<string, ResolvedOperation>()
+  #outcomes = new Map<string, MaterializedOperation>()
+  #finality: VerifiedFinality = { closedThroughMs: null, included: new Map(), excludedProposalIds: new Set(), proofs: [] }
+  #revision: MaterializedRevision
   readonly #listeners = new Set<() => void>()
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
-  readonly #recoveryListeners = new Set<(notice: RecoveryNotice) => void>()
-  #authority: PeerAuthority
-  #authorityTail: Promise<unknown> = Promise.resolve()
-  #data: ApplicationData<D> | undefined
-  #dataTask: Promise<ApplicationData<D>> | undefined
-  #initialDataTask: Promise<ApplicationData<D>> | undefined
-  #database: SessionStatus['database'] = 'idle'
-  #dataDisposers: Array<() => void> = []
-  #lastStatus = ''
-  #closed = false
-  #closeTask: Promise<void> | undefined
-  #control: ApplicationControlParticipant | undefined
-  #participation: OwnedApplicationParticipation | undefined
-
-  constructor(options: OpenPeerApplicationOptions<D>, authority: PeerAuthority, closing: () => Promise<void>) {
-    this.#options = options; this.#authority = authority; this.#closing = closing
-    this.capabilities = Object.freeze({ ...PEER_GENERATION_CAPABILITIES,
-      sql: options.definition.schema !== undefined || authority.descriptor.schemaDigest !== null })
-    const session = this
-    this.#participant = {
-      device: options.device.identity, storageId: options.device.storageId,
-      get descriptor() { return session.#authority.descriptor },
-      get authority() { return session.#authority.bundle },
-      get generation() {
-        const generation = session.#authority.current
-        if (generation === null) throw new Error('PEER_NO_SELECTED_GENERATION')
-        return generation
-      },
-      get isCoordinator() { return this.generation.payload.coordinator === this.device.publicKey },
-      grant(publicKey) { return session.#authority.grant(publicKey) },
-      adoptAuthority: async input => { await this.#adoptAuthority(input) },
-      subscribe: listener => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener) } },
-      get data() { return session.#data?.replica.closed === false ? session.#data : undefined }, openData: () => this.#openData(),
-    }
-    const signals = new SignalChannel({ ...options.signals?.limits, scope: this.applicationId,
-      relay: options.signals?.delivery === 'application', localEcho: options.signals?.localEcho === true,
-      identity: { publicKeyBytes: hexToBytes(this.deviceId), privateKey: options.device.identity.privateKey },
-      authorize: ({ scope, authorId }) => scope === this.applicationId && this.#participant.grant(bytesToHex(authorId))?.reader === true })
-    this.signals = signals
-    internals.set(this, { participant: this.#participant, signals, signal: this.signal,
-      attach: (peerId, submit, link) => this.#attachPeer(peerId, submit, link), resume: () => this.resume(),
-      observeHead: (peerId, revision, requestedAt) => this.#participation?.observeHead(peerId, revision, requestedAt) })
-    this.content = Object.freeze({
-      stage: async input => (await this.#requireData()).content.stage(input),
-      resume: async id => (await this.#requireData()).content.resume(id),
-      discard: async id => (await this.#requireData()).content.discard(id),
-      putBytes: async (bytes, input = {}) => (await this.#dataFor(input.signal)).content.putBytes(bytes, input),
-      readBytes: async (reference, input) => (await this.#dataFor(input?.signal)).content.readBytes(reference, input),
-      prune: async reference => { const captured = structuredClone(reference); return (await this.#requireData()).content.prune(captured) },
-      read(reference, input = {}) { return deferredStream(async signal =>
-        (await session.#dataFor(signal)).content.read(reference, { ...input, signal }), {
-        signal: input.signal === undefined ? session.signal : AbortSignal.any([session.signal, input.signal]),
-        concurrentNextError: 'APPLICATION_CONTENT_CONCURRENT_NEXT', abort: 'throw' }) },
-      retain: async (reference, input = {}) => (await this.#dataFor(input.signal)).content.retain(reference, input),
-      retained: async reference => (await this.#requireData()).content.retained(reference),
-      retention: async reference => (await this.#requireData()).content.retention(reference),
-      observeRetention: async receipt => (await this.#requireData()).content.observeRetention(receipt),
-    })
-    this.keys = Object.freeze({
-      missing: async required => (await this.#requireData()).keys.missing(required),
-      install: async input => (await this.#requireData()).keys.install(input),
-      ensure: async required => (await this.#requireData()).keys.ensure(required),
-      request: async required => (await this.#requireData()).keys.request(required),
-      offer: async request => (await this.#requireData()).keys.offer(request),
-      validate: async () => (await this.#requireData()).keys.validate(),
-    })
-    this.recovery = Object.freeze({
-      inspect: async () => (await this.#requireData()).recovery.inspect(),
-      takeover: async (host, input = {}) => (await this.#dataFor(input.signal)).recovery.takeover(host, input),
-      handover: async (host, input) => (await this.#dataFor(input.signal)).recovery.handover(host, input),
-    })
-    this.operations = Object.freeze({
-      get: async (id, input = {}) => (await this.#requireData()).operations.get(id, input),
-      inspect: async (id, input = {}) => (await this.#requireData()).operations.inspect(id, input),
-      wait: (id, input = {}) => this.waitFor(id, input),
-    })
+  readonly #factListeners = new Set<() => void>()
+  readonly #changeListeners = new Set<(change: ApplicationChange) => void>()
+  readonly #stopAuthority: () => void
+  private constructor(options: SessionOptions<D>, journal: Journal, policyDigest: string) {
+    this.#options = options; this.authority = options.authority; this.definition = options.definition; this.device = options.device
+    this.#key = `operation-set/${options.authority.descriptor.applicationId}`; this.#journal = journal
+    this.#revision = { digest: '', view: 'local', executionManifestDigest: this.authority.descriptor.executionManifestDigest, policyDigest }
+    this.provisioning = createApplicationProvisioning({ store: options.device.store, authority: options.authority, identity: options.device.identity })
+    this.content = new ApplicationContent({ store: options.store, authority: options.authority, identity: options.device.identity, storageId: options.device.storageId })
+    this.signals = new SignalChannel({ scope: options.authority.descriptor.applicationId, identity: { publicKeyBytes: hexToBytes(options.device.identity.publicKey), privateKey: options.device.identity.privateKey }, localEcho: true, relay: true, authorize: input => options.authority.grant(bytesToHex(input.authorId))?.reader === true })
+    this.#stopAuthority = this.authority.subscribe(() => { this.#scheduleReplay(); this.#factsChanged() })
   }
-
+  static async open<D extends ApplicationDefinition>(options: SessionOptions<D>): Promise<ApplicationSession<D>> {
+    const applicationId = options.authority.descriptor.applicationId, bytes = await options.store.get(`operation-set/${applicationId}`)
+    const journal: Journal = bytes === null ? { format: 'authored-operation-set-v1', applicationId, envelopes: [], requests: [], retentions: [], finality: [] } : decodeRecord<Journal>(bytes)
+    check(journal.format === 'authored-operation-set-v1' && journal.applicationId === applicationId && journal.requests.every(request => typeof request.authorTimestampMs === 'bigint' && request.authorTimestampMs >= 0n && request.authorTimestampMs <= (1n << 63n) - 1n), 'OPERATION_STORE_FORMAT_INVALID')
+    const session = new ApplicationSession(options, journal, await finalityPolicyDigest(options.authority.descriptor.finalityPolicy))
+    for (const envelope of journal.envelopes) await verifyEnvelope(envelope, session.authority)
+    await session.#indexEnvelopes()
+    for (const retention of journal.retentions) await session.#verifyRetention(retention)
+    session.#finality = await verifyFinalityProofs(session.authority.descriptor, journal.finality, session.authority)
+    if (bytes === null) await options.store.put(session.#key, encodeRecord(journal))
+    session.#scheduleReplay(); return session
+  }
   get signal(): AbortSignal { return this.#lifetime.signal }
-  get revision(): PeerRevision | null { return this.#data?.replica.ready ? this.#data.replica.revision : null }
-  get deviceId(): string { return this.#options.device.identity.publicKey }
-  get applicationId(): string { return this.#participant.descriptor.applicationId }
-  get historyId(): string { return this.#participant.descriptor.historyId }
-  get storageId(): string { return this.#options.device.storageId }
-  get participation(): ApplicationParticipation | undefined { return this.#participation }
-  get status(): SessionStatus {
-    const coordinator = this.#participant.generation.payload.coordinator, data = this.#participant.data
-    return { phase: this.#closed ? 'closed' : data !== undefined && data.keys.missing().length > 0 ? 'awaiting-keys'
-      : data !== undefined && !data.replica.ready ? 'recovering' : this.#participant.isCoordinator || this.#peers.has(coordinator) ? 'ready' : 'waiting',
-      database: this.#database, role: this.#participant.isCoordinator ? 'coordinator' : 'follower',
-      generation: this.#participant.generation.id, coordinator, connectedPeers: this.#peers.size }
+  connectPeer(options: InlineApplicationPeerConnectOptions): Promise<InlineApplicationPeerLink> { return import('./network.js').then(module => module.connectApplicationPeer(this, options)) }
+  diagnostics(): Promise<readonly InlineApplicationPeerDiagnostics[]> { return import('./network.js').then(module => module.applicationPeerDiagnostics(this)) }
+  get applicationId(): string { return this.authority.descriptor.applicationId }
+  get identity(): { readonly publicKey: string } { return { publicKey: this.device.identity.publicKey } }
+  get revision(): MaterializedRevision { return { ...this.#revision } }
+  get status(): SessionStatus { return { pendingDependencies: [...(this.#finality.pendingDependencies ?? []), ...[...this.#pending].filter(([, kind]) => kind !== 'materializer').map(([id, kind]) => `${kind}/${id}`)], canAuthor: !this.#closed && this.authority.grant(this.device.identity.publicKey)?.writer === true && this.authority.epochKey(this.authority.currentMembership.epoch) !== null, phase: this.#closed ? 'closed' : [...this.#pending.values()].includes('key') ? 'awaiting-keys' : 'ready', database: this.#database, connectedPeers: this.#connectedPeers, connectionRevision: this.#connectionRevision, pendingOperations: this.#pending.size, materializationError: this.#error?.message ?? null } }
+  #serial<T>(work: () => Promise<T>): Promise<T> {
+    const task = this.#tail.then(() => { check(!this.#closed, 'SESSION_CLOSED'); return work() }); this.#tail = task.catch(() => undefined); return task
   }
-  describe() { return { ...describeApplication(this.#options.definition), capabilities: this.capabilities } }
-  /** Public signed authority already verified by this owner; no data activation or host request. */
-  async authority(): Promise<AuthorityBundle> {
-    this.#assertOpen()
-    return structuredClone(this.#participant.authority)
-  }
-  onStatus(listener: (status: SessionStatus) => void): () => void {
-    this.#statusListeners.add(listener)
-    try { listener(this.status) } catch { /* Observers cannot change ownership. */ }
-    return () => { this.#statusListeners.delete(listener) }
-  }
-  #changed(): void {
-    for (const listener of this.#listeners) { try { listener() } catch { /* Observers cannot change ownership. */ } }
-    const status = this.status, encoded = JSON.stringify(status)
-    if (encoded === this.#lastStatus) return
-    this.#lastStatus = encoded
-    for (const listener of this.#statusListeners) { try { listener(status) } catch { /* Observers cannot change ownership. */ } }
-  }
-  #serializeAuthority<T>(run: () => Promise<T>): Promise<T> {
-    const result = this.#authorityTail.then(run); this.#authorityTail = result.catch(() => undefined); return result
-  }
-  #adoptAuthority(input: AuthorityBundle): Promise<RecoveryNotice | null> {
-    const captured = structuredClone(input)
-    return this.#serializeAuthority(async () => {
-      this.#assertOpen()
-      const next = await verifyAuthorityBundle(captured, this.#participant.authority.descriptor)
-      assertAuthorityExtension(await verifyAuthorityBundle(this.#participant.authority), next)
-      const retained = await retainApplicationAuthority(this.#options.device, next.bundle)
-      this.#assertOpen(); this.#authority = retained
-      const data = this.#participant.data
-      let recovery: RecoveryNotice | null = null
-      if (data !== undefined) {
-        try { recovery = (await data.replica.receiveHistory(retained.bundle, [])).recovery }
-        catch (error) { if (!data.replica.closed) throw error }
-      }
-      this.#changed(); return recovery
-    })
-  }
-  #openData(): Promise<ApplicationData<D>> {
-    this.#assertDataAvailable()
-    if (this.#dataTask !== undefined) return this.#dataTask
-    this.#database = 'opening'
-    const task = (async () => {
-      let data: ApplicationData<D> | undefined
-      try {
-        const { openApplicationData } = await import('./application-data.js')
-        this.#assertOpen()
-        data = await openApplicationData({ ...this.#options, authority: this.#participant.authority, session: this,
-          adoptAuthority: async input => { await this.#adoptAuthority(input) },
-          submit: async attempt => { await this.#peers.get(this.#participant.generation.payload.coordinator)?.submit(attempt) } })
-        const opened = data
-        await this.#serializeAuthority(async () => {
-          this.#assertOpen()
-          const retained = await retainApplicationAuthority(this.#options.device, opened.replica.authority)
-          await opened.replica.receiveHistory(retained.bundle, []); this.#assertOpen()
-          this.#authority = retained; this.#data = opened
-          this.#dataDisposers = [opened.replica.subscribe(() => {
-            if (opened.replica.closed && !this.#closed) {
-              this.#database = 'failed'
-              for (const dispose of this.#dataDisposers.splice(0)) dispose()
-              void opened.close(new Error('APPLICATION_DATA_UNAVAILABLE')).catch(() => undefined)
-            }
-            this.#changed()
-          }), opened.keys.subscribe(() => this.#changed()),
-            opened.replica.onRecovery(notice => { for (const listener of this.#recoveryListeners) {
-              try { listener(notice) } catch { /* Observers cannot undo durable recovery. */ }
-            } })]
-          this.#database = 'ready'; this.#changed()
-        })
-        void opened.resume().catch(() => undefined)
-        return opened
-      } catch (error) {
-        await data?.close().catch(() => undefined)
-        if (!this.#closed) { this.#database = 'failed'; this.#changed() }
-        throw error
-      }
-    })()
-    this.#dataTask = task; this.#changed()
-    void task.catch(() => undefined)
-    return task
-  }
-  /** Existing links join the first public data demand once; inbound activation remains local-only. */
-  #requireData(): Promise<ApplicationData<D>> {
-    this.#assertDataAvailable()
-    this.#initialDataTask ??= Promise.resolve().then(async () => {
-      const data = await this.#openData()
-      await Promise.allSettled(connectedApplicationPeers(internals.get(this)!).map(link => link.synchronize()))
-      this.#assertDataAvailable(); return data
-    })
-    return this.#initialDataTask
-  }
-  #dataFor(signal?: AbortSignal): Promise<ApplicationData<D>> {
-    return awaitOwnedTask(signal === undefined ? this.signal : AbortSignal.any([this.signal, signal]), () => this.#requireData())
-  }
-
-  async command<Name extends keyof D['commands'] & string>(name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions): Promise<ApplicationOperation> {
-    return (await this.#requireData()).command(name, input, options)
-  }
-  /** The owning host has authenticated and approved the use of this signing identity. */
-  async submitProgramAs(program: ChangeProgram, author: PeerIdentity, options: CommandOptions): Promise<ApplicationSubmission> {
-    const capturedProgram = structuredClone(program), identity = { ...author }, request = structuredClone(options)
-    return (await this.#requireData()).submitProgramAs(capturedProgram, identity, request)
-  }
-  async reapply<Name extends keyof D['commands'] & string>(id: string, name: Name, input: CommandArguments<D['commands'][Name]>, options: CommandOptions & { readonly originalAuthor?: string }): Promise<ApplicationOperation> {
-    return (await this.#requireData()).reapply(id, name, input, options)
-  }
-  async query<Name extends keyof D['queries'] & string>(name: Name, input: QueryArguments<D['queries'][Name]>): Promise<{ readonly revision: PeerRevision; readonly value: QueryResult<D['queries'][Name]> }> {
-    return (await this.#requireData()).query(name, input)
-  }
-  memberGrant(publicKey: string): PeerGrant | null {
-    this.#assertOpen()
-    return this.#participant.grant(publicKey)
-  }
-  async operationByAttempt(attemptId: string, author: string): Promise<OperationState | null> {
-    return (await this.#requireData()).replica.operationByAttempt(attemptId, author)
-  }
-  async readView(): Promise<ApplicationReadView> { return (await this.#requireData()).readView() }
-  onRecovery(listener: (notice: RecoveryNotice) => void): () => void {
-    this.#assertOpen(); this.#recoveryListeners.add(listener); return () => { this.#recoveryListeners.delete(listener) }
-  }
-  async inspectRecovery(): Promise<readonly RecoveryNotice[]> { return (await this.#requireData()).inspectRecovery() }
-  async recoveryPoint(): Promise<PrefixProof> { return (await this.#requireData()).recoveryPoint() }
-  /** Durable pause covers local and remote coordinator ordering; closing does not release it. */
-  async pauseOrdering(operationId: string): Promise<PeerOrderingPause> { return (await this.#requireData()).replica.pauseOrdering(operationId) }
-  async orderingPause(): Promise<PeerOrderingPause | null> { return (await this.#requireData()).replica.orderingPause() }
-  /** Reconcile the original control operation before resuming; a lost reply is not cancellation. */
-  async resumeOrdering(operationId: string): Promise<void> { return (await this.#requireData()).replica.resumeOrdering(operationId) }
-  async adopt(authority: AuthorityBundle): Promise<RecoveryNotice | null> {
-    const data = await this.#requireData(), notice = await this.#adoptAuthority(authority)
-    this.#assertDataAvailable()
-    return await data.adopt(this.#participant.authority) ?? notice
-  }
-  async compact(options: HistoryCompactionOptions & {
-    readonly summarize?: (events: readonly ApplicationEvent[]) => ChangeProgram | null | Promise<ChangeProgram | null>
-    readonly operationId?: string
-    readonly signal?: AbortSignal
-  } = {}): Promise<HistoryCompactionResult> {
-    return (await this.#dataFor(options.signal)).compact(options)
-  }
-  changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
-    return deferredStream(async signal => (await this.#dataFor(signal)).changes({ signal }), {
-      signal: options.signal === undefined ? this.signal : AbortSignal.any([this.signal, options.signal]),
-      concurrentNextError: 'APPLICATION_CHANGE_CONCURRENT_NEXT', abort: 'done' })
-  }
-  project<State extends EventPayload>(definition: ApplicationProjectionDefinition<State>): ApplicationProjectionHandle<State> {
-    this.#assertOpen()
-    if (this.#projections.has(definition.id)) throw new Error('APPLICATION_PROJECTION_IN_USE')
-    if (this.#projections.size >= APPLICATION_PROJECTION_LIMITS.active) throw new Error('APPLICATION_PROJECTION_LIMIT')
-    const captured = { ...definition, initial: structuredClone(definition.initial),
-      ...(definition.topics === undefined ? {} : { topics: [...definition.topics] }) }
-    const lifetime = new AbortController(), signal = AbortSignal.any([this.signal, lifetime.signal])
-    let closed = false, actual: ApplicationProjectionHandle<State> | undefined
-    const acquire = async (input?: AbortSignal): Promise<ApplicationProjectionHandle<State>> => {
-      if (closed) throw new Error('APPLICATION_PROJECTION_CLOSED')
-      const data = await this.#dataFor(input === undefined ? signal : AbortSignal.any([signal, input]))
-      if (closed) throw new Error('APPLICATION_PROJECTION_CLOSED')
-      actual ??= data.project(captured); return actual
+  async #indexEnvelopes(): Promise<void> {
+    const indexed = new Map<string, SignedOperationEnvelope>()
+    for (const envelope of this.#journal.envelopes) {
+      let digest = this.#envelopeDigests.get(envelope)
+      if (digest === undefined) { digest = await recordDigest(envelope); this.#envelopeDigests.set(envelope, digest) }
+      indexed.set(digest, envelope)
     }
-    const handle: ApplicationProjectionHandle<State> = Object.freeze({ id: captured.id,
-      read: async (options: { readonly signal?: AbortSignal } = {}) => (await acquire(options.signal)).read(options),
-      changes(options: { readonly signal?: AbortSignal } = {}) { return deferredStream(async owned =>
-        (await acquire(owned)).changes({ signal: owned }), {
-        signal: options.signal === undefined ? signal : AbortSignal.any([signal, options.signal]),
-        concurrentNextError: 'APPLICATION_PROJECTION_CONCURRENT_NEXT', abort: 'done' }) },
-      close: async () => { if (closed) return; closed = true; lifetime.abort(new Error('APPLICATION_PROJECTION_CLOSED'))
-        this.#projections.delete(captured.id); await actual?.close() },
+    this.#envelopesByDigest = indexed
+  }
+  #canonicalAuthor(id: string): string | undefined {
+    if (this.#journal.requests.some(request => request.proposalId === id)) return this.device.identity.publicKey
+    const resolved = this.#resolved.get(id)
+    return resolved === undefined ? undefined : bytesToHex(resolved.core.authorId)
+  }
+  #subjectEnvelope(id: string): SignedOperationEnvelope | undefined {
+    const knownAuthor = this.#canonicalAuthor(id), candidates = [...this.#envelopesByDigest].filter(([digest, envelope]) => envelope.payload.proposalId === id && !this.#invalidEnvelopes.has(digest) && (knownAuthor === undefined || envelope.payload.author === knownAuthor))
+    const authors = new Set(candidates.map(([, envelope]) => envelope.payload.author))
+    return authors.size === 1 ? candidates[0]?.[1] : undefined
+  }
+  #retained(id: string): readonly RetentionEvidence[] {
+    const author = this.#canonicalAuthor(id) ?? this.#subjectEnvelope(id)?.payload.author
+    if (author === undefined) return []
+    return this.#journal.retentions.filter(evidence => {
+      const receipt = evidence.payload, envelope = this.#envelopesByDigest.get(receipt.envelopeDigest)
+      return receipt.proposalId === id && receipt.author === author && this.authority.grant(evidence.signer) !== null && evidence.signer !== this.device.identity.publicKey && receipt.storageId !== this.device.storageId && envelope?.payload.proposalId === id && envelope.payload.author === author && !this.#invalidEnvelopes.has(receipt.envelopeDigest)
     })
-    this.#projections.set(captured.id, handle); return handle
   }
-  projection<State extends EventPayload = EventPayload>(id: string): ApplicationProjectionHandle<State> {
-    this.#assertOpen(); const handle = this.#projections.get(id)
-    if (handle === undefined) throw new Error('APPLICATION_PROJECTION_NOT_FOUND')
-    return handle as ApplicationProjectionHandle<State>
-  }
-  connectPeer(options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
-    this.#assertOpen(); return connectApplicationPeer(internals.get(this)!, options)
-  }
-  participate(options: ApplicationParticipationOptions): ApplicationParticipation {
-    this.#assertOpen()
-    if (this.#participation !== undefined) throw new Error('APPLICATION_PARTICIPATION_ALREADY_STARTED')
-    const participation = new OwnedApplicationParticipation({ participant: this.#participant,
-      store: this.#options.device.store, signal: this.signal, connect: input => this.connectPeer(input),
-      links: () => connectedApplicationPeers(internals.get(this)!), resume: () => this.resume() }, options)
-    this.#participation = participation; this.#links.add(participation); return participation
-  }
-  connectControlParticipant(options: ControlParticipantOptions): ApplicationControlParticipant {
-    this.#assertOpen()
-    if (this.#control !== undefined && this.#links.has(this.#control)) throw new Error('APPLICATION_CONTROL_ALREADY_ATTACHED')
-    const participant = new ApplicationControlParticipant(this.#participant, this.#options.device.store, this.signal, options)
-    this.#control = participant; this.#links.add(participant)
-    participant.signal.addEventListener('abort', () => {
-      const released = (): void => { this.#links.delete(participant) }
-      void participant.close().then(released, released)
-    }, { once: true })
-    return participant
-  }
-  async retry(id: string, author?: string): Promise<void> { return (await this.#requireData()).retry(id, author) }
-  async resume(): Promise<void> {
-    this.#assertOpen()
-    if (this.#participant.data !== undefined) await this.#data?.resume()
-  }
-  async waitFor(id: string, options: { readonly author?: string; readonly signal?: AbortSignal } = {}): Promise<AppliedResult> {
-    return (await this.#dataFor(options.signal)).waitFor(id, options)
-  }
-  async waitForCoverage(applied: AppliedResult, options: { readonly signal?: AbortSignal } = {}): Promise<readonly SignedRetainedCoverage[]> {
-    return (await this.#dataFor(options.signal)).waitForCoverage(applied, options)
-  }
-  #attachPeer(peerId: string, submit: (attempt: SignedAttempt) => Promise<void>, link: { close(): Promise<void> }): () => void {
-    this.#assertOpen()
-    if (this.#participant.grant(peerId)?.reader !== true) throw new Error('APPLICATION_PEER_NOT_AUTHORIZED')
-    if (this.#peers.size >= 8 && !this.#peers.has(peerId)) throw new Error('APPLICATION_PEER_LIMIT')
-    const previous = this.#peers.get(peerId), endpoint = { submit, link }
-    this.#peers.set(peerId, endpoint); this.#links.add(link)
-    if (previous !== undefined && previous.link !== link) {
-      try { void Promise.resolve(previous.link.close()).catch(() => undefined) } catch { /* The previous endpoint is replaced. */ }
+  async #persist(journal: Journal): Promise<void> {
+    check(journal.envelopes.length <= (this.#options.maxOperations ?? 100_000), 'OPERATION_COUNT_LIMIT')
+    const bytes = encodeRecord(journal); check(bytes.length <= (this.#options.maxHistoryBytes ?? 32 * 1024 * 1024), 'OPERATION_HISTORY_LIMIT')
+    try { await this.#options.store.put(this.#key, bytes); this.#journal = journal; await this.#indexEnvelopes() }
+    catch (error) {
+      // A lost durability reply is not proof that the write failed. Reconcile before retry.
+      const retained = await this.#options.store.get(this.#key)
+      if (retained !== null) { this.#journal = decodeRecord<Journal>(retained); await this.#indexEnvelopes(); this.#scheduleReplay(); this.#factsChanged(); this.#notify() }
+      throw error
     }
-    this.#changed()
-    return () => { if (this.#peers.get(peerId) === endpoint) this.#peers.delete(peerId); this.#links.delete(link); this.#changed() }
+  }
+  async #commitPrepared(intent: PreparedIntent): Promise<ApplicationOperation> {
+    const { request, envelope } = intent
+    await this.#persist({ ...this.#journal, envelopes: [...this.#journal.envelopes, envelope], requests: [...this.#journal.requests, request] })
+    this.#prepared.delete(request.operationId); this.#pending.set(request.proposalId, 'materializer'); this.#notify(); this.#factsChanged(); this.#scheduleReplay()
+    return new ApplicationOperation(request.proposalId, request.operationId, this)
+  }
+  /** Completion is local durable signed storage, not network dispatch or engine warm-up. */
+  submit(input: ApplicationSubmission): Promise<ApplicationOperation> {
+    const program = structuredClone(input.program), operationId = input.operationId ?? crypto.randomUUID(), suppliedTimestamp = input.authorTimestampMs ?? null
+    return this.#serial(async () => {
+      const requestDigest = await recordDigest({ program: bytesToHex(encodeChangeProgram(program)) })
+      const prior = this.#journal.requests.find(request => request.operationId === operationId)
+      if (prior !== undefined) {
+        check(prior.requestDigest === requestDigest && (suppliedTimestamp === null || suppliedTimestamp === prior.authorTimestampMs), 'OPERATION_ID_REUSED')
+        this.#prepared.delete(operationId); this.#scheduleReplay(); this.#factsChanged(); return new ApplicationOperation(prior.proposalId, operationId, this)
+      }
+      const prepared = this.#prepared.get(operationId)
+      if (prepared !== undefined) {
+        check(prepared.request.requestDigest === requestDigest && (suppliedTimestamp === null || suppliedTimestamp === prepared.envelope.payload.authorTimestampMs), 'OPERATION_ID_REUSED')
+        return this.#commitPrepared(prepared)
+      }
+      check(this.#prepared.size < 32, 'AUTHORING_PREPARATION_LIMIT')
+      const grant = this.authority.grant(this.device.identity.publicKey)
+      check(grant?.writer, 'OPERATION_WRITER_FORBIDDEN')
+      // Only this device's durable DEFAULT allocations advance its author clock.
+      // Explicit authored timestamps (including authenticated remote int64 maxima) never poison defaults.
+      const highestDefault = this.#journal.requests.filter(request => request.suppliedTimestamp === null).reduce((highest, request) => request.authorTimestampMs > highest ? request.authorTimestampMs : highest, -1n)
+      const now = BigInt(Date.now())
+      const authorTimestampMs = suppliedTimestamp ?? (now > highestDefault ? now : highestDefault + 1n)
+      const memberships = this.authority.bundle().memberships
+      const historical = [...memberships].reverse().find(item => authorTimestampMs > item.payload.authorTimeAfterMs)
+      check(historical !== undefined && historical.payload.members.some(member => member.publicKey === this.device.identity.publicKey && member.writer), 'OPERATION_MEMBERSHIP_TIME_INVALID')
+      const membership = historical.payload, membershipId = await recordDigest(historical)
+      const epochKey = this.authority.epochKey(membership.epoch); check(epochKey !== null, 'OPERATION_EPOCH_KEY_MISSING')
+      const core: TransactionCore = { operationId, groupId: hexToBytes(this.applicationId), membershipRevision: hexToBytes(membershipId), validationPolicy: hexToBytes(this.#revision.policyDigest), authorId: hexToBytes(this.device.identity.publicKey), authorTimestampMs, nonce: crypto.getRandomValues(new Uint8Array(16)), executionManifestDigest: hexToBytes(this.authority.descriptor.executionManifestDigest), program }
+      const body = await signOperation(core, this.device.identity), envelope = await wrapOperation(body, this.device.identity, membership.epoch, epochKey)
+      const intent = { envelope, request: { operationId, requestDigest, suppliedTimestamp, authorTimestampMs, proposalId: body.payload.proposalId } }
+      this.#prepared.set(operationId, intent)
+      return this.#commitPrepared(intent)
+    }).catch((error: unknown) => {
+      if (error instanceof Error) Object.assign(error, { operationId, applicationId: this.applicationId, durability: this.#journal.requests.some(request => request.operationId === operationId) ? 'stored' : 'unconfirmed' })
+      throw error
+    })
+  }
+  command(name: string, input: unknown, options: CommandOptions = {}): Promise<ApplicationOperation> {
+    const command = this.definition.commands[name]; check(command !== undefined, 'APPLICATION_COMMAND_UNKNOWN')
+    return this.submit({ ...options, program: command.prepare(input as never) })
+  }
+  #operation(id: string): ApplicationOperation | null {
+    const request = this.#journal.requests.find(item => item.operationId === id || item.proposalId === id)
+    const resolved = this.#resolved.get(id)
+    const envelope = this.#subjectEnvelope(id)
+    return request === undefined ? resolved === undefined ? envelope === undefined ? null : new ApplicationOperation(id, '', this) : new ApplicationOperation(id, resolved.core.operationId, this) : new ApplicationOperation(request.proposalId, request.operationId, this)
+  }
+  get operations() {
+    const session = this
+    return { get: (id: string) => session.#operation(id), async retry(id: string): Promise<ApplicationOperation> {
+      const operation = session.#operation(id); check(operation !== null && operation.inspect().author === session.device.identity.publicKey, 'OPERATION_RETRY_FORBIDDEN')
+      session.#scheduleReplay(); session.#factsChanged(); return operation
+    }, async *subscribe(options: { readonly operationId: string; readonly signal?: AbortSignal }): AsyncIterable<OperationInspection> {
+      const signal = options.signal === undefined ? session.signal : AbortSignal.any([session.signal, options.signal]); let dirty = true, wake: (() => void) | undefined
+      const listener = (): void => { dirty = true; wake?.() }; session.#listeners.add(listener); signal.addEventListener('abort', listener)
+      try { while (!signal.aborted) { if (!dirty) await new Promise<void>(resolve => { wake = resolve }); if (signal.aborted) break; dirty = false; const operation = session.#operation(options.operationId); if (operation !== null) yield operation.inspect(); else if (session.#pending.has(options.operationId)) yield session.inspectOperation(options.operationId) } }
+      finally { session.#listeners.delete(listener); signal.removeEventListener('abort', listener) }
+    } }
+  }
+  inspectOperation(id: string): OperationInspection {
+    const envelope = this.#subjectEnvelope(id), resolved = this.#resolved.get(id)
+    const materialized = this.#outcomes.get(id) ?? null, cutoff = this.#finality.closedThroughMs
+    const finalized = this.authority.descriptor.finalityPolicy.kind !== 'none' && cutoff !== null && this.#finality.included.has(id) && !this.#finality.excludedProposalIds.has(id) && resolved !== undefined && resolved.core.authorTimestampMs <= cutoff && materialized !== null && this.#pending.size === 0 && this.#error === null
+    return { applicationId: this.applicationId, author: resolved === undefined ? envelope?.payload.author ?? '' : bytesToHex(resolved.core.authorId), authorTimestampMs: (resolved?.core.authorTimestampMs ?? envelope?.payload.authorTimestampMs)?.toString() ?? null, proposalId: id, operationId: resolved?.core.operationId ?? this.#journal.requests.find(item => item.proposalId === id)?.operationId ?? '', stored: envelope !== undefined, pending: this.#pending.get(id) ?? null, materialized, retained: structuredClone(this.#retained(id)), finalized, excluded: this.#invalid.has(id) || this.#finality.excludedProposalIds.has(id) }
+  }
+  waitOperation(id: string, fact: 'materialized' | 'retained' | 'finalized', options: WaitOptions = {}): Promise<OperationInspection> {
+    if (fact === 'finalized' && this.authority.descriptor.finalityPolicy.kind === 'none') return Promise.reject(Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' }))
+    const timeoutMs = options.timeoutMs ?? 30_000
+    check(Number.isSafeInteger(timeoutMs) && timeoutMs >= 1 && timeoutMs <= 120_000, 'OPERATION_WAIT_LIMIT')
+    return new Promise((resolve, reject) => {
+      const finish = (error?: unknown, value?: OperationInspection): void => { clearTimeout(timer); this.#listeners.delete(checkFact); options.signal?.removeEventListener('abort', abort); if (error !== undefined) reject(error); else resolve(value!) }
+      const abort = (): void => finish(options.signal?.reason ?? new Error('ABORTED'))
+      const checkFact = (): void => { const value = this.inspectOperation(id); if (this.#closed) finish(new Error('SESSION_CLOSED')); else if (value.excluded) finish(Object.assign(new Error('OPERATION_EXCLUDED'), { inspection: value })); else if (fact === 'materialized' ? value.materialized !== null : fact === 'retained' ? value.retained.length > 0 : value.finalized) finish(undefined, value) }
+      const timer = setTimeout(() => finish(new Error('OPERATION_WAIT_TIMEOUT')), timeoutMs); this.#listeners.add(checkFact); options.signal?.addEventListener('abort', abort, { once: true }); if (options.signal?.aborted) abort(); else checkFact()
+    })
+  }
+  exportFacts(): SessionFacts { return structuredClone({ authority: this.authority.bundle(), envelopes: this.#journal.envelopes, retentions: this.#journal.retentions, finality: this.#journal.finality }) }
+  async #verifyRetention(evidence: RetentionEvidence): Promise<void> {
+    check(evidence.payload.applicationId === this.applicationId && evidence.payload.peer === evidence.signer && typeof evidence.payload.storageId === 'string' && evidence.payload.storageId.length > 0 && evidence.payload.storageId.length <= 128 && /^[0-9a-f]{64}$/u.test(evidence.payload.proposalId) && /^[0-9a-f]{64}$/u.test(evidence.payload.author) && /^[0-9a-f]{64}$/u.test(evidence.payload.envelopeDigest) && this.authority.bundle().memberships.some(membership => membership.payload.members.some(member => member.publicKey === evidence.signer)), 'RETENTION_SCOPE_INVALID')
+    await verifyRecord('retention', evidence, evidence.payload.peer)
+  }
+  async mergeFacts(input: SessionFacts): Promise<void> {
+    const facts = structuredClone(input)
+    if (facts.authority !== undefined) await this.mergeAuthority(facts.authority)
+    return this.#serial(async () => {
+      const envelopes = [...this.#journal.envelopes], retentions = [...this.#journal.retentions]
+      const known = new Set(await Promise.all(envelopes.map(item => recordDigest(item))))
+      for (const envelope of facts.envelopes) { await verifyEnvelope(envelope, this.authority); const id = await recordDigest(envelope); if (!known.has(id)) { check(envelopes.filter(item => item.payload.proposalId === envelope.payload.proposalId && item.payload.author === envelope.payload.author).length < 8, 'OPERATION_ENVELOPE_LIMIT'); known.add(id); envelopes.push(envelope) } }
+      const receipts = new Set(await Promise.all(retentions.map(item => recordDigest(item))))
+      for (const receipt of facts.retentions) { await this.#verifyRetention(receipt); const id = await recordDigest(receipt); if (!receipts.has(id)) { receipts.add(id); retentions.push(receipt) } }
+      const proofs = await mergeFinalityProofs(this.#journal.finality, facts.finality)
+      const verified = await verifyFinalityProofs(this.authority.descriptor, proofs, this.authority)
+      const journal = { ...this.#journal, envelopes, retentions, finality: proofs }
+      if (await recordDigest(journal) === await recordDigest(this.#journal)) return
+      await this.#persist(journal); this.#finality = verified
+      this.#notify(); this.#factsChanged(); this.#scheduleReplay()
+    })
+  }
+  async retain(proposalId: string, subject?: { readonly author: string; readonly envelopeDigest: string }): Promise<RetentionEvidence> {
+    const envelope = subject === undefined ? this.#subjectEnvelope(proposalId) : this.#envelopesByDigest.get(subject.envelopeDigest)
+    check(envelope !== undefined && envelope.payload.proposalId === proposalId && (subject === undefined || envelope.payload.author === subject.author), 'RETENTION_SUBJECT_MISSING')
+    const author = envelope.payload.author, envelopeDigest = this.#envelopeDigests.get(envelope)!
+    check(!this.#invalidEnvelopes.has(envelopeDigest), 'RETENTION_SUBJECT_INVALID')
+    const existing = this.#journal.retentions.find(item => item.payload.proposalId === proposalId && item.payload.author === author && item.payload.envelopeDigest === envelopeDigest && item.signer === this.device.identity.publicKey && item.payload.storageId === this.device.storageId)
+    if (existing !== undefined) return structuredClone(existing)
+    const evidence = await signRecord('retention', { applicationId: this.applicationId, proposalId, author, envelopeDigest, peer: this.device.identity.publicKey, storageId: this.device.storageId }, this.device.identity)
+    await this.mergeFacts({ envelopes: [], retentions: [evidence], finality: [] }); return evidence
+  }
+  async mergeAuthority(bundle: InlineAuthorityBundle): Promise<void> {
+    const current = this.authority.currentMembership.revision, sealed = this.#finality.closedThroughMs
+    if (sealed !== null) for (const membership of bundle.memberships.slice(current + 1)) check(membership.payload.authorTimeAfterMs >= sealed, 'FINALITY_MEMBERSHIP_BEHIND_SEAL')
+    await this.authority.merge(bundle)
+  }
+  get finality() {
+    const session = this
+    const prepare = (options: { readonly throughMs: bigint }): Promise<readonly Signed<FinalityStatement>[]> => session.#serial(async () => {
+      const policy = session.authority.descriptor.finalityPolicy
+      check(policy.kind !== 'none', 'FINALITY_UNSUPPORTED')
+      check(session.authority.grant(session.device.identity.publicKey)?.finalizer === true, 'FINALITY_FINALIZER_REQUIRED')
+      check(policy.kind === 'signed-frontier' ? policy.signer === session.device.identity.publicKey : policy.validators.includes(session.device.identity.publicKey), 'FINALITY_SIGNER_FORBIDDEN')
+      check(typeof options.throughMs === 'bigint' && options.throughMs >= 0n && options.throughMs <= (1n << 63n) - 1n, 'FINALITY_TIME_INVALID')
+      const entriesById = new Map<string, { id: string; timestamp: bigint; membershipId: string; author: string; available: boolean }>()
+      for (const envelope of session.#journal.envelopes) {
+        try {
+          const resolved = await unwrapOperation(envelope, session.authority)
+          if (typeof resolved !== 'string' && resolved.admission === 'excluded') continue
+          const entry = { id: envelope.payload.proposalId, timestamp: envelope.payload.authorTimestampMs, membershipId: envelope.payload.membershipId, author: envelope.payload.author, available: typeof resolved !== 'string' }, prior = entriesById.get(entry.id)
+          if (prior === undefined || !prior.available && (entry.available || entry.timestamp < prior.timestamp)) entriesById.set(entry.id, entry)
+        } catch { /* Invalid envelopes cannot supply execution or a closure dependency. */ }
+      }
+      const entries = [...entriesById.values()], certified = await verifyFinalityProofs(session.authority.descriptor, session.#journal.finality, session.authority)
+      const votes: Signed<FinalityStatement>[] = []
+      for (const scope of await finalityAdmissionScopes(session.authority)) {
+        const history = (certified.certifiedProofs ?? []).filter(proof => proof.statement.scope === scope.id), head = history.at(-1)?.statement
+        const firstIncluded = new Set(history.flatMap(proof => proof.statement.inclusions.map(inclusion => inclusion.proposalId)))
+        const matching = entries.filter(entry => entry.timestamp > scope.authorTimeAfterMs && (!session.authority.hasMembership(scope.id) || entry.membershipId === scope.id))
+        const blockers = matching.filter(entry => !entry.available && entry.timestamp <= options.throughMs).map(entry => ({ proposalId: entry.id, authorTimestampMs: entry.timestamp, membershipId: entry.membershipId, author: entry.author }))
+        let closedThroughMs = options.throughMs > scope.authorTimeAfterMs ? options.throughMs : scope.authorTimeAfterMs
+        for (const blocker of blockers) if (closedThroughMs >= blocker.authorTimestampMs) closedThroughMs = blocker.authorTimestampMs - 1n
+        check(closedThroughMs >= (head?.closedThroughMs ?? scope.authorTimeAfterMs), 'FINALITY_DEPENDENCY_BEHIND_SEAL')
+        const statement: FinalityStatement = { applicationId: session.applicationId, policyDigest: session.#revision.policyDigest, authorityHead: session.authority.currentMembershipId, scope: scope.id, sequence: (head?.sequence ?? -1) + 1, previous: head === undefined ? null : await recordDigest(head), inclusions: matching.filter(entry => entry.available && !firstIncluded.has(entry.id)).map(entry => ({ proposalId: entry.id, authorTimestampMs: entry.timestamp, membershipId: entry.membershipId, author: entry.author })).sort((a, b) => a.proposalId.localeCompare(b.proposalId)), closedThroughMs, blockers }
+        votes.push(await signFinalityStatement(statement, session.device.identity))
+      }
+      return votes
+    })
+    return { voteAuthorTime: prepare, async closeAuthorTime(options: { readonly throughMs: bigint }): Promise<{ readonly closedThroughMs: bigint | null; readonly proofs: readonly FinalityProof[] }> {
+      const policy = session.authority.descriptor.finalityPolicy; check(policy.kind !== 'none', 'FINALITY_UNSUPPORTED'); check(session.authority.grant(session.device.identity.publicKey)?.finalizer === true, 'FINALITY_FINALIZER_REQUIRED'); check(policy.kind === 'signed-frontier' || policy.threshold === 1, 'FINALITY_QUORUM_REQUIRED')
+      const votes = await prepare(options), proofs = votes.map(vote => ({ statement: vote.payload, signatures: [vote] }))
+      await session.mergeFacts({ envelopes: [], retentions: [], finality: proofs }); await session.retryMaterialization()
+      return { closedThroughMs: session.#finality.closedThroughMs, proofs }
+    }, async submitProofs(proofs: readonly FinalityProof[]): Promise<void> { await session.mergeFacts({ envelopes: [], retentions: [], finality: proofs }) } }
+  }
+  onFacts(listener: () => void): () => void { this.#factListeners.add(listener); return () => { this.#factListeners.delete(listener) } }
+  #factsChanged(): void { for (const listener of this.#factListeners) { try { listener() } catch { /* A transport observer cannot reject committed facts. */ } } }
+  #notify(): void { for (const listener of this.#listeners) { try { listener() } catch { /* Isolated observers. */ } }; for (const listener of this.#statusListeners) { try { listener(this.status) } catch { /* Isolated observers. */ } } }
+  onStatus(listener: (value: SessionStatus) => void): () => void { this.#statusListeners.add(listener); try { listener(this.status) } catch { /* Observation cannot reject a committed session. */ }; return () => { this.#statusListeners.delete(listener) } }
+  onChange(listener: (value: ApplicationChange) => void): () => void { this.#changeListeners.add(listener); return () => { this.#changeListeners.delete(listener) } }
+  setConnectedPeers(count: number): void { check(Number.isSafeInteger(count) && count >= 0 && count <= 8, 'SESSION_PEER_LIMIT'); if (count !== this.#connectedPeers) this.#connectionRevision++; this.#connectedPeers = count; this.#notify() }
+  #scheduleReplay(): void {
+    if (this.#closed) return
+    this.#replayTail = this.#replayTail.then(() => this.#replay()).catch(error => { this.#error = error instanceof Error ? error : new Error('MATERIALIZATION_FAILED', { cause: error }); this.#database = 'failed'; this.#notify() })
+  }
+  async #engine(): Promise<ChronologMaterializationRuntime> {
+    if (this.#runtime !== null) return this.#runtime
+    this.#database = 'opening'; this.#notify()
+    if (this.#openingRuntime === null) {
+      const opening = this.#options.createMaterializer === undefined ? createEventMaterializationRuntime({ store: this.#options.store, namespace: this.applicationId }) : this.#options.createMaterializer({ signal: this.#lifetime.signal, rootPrincipal: hexToBytes(this.authority.descriptor.rootPrincipal), store: this.#options.store })
+      this.#openingRuntime = Promise.resolve(opening)
+    }
+    try { const runtime = await this.#openingRuntime; check(bytesToHex(runtime.queries.executionManifestDigest) === this.authority.descriptor.executionManifestDigest, 'EXECUTION_MANIFEST_UNAVAILABLE'); this.#runtime = runtime; return runtime }
+    catch (error) { this.#openingRuntime = null; throw error }
+  }
+  async #replay(): Promise<void> {
+    if (this.#closed) return
+    const journal = this.#journal, resolved = new Map<string, ResolvedOperation>(), pending = new Map<string, OperationInspection['pending']>(), invalid = new Set<string>(), invalidEnvelopes = new Set<string>()
+    for (const envelope of journal.envelopes) {
+      const id = envelope.payload.proposalId, digest = this.#envelopeDigests.get(envelope)!, knownAuthor = this.#canonicalAuthor(id)
+      if (knownAuthor !== undefined && knownAuthor !== envelope.payload.author) { invalidEnvelopes.add(digest); continue }
+      let result: Awaited<ReturnType<typeof unwrapOperation>>
+      try { result = await unwrapOperation(envelope, this.authority) } catch { invalidEnvelopes.add(digest); continue }
+      if (typeof result === 'string') { if (!resolved.has(id)) pending.set(id, result); continue }
+      const txId = hexToBytes(id)
+      pending.delete(id)
+      if (result.admission === 'excluded') invalid.add(id); else invalid.delete(id)
+      resolved.set(id, { envelope, core: result.core, proposal: { txId, candidateDigest: txId, canonicalCandidate: result.body.payload.canonicalCore, core: result.core } })
+    }
+    // Header claims cannot poison another author's proposal. Identity verification does not await SQL.
+    this.#invalidEnvelopes = invalidEnvelopes; this.#resolved = resolved
+    const finality = await verifyFinalityProofs(this.authority.descriptor, journal.finality, this.authority, [...resolved].map(([proposalId, entry]) => ({ proposalId, authorTimestampMs: entry.core.authorTimestampMs, membershipId: bytesToHex(entry.core.membershipRevision), author: bytesToHex(entry.core.authorId) })))
+    for (const [id, inclusion] of finality.included) {
+      const entry = resolved.get(id)
+      if (entry === undefined) pending.set(id, 'body')
+      else check(entry.core.authorTimestampMs === inclusion.authorTimestampMs, 'FINALITY_BODY_TIME_MISMATCH')
+    }
+    const cutoffForAdmission = finality.closedThroughMs
+    for (const [id, entry] of resolved) if (cutoffForAdmission !== null && entry.core.authorTimestampMs <= cutoffForAdmission && !finality.included.has(id)) invalid.add(id)
+    const eligible = [...resolved.values()].filter(entry => !invalid.has(entry.envelope.payload.proposalId) && !finality.excludedProposalIds.has(entry.envelope.payload.proposalId)).sort((a, b) => compareTransactionOrder(transactionOrderKey(a.core, a.proposal.txId), transactionOrderKey(b.core, b.proposal.txId)))
+    this.#pending = new Map(pending); for (const entry of eligible) this.#pending.set(entry.envelope.payload.proposalId, 'materializer'); this.#invalid = invalid
+    const runtime = await this.#engine()
+    const result = await runtime.replay.materialize(eligible.map(entry => entry.proposal))
+    if (result !== null) await runtime.publications.publish(result.publication)
+    const digest = await recordDigest(['materialized-operation-set', this.applicationId, this.#revision.executionManifestDigest, this.#revision.policyDigest, 'local', eligible.map(entry => entry.envelope.payload.proposalId)])
+    const revision: MaterializedRevision = { ...this.#revision, digest }
+    const outcomes = new Map<string, MaterializedOperation>()
+    for (const entry of eligible) { const id = entry.envelope.payload.proposalId, outcome = runtime.queries.outcome(entry.proposal.txId); check(outcome !== null, 'MATERIALIZATION_OUTCOME_MISSING'); outcomes.set(id, { proposalId: id, revision, outcome: outcome.outcome, rejectionCode: outcome.rejectionCode, failingStatementIndex: outcome.failingStatementIndex }) }
+    let finalLength = 0
+    const cutoff = finality.closedThroughMs
+    if (cutoff !== null && pending.size === 0) {
+      for (const entry of eligible) { if (entry.core.authorTimestampMs > cutoff || !finality.included.has(entry.envelope.payload.proposalId)) break; finalLength++ }
+      await runtime.replay.publishFinal?.(finalLength)
+    }
+    const revisedProposalIds = [...new Set([...this.#outcomes.keys(), ...outcomes.keys()])].filter(id => { const prior = this.#outcomes.get(id), current = outcomes.get(id); return prior?.outcome !== current?.outcome || prior?.rejectionCode !== current?.rejectionCode })
+    const changed = this.#revision.digest !== digest
+    this.#resolved = resolved; this.#pending = pending; this.#outcomes = outcomes; this.#revision = revision; this.#finality = finality; this.#error = null; this.#database = 'ready'; this.#notify()
+    if (changed || finalLength > 0) for (const listener of this.#changeListeners) { try { listener({ kind: changed ? 'materialized' : 'finalized', revision, revisedProposalIds }) } catch { /* Isolated observers. */ } }
+  }
+  async retryMaterialization(): Promise<void> { this.#scheduleReplay(); await this.#replayTail; if (this.#error !== null) throw this.#error }
+  async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<ApplicationReadView> {
+    await this.#replayTail; check(!this.#closed, 'SESSION_CLOSED'); check(this.authority.grant(this.device.identity.publicKey)?.reader, 'APPLICATION_READER_REQUIRED'); if (this.#error !== null) throw this.#error
+    check(this.#runtime !== null, 'MATERIALIZATION_UNAVAILABLE')
+    const view = options.view ?? 'local'
+    if (view === 'final') { check(this.authority.descriptor.finalityPolicy.kind !== 'none', 'FINALITY_UNSUPPORTED'); check(this.#finality.closedThroughMs !== null && this.#pending.size === 0, 'FINAL_READ_UNAVAILABLE') }
+    const readHandle = this.#runtime.queries.captureRead?.({ view }), snapshot = readHandle ?? this.#runtime.queries.captureApplication({ view })
+    const ids: string[] = [], events: ApplicationEvent[] = []
+    for (let i = 0; i < snapshot.orderLength; i++) {
+      const transaction = snapshot.transactionAt(i); check(transaction !== null, 'READ_SNAPSHOT_INCOMPLETE')
+      const id = bytesToHex(transaction.txId); ids.push(id)
+      if (transaction.outcome !== 'accepted') continue
+      const core = decodeTransactionCore(transaction.canonicalCandidate)
+      let ordinal = 0
+      for (const step of core.program.steps) if (isEmitStep(step)) events.push({ id: `${id}:${ordinal++}`, proposalId: id, operationId: core.operationId, author: bytesToHex(core.authorId), authorTimestampMs: core.authorTimestampMs.toString(), topic: step.topic, payload: structuredClone(step.payload) })
+    }
+    const revision: MaterializedRevision = { ...this.#revision, view, digest: await recordDigest(['materialized-operation-set', this.applicationId, this.#revision.executionManifestDigest, this.#revision.policyDigest, view, ids]) }
+    let released = false
+    return { applicationId: this.applicationId, revision, query(sql, parameters = []) {
+      check(!released, 'READ_VIEW_RELEASED'); check(readHandle !== undefined, 'SQL_UNAVAILABLE')
+      const result = readHandle.query(sql, parameters.map(toSqlValue))
+      return { columns: result.columns, rows: result.rows.map(row => row.map(fromSqlValue)) }
+    }, readEvents: (input = {}) => { check(!released, 'READ_VIEW_RELEASED'); return readEvents(events, revision, input) }, release() { if (released) return; released = true; readHandle?.release() } }
+  }
+  async query(name: string, input: unknown, options: { readonly signal?: AbortSignal } = {}): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly value: unknown }> {
+    const query = this.definition.queries[name]; check(query !== undefined, 'APPLICATION_QUERY_UNKNOWN')
+    const signal = options.signal === undefined ? this.signal : AbortSignal.any([this.signal, options.signal]), opening = this.readView()
+    let view: ApplicationReadView
+    try { view = await awaitOwnedTask(signal, () => opening) }
+    catch (error) { void opening.then(late => late.release()).catch(() => undefined); throw error }
+    try { return { applicationId: this.applicationId, revision: view.revision, value: await awaitOwnedTask(signal, () => query.read(view as never, input as never)) } }
+    finally { view.release() }
+  }
+  async readEvents(options: ApplicationEventOptions = {}): Promise<ApplicationEventBatch> { const view = await this.readView(); try { return view.readEvents(options) } finally { view.release() } }
+  async *changes(options: { readonly signal?: AbortSignal } = {}): AsyncIterable<ApplicationChange> {
+    const queue: ApplicationChange[] = []; let wake: (() => void) | undefined
+    const stop = this.onChange(value => { queue.splice(0, queue.length, value); wake?.() }), close = (): void => { wake?.() }
+    const signal = options.signal === undefined ? this.#lifetime.signal : AbortSignal.any([this.#lifetime.signal, options.signal]); signal.addEventListener('abort', close)
+    try { while (!signal.aborted) { if (queue.length === 0) await new Promise<void>(resolve => { wake = resolve }); while (queue.length > 0 && !signal.aborted) yield queue.shift()! } }
+    finally { stop(); signal.removeEventListener('abort', close) }
   }
   close(): Promise<void> {
-    if (this.#closeTask !== undefined) return this.#closeTask
-    this.#closeTask = Promise.resolve().then(async () => {
-      await Promise.allSettled([...this.#links, ...this.#projections.values()].map(value => Promise.resolve().then(() => value.close())))
-      await this.#dataTask?.catch(() => undefined)
-      for (const dispose of this.#dataDisposers.splice(0)) dispose()
-      await this.#authorityTail
-      try { await this.#data?.close() } finally { await this.#closing() }
-    })
-    this.#closed = true; this.#database = 'closed'; this.#lifetime.abort(new Error('APPLICATION_SESSION_CLOSED'))
-    internals.get(this)!.signals.close(); this.#changed()
-    this.#listeners.clear(); this.#statusListeners.clear(); this.#recoveryListeners.clear()
-    return this.#closeTask
-  }
-  #assertOpen(): void { if (this.#closed) throw new Error('APPLICATION_SESSION_CLOSED') }
-  #assertDataAvailable(): void {
-    this.#assertOpen()
-    if (this.#data?.replica.closed === true) throw new Error('APPLICATION_DATA_UNAVAILABLE')
+    return this.#closing ??= (async () => { this.#closed = true; this.#stopAuthority(); this.#lifetime.abort(new Error('SESSION_CLOSED')); this.#notify(); await this.#tail; await this.#replayTail; this.#database = 'closed'; await this.#runtime?.close(); this.signals.close(); await this.content.close(); await this.#options.release(); this.#notify(); this.#listeners.clear(); this.#factListeners.clear(); this.#statusListeners.clear(); this.#changeListeners.clear() })()
   }
 }
-
-/** In-process transport uses the same participant and durable-facet protocol. */
-export async function connectApplications(left: ApplicationSession, right: ApplicationSession): Promise<{ synchronize(): Promise<void>; close(): Promise<void> }> {
-  if (left === right) throw new Error('APPLICATION_PEER_SELF')
-  return connectApplicationPeerPair(internals.get(left)!, internals.get(right)!)
+function toSqlValue(value: QueryParameter): MaterializedLocalSqlValue {
+  if (value === null) return { kind: 'null' }; if (typeof value === 'bigint') return { kind: 'integer', value: value.toString() }; if (typeof value === 'number') return Number.isSafeInteger(value) ? { kind: 'integer', value: String(value) } : { kind: 'real', value }; if (typeof value === 'string') return { kind: 'text', value }; return { kind: 'blob', value: value.slice() }
 }
+function fromSqlValue(value: MaterializedLocalSqlValue): QueryParameter { switch (value.kind) { case 'null': return null; case 'integer': { const bigint = BigInt(value.value); return bigint >= BigInt(Number.MIN_SAFE_INTEGER) && bigint <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(bigint) : bigint }; case 'real': case 'text': return value.value; case 'blob': return value.value.slice() } }
+function readEvents(events: readonly ApplicationEvent[], revision: MaterializedRevision, options: ApplicationEventOptions): ApplicationEventBatch {
+  const topics = options.topics === undefined ? null : [...new Set(options.topics)].sort(), limit = options.limit ?? 100
+  check(Number.isSafeInteger(limit) && limit > 0 && limit <= 1000 && (topics === null || topics.length <= 128 && topics.every(topic => typeof topic === 'string' && topic.length <= 128)), 'EVENT_READ_LIMIT')
+  const scope = JSON.stringify(topics); let offset = 0
+  if (options.cursor !== undefined) { check(options.cursor.length <= 128 * 1024, 'EVENT_CURSOR_LIMIT'); const cursor = JSON.parse(options.cursor) as { revision: string; scope: string; offset: number }; check(cursor.revision === revision.digest, 'EVENT_CURSOR_STALE'); check(cursor.scope === scope && Number.isSafeInteger(cursor.offset) && cursor.offset >= 0 && cursor.offset <= events.length, 'EVENT_CURSOR_INVALID'); offset = cursor.offset }
+  const selected: ApplicationEvent[] = []; let index = offset
+  while (index < events.length && selected.length < limit) { const event = events[index++]!; if (topics === null || topics.includes(event.topic)) selected.push(structuredClone(event)) }
+  return { revision, events: selected, cursor: JSON.stringify({ revision: revision.digest, scope, offset: index }), hasMore: index < events.length }
+}
+export type { MaterializedRevision, SessionStatus, ApplicationReadView, QueryRows, QueryParameter, ApplicationEvent, ApplicationEventOptions, ApplicationEventBatch, CommandOptions, ApplicationChange } from './session-types.js'
+export { ApplicationOperation } from './operation.js'
+export type { ApplicationSubmission, OperationInspection, MaterializedOperation, RetentionEvidence } from './operation.js'

@@ -47,16 +47,20 @@ export function executeTransactionProgram(
   program: ChangeProgram,
   context: DeterministicContext,
   limits: Partial<SqlRuntimeLimits> = {},
-  policy: { readonly protectedChanges?: boolean } = {},
 ): void {
+  // The pinned SQLite clock supports Gregorian years 0000..9999. Authored
+  // ordering remains int64 bigint; an unsupported clock is a deterministic
+  // profile rejection, not an operational replay blocker or a retimestamp.
+  if (context.authorTimestampMs < 0n || context.authorTimestampMs > 253_402_300_799_999n) {
+    throw new SqlRejection('profile:timestamp-range', null)
+  }
   const platform = new PlatformSession(database, { actor: context.actor, txId: context.txId, groupId: context.groupId, limits })
   // Before the context: it assigns a first-time signer its principal id, which
   // the context pins as chronolog_actor_id().
-  const { actorId, schemaAdmin: signerIsSchemaAdmin, schemaVersion: schemaBefore } = platform.begin()
+  const { actorId, schemaVersion: schemaBefore } = platform.begin()
   database.setDeterministicContext(context.authorTimestampMs, prngSeed(context.txId), context.actor, actorId, context.txId)
   try {
     resetChangeCounter(database)
-    let schemaAdmin = policy.protectedChanges !== false && signerIsSchemaAdmin
     // Reconcile right after every statement that changed the schema, so a new
     // table is owner-checked from the next statement on (§3).
     let reconciledVersion = schemaBefore
@@ -74,15 +78,17 @@ export function executeTransactionProgram(
       // durable outcome commits. A later SQL failure therefore exposes none.
       if (isEmitStep(step)) continue
       if (isPlatformOp(step)) {
-        if (policy.protectedChanges === false) throw new SqlRejection('protected_change_required', index)
         try {
           platform.execute(step, index)
         } catch (error) {
           throw rejectionFor(error, index)
         }
-        schemaAdmin = platform.isSchemaAdmin()
       } else {
-        executeStatement(database, step, index, limits, { schemaAdmin, writeProtectedTables: writeProtectedTables(database), lifecycleTriggers: lifecycleTriggerNames(database) })
+        const reservedBefore = platform.reservedObjectNames()
+        executeStatement(database, step, index, limits, { ddlPermissions: platform.ddlPermissions(), writeProtectedTables: writeProtectedTables(database), lifecycleTriggers: lifecycleTriggerNames(database) })
+        if (schemaVersion(database) !== reconciledVersion) {
+          try { platform.assertReservedObjectsUnchanged(reservedBefore) } catch (error) { throw rejectionFor(error, index) }
+        }
       }
       reconcileIfChanged(index)
     }
@@ -101,11 +107,11 @@ function executeStatement(
 ): void {
   try {
     if (database.nativeProfile !== undefined) {
-      const rejection = database.nativeProfile.executeConsensus(statement, authorization.schemaAdmin === true)
+      const rejection = database.nativeProfile.executeReplicated(statement, authorization.ddlPermissions ?? { create: false, alter: [], drop: [], index: [], trigger: [] })
       if (rejection !== null) throw new SqlRejection(rejection, index)
       return
     }
-    withProfiledStatement(database, statement.sql, 'consensus', (prepared) => {
+    withProfiledStatement(database, statement.sql, 'replicated', (prepared) => {
       prepared.run(bindingArray(prepared, statement, index))
     }, limits, authorization)
   } catch (error) {

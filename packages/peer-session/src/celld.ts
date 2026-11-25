@@ -1,28 +1,11 @@
 import { CelldBytesStore, type CelldBytesStorage, type CelldBytesStoreOptions } from '@chronolog/records/celld'
-import type { PeerIdentity } from '@chronolog/peer-generation/control'
+import type { SigningIdentity } from '@chronolog/authority'
 import { hexToBytes, importEd25519PrivateKey } from '@chronolog/protocol'
-
 import { openApplicationDevice, verifyDeviceSigner, type ApplicationDevice } from './device.js'
-
-export { openPeerApplication as openCelldApplication } from './runtime.js'
-export type { OpenPeerApplicationOptions } from './runtime.js'
-export { openCelldApplicationControl, type CelldApplicationControl } from './celld-control.js'
-export {
-  createCelldPeerTransport, frameCelldPeerStream,
-  type CelldPeerBinding, type CelldPeerEndpoint, type CelldPeerStream,
-} from './celld-peer.js'
-export {
-  acceptCelldApplicationInvitation, signCelldApplicationInvitation,
-  type CelldApplicationInvitation, type AcceptedCelldApplicationInvitation,
-} from './celld-invitation.js'
-export {
-  signCelldWorkspacePublication, verifyCelldWorkspacePublication,
-  type CelldWorkspacePublication, type SignedCelldWorkspacePublication,
-} from './celld-workspace-publication.js'
-export { CelldBytesStore, type CelldBytesStorage, type CelldBytesStoreOptions } from '@chronolog/records/celld'
-
+export { CelldBytesStore, CelldPrivateBytesStore, type CelldBytesStorage, type CelldBytesStoreOptions, type CelldPrivateBytesStorage } from '@chronolog/records/celld'
+export { createApplicationSession } from './index.js'
 /** Import a per-class secret against the public key admitted by the host. */
-export async function importCelldSigningIdentity(publicKey: string, pkcs8Hex: string | undefined): Promise<PeerIdentity> {
+export async function importCelldSigningIdentity(publicKey: string, pkcs8Hex: string | undefined): Promise<SigningIdentity> {
   if (pkcs8Hex === undefined) throw new Error('CELLD_SIGNING_SECRET_MISSING')
   if (pkcs8Hex.length < 2 || pkcs8Hex.length > 512 || !/^(?:[0-9a-f]{2})+$/u.test(pkcs8Hex)) {
     throw new Error('CELLD_SIGNING_SECRET_INVALID')
@@ -44,7 +27,7 @@ export async function importCelldSigningIdentity(publicKey: string, pkcs8Hex: st
 export async function openCelldDevice(options: {
   readonly storage: CelldBytesStorage
   readonly create?: true
-  readonly managedSigner?: PeerIdentity
+  readonly managedSigner?: SigningIdentity
   readonly metadataLimits?: CelldBytesStoreOptions
   readonly dataLimits?: CelldBytesStoreOptions
   readonly openDataStorage?: () => CelldBytesStorage
@@ -69,7 +52,3 @@ export async function openCelldDevice(options: {
     throw error
   }
 }
-
-export {
-  celldDoltPublicationPeer, serveCelldDoltPublication, type CelldDoltPublicationGrant,
-} from './celld-dolt-carrier.js'

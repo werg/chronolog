@@ -26,7 +26,7 @@ try {
   used = db.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get().bytes
 } catch (cause) {
   try { db?.close() } catch {}
-  if (/locked|busy/i.test(cause.message)) cause = new Error('BYTES_STORE_IN_USE', { cause })
+  if (/locked|busy/i.test(cause.message)) cause = Object.assign(new Error('BYTES_STORE_IN_USE', { cause }), { code: 'BYTES_STORE_IN_USE' })
   reply(0, undefined, cause)
   parentPort.close()
   return

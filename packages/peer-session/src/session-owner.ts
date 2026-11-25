@@ -1,149 +1,160 @@
+import { check, type AuthorityBundle, type FinalityProof } from '@chronolog/authority'
+import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
 import type { ApplicationSession } from './session.js'
-import { serveApplicationWorker } from './worker-application-server.js'
-import { bounded, type Endpoint } from './worker-application-protocol.js'
-import { APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES, APPLICATION_OWNER_PROTOCOL,
-  type ApplicationAttachmentCapability, type ApplicationAttachmentPolicy, type ApplicationEndpointBinding,
-  type ApplicationEndpointContext, type ApplicationEndpointState, type ApplicationOwnerHandshake,
-  type ApplicationOwnerOptions, type ApplicationSessionOwner } from './owner-types.js'
-export * from './owner-types.js'
-
-const owners = new WeakMap<ApplicationSession, ApplicationSessionOwner>()
-const CAPABILITIES = [...APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES, 'ownerAdmin']
-const LIMITS = { requests: 512, streams: 256, views: 128 } as const
-
-/** One protocol/session/journal owner, with isolated attachment lifetimes and quotas. */
+import { awaitOwnedTask } from './lifetime.js'
+import { describeApplication } from './definition.js'
+import { APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES, type ApplicationAttachmentCapability, type ApplicationAttachmentPolicy, type ApplicationEndpointBinding, type ApplicationEndpointContext, type ApplicationOwnerOptions, type ApplicationSessionOwner } from './owner-types.js'
+import { APPLICATION_OWNER_PROTOCOL, type OwnerRequest } from './worker-application-protocol.js'
+import type { ApplicationReadView } from './session-types.js'
+import type { ContentUpload } from './content.js'
+import type { ApplicationWorkerEndpoint } from './worker-transport.js'
+interface SignalStream { readonly iterator: AsyncIterator<EphemeralSignal>; readonly lifetime: AbortController; pending: Promise<IteratorResult<EphemeralSignal>> | null; busy: boolean }
+interface Reader { readonly iterator: AsyncIterator<Uint8Array>; readonly lifetime: AbortController; busy: boolean }
+interface RequestContext { readonly lifetime: AbortController; readonly signal: AbortSignal; readonly method: string; readonly control: boolean }
+const isArray = (value: unknown): boolean => Array.isArray(value)
+const CONTROLS = new Set(['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'signals.close', 'upload.discard'])
+function requestBudget(value: unknown): void {
+  let nodes = 0, bytes = 0
+  const walk = (item: unknown, depth: number): void => {
+    check(++nodes <= 16384 && depth <= 32, 'ENDPOINT_REQUEST_SIZE_LIMIT')
+    if (item instanceof Uint8Array) bytes += item.length
+    else if (typeof item === 'string') bytes += item.length * 3
+    else if (Array.isArray(item)) for (const child of item) walk(child, depth + 1)
+    else if (item !== null && typeof item === 'object') for (const [key, child] of Object.entries(item)) { bytes += key.length * 3; walk(child, depth + 1) }
+    else check(item === null || typeof item === 'number' || typeof item === 'boolean' || typeof item === 'bigint' || item === undefined, 'ENDPOINT_REQUEST_INVALID')
+    check(bytes <= 4 * 1024 * 1024, 'ENDPOINT_REQUEST_SIZE_LIMIT')
+  }; walk(value, 0)
+}
+function limit(value: number | undefined, fallback: number, maximum: number): number { const result = value ?? fallback; check(Number.isSafeInteger(result) && result > 0 && result <= maximum, 'OWNER_CONFIGURATION_INVALID'); return result }
+/** One fenced signer/storage owner, with independent bounded and cancellable client attachments. */
 export function createApplicationOwner(session: ApplicationSession, options: ApplicationOwnerOptions = {}): ApplicationSessionOwner {
-  session.signal.throwIfAborted()
-  if (owners.has(session)) throw new Error('OWNER_BUSY')
-  const ownerInstanceId = crypto.randomUUID(), maxAttachments = limit(options.maxAttachments, 32, 128)
-  const bounds = { requests: limit(options.maxRequests, LIMITS.requests, 4096), streams: limit(options.maxStreams, LIMITS.streams, 1024), views: limit(options.maxViews, LIMITS.views, 1024) }
-  const used = { requests: 0, streams: 0, views: 0 }
-  const attachments = new Map<string, { binding: ApplicationEndpointBinding; state: ApplicationEndpointState; close(): Promise<void> }>()
-  const listeners = new Set<() => void>()
-  let closing: Promise<void> | undefined, closed = false
-  const reserve = (kind: keyof typeof used): (() => void) => {
-    if (closed) throw new Error('OWNER_UNREACHABLE')
-    if (used[kind] >= bounds[kind]) throw Object.assign(new Error('OWNER_BUSY'), { code: 'OWNER_BUSY' })
-    used[kind]++
-    let released = false
-    return () => { if (!released) { released = true; used[kind]-- } }
-  }
+  const ownerInstanceId = crypto.randomUUID(), maxAttachments = limit(options.maxAttachments, 16, 64)
+  const attachments = new Map<string, { binding(): ApplicationEndpointBinding; state(): 'active' | 'suspended'; close(): void }>()
+  let closed = false, closing: Promise<void> | undefined
   const owner: ApplicationSessionOwner = {
     ownerInstanceId, session,
-    attach(endpoint: Endpoint, fixed: ApplicationAttachmentPolicy = {}) {
-      if (closed) throw new Error('OWNER_UNREACHABLE')
-      validatePolicy(fixed)
-      const owned = new Set<string>()
-      let detached = false
-      const receive = (event: MessageEvent): void => {
-        const frame = event.data as { protocol?: unknown; port?: MessagePort; handshake?: unknown } | null
-        if (typeof frame?.protocol !== 'string' || !frame.protocol.startsWith('chronolog/peer-session/')) return
-        const port = frame.port
-        if (port === undefined || typeof port.postMessage !== 'function' || typeof port.close !== 'function') return
-        try {
-          if (closed || detached) throw new Error('OWNER_UNREACHABLE')
-          if (frame.protocol !== APPLICATION_OWNER_PROTOCOL) throw new Error('CONTRACT_INCOMPATIBLE')
-          bounded(frame.handshake)
-          const handshake = validateHandshake(frame.handshake)
-          const description = session.describe()
-          if (handshake.applicationId !== session.applicationId || handshake.definitionId !== description.id || handshake.definitionVersion !== description.version) throw new Error('CONTRACT_INCOMPATIBLE')
-          if (attachments.size >= maxAttachments) throw new Error('APPLICATION_OWNER_ATTACHMENT_LIMIT')
-          const approved = options.authorize?.(structuredClone(handshake)) ?? {}
-          validatePolicy(approved)
-          const policy = mergePolicy(fixed, approved)
-          // The page automatically holds status and recovery observers, plus
-          // participation when present. Each uses one stream and a passive
-          // stream.next request. Reject incompatible owner-side limits before
-          // publishing a ready facade instead of accepting one that immediately
-          // closes when its built-in observers hit a quota.
-          if ((policy.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES).includes('diagnostics')) {
-            const observers = session.participation === undefined ? 2 : 3
-            if ((policy.maxStreams ?? 8) <= observers || (policy.maxRequests ?? 16) <= observers ||
-                bounds.streams <= observers || bounds.requests <= observers) throw new Error('APPLICATION_ATTACHMENT_OBSERVER_LIMIT')
-          }
-          const claimedContext = checkedContext(policy.context ?? handshake.context ?? {})
-          // A duplicate tab can copy its storage; it cannot acquire another live view's drafts.
-          const requestedView = claimedContext.viewId
-          const viewId = requestedView !== undefined && ![...attachments.values()].some(value => value.binding.context.viewId === requestedView)
-            ? requestedView : crypto.randomUUID()
-          const binding: ApplicationEndpointBinding = Object.freeze({ ownerInstanceId, endpointId: crypto.randomUUID(), endpointIncarnation: crypto.randomUUID(),
-            context: Object.freeze({ ...claimedContext, viewId }), ...(policy.identity === undefined ? {} : { identity: Object.freeze(structuredClone(policy.identity)) }), evidence: 'owner-bound', contextEvidence: policy.contextEvidence ?? 'caller-asserted',
-            capabilities: Object.freeze([...(policy.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES)]) })
-          const record = { binding, state: 'active' as ApplicationEndpointState, close: async (): Promise<void> => undefined }
-          attachments.set(binding.endpointId, record); owned.add(binding.endpointId)
-          const server = serveApplicationWorker(session, endpoint, { ...policy, ...(options.host === undefined ? {} : { host: options.host }),
-            capabilities: binding.capabilities, closeSession: false, initialPort: port, binding, reserve,
-            maxRequests: limit(policy.maxRequests, 16, 64), maxStreams: limit(policy.maxStreams, 8, 16), maxViews: limit(policy.maxViews, 8, 32),
-            ...(options.prepareCommand === undefined ? {} : { prepareCommand: options.prepareCommand }),
-            listEndpoints: () => owner.endpoints(), shutdown: () => owner.close(),
-            onState(state) { record.state = state },
-            onClose() {
-              record.state = 'detached'; attachments.delete(binding.endpointId); owned.delete(binding.endpointId)
-              if (!closed && attachments.size === 0 && options.lastClient === 'shutdown') void owner.close().catch(() => undefined)
-            },
-          })
-          record.close = () => server.close()
-        } catch (error) {
-          const code = error instanceof Error ? error.message : 'APPLICATION_OWNER_HANDSHAKE_INVALID'
-          try { port.postMessage({ ended: { name: 'Error', message: code, code } }) } finally { port.close() }
-        }
+    endpoints: () => [...attachments.values()].map(value => ({ ...value.binding(), state: value.state() })),
+    close: () => closing ??= (async () => { closed = true; for (const attachment of [...attachments.values()]) attachment.close(); await session.close() })(),
+    attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }, policy: ApplicationAttachmentPolicy = {}) {
+      check(!closed && attachments.size < maxAttachments, 'OWNER_ATTACHMENT_LIMIT')
+      const endpointId = crypto.randomUUID(), endpointIncarnation = crypto.randomUUID(), lifetime = new AbortController()
+      const views = new Map<string, ApplicationReadView>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
+      let effective = policy, attachment = '', initialized = false, detached = false, suspended = false, highestRequest = 0, viewReservations = 0, uploadReservations = 0, lastReceived = performance.now(), context: ApplicationEndpointContext = policy.context ?? {}
+      let stopStatus: (() => void) | undefined, stopChange: (() => void) | undefined
+      const physical = endpoint as unknown as { addEventListener(type: string, listener: EventListener): void; removeEventListener(type: string, listener: EventListener): void; on?(type: string, listener: () => void): void; off?(type: string, listener: () => void): void }
+      const binding = (): ApplicationEndpointBinding => ({ ownerInstanceId, endpointId, endpointIncarnation, context: structuredClone(context), evidence: 'owner-bound', contextEvidence: effective.contextEvidence ?? 'caller-asserted', capabilities: [...(effective.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES)], ...(effective.identity === undefined ? {} : { identity: structuredClone(effective.identity) }) })
+      const has = (capability: ApplicationAttachmentCapability): boolean => (effective.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES).includes(capability)
+      const allow = (capability: ApplicationAttachmentCapability): void => check(has(capability), 'ENDPOINT_CAPABILITY_FORBIDDEN')
+      const post = (message: unknown): void => { if (!detached) endpoint.postMessage(message) }
+      const releaseResources = (): void => {
+        for (const view of views.values()) view.release(); views.clear()
+        for (const reader of readers.values()) { reader.lifetime.abort(); void reader.iterator.return?.().catch(() => undefined) }; readers.clear()
+        for (const stream of streams.values()) { stream.lifetime.abort(); void stream.iterator.return?.().catch(() => undefined) }; streams.clear()
       }
-      const detach = (): void => {
+      const close = (): void => {
         if (detached) return
-        detached = true; endpoint.removeEventListener('message', receive); listeners.delete(detach)
-        for (const id of owned) void attachments.get(id)?.close().catch(() => undefined)
+        try { post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'closed', value: 'ENDPOINT_CLOSED' }) } catch { /* The physical endpoint may already be gone. */ }
+        detached = true; clearInterval(expiry); lifetime.abort(new Error('ENDPOINT_CLOSED'))
+        for (const request of pending.values()) request.lifetime.abort(new Error('ENDPOINT_CLOSED')); pending.clear()
+        endpoint.removeEventListener('message', receive); physical.removeEventListener('close', physicalClose); physical.removeEventListener('messageerror', physicalClose); physical.off?.('close', close); physical.off?.('messageerror', close)
+        stopStatus?.(); stopChange?.(); releaseResources(); uploads.clear(); completedUploads.clear(); attachments.delete(endpointId); endpoint.close?.()
+        if (!closed && attachments.size === 0 && options.lastClient === 'shutdown') void owner.close()
       }
-      endpoint.addEventListener('message', receive); endpoint.start?.(); listeners.add(detach)
-      return detach
-    },
-    endpoints: () => [...attachments.values()].map(({ binding, state }) => ({ ...structuredClone(binding), state })),
-    close() {
-      if (closing !== undefined) return closing
-      closed = true; session.signal.removeEventListener('abort', abort)
-      const pending = [...attachments.values()].map(value => value.close())
-      for (const detach of [...listeners]) detach()
-      closing = Promise.allSettled(pending).then(async () => { try { await session.close() } finally { owners.delete(session) } })
-      return closing
+      const physicalClose: EventListener = () => close()
+      const active = (request: RequestContext): void => { request.signal.throwIfAborted(); check(!detached, 'ENDPOINT_CLOSED') }
+      const invoke = async (method: string, args: readonly unknown[], request: RequestContext): Promise<unknown> => {
+        active(request)
+        if (method === 'hello') {
+          check(!initialized && typeof args[0] === 'object' && args[0] !== null, 'ENDPOINT_HANDSHAKE_INVALID')
+          const handshake = args[0] as { applicationId: string; context?: ApplicationEndpointContext }
+          check(handshake.applicationId === session.applicationId, 'ENDPOINT_APPLICATION_MISMATCH')
+          effective = { ...policy, ...options.authorize?.(handshake) }; limit(effective.maxRequests, 32, 64); limit(effective.maxViews, 8, 32)
+          check(effective.capabilities === undefined || isArray(effective.capabilities) && effective.capabilities.length <= APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES.length && new Set(effective.capabilities).size === effective.capabilities.length && effective.capabilities.every(capability => APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES.includes(capability)), 'OWNER_CONFIGURATION_INVALID')
+          context = effective.context ?? handshake.context ?? {}; initialized = true
+          stopStatus = session.onStatus(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'status', value }) })
+          stopChange = session.onChange(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'change', value }) })
+          return { applicationId: session.applicationId, identity: session.identity, definition: describeApplication(session.definition), status: session.status, binding: binding() }
+        }
+        if (method === 'close') return null
+        check(initialized, 'ENDPOINT_HANDSHAKE_REQUIRED')
+        if (method === 'attachment.ping') return { ...binding(), state: suspended ? 'suspended' : 'active' }
+        if (method === 'attachment.suspend') { suspended = true; for (const work of pending.values()) if (!work.control) work.lifetime.abort(new Error('ENDPOINT_SUSPENDED')); releaseResources(); return null }
+        if (method === 'attachment.resume') { suspended = false; return session.status }
+        // Lease/resource release and detachment remain usable under suspension and a full ordinary request quota.
+        if (method === 'view.release') { const id = String(args[0]), view = views.get(id); views.delete(id); view?.release(); return null }
+        if (method === 'content.cancel') { const id = String(args[0]), reader = readers.get(id); readers.delete(id); reader?.lifetime.abort(); await reader?.iterator.return?.(); return null }
+        if (method === 'signals.close') { const id = String(args[0]), stream = streams.get(id); streams.delete(id); stream?.lifetime.abort(); await stream?.iterator.return?.(); return null }
+        if (method === 'upload.discard') { const id = String(args[0]), upload = uploads.get(id) ?? completedUploads.get(id); uploads.delete(id); completedUploads.delete(id); await upload?.discard(); return null }
+        check(!suspended, 'ENDPOINT_SUSPENDED')
+        if (method === 'submit') { allow('commands'); check(effective.rawSubmit ?? effective.commands === undefined, 'ENDPOINT_RAW_SUBMIT_FORBIDDEN'); const operation = await session.submit(args[0] as Parameters<ApplicationSession['submit']>[0]); return { id: operation.id, operationId: operation.operationId } }
+        if (method === 'command') { allow('commands'); const name = String(args[0]); check(effective.commands === undefined || effective.commands.includes(name), 'ENDPOINT_COMMAND_FORBIDDEN'); const input = options.prepareCommand === undefined ? args[1] : options.prepareCommand(binding(), name, args[1]); const operation = await session.command(name, input, args[2] as Parameters<ApplicationSession['command']>[2]); return { id: operation.id, operationId: operation.operationId } }
+        if (method === 'query') { allow('queries'); const name = String(args[0]); check(effective.queries === undefined || effective.queries.includes(name), 'ENDPOINT_QUERY_FORBIDDEN'); return session.query(name, args[1], { signal: request.signal }) }
+        if (method === 'readView') {
+          check(has('queries') || has('events'), 'ENDPOINT_CAPABILITY_FORBIDDEN'); check(views.size + viewReservations < (effective.maxViews ?? 8), 'ENDPOINT_VIEW_LIMIT'); viewReservations++
+          let view: ApplicationReadView | undefined, deferred = false
+          const opening = session.readView(args[0] as Parameters<ApplicationSession['readView']>[0])
+          try { view = await awaitOwnedTask(request.signal, () => opening); active(request); const id = crypto.randomUUID(); views.set(id, view); const result = { id, revision: view.revision }; view = undefined; return result }
+          catch (error) { if (request.signal.aborted && view === undefined) { deferred = true; void opening.then(late => late.release()).catch(() => undefined).finally(() => { viewReservations-- }) }; throw error }
+          finally { if (!deferred) viewReservations--; view?.release() }
+        }
+        if (method === 'view.query' || method === 'view.events') { const view = views.get(String(args[0])); check(view !== undefined, 'ENDPOINT_VIEW_STALE'); if (method === 'view.query') { allow('queries'); check(effective.rawSql ?? effective.queries === undefined, 'ENDPOINT_RAW_SQL_FORBIDDEN'); return view.query(String(args[1]), args[2] as Parameters<ApplicationReadView['query']>[1]) }; allow('events'); return view.readEvents(args[1] as Parameters<ApplicationReadView['readEvents']>[0]) }
+        if (method === 'operation.retry') { allow('operations'); const operation = await session.operations.retry(String(args[0])); return { id: operation.id, operationId: operation.operationId } }
+        if (method === 'operation.get') { allow('operations'); const operation = session.operations.get(String(args[0])); return operation === null ? null : { id: operation.id, operationId: operation.operationId, inspection: operation.inspect() } }
+        if (method === 'operation.inspect') { allow('operations'); return session.inspectOperation(String(args[0])) }
+        if (method === 'operation.wait') { allow('operations'); const operation = session.operations.get(String(args[0])); check(operation !== null, 'OPERATION_UNKNOWN'); const fact = args[1]; check(fact === 'materialized' || fact === 'retained' || fact === 'finalized', 'OPERATION_FACT_INVALID'); return operation[fact]({ signal: request.signal, timeoutMs: Number(args[2] ?? 30_000) }) }
+        if (method === 'diagnostics.peers') { allow('diagnostics'); return session.diagnostics() }
+        if (method === 'authority.read') { allow('diagnostics'); return session.authority.bundle() }
+        if (method === 'endpoints.list') { allow('diagnostics'); return owner.endpoints() }
+        if (method === 'authority.merge') { allow('diagnostics'); return session.mergeAuthority(args[0] as AuthorityBundle) }
+        if (method === 'finality.closeAuthorTime') { allow('finality'); return session.finality.closeAuthorTime(args[0] as { throughMs: bigint }) }
+        if (method === 'finality.voteAuthorTime') { allow('finality'); return session.finality.voteAuthorTime(args[0] as { throughMs: bigint }) }
+        if (method === 'finality.submitProofs') { allow('finality'); return session.finality.submitProofs(args[0] as readonly FinalityProof[]) }
+        if (method === 'provisioning.createProvisioningRequest') { allow('provisioning'); return session.provisioning.createProvisioningRequest() }
+        if (method === 'provisioning.exportProvisioning') { allow('provisioning'); return session.provisioning.exportProvisioning(args[0] as Parameters<ApplicationSession['provisioning']['exportProvisioning']>[0]) }
+        if (method === 'provisioning.importProvisioning') { allow('provisioning'); return session.provisioning.importProvisioning(args[0] as Parameters<ApplicationSession['provisioning']['importProvisioning']>[0]) }
+        if (['content.retain', 'content.retention', 'content.retained', 'content.discard'].includes(method)) { allow('content'); const reference = args[0] as Parameters<ApplicationSession['content']['retain']>[0]; if (method === 'content.retain') return session.content.retain(reference, { signal: request.signal }); if (method === 'content.retention') return session.content.retention(reference, { signal: request.signal }); if (method === 'content.retained') return session.content.retained(reference); return session.content.discard(reference) }
+        if (method === 'content.stage') { allow('content'); check(uploads.size + uploadReservations < 4, 'ENDPOINT_UPLOAD_LIMIT'); uploadReservations++; let upload: ContentUpload | undefined; try { upload = await session.content.stage(args[0] as Parameters<ApplicationSession['content']['stage']>[0]); active(request); uploads.set(upload.id, upload); const id = upload.id; upload = undefined; return id } finally { uploadReservations--; if (upload !== undefined) await upload.discard() } }
+        if (['upload.write', 'upload.progress', 'upload.commit'].includes(method)) {
+          allow('content'); const id = String(args[0]), upload = uploads.get(id) ?? completedUploads.get(id); check(upload !== undefined, 'CONTENT_UPLOAD_UNKNOWN')
+          if (method === 'upload.write') { check(args[2] instanceof Uint8Array && args[2].length <= 65536, 'CONTENT_CHUNK_LIMIT'); return upload.write(Number(args[1]), args[2]) }
+          if (method === 'upload.progress') return upload.progress()
+          const reference = await upload.commit(); uploads.delete(id); completedUploads.set(id, upload); while (completedUploads.size > 32) completedUploads.delete(completedUploads.keys().next().value!); return reference
+        }
+        if (method === 'content.openRead') { allow('content'); check(readers.size < 4, 'ENDPOINT_READER_LIMIT'); const id = crypto.randomUUID(), owned = new AbortController(), iterator = session.content.read(args[0] as Parameters<ApplicationSession['content']['read']>[0], { signal: AbortSignal.any([owned.signal, lifetime.signal]) })[Symbol.asyncIterator](); readers.set(id, { iterator, lifetime: owned, busy: false }); return id }
+        if (method === 'content.next') { allow('content'); const id = String(args[0]), reader = readers.get(id); check(reader !== undefined && !reader.busy, 'CONTENT_READER_UNKNOWN'); reader.busy = true; const abort = (): void => { reader.lifetime.abort(); readers.delete(id) }; request.signal.addEventListener('abort', abort, { once: true }); try { const next = await reader.iterator.next(); active(request); if (next.done) { readers.delete(id); return null }; check(next.value.length <= 65536, 'CONTENT_CHUNK_LIMIT'); return next.value } finally { request.signal.removeEventListener('abort', abort); reader.busy = false } }
+        if (method === 'signals.send') { allow('signals'); const supplied = (args[2] ?? {}) as Omit<SignalSendOptions, 'signal'>; return session.signals.send(String(args[0]), args[1] as SignalPayload, { ...supplied, signal: request.signal, stream: { ...supplied.stream, streamId: supplied.stream?.streamId ?? endpointId, endpointId, endpointIncarnation } }) }
+        if (method === 'signals.open') { allow('signals'); check(streams.size < 4, 'ENDPOINT_STREAM_LIMIT'); const id = crypto.randomUUID(), owned = new AbortController(), iterator = session.signals.subscribe({ ...(args[0] ?? {}) as SignalSubscribeOptions, signal: AbortSignal.any([owned.signal, lifetime.signal]) })[Symbol.asyncIterator](); streams.set(id, { iterator, lifetime: owned, pending: null, busy: false }); return id }
+        if (method === 'signals.next') {
+          allow('signals'); const stream = streams.get(String(args[0])); check(stream !== undefined && !stream.busy, 'ENDPOINT_STREAM_BUSY'); stream.busy = true
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const abort = (): void => { stream.lifetime.abort(); streams.delete(String(args[0])) }; request.signal.addEventListener('abort', abort, { once: true })
+          try { stream.pending ??= stream.iterator.next(); void stream.pending.catch(() => undefined); const idle = Symbol('idle'), next = await Promise.race([stream.pending, new Promise<typeof idle>(resolve => { timer = setTimeout(() => resolve(idle), 20_000) })]); active(request); if (next === idle) return { idle: true }; stream.pending = null; return next.done ? { done: true } : { value: next.value } }
+          finally { clearTimeout(timer); request.signal.removeEventListener('abort', abort); stream.busy = false }
+        }
+        if (method === 'events.read') { allow('events'); return session.readEvents(args[0] as Parameters<ApplicationSession['readEvents']>[0]) }
+        throw Object.assign(new Error('ENDPOINT_METHOD_UNKNOWN'), { code: 'ENDPOINT_METHOD_UNKNOWN' })
+      }
+      const receive = (event: MessageEvent): void => {
+        const input = event.data as Partial<OwnerRequest> & { readonly kind?: string }
+        if (input?.protocol !== APPLICATION_OWNER_PROTOCOL || detached || typeof input.attachment !== 'string') return
+        if (attachment !== '' && input.attachment !== attachment) return
+        if ((input.kind as string) === 'cancel') { if (Number.isSafeInteger(input.id)) pending.get(input.id!)?.lifetime.abort(new Error('REQUEST_CANCELLED')); return }
+        if (input.kind !== 'request') return
+        if (input.attachment.length > 128 || !Number.isSafeInteger(input.id) || input.id! < 1 || typeof input.method !== 'string' || !Array.isArray(input.args)) { close(); return }
+        if (attachment === '') attachment = input.attachment
+        const id = input.id!; if (id <= highestRequest) return; highestRequest = id; lastReceived = performance.now()
+        const reply = (value: unknown, error?: string): void => { try { post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'response', id, ...(error === undefined ? { value } : { error }) }) } catch { close() } }
+        try { requestBudget(input.args) } catch { reply(null, 'ENDPOINT_REQUEST_SIZE_LIMIT'); return }
+        const control = CONTROLS.has(input.method)
+        if ((!control && [...pending.values()].filter(request => !request.control).length >= (effective.maxRequests ?? 32)) || control && [...pending.values()].filter(request => request.control).length >= 8) { reply(null, 'ENDPOINT_REQUEST_LIMIT'); return }
+        const owned = new AbortController(), request: RequestContext = { lifetime: owned, signal: AbortSignal.any([lifetime.signal, owned.signal]), method: input.method, control }; pending.set(id, request)
+        const timer = setTimeout(() => owned.abort(new Error('ENDPOINT_REQUEST_TIMEOUT')), 120_000)
+        void invoke(input.method, input.args, request).then(value => { if (!request.signal.aborted) reply(value); if (input.method === 'close') close() }, (error: unknown) => { if (!request.signal.aborted) reply(null, error instanceof Error ? error.message : 'ENDPOINT_REQUEST_FAILED') }).finally(() => { clearTimeout(timer); pending.delete(id) })
+      }
+      const expiry = setInterval(() => { if (!suspended && performance.now() - lastReceived > 90_000) close() }, 10_000); expiry.unref?.()
+      endpoint.addEventListener('message', receive); physical.addEventListener('close', physicalClose); physical.addEventListener('messageerror', physicalClose); physical.on?.('close', close); physical.on?.('messageerror', close); endpoint.start?.()
+      attachments.set(endpointId, { binding, state: () => suspended ? 'suspended' : 'active', close }); return close
     },
   }
-  const abort = (): void => { void owner.close().catch(() => undefined) }
-  session.signal.addEventListener('abort', abort, { once: true }); owners.set(session, owner)
-  if (session.signal.aborted) abort()
   return owner
-}
-
-function limit(value: number | undefined, fallback: number, maximum: number): number {
-  const result = value ?? fallback
-  if (!Number.isSafeInteger(result) || result < 1 || result > maximum) throw new Error('APPLICATION_OWNER_LIMIT_INVALID')
-  return result
-}
-function checkedContext(value: ApplicationEndpointContext): ApplicationEndpointContext {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || Object.entries(value).some(([key, item]) =>
-      !['viewId', 'documentPath', 'publicationId', 'runId'].includes(key) || typeof item !== 'string' || item.length === 0 || item.length > (key === 'documentPath' ? 1024 : 128) || [...item].some(character => character.charCodeAt(0) < 32))) throw new Error('APPLICATION_ENDPOINT_CONTEXT_INVALID')
-  return structuredClone(value)
-}
-function validateHandshake(value: unknown): ApplicationOwnerHandshake {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('APPLICATION_OWNER_HANDSHAKE_INVALID')
-  const input = value as ApplicationOwnerHandshake
-  if (Object.keys(input).some(key => !['applicationId', 'definitionId', 'definitionVersion', 'context'].includes(key)) ||
-      !/^[0-9a-f]{64}$/u.test(input.applicationId) || typeof input.definitionId !== 'string' || typeof input.definitionVersion !== 'string' ||
-      input.definitionId.length > 128 || input.definitionVersion.length > 128) throw new Error('APPLICATION_OWNER_HANDSHAKE_INVALID')
-  if (input.context !== undefined) checkedContext(input.context)
-  return input
-}
-function validatePolicy(policy: ApplicationAttachmentPolicy): void {
-  if (policy === null || typeof policy !== 'object' || Array.isArray(policy) ||
-      policy.capabilities !== undefined && (!Array.isArray(policy.capabilities) || policy.capabilities.some((value: unknown) => typeof value !== 'string' || !CAPABILITIES.includes(value))) ||
-      [policy.commands, policy.queries].some(values => values !== undefined && (!Array.isArray(values) || values.length > 128 || values.some(value => typeof value !== 'string' || value.length > 128))) ||
-      policy.contextEvidence !== undefined && !['caller-asserted', 'owner-validated'].includes(policy.contextEvidence)) throw new Error('APPLICATION_ATTACHMENT_POLICY_INVALID')
-  if (policy.identity !== undefined && (policy.identity === null || typeof policy.identity !== 'object' || Array.isArray(policy.identity) || Object.entries(policy.identity).some(([key, value]) => !['principalId', 'agentBindingId', 'deviceProfileId'].includes(key) || typeof value !== 'string' || value.length === 0 || value.length > 128))) throw new Error('APPLICATION_ATTACHMENT_IDENTITY_INVALID')
-  if (policy.context !== undefined) checkedContext(policy.context)
-  limit(policy.maxRequests, 16, 64); limit(policy.maxStreams, 8, 16); limit(policy.maxViews, 8, 32)
-}
-function mergePolicy(a: ApplicationAttachmentPolicy, b: ApplicationAttachmentPolicy): ApplicationAttachmentPolicy {
-  const intersection = <T>(left: readonly T[] | undefined, right: readonly T[] | undefined): readonly T[] | undefined =>
-    left === undefined ? right : right === undefined ? left : left.filter(value => right.includes(value))
-  const capabilities = intersection<ApplicationAttachmentCapability>(a.capabilities, b.capabilities), commands = intersection(a.commands, b.commands), queries = intersection(a.queries, b.queries)
-  return { ...a, ...b, ...(capabilities === undefined ? {} : { capabilities }), ...(commands === undefined ? {} : { commands }), ...(queries === undefined ? {} : { queries }),
-    maxRequests: Math.min(a.maxRequests ?? 16, b.maxRequests ?? 16), maxStreams: Math.min(a.maxStreams ?? 8, b.maxStreams ?? 8), maxViews: Math.min(a.maxViews ?? 8, b.maxViews ?? 8) }
 }

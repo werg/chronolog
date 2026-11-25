@@ -31,15 +31,15 @@
     "package:signals": "node tools/package-signals.mjs",
     "test:signals-package": "node tools/test-signals-package.mjs",
     "package:session": "node tools/package-peer-session.mjs",
-    "package:control": "node tools/package-peer-generation-control.mjs",
     "test:session-sql": "node tools/test-peer-session-sql.mjs",
-    "test:session-webrtc": "tsx tools/test-peer-session-webrtc.ts"
+    "test:session-webrtc": "tsx tools/test-peer-session-webrtc.ts",
+    "package:authority": "node tools/package-authority.mjs"
   },
   "devDependencies": {
     "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",
     "@chronolog/materializer-doltlite": "workspace:*",
-    "@chronolog/peer-generation": "workspace:*",
+    "@chronolog/authority": "workspace:*",
     "@chronolog/peer-session": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",

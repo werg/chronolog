@@ -6,18 +6,9 @@ import { ProtocolError, protocolInvariant } from './errors.js'
 export const DOMAINS = {
   transaction: 'chronolog/transaction-core/v1',
   materializedLog: 'chronolog/materialized-log/v1',
-  peerDescriptor: 'chronolog/peer-generation/descriptor/v1',
   celldApplicationInvitation: 'chronolog/celld/application-invitation/v1',
   celldWorkspacePublication: 'chronolog/celld/workspace-publication/v1',
-  peerSchema: 'chronolog/peer-generation/schema/v1',
-  peerPublication: 'chronolog/publication/v1',
-  peerControl: 'chronolog/peer-generation/control/v1',
-  peerGeneration: 'chronolog/peer-generation/generation/v1',
-  peerTransition: 'chronolog/peer-generation/transition/v1',
-  peerAttempt: 'chronolog/peer-generation/attempt/v1',
-  peerOrder: 'chronolog/peer-generation/order/v1',
-  peerCoverage: 'chronolog/peer-generation/coverage/v1',
-  peerConnection: 'chronolog/peer-generation/connection/v1',
+  publication: 'chronolog/publication/v1',
 } as const
 
 export type ProtocolDomain = (typeof DOMAINS)[keyof typeof DOMAINS]

@@ -22,7 +22,7 @@ describe('compiled native extension diagnostics', () => {
     database.close()
   })
 
-  it('provides JSON1 and integer RTree locally while consensus features remain gated', () => {
+  it('provides JSON1 and integer RTree locally while replicated features remain gated', () => {
     const database = new DatabaseSync(':memory:')
     expect(database.prepare(`SELECT json_extract('{"value":"exact"}', '$.value') AS value`).get()).toEqual({ value: 'exact' })
     database.exec(`

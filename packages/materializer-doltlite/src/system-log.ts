@@ -9,24 +9,7 @@ export const SYSTEM_LOG_SQL = `
     CREATE TABLE ${EXECUTION_MANIFEST_TABLE} (
       singleton_key INTEGER PRIMARY KEY NOT NULL CHECK (singleton_key = 1),
       manifest_digest BLOB NOT NULL CHECK (length(manifest_digest) = 32),
-      canonical_manifest BLOB NOT NULL,
-      bootstrap_program BLOB NOT NULL
-    ) STRICT;
-    CREATE TABLE chronolog_peer_control (
-      singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-      application_id BLOB NOT NULL CHECK (length(application_id) = 32),
-      revision INTEGER NOT NULL,
-      digest BLOB NOT NULL CHECK (length(digest) = 32)
-    ) STRICT;
-    CREATE TABLE chronolog_execution_context (
-      singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-      transaction_id BLOB NOT NULL CHECK (length(transaction_id) = 32),
-      application_id BLOB NOT NULL CHECK (length(application_id) = 32),
-      generation BLOB NOT NULL CHECK (length(generation) = 32)
-    ) STRICT;
-    CREATE TABLE chronolog_attempt_generations (
-      transaction_id BLOB PRIMARY KEY NOT NULL CHECK (length(transaction_id) = 32),
-      generation BLOB NOT NULL CHECK (length(generation) = 32)
+      canonical_manifest BLOB NOT NULL
     ) STRICT;
     CREATE TABLE ${TRANSACTION_LOG_TABLE} (
       tx_id BLOB PRIMARY KEY NOT NULL,
@@ -56,17 +39,16 @@ export function initializeSystemLog(database: DatabaseLike): void {
 
 export function insertExecutionManifest(database: DatabaseLike, manifest: StoredExecutionManifest): void {
   database.prepare(`
-    INSERT INTO ${EXECUTION_MANIFEST_TABLE} (singleton_key, manifest_digest, canonical_manifest, bootstrap_program) VALUES (1, ?, ?, ?)
-  `).run(manifest.manifestDigest, manifest.canonicalManifest, manifest.bootstrapProgram)
+    INSERT INTO ${EXECUTION_MANIFEST_TABLE} (singleton_key, manifest_digest, canonical_manifest) VALUES (1, ?, ?)
+  `).run(manifest.manifestDigest, manifest.canonicalManifest)
 }
 
 export function readExecutionManifest(database: DatabaseLike): StoredExecutionManifest {
   const raw = database.prepare(`
-    SELECT manifest_digest, canonical_manifest, bootstrap_program FROM ${EXECUTION_MANIFEST_TABLE} WHERE singleton_key = 1
+    SELECT manifest_digest, canonical_manifest FROM ${EXECUTION_MANIFEST_TABLE} WHERE singleton_key = 1
   `).get()
   if (raw === undefined || Array.isArray(raw)) throw new Error('DATABASE_MANIFEST_MISSING')
-  return { manifestDigest: asDigest(raw.manifest_digest), canonicalManifest: asBytes(raw.canonical_manifest),
-    bootstrapProgram: asBytes(raw.bootstrap_program) }
+  return { manifestDigest: asDigest(raw.manifest_digest), canonicalManifest: asBytes(raw.canonical_manifest) }
 }
 
 export function readSystemLog(database: DatabaseLike): TransactionLogRow[] {

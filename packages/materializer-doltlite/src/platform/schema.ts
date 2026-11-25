@@ -9,6 +9,26 @@ import { SEALED_TABLES_SQL } from './sealed.js'
  * operations write it.
  */
 export const PLATFORM_TABLES_SQL: readonly string[] = [
+  `CREATE TABLE chronolog_ddl_namespaces (
+    name TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    owner BLOB NOT NULL CHECK (length(owner) = 32)
+  ) STRICT`,
+  `CREATE TABLE chronolog_ddl_objects (
+    name TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    kind TEXT NOT NULL CHECK (kind IN ('table', 'view', 'virtual')),
+    owner BLOB NOT NULL CHECK (length(owner) = 32),
+    created_tx BLOB NOT NULL
+  ) STRICT`,
+  `CREATE TABLE chronolog_ddl_grants (
+    grant_id BLOB PRIMARY KEY NOT NULL CHECK (length(grant_id) = 32),
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('namespace', 'object')),
+    scope_name TEXT NOT NULL COLLATE NOCASE,
+    grantor BLOB NOT NULL CHECK (length(grantor) = 32),
+    grantee BLOB NOT NULL CHECK (length(grantee) = 32),
+    operations TEXT NOT NULL,
+    created_tx BLOB NOT NULL,
+    revoked_tx BLOB
+  ) STRICT`,
   `CREATE TABLE chronolog_platform (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
     root_admin BLOB NOT NULL CHECK (length(root_admin) = 32),
@@ -127,12 +147,12 @@ export const PLATFORM_VIEW_NAMES: ReadonlySet<string> = new Set(
 
 /**
  * Create the platform tables and views and the `group` collective,
- * administered by the signed schema key. Fork seeding starts open only in a fork.
+ * administered by the trusted initial principal. Fork seeding starts open only in a fork.
  */
-export function initializePlatform(database: DatabaseLike, rootAdministrator: Uint8Array, forkSeeding: boolean): void {
-  if (rootAdministrator.length !== 32) throw new Error('MATERIALIZER_ROOT_ADMINISTRATOR_INVALID')
+export function initializePlatform(database: DatabaseLike, rootPrincipal: Uint8Array, forkSeeding: boolean): void {
+  if (rootPrincipal.length !== 32) throw new Error('MATERIALIZER_ROOT_PRINCIPAL_INVALID')
   for (const sql of [...PLATFORM_TABLES_SQL, ...PLATFORM_VIEWS_SQL]) database.exec(sql)
-  database.prepare('INSERT INTO chronolog_platform (singleton, root_admin, seeding_open) VALUES (1, ?, ?)').run(rootAdministrator, forkSeeding ? 1 : 0)
+  database.prepare('INSERT INTO chronolog_platform (singleton, root_admin, seeding_open) VALUES (1, ?, ?)').run(rootPrincipal, forkSeeding ? 1 : 0)
   database.prepare(`
     INSERT INTO chronolog_collectives (collective_id, kind, insert_role, update_role, delete_role, created_tx)
     VALUES (?, 'group', 'admin', 'admin', 'admin', NULL)
@@ -140,12 +160,13 @@ export function initializePlatform(database: DatabaseLike, rootAdministrator: Ui
   database.prepare(`
     INSERT INTO chronolog_collective_members (collective_id, member_key, role, state, joined_tx, left_tx)
     VALUES (?, ?, 'admin', 'active', NULL, NULL)
-  `).run(GROUP_COLLECTIVE_ID, rootAdministrator)
+  `).run(GROUP_COLLECTIVE_ID, rootPrincipal)
+  database.prepare("INSERT INTO chronolog_ddl_namespaces (name, owner) VALUES ('main', ?)").run(rootPrincipal)
   // The group collective is principal 1 and the root administrator 2.
-  database.prepare('INSERT INTO chronolog_principals (id, key) VALUES (1, ?), (2, ?)').run(GROUP_COLLECTIVE_ID, rootAdministrator)
+  database.prepare('INSERT INTO chronolog_principals (id, key) VALUES (1, ?), (2, ?)').run(GROUP_COLLECTIVE_ID, rootPrincipal)
 }
 
-export function readRootAdministrator(database: DatabaseLike): Uint8Array {
+export function readRootPrincipal(database: DatabaseLike): Uint8Array {
   const row = database.prepare('SELECT root_admin FROM chronolog_platform WHERE singleton = 1').get()
   if (row === undefined || Array.isArray(row) || !(row.root_admin instanceof Uint8Array)) throw new Error('MATERIALIZER_PLATFORM_STATE_MISSING')
   return Uint8Array.from(row.root_admin)

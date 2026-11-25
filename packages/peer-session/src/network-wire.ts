@@ -1,5 +1,5 @@
 import { assertCanonicalCbor, encodeCanonicalCbor } from '@chronolog/protocol'
-import { decodePeerValue, encodePeerValue } from '@chronolog/peer-generation'
+import { decodeRecord, encodeRecord } from '@chronolog/authority'
 import type { FramedPeerConnection } from '@chronolog/records'
 export type { FramedPeerConnection, PeerLiveLane } from '@chronolog/records'
 export const APPLICATION_NETWORK_LIMITS = Object.freeze({
@@ -53,7 +53,7 @@ export class ApplicationMessageWire {
   send(value: unknown, authorize?: () => void): Promise<void> {
     this.#signal.throwIfAborted()
     requireNetwork(this.#pending < APPLICATION_NETWORK_LIMITS.queuedMessages, 'APPLICATION_NETWORK_BACKPRESSURE')
-    const bytes = encodePeerValue(value)
+    const bytes = encodeRecord(value)
     requireNetwork(bytes.length > 0 && bytes.length <= APPLICATION_NETWORK_LIMITS.messageBytes &&
       this.#pendingBytes + bytes.length <= APPLICATION_NETWORK_LIMITS.queuedBytes, 'APPLICATION_NETWORK_BACKPRESSURE')
     this.#pending++; this.#pendingBytes += bytes.length
@@ -64,7 +64,7 @@ export class ApplicationMessageWire {
       requireNetwork(this.#outgoing < Number.MAX_SAFE_INTEGER, 'APPLICATION_NETWORK_SEQUENCE_EXHAUSTED')
       const id = ++this.#outgoing
       for (let offset = 0; offset < bytes.length; offset += APPLICATION_NETWORK_LIMITS.fragmentBytes) {
-        signal.throwIfAborted(); this.#authorize()
+        signal.throwIfAborted(); this.#authorize(); authorize?.()
         const fragment = bytes.subarray(offset, offset + APPLICATION_NETWORK_LIMITS.fragmentBytes)
         const frame = encodeCanonicalCbor([1n, BigInt(id), BigInt(offset), BigInt(bytes.length), fragment])
         await interruptible(this.#connection.send(frame, { signal }), signal)
@@ -104,7 +104,7 @@ export class ApplicationMessageWire {
         if (offset === total) {
           const complete = body; body = null; offset = 0; this.#incoming++
           assembly?.cancel(); assembly = undefined
-          yield decodePeerValue<unknown>(complete)
+          yield decodeRecord<unknown>(complete)
         }
       }
     } finally {

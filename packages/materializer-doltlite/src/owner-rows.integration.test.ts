@@ -122,7 +122,7 @@ describe('owner-controlled rows: identity and the owner column', () => {
 })
 
 describe('owner-controlled rows: schema administration', () => {
-  it('limits DDL, including triggers, to group admins', async () => {
+  it('requires explicit DDL permission, including for triggers', async () => {
     const book = await notesLedger()
     for (const sql of [
       'CREATE TABLE extra (id INTEGER PRIMARY KEY)',
@@ -397,13 +397,16 @@ describe('owner-controlled rows: collectives', () => {
     await book.expectOutcome('policy:notes:insert', ALICE, sqlStatement("INSERT INTO notes (id, body, chronolog_owner) VALUES (21, 'x', (SELECT id FROM chronolog_principals WHERE key = ?))", [team]))
   })
 
-  it('makes group admins schema administrators', async () => {
+  it('keeps group administration independent of object DDL ownership', async () => {
     const book = await notesLedger()
     await book.expectOutcome('accepted', ROOT_KEY, platformOp.setMembers(GROUP_COLLECTIVE_ID, [{ member: ALICE, role: 'admin' }]))
     await book.expectOutcome('denied', ALICE, 'CREATE INDEX notes_status ON notes (status)')
-    await book.expectOutcome('accepted', ALICE, platformOp.acceptMembership(GROUP_COLLECTIVE_ID), 'CREATE INDEX notes_status ON notes (status)')
+    await book.expectOutcome('denied', ALICE, platformOp.acceptMembership(GROUP_COLLECTIVE_ID), 'CREATE INDEX notes_status ON notes (status)')
+    await book.expectOutcome('accepted', ALICE, platformOp.acceptMembership(GROUP_COLLECTIVE_ID))
+    await book.expectOutcome('accepted', ROOT_KEY, platformOp.grantDdl({ scope: { kind: 'object', name: 'notes' }, grantee: ALICE, operations: ['index'] }))
+    await book.expectOutcome('accepted', ALICE, 'CREATE INDEX notes_status ON notes (status)')
     await book.expectOutcome('accepted', ALICE, platformOp.setMembers(GROUP_COLLECTIVE_ID, [{ member: ROOT_KEY, role: 'remove' }]))
-    await book.expectOutcome('denied', ROOT_KEY, 'DROP INDEX notes_status')
+    await book.expectOutcome('accepted', ROOT_KEY, 'DROP INDEX notes_status')
   })
 })
 

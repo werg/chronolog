@@ -1,5 +1,5 @@
 import { generateX25519KeyPair, HPKE_SUITE, hpkeReceiveExportBase, hpkeSendExportBase, type X25519KeyPair } from '@chronolog/crypto'
-import { encodePeerValue } from '@chronolog/peer-generation'
+import { encodeRecord } from '@chronolog/authority'
 import { bytesToHex, hexToBytes } from '@chronolog/protocol'
 import type { FramedPeerConnection, PeerLiveLane } from '@chronolog/records'
 import { MAX_SIGNAL_BYTES } from '@chronolog/signals'
@@ -10,11 +10,11 @@ export const APPLICATION_CHANNEL_LIMITS = Object.freeze({ overheadBytes: 22, rec
 export interface ApplicationChannelHello { readonly suite: typeof APPLICATION_CHANNEL_SUITE; readonly receiverKey: string }
 const DOMAIN = 'chronolog/peer-channel/v1'
 // These disjoint slices are independent exporter output, never HPKE's own AEAD key.
-const EXPORT_CONTEXT = encodePeerValue({ domain: DOMAIN, layout: ['reliable-key:32', 'reliable-nonce:12', 'live-key:32', 'live-nonce:12'] })
+const EXPORT_CONTEXT = encodeRecord({ domain: DOMAIN, layout: ['reliable-key:32', 'reliable-nonce:12', 'live-key:32', 'live-nonce:12'] })
 const HEADER = 6, TAG = 16
 const limit = (live: boolean): number => live ? MAX_SIGNAL_BYTES : APPLICATION_NETWORK_LIMITS.fragmentBytes + 128
 const source = (bytes: Uint8Array): ArrayBuffer => Uint8Array.from(bytes).buffer
-const context = (sender: unknown, receiver: unknown): Uint8Array => encodePeerValue({ domain: DOMAIN, suite: APPLICATION_CHANNEL_SUITE, sender, receiver })
+const context = (sender: unknown, receiver: unknown): Uint8Array => encodeRecord({ domain: DOMAIN, suite: APPLICATION_CHANNEL_SUITE, sender, receiver })
 
 /** One direction and one lane. A nonce is consumed even when a live dispatch is dropped. */
 class RecordCipher {

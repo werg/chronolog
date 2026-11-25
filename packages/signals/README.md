@@ -47,9 +47,8 @@ relayed, and do not consume replay identities.
 saturates at `Number.MAX_SAFE_INTEGER`. Fatal errors retain their failure path and
 are not counted as these drops. Counters describe this receive route,
 contain no signal payloads or per-author history, and are not an estimate of a
-remote clock offset. The same optional `signalRejections` snapshot is available
-on `ApplicationPeerLink.stats` and each `session.participation.diagnostics()`
-connection. A missing field means that implementation does not report it.
+remote clock offset. These counters are available on the owning `SignalRoute`;
+implementations that do not expose a receive-route diagnostic must not invent one.
 
 A successful `send()` confirms only the configured local/route dispatch.
 `localEcho: true` can succeed from local delivery even without a remote route;
@@ -62,7 +61,7 @@ When multiple local endpoints or runs share one signing identity, attach `stream
 
 ## Inside `ApplicationSession`
 
-`session.signals` uses the session's signing device, application scope, and verified reader grants. `session.participate()` attaches live peer lanes automatically. Configure delivery with `openPeerApplication({ signals: { delivery: 'neighbors' | 'application', localEcho: false } })`. See [owned participation](../peer-session/README.md#owned-participation-and-recovery).
+`session.signals` uses the owned signing device, application scope and verified reader grants. Authenticated `session.connectPeer()` links attach the independent live lane; the session forwards application-scoped signals and allows local echo without opening a network route. The page facade provides bounded `send`/`subscribe` RPCs and owner-bound endpoint context, without receiving the private key. For other standalone dispatch policies, configure `SignalChannel` directly. See [content, signals and tools](../peer-session/README.md#content-signals-tools-and-exporter-effects).
 
 ## Packaging
 

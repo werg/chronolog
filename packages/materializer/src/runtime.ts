@@ -43,33 +43,16 @@ export interface MaterializationPublicationRequest {
   readonly candidateIdentity: string
 }
 
-export interface CoordinatedMaterialization {
+export interface ReplayMaterializationResult {
   readonly revision: MaterializedRevision
   readonly publication: MaterializationPublicationRequest
 }
 
-/** Executes one order already authenticated by the history owner, independently of transport or ordering policy. */
-export interface MaterializationCoordinator {
-  materialize(
-    orderedTransactions: readonly ReplayProposal[],
-    controls?: PeerExecutionControls,
-  ): Promise<CoordinatedMaterialization | null>
-  /** Optional settlement capability, invoked only by an owner holding the required settlement evidence. */
-  publishFinal?(prefixLength: number, controls?: PeerExecutionControls): Promise<void>
-}
-
-/** A verified control projection supplied by the history owner, never an application callback. */
-export interface PeerExecutionControl {
-  readonly revision: number
-  readonly digest: Uint8Array
-  readonly members: readonly { readonly publicKey: Uint8Array; readonly role: 'member' | 'admin' }[]
-}
-export interface PeerExecutionControls {
-  /** Authenticated attempt generations supplied by the history owner, never command input. */
-  readonly attemptGenerations?: readonly { readonly attemptId: Uint8Array; readonly generation: Uint8Array }[]
-  readonly applicationId: Uint8Array
-  readonly currentRevision: number
-  readonly revisions: readonly PeerExecutionControl[]
+/** Replays an already authenticated, strictly authored-time-ordered operation set. */
+export interface MaterializationReplay {
+  materialize(orderedTransactions: readonly ReplayProposal[]): Promise<ReplayMaterializationResult | null>
+  /** Invoked only after the owner verifies finality evidence for this prefix. */
+  publishFinal?(prefixLength: number): Promise<void>
 }
 
 export type MaterializedLocalSqlValue =
@@ -157,7 +140,7 @@ export interface MaterializationPublicationStore {
 }
 
 export interface ChronologMaterializationRuntime {
-  readonly coordinator: MaterializationCoordinator
+  readonly replay: MaterializationReplay
   readonly queries: MaterializedQueryService
   readonly publications: MaterializationPublicationStore
   close(): void | Promise<void>

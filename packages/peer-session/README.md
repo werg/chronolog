@@ -1,416 +1,218 @@
 # `@chronolog/peer-session`
 
-Public application session for Node.js and browser Workers. Owns device identity, durable storage, commands, queries, events, live signals, chunked content, epoch keys, peer networking, control sync, and recovery.
+A local-first signed operation-set runtime for native applications and browser Workers. Devices retain immutable authored intents, union verified facts, and independently replay eligible operations. Application order is only `(signed authorTimestampMs: bigint, author public-key bytes, canonical proposal-ID bytes)`. Arrival, transport counters, host clocks and participant placement do not assign order.
 
-## Entrypoints
+The [authored operation-set contract](../../docs/CRDT_CONTRACT.md) is normative. This is a new format, not a reader or migration for the removed protocol.
+
+## Public entrypoints
 
 | Import | Purpose |
 | --- | --- |
-| `@chronolog/peer-session` | Definitions, session types, tools (`createApplicationTools`, `createScopedApplicationTools`), `createLiveView`, `forwardSessionEvents`, `createViewStore`, `operationReference`, `SessionError`, `canonicalJson`, control participant, owner lock, and authority helpers |
-| `@chronolog/peer-session/native` | `openNativeDevice`, `openNativeApplication`, `NativeBytesStore` |
-| `@chronolog/peer-session/worker` | `openBrowserDevice`, `openBrowserApplication`, `serveApplicationWorker`, `probeBrowserCapabilities`, `createApplicationOwner` |
-| `@chronolog/peer-session/browser` | Page-side facade: `connectApplicationWorker`, `connectApplicationOwner`, `createLiveView`, `createViewStore`, `operationReference`, `SessionError` (no keys or durable storage) |
-| `@chronolog/peer-session/webrtc` | `openWebRtcConnection`, `connectApplicationWebRtc`, Worker RTC bridge |
-| `@chronolog/peer-session/webrtc-native` | `createNativePeerConnection`, `connectNativeApplicationWebRtc` |
-| `@chronolog/peer-session/websocket` | Dual-socket WebSocket peer connection |
-| `@chronolog/peer-session/tendriller` | `createApplicationBackend` adapter for Tendriller browser runtime |
-| `@chronolog/peer-session/sql` | `prepareSqlApplication`, `openSqlApplication` (in SQL archives) |
-| `@chronolog/peer-session/sql-native` | `createNativeSqlEngine` (native DoltLite) |
-| `@chronolog/peer-session/sql-browser` | Browser WASM DoltLite loader |
+| `@chronolog/peer-session` | `createApplicationSession`, definitions, authority helpers/types, live views, view stores, projections, scoped tools, event forwarding, checkpoints and owner composition |
+| `@chronolog/peer-session/native` | `openNativeDevice`, `openDisposableNativeDevice`, `NativeBytesStore`, `createApplicationSession` |
+| `@chronolog/peer-session/worker` | `openBrowserDevice`, `createApplicationSession`, `createApplicationOwner`, owner locks and lazy browser capability probing |
+| `@chronolog/peer-session/browser` | `connectApplicationOwner`, the page facade, live views, view stores, scoped tools and event forwarding; no signing keys or SQL engine |
+| `@chronolog/peer-session/webrtc` | Browser RTC transport and the page/Worker raw-frame bridge |
+| `@chronolog/peer-session/webrtc-native` | Native RTC transport |
+| `@chronolog/peer-session/websocket` | Separate reliable/live WebSocket transport lanes |
+| `@chronolog/peer-session/tendriller` | `createApplicationBackend` for the host runtime |
+| `@chronolog/peer-session/sql` | `createSqlMaterializationRuntime({ engine, path, rootPrincipal, ... })` in SQL-enabled archives |
+| `@chronolog/peer-session/sql-native` | `createNativeSqlEngine` |
+| `@chronolog/peer-session/sql-browser` | Verified browser WASM loader, `createBrowserSqlEngine`, `createDoltLiteExecutionManifest`, `digestEngineManifest` |
+| `@chronolog/peer-session/sql-wasm` | Node WASM loader and engine capability |
+| `@chronolog/peer-session/celld` | Object-owned device/byte storage and managed signer import |
+| `@chronolog/peer-session/sql-celld` | `createCelldSqlEngine` and the common SQL runtime factory |
 
-Browser entries never load Node or Werift modules. Passive protocol imports keep durable storage lazy (`status.database === 'idle'`) until first durable read/write.
+Importing a passive entry does not open a database. Calling `createApplicationSession` explicitly opens local owned storage and cached authority; materialization then warms independently of submission. SQL engine selection remains explicit. Browser/page entries do not eagerly load native SQL or native RTC.
 
-## Define an application
+## Define preparation and coherent reads
 
 ```ts
-import { defineApplication, defineCommand, defineQuery, emit, program } from '@chronolog/peer-session'
+import {
+  defineApplication, defineCommand, defineQuery, emit, program,
+  type ApplicationReadView,
+} from '@chronolog/peer-session'
 
-export const notesApp = defineApplication({
-  id: 'notes-v1',
+export const notes = defineApplication({
+  id: 'notes',
   version: '1',
   commands: {
-    addNote: defineCommand({
+    add: defineCommand({
       description: 'Add a note',
-      input: { type: 'object', properties: { text: { type: 'string', minLength: 1 } }, required: ['text'], additionalProperties: false },
-      prepare: ({ text }) => program(emit('note', { text })),
+      input: { type: 'string', minLength: 1, maxLength: 4096 },
+      prepare: text => program(emit('note', { text })),
     }),
   },
   queries: {
     notes: defineQuery({
-      description: 'List notes',
+      description: 'Read effective note events',
       input: { type: 'null' },
-      read: view => view.readEvents({ topics: ['note'] }).events,
+      read: (view: ApplicationReadView) => view.readEvents({ topics: ['note'] }),
     }),
   },
 })
 ```
 
-For guarded SQL transactions, include `schema` on the definition, sign it with `prepareSqlApplication`, and open with `openSqlApplication({ ..., createEngine })`.
+Definition versions describe an API; they are not admission locks or database schema hashes. A named `session.query(name, input)` returns `{ applicationId, revision, value }`. A captured `view.query(sql, parameters)` returns rows directly, with its revision on the view.
 
-## Open a device and session
+## Explicit enrollment, then local reopening
 
-**Native (Node.js):**
-
-```ts
-import { openNativeDevice, openNativeApplication } from '@chronolog/peer-session/native'
-
-const device = await openNativeDevice({ path: './device.sqlite', mode: 'openOrCreate' })
-const session = await openNativeApplication({ device, definition: notesApp, authority })
-```
-
-**Browser Worker + page facade:**
+First setup creates a device only when explicitly requested. The owner signs in and completes enrollment/key provisioning. For a fresh browser-first application, `rootPrincipal` is the actual first owning browser key, not an invented native identity. Signing identities, epoch keys and private setup state stay in the owning Worker or native profile, never in published assets.
 
 ```ts
-// worker.ts
-import { openBrowserDevice, openBrowserApplication, serveApplicationWorker } from '@chronolog/peer-session/worker'
+import { createApplicationSession } from '@chronolog/peer-session'
+import { openNativeDevice } from '@chronolog/peer-session/native'
 
-const device = await openBrowserDevice({ name: 'notes-profile', mode: 'openOrCreate' })
-const session = await openBrowserApplication({ device, definition: notesApp, authority })
-serveApplicationWorker({ session, port: self })
+// Explicit first device creation; omit create when reopening an existing profile.
+const device = await openNativeDevice({ path: './private/device.sqlite', create: true })
 
-// page.ts
-import { connectApplicationWorker } from '@chronolog/peer-session/browser'
-
-const session = await connectApplicationWorker({ port: worker })
-```
-
-Existing devices should open with `mode: 'open'` so missing storage fails closed instead of minting a replacement identity.
-
-## Run a device inside celld
-
-The `@chronolog/peer-session/celld` entry uses a celld Durable Object's
-SQLite storage for the same device identity and application session.
-
-```ts
-import { openCelldApplication, openCelldDevice } from '@chronolog/peer-session/celld'
-
-const device = await openCelldDevice({ storage: ctx.storage })
-const session = await openCelldApplication({ device, definition, authority })
-```
-
-Pass `create: true` during explicit device setup. Later activations reopen
-the retained signer and history. Provide `openDataStorage` to open a
-separate SQLite facet on demand. Closing the device releases its handles
-within the Durable Object. Pass `frameCelldPeerStream(stream)` as the
-`connection` to `session.connectPeer()` for streams opened or accepted
-by the same object. The session authenticates the peer's application
-identity. The Iroh node ID identifies the transport endpoint.
-
-For a host-managed device, declare the Ed25519 private key as a class
-secret. Use the admitted public key and the secret's lowercase PKCS#8 hex
-value on every activation.
-
-```ts
-import { importCelldSigningIdentity, openCelldDevice } from '@chronolog/peer-session/celld'
-
-const managedSigner = await importCelldSigningIdentity(admittedPublicKey, env.CHRONOLOG_SIGNER_PKCS8)
-const device = await openCelldDevice({ storage: ctx.storage, managedSigner })
-```
-
-Pass `create: true` on the initial managed enrollment. The device metadata
-keeps only the public identity and its storage binding. A missing or
-different key prevents resume. The same imported identity can sign
-generation selections through `openCelldApplicationControl` where it
-matches that application's registered control key.
-
-### Invite a device
-
-After the control object selects a generation with the member's reader
-grant, an admitted administrator can sign a celld invitation with
-`signCelldApplicationInvitation({ authority, memberPublicKey, endpoint, inviter })`.
-Use the administrator device's Ed25519 identity and its actual Iroh
-endpoint. The signed invitation carries the selected authority and
-endpoint. Epoch keys remain on the authenticated peer link.
-
-On the invited device, call
-`acceptCelldApplicationInvitation(device, invitation)`. It checks the exact
-member key, signature and signed control history, and retains the authority
-before opening the application. Pass the returned `authority` to
-`openCelldApplication` and use the returned `peer` and `endpoint` with
-`createCelldPeerTransport`. The application session authenticates that peer
-and synchronizes the selected history over the connection.
-
-## Commands, queries, and change streams
-
-```ts
-const before = await session.query('notes', null)
-const op = await session.command('addNote', { text: 'Hi' }, {
-  operationId: crypto.randomUUID(),
-  basedOn: before.revision,
-})
-const applied = await op.applied()   // accepted | rejected at (generation, sequence)
-const shared = await op.shared()     // independent peer retention receipt
-```
-
-- Retrying `command()` with the same `operationId` and inputs reuses the saved signed attempt.
-- Use `session.operations.get(id)` / `inspect(id)` / `wait(id)` to check uncertain writes.
-- Use `session.readView()` for multi-query atomic snapshots; always `await view.release()`.
-- Iterate `for await (const change of session.changes({ signal }))` for coalesced update and recovery notifications.
-- Use `session.defineProjection(...)` for durable derived local projections that reset cleanly across recovery.
-
-## Control participant and publications
-
-Attach a filtered control host (such as Tendriller) without granting it reader access:
-
-```ts
-const control = session.connectControlParticipant({ exchange })
-await control.refresh()
-await control.publish({ files, entry: 'index.html', runtime })
-```
-
-To pause coordinator ordering while an owner reviews a signed control change (such as enrolling a browser), call `await session.pauseOrdering(...)` to retain a durable prefix proof before submitting the transition.
-
-## Owned participation and recovery
-
-`session.participate()` owns peer discovery, direct WebRTC attempts, WebSocket relay fallback, authenticated link handover, and automatic recovery observation:
-
-```ts
-const participation = session.participate({
-  discovery,
-  openDirect: ({ peerId, role, signal }) => openWebRtcConnection({ ... }),
-  openRelay: ({ peerId, role, signal }) => openWebSocketConnection({ ... }),
-  control,
+// verifiedAuthority and initialEpochKeys come from trusted enrollment/provisioning.
+const session = await createApplicationSession({
+  device,
+  definition: notes,
+  authority: verifiedAuthority,
+  epochKeys: initialEpochKeys,
 })
 ```
 
-- **Direct-first, relay-fallback**: attempts direct WebRTC, falls back to opaque encrypted WebSocket relay when needed, and upgrades back to direct on event-driven triggers without polling.
-- **Graceful replacement**: drains in-flight authenticated RPCs up to `drainTimeoutMs` (default 5s) when replacing a peer link.
-- **Recovery**: `session.recovery.inspect()`, `takeover(control)`, and `handover(control, { to })` execute explicit signed generation transitions. Abandoned operations throw `AbandonedOperationError` and require deliberate reapplication (`reapplyOf`).
-- **Epoch keys**: `session.keys.ensure()`, `missing()`, `request()`, `offer()`, and `install()` manage reader encryption keys peer-to-peer.
+Subsequent activations can call `createApplicationSession({ device, definition: notes, applicationId })` using cached authority and keys, before host lookup. Missing identity/storage fails explicitly; it does not mint a replacement signer.
 
-## Content, signals, and agent tools
+Authority metadata and encryption grants are separate from application SQL permissions. An unchanged writer grant remains usable by an offline cached certificate. A writer revocation interrupts that certificate; a later regrant does not silently revive it. Original operations remain stored for inspection even when excluded from replay.
 
-- **Content**: `session.content.putBytes()`, `readBytes(ref, { maxBytes })`, `stage()`, `read(ref, { offset, length })`, `retain()`, and `retention()` transfer encrypted 64 KiB chunks peer-to-peer under current reader grants. `prune(ref)` explicitly evicts a local copy when the application no longer needs it.
-- **Signals**: `session.signals.send(topic, payload, opts)` and `subscribe(opts)` share ephemeral signed updates over the live lane. With `mode: 'latest'`, an active subscription coalesces newly received updates; it does not return a current-value snapshot or replay earlier messages.
-- **Agent tools**: `createApplicationTools(session)` exposes declared commands/queries as schema-validated tool descriptors for local or remote assistants.
-- **Multi-client ownership**: `createApplicationOwner()` and `acquireApplicationOwnerLock()` allow multiple tabs or local attachments to share one owning session while keeping operation scopes, bounded RPC deadlines (`boundedRequest`), and read-view authority isolated.
-
-### Bounded snapshots and clips
-
-Both native sessions and browser Worker facades provide the same convenience APIs:
+For browser ownership:
 
 ```ts
-const stop = new AbortController()
-const reference = await session.content.putBytes(clipBytes, {
-  mediaType: 'audio/webm', signal: stop.signal,
-})
-const received = await session.content.readBytes(reference, {
-  maxBytes: 8 * 1024 * 1024, signal: stop.signal,
-})
-// After review/discard, when this application no longer needs its local copy:
-await session.content.prune(reference)
+// Inside the owning Worker. Fresh setup has already verified/provisioned this profile.
+import {
+  openBrowserDevice, createApplicationSession, createApplicationOwner,
+} from '@chronolog/peer-session/worker'
+
+const device = await openBrowserDevice({ name: 'notes-profile' })
+const session = await createApplicationSession({ device, definition: notes, applicationId })
+const owner = createApplicationOwner(session)
+owner.attach(self)
+
+// In the page; no private key or store crosses this port.
+import { connectApplicationOwner } from '@chronolog/peer-session/browser'
+const client = await connectApplicationOwner(worker, { applicationId })
 ```
 
-`putBytes` accepts a `Uint8Array`, chunks it at 64 KiB, and returns a committed
-`ContentReference`. Content is limited to 128 MiB. Do not mutate the input until
-the promise settles. `readBytes` requires an explicit integer `maxBytes` between
-zero and 128 MiB, rejects larger references before fetching, allocates one result
-buffer, and verifies the complete byte count. Use `read(ref, { offset, length,
-signal })` to process larger permitted content incrementally instead of assembling
-it in memory. Worker calls retain the same bounded per-chunk message sizes.
+Acquire `acquireApplicationOwnerLock(profileId)` before opening a shared browser profile. Reuse the same owned device records on resume. Multiple authenticated attachments can share one owner; they do not create independent signers or stores.
 
-Aborting a convenience upload or download rejects its wait and prevents a late
-result from being returned. An upload queues local discard after already-started
-writes settle; aborting does not claim to undo physical storage work immediately.
-If the storage owner closes or storage fails, cleanup can fail too. Applications
-that need explicitly resumable uploads should use `stage`, keep its ID, and use
-`resume`; a returned upload also has an idempotent `discard()` method that removes
-its local staged or committed copy. `session.content.discard(uploadId)` performs
-the same idempotent cleanup from a saved ID without requiring the old stage epoch
-to remain current. The native session and Worker facade expose both forms.
+## Durable submission and independent facts
 
-`prune` is local eviction: it removes the manifest, reference-owned encrypted chunks, associated
-upload records, and this device's cached retention observations. It aborts current
-reads of that reference and fences late provider replies before they can restore
-the deleted bytes. A durable deletion inventory permits retry after an interrupted
-prune; reads remain fenced until `prune(reference)` completes. Repeated calls are
-safe. Pruning a reference does not discard an independent pending upload that
-shares its stage identity; call `discard(uploadId)` to explicitly stop that upload.
-Unrelated application records and other devices' copies are unchanged, and a
-later explicit read may fetch the content again. Retention receipts held by other
-peers remain historical observations; pruning neither retracts them nor erases an
-application command that references the content. The application chooses when an
-observation is disposable and when a declared command retains its reference.
+```ts
+const operation = await session.command('add', 'Hello', {
+  operationId: crypto.randomUUID(), // retain this handle for uncertain replies
+})
+// Return means the exact signed intent is durable locally, not that SQL/network/finality completed.
+const local = await operation.materialized()
+const inspection = operation.inspect() // async on the page facade
+```
 
-Memory, native SQLite, IndexedDB, and OPFS storage support eviction. Custom
-`BytesStore` implementations may supply optional `delete(key)`; pruning reports
-`CONTENT_PRUNE_UNSUPPORTED` when deletion is absent. Native deletion releases
-logical quota and reusable SQLite pages; it does not promise file compaction or
-secure physical erasure.
+- `stored`: exact signed intent is retained on this device.
+- `materialized()`: accepted/rejected local outcome at an operation-set revision. Earlier late operations can revise it.
+- `retained()`: authenticated availability assertions from other signing identities and other storage IDs. Each binds the original author and the canonical digest of an exact stored signed envelope, not just a claimed proposal ID. Keyless encrypted storage can acknowledge that physical subject without waiting for SQL. Only matching known subjects from currently trusted peers qualify; raw historical/unknown-subject evidence remains retained for verification/gossip. Local/self-echo evidence does not qualify. It does not prove execution, finality or permanent availability.
+- `finalized()`: inclusion/closed-time evidence under the configured policy, with necessary local dependencies and replay complete. `none` explicitly returns `FINALITY_UNSUPPORTED`.
 
-New uploads and downloads store chunks under each content reference. Older stores
-used a global chunk hash that can be shared by multiple manifests. Those ambiguous
-legacy ciphertext records remain readable and are conservatively preserved during
-pruning; removing one old reference must not silently destroy another offline copy.
-The manifest and associated metadata are still evicted. This compatibility policy
-can leave legacy payload bytes on disk; it does not affect reclamation of newly
-captured media under the reference-owned layout.
+Default author timestamps are allocated once from wall time and this owner's durable default allocations. Explicit local or remote future timestamps do not advance that allocator. Provided timestamps are never clamped or rewritten. Exact retries preserve the original core, timestamp, nonce, signature and envelope; changed input under a reused handle is rejected.
 
-## Owned view and tool helpers
+Use `session.operations.get(ownedOperationIdOrProposalId)`, `operations.subscribe({ operationId, signal })`, and `operations.retry(id)`. Retry wakes the original stored intent and replication/dependency work; it does not reprepare or retimestamp it. A bounded same-owner preparation cache also preserves signatures after a precommit storage error. If nothing ever became durable and that owner process crashes, the intent remains unsaved; retain and review the original UI input rather than claiming restart preservation.
 
-`createLiveView(session, { query, input })` subscribes before its initial coherent
-read. `ready({ signal, timeoutMs })` bounds initial readiness; `refresh()` waits
-for the next accepted snapshot. Call `close()` to release subscriptions. Session
-closure, stream termination and cancellation also release them and reject pending
-reads. Late query replies cannot reopen a closed observer.
+## Ordinary SQL, DDL and permissions
 
-`forwardSessionEvents({ session, checkpoint, project, deliver, signal })` releases
-each captured view before invoking external delivery. It saves the batch cursor
-only after all projections and deliveries succeed. Failures leave the last saved
-cursor for at-least-once replay, so delivery must deduplicate by event identity.
-Recovery during processing stops the forwarder for explicit review; it never
-silently resets an old cursor. Cancellation fences later callbacks and checkpoints;
-it cannot undo delivery or a checkpoint write already started by the caller.
+```ts
+import { createSqlMaterializationRuntime } from '@chronolog/peer-session/sql'
+import { createNativeSqlEngine } from '@chronolog/peer-session/sql-native'
 
-### Review and resume after a generation change
+const sqlSession = await createApplicationSession({
+  device, definition: notes, authority: verifiedSqlAuthority,
+  createMaterializer: ({ rootPrincipal }) => createSqlMaterializationRuntime({
+    engine: createNativeSqlEngine(), path: './private/application.db', rootPrincipal,
+  }),
+})
 
-A routine device enrollment can select a new generation even when its retained
-history is unchanged. An old event cursor still stops with `RecoveredViewError`
-(`code: APPLICATION_VIEW_RECOVERED`). The direct reader and attached Worker/native
-facade expose `revision` and `recovery: { reason, adopted, unknownLoss } | null`.
-`reason` is the **selected transition's** verified reason (`control-change`,
-`handover`, `takeover`, or `create`), not a statement about all transitions since
-the cursor. `adopted` is that selection's retained history point. Missing evidence
-is `null`; an older retained notice can have `reason: null`.
+const ddl = await sqlSession.submit({
+  operationId: 'reviewed-notes-table',
+  program: program('CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)'),
+})
+const outcome = await ddl.materialized() // may be rejected if this signer lacks namespace rights
+```
 
-`forwardSessionEvents` keeps its `EVENT_FORWARDER_REVIEW_RECOVERY` stop during
-in-flight delivery and exposes the same `revision`/`recovery` fields on
-`EventForwarderRecoveryError`. Starting a forwarder with an already-stale
-checkpoint can instead surface the reader's `APPLICATION_VIEW_RECOVERED`; both
-errors preserve the same evidence shape. Newly generated `RecoveryNotice` values also carry
-the verified `reason`; older retained notices can omit it. The cursor is never
-rewritten or advanced automatically. `control-change`, an empty `abandoned`
-list, or a retained point is not proof that the complete handled prefix survived;
-`unknownLoss` remains explicit. There is no transparent continuation guarantee.
+The descriptor pins engine/platform execution semantics, not an application schema. Only the trusted initial internal permission bootstrap uses `rootPrincipal`. Application DDL, DML, ownership, membership and permission changes are ordinary signed programs with author-time replay and atomic rollback. The creator owns newly created objects; crypto administrators are not implicitly SQL/schema administrators.
 
-After a recovery stop:
+Use `platformOp.grantDdl`/`revokeDdl` for namespace/object rights and ordinary platform operations for application grants. `GROUP_COLLECTIVE_ID` names the initial application collective. Host account/device membership does not overwrite that SQL collective.
 
-1. Stop the old consumer and preserve its last **handled** checkpoint and durable
-   work records. Reconcile any external effect already started, using the same
-   provider idempotency key or read-back evidence; cancellation cannot undo it.
-2. Confirm the application/history and selected revision. Review the reason,
-   adopted point and any abandoned/uncertain work. Missing evidence needs explicit
-   review; never catch the error by jumping to the newest cursor.
-3. Open a fresh selected view. Rebuild the application's declared durable inbox
-   if it has one, or explicitly rescan retained events from the beginning with no
-   cursor. Release each view before performing external work.
-4. Reconcile each event against the existing durable work store. Scope event
-   identities by application/history; `event.id` contains the signed attempt and
-   emitted-event ordinal. Use the application's stable request identity when a
-   deliberate reapplication should refer to the same external effect. A bare
-   operation ID is not globally unique. No unbounded in-memory deduplication set
-   is required.
-5. Save a new handled cursor only after that batch's work/receipts have durable
-   outcomes. A crash or rescan can redeliver events, so retain the same idempotency
-   policy. Do not replay excluded effects automatically or claim exactly-once
-   behavior for external systems.
+Keep identity/key records in storage outside the authored SQL image. Native SQL and private records use separate files; Celld deployments must likewise keep private records in private KV or a separate storage facet, not an application-queryable SQL namespace. The `celld` entry can reopen object-owned devices with `openCelldDevice`; SQL still uses the same explicit materializer capability and ordinary programs.
 
-This is an explicit consumer recovery procedure over existing retained state,
-not a cursor migration or a new host event store.
+## Reactive snapshots and drafts
 
-`createScopedApplicationTools(session, { queries, commands })` defaults to no
-permissions. Journal inspection, retry and wait verify the saved signed command
-against the allowed name; reapplication requires permission for both the original
-and replacement commands. Write/journal results use `operationReference()`'s
-application/history/author/operation/attempt/generation identity. A `generation`
-argument checks before and after execution; use `basedOn` for an atomic command
-revision guard. An error after a write begins does not imply that it was cancelled:
-inspect the same operation ID before retrying.
+```ts
+const view = await session.readView()
+try {
+  const rows = await view.query('SELECT id, text FROM notes ORDER BY id')
+  // Render this captured revision; release does not change the signed operation set.
+} finally { await view.release() }
 
-`createViewStore()` retains per-view drafts and operation intent in caller-owned
-storage. It validates retained records against their storage-key scope and refuses
-to overwrite corrupt or conflicting evidence. It is local bookkeeping, not an
-authorization source or a replacement for the session's signed journal.
+const live = createLiveView(session, async view => (await view.readEvents()).events)
+await live.ready()
+const stop = live.subscribe(snapshot => render(snapshot.value))
+```
 
-## Packaging
+`createLiveView` invalidates and rederives coherent snapshots after late state/schema/outcome changes. It exposes stale-query failures instead of fabricating rows. `defineProjection`/`createProjection` wrap the same reactive derivation. Keep drafts/focus independent of read snapshots, and close views/subscriptions when their owner ends.
+
+`createViewStore({ storage, applicationId, profileId, viewId })` keeps local drafts and authenticated full proposal references separately from materialized data. Retained references preserve original submission context and reject conflicting replacements. Draft storage is not application authorization or a second application database. Event cursors are scoped to one captured revision/filter; a changed revision requires a fresh read.
+
+## Optional finality and provisioning
+
+`none` is complete local-first operation without a finalizer. Signed-frontier and fixed-validator policies authenticate first inclusion, complete historical admission scopes and closed author-time frontiers; they never provide a comparator or assign operation positions.
+
+- `session.finality.closeAuthorTime({ throughMs })` issues an owned signed-frontier closure, or a one-validator fixed-policy closure.
+- `voteAuthorTime({ throughMs })` and `submitProofs(proofs)` support configured fixed-validator quorum evidence. Thresholds are never silently reduced.
+- The signer must have an explicit finalizer grant and match the configured policy. Historical evidence survives valid later revocation; an old head cannot bypass revocation for a later author-time range.
+- Missing bodies, keys or authority predecessors remain pending. A blocker at T limits closure to T−1. Work first included behind a sealed frontier is explicitly excluded without changing its signed timestamp.
+
+The owning native session and page facade expose:
+
+```ts
+const request = await recipient.provisioning.createProvisioningRequest()
+const encrypted = await source.provisioning.exportProvisioning(request)
+await recipient.provisioning.importProvisioning(encrypted)
+```
+
+A public signed request can precede enrollment. Export requires the enrolled recipient's reader grant; import verifies recipient/request/sender scope and signed epoch-key commitments. The recipient's agreement secret remains in its original private owner store. `mergeAuthority(bundle)` verifies and durably retains newer signed membership evidence without adding SQL permissions.
+
+## Content, signals, tools and exporter effects
+
+- `content.putBytes`, `readBytes(ref, { maxBytes })`, `stage`, `read`, `retain`, `retention`, `retained`, and `discard(ref)` use verified encrypted 64 KiB chunks. An explicit upload has `write`, `progress`, `commit`, and `discard`; native/Worker-owner content can `resumeUpload(id)`. Peer pulls resume cached chunks after interruption/restart. Local eviction does not erase authored references or other devices' copies.
+- `signals.send(topic, payload, options)` and `signals.subscribe(options)` share disposable signed updates over the independent live lane. `mode: 'latest'` coalesces; `includeLatest` requests still-fresh remembered values. Signal updates never change the application revision.
+- `createScopedApplicationTools(session, { commands, queries })` defaults to no named permissions. `operationId(raw, { caller })` and `execute` use the same caller-scoped identity, including an explicit trusted physical binding namespace when present. Inspect/retry/wait cannot adopt another caller's handle.
+- `forwardSessionEvents` rederives effective captured snapshots, emits stable-ID upserts/retractions and independent fact updates, and checkpoints a bounded pending delivery ledger before callbacks. Lost acknowledgements can redeliver the same identity. Delivery must be idempotent; neither finality nor this helper promises exactly-once external effects.
+
+## Attachment boundaries and lifetime
+
+Owner attachment capabilities independently name `commands`, `queries`, `events`, `content`, `signals`, `operations`, `diagnostics`, `finality`, and `provisioning`. Diagnostic access only reads public authority/endpoint metadata; it does not grant private finalizer or key-provisioning actions. Configured command/query allowlists and captured raw-SQL/event checks remain independent. `prepareCommand` receives the actual owner-bound endpoint context, not an unverified document label.
+
+The page facade exposes `endpoint`, `boundedRequest`, `detach`, `suspendAttachment`/`suspend`, and `resumeAttachment`. Requests, views, streams and upload handles are bounded; cancellation and physical port loss release owned work, including late acquisitions. Cleanup/detach remain available under a full ordinary request quota. Closing a facade detaches that client; owner shutdown is explicit.
+
+`connectPeer({ connection, peerIdentity? })` authenticates the peer and unions signed facts over bounded encrypted framing. RTC and WebSocket adapters retain separate reliable/live lanes. Signaling/host availability does not gate local Save. A synchronization acknowledgement is not a materialization or finality result.
+
+`session.diagnostics()` (also on the page facade through `diagnostics.peers`) only snapshots existing authenticated links. It returns `{ connectionId, peerId, kind: 'unknown', sentReliableBytes, receivedReliableBytes }`; counters describe reliable protocol framing, not live-lane or encryption/transport overhead. No host fetch or new connection is performed. `status.connectionRevision` is a local physical add/remove invalidation counter, never an application position.
+
+The owning Worker/native process must remain running for live participation or assistant event delivery. Page residency and MCP do not establish future wake of an existing conversation. Inspect and report actual process/resume state; do not present installation or a preview as a connected application.
+
+## Private checkpoints and release qualification
+
+Quiesce the owning session before `exportDeviceCheckpoint` or the streaming checkpoint APIs. Persist authenticated encrypted output before source retirement; restore only into a fresh private store, including consistent separately captured SQL bytes. Resume original identity/storage rather than merging SQL state or replacing a missing signer. A backup is not permission to run cloned signing identities concurrently.
+
+Release packaging and source tests are separate gates:
 
 ```sh
-node tools/package-peer-session.mjs
-node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
-node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-session-sql-browser
+pnpm lint && pnpm typecheck && pnpm test:fast
+pnpm test && pnpm build && pnpm docs:check
+node tools/package-peer-session.mjs --sql-native --sql-browser --sql-wasm --sql-celld
 ```
 
-See [Qualification](../../docs/release-hardening.md) and [Browser storage](../../docs/browser-storage.md) for verification details.
+The default suite reports optional actual-Celld bridge skips unless `CHRONOLOG_CELLD_BINARY` names the rebuilt engine. Browser/native RTC diagnostics run separately. Dirty-source diagnostics are not clean release attestations; deployment is a separate action.
 
-
-Use `--sql-celld` to include the signed SQL and workspace adapters for celld. The release workflow attests this archive for host builds.
-
-## Quiesced device handoff and disposable sessions
-
-A device move requires the old participant to stop first. Export rejects known
-active device/session use. `exportDeviceCheckpoint(store, { secret, persist })`
-requires the `persist({ bytes, metadata })` callback to durably retain the encrypted
-handoff before retiring the source. Persist into private staging and fsync it;
-publish the staged file/directory only after export succeeds. If publication
-fails afterward, retain staging for recovery. A failed persistence callback leaves
-the source usable. `retireSource:false` is an explicit backup, not a safe move or
-permission to run two copies of the same signing identity.
-
-`restoreDeviceCheckpoint(store, bytes, { secret })` requires enumeration and atomic
-`putAllIfEmpty`. It never merges with or overwrites existing identity. Memory,
-native SQLite and IndexedDB stores implement this primitive; other stores fail
-closed until they supply it. Stage a fresh private target, restore any returned
-SQL bytes beside it, reopen and verify its device identity, then publish the target
-directory as one unit. The byte-array compatibility APIs materialize the checkpoint;
-optional `limits: { maxBytes, maxEntries, maxValueBytes }` set caller budgets rather
-than imposing a smaller fixed quota than the source store. Outboxes remain bounded
-to 1024 records. The caller owns quiescence of external/direct store writers and
-consistency of separately captured SQL bytes.
-
-For large stores, use `exportDeviceCheckpointStream(store, { secret, sink })`.
-The sink receives bounded binary AES-GCM frames through `write(bytes)` and must
-resolve `commit(metadata)` only after the complete checkpoint is durable. Source
-retirement follows commit. Supply `retireSource: false` for a backup. Optional
-`sqlDatabase: { bytes, chunks }` streams quiesced SQL bytes without copying the
-whole database into the checkpoint encoder. Frame counters and an authenticated
-footer reject reordered, truncated, or trailing input.
-
-`restoreDeviceCheckpointStream(target, encryptedChunks, { secret, limits, sqlSink })`
-uses `putStreamIfEmpty` to stage entries and atomically publish them only after the
-whole input authenticates. The target must be fresh. Memory, native SQLite and
-IndexedDB implement this primitive; other stores fail closed. A SQL sink stages
-its bytes separately and commits only after authentication; publish its SQL output
-and the restored target together as one private device directory. Without a SQL
-sink, SQL bytes are returned in memory. Streaming has no fixed aggregate quota;
-memory use follows one store value and bounded transport pages/frames. Individual
-values and the destination store remain subject to their configured quotas.
-
-Native records use stable prebuilt `better-sqlite3` bindings in a dedicated worker.
-Await `NativeBytesStore.open(path, options)` for acquisition and `await store.close()`
-for durable release before reopening or deleting the file. `checkpointWal()` also
-returns a promise; `usageBytes()` reports the last completed worker operation.
-Existing `node:sqlite`-created stores reopen without conversion. No native C/C++
-compilation is required on platforms supplied by the binding's prebuilt packages.
-
-Peer hello and state exchanges use authority summaries and signed missing suffixes.
-Use `connectPeer({ ..., authorityExchange: 'bundle' })` when connecting to an older
-endpoint that only understands complete bundles. Registry state migrates existing
-bundles to an append log on the first successful selection. Signed records are
-written before the small head; failed head acknowledgments are resolved by retrying
-the exact transition ID.
-
-Replica startup reads and hashes original journal/record bytes in bounded batches.
-Small HMAC attestations, keyed from the local signing identity through HKDF, allow
-unchanged originals to reuse prior origin/receipt verification; they contain no
-plaintext command bodies. Invalid or stale attestations trigger full verification.
-Only a clean close writes optional attestations. They are acceleration data, never
-an alternative source of history. `createPeerReplica({ ..., verificationCache: false })`
-forces a full cryptographic audit. Retained encrypted bodies and decoded cores are
-shared by the replica's internal indexes.
-
-Disposable devices are explicitly ephemeral and non-resumable. Requested memory
-store quotas are enforced, and failed SQL-device construction removes its managed
-temporary directory. Closing an ergonomic client fences new submissions; cancelling
-submitted work reports known/uncertain outcomes without claiming it was rolled back.
-
-Node WASM SQL uses prebuilt `fs-native-extensions` OS locks on the database inode,
-plus the verified WASM engine. It creates no SQLite owner sidecar and needs no
-experimental Node SQLite API. Stop all older runtimes before removing obsolete
-`<db>.chronolog-owner.sqlite` files (and their WAL/SHM companions). The new VFS
-refuses a database with an old marker because older processes use a different
-ownership fence. The VFS
-implements per-connection SQLite locks within that owner. The SQLite cache budget
-is per connection, not a total process/WASM RSS guarantee; temporary SQL storage
-uses files. Unknown budget options fail closed. The loader and WASM binary must
-match the hashes in a trusted build manifest. SQL WASM package consumers are
-qualified independently on Linux, macOS and Windows in remote CI.
+See [release hardening](../../docs/release-hardening.md) and [browser storage](../../docs/browser-storage.md) for qualification boundaries.

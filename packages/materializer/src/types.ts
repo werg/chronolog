@@ -1,9 +1,11 @@
 import type { TransactionCore } from '@chronolog/protocol'
 
 /**
- * An original signed proposal selected by the verified history owner for replay.
- * The materializer executes the supplied order and never infers admission or
- * settlement from transport roles or a separate ordering implementation.
+ * An authenticated original proposal eligible for authored-time replay.
+ * Inputs must be strictly compareTransactionOrder-ordered; admission/finality
+ * evidence is verified by the owning replica, never inferred from transport.
+ * txId = candidateDigest = transactionDigest(canonicalCandidate), where
+ * canonicalCandidate is the raw canonical TransactionCore encoding.
  */
 export interface ReplayProposal {
   readonly txId: Uint8Array

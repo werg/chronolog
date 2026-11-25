@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { replayProposal, ROOT_KEY } from './test-fixtures.js'
 import { generateX25519KeyPair, sealSealedValue } from '../../crypto/src/index.js'
-import { CONSENSUS_DENIED_FUNCTIONS } from './sql-profile.js'
+import { REPLICATED_DENIED_FUNCTIONS } from './sql-profile.js'
 import { createBrowserSqlEngine, verifyWasmBuild, type ChronologWasmModule, type WasmBuildManifest } from './wasm-engine.js'
 
 const directory = resolve(process.env.CHRONOLOG_WASM_DIRECTORY ?? 'artifacts/wasm')
@@ -44,7 +44,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
 
   it('executes identical histories, rejects assertions, replays a late predecessor, and reopens exact state', async () => {
     const engine = createNativeSqlEngine()
-    const options = { engine, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
+    const options = { engine, rootPrincipal: ROOT_KEY, checkpointEvery: 1 }
     const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'replay.db') })
     let browser = await DeterministicMaterializer.open({ ...options, path: '/replay.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
@@ -85,7 +85,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
 
   it('enforces the same ownership, denied SQL, budgets, trigger lint, and extension behavior', async () => {
     const engine = createNativeSqlEngine({ limits: { maxVmSteps: 5_000 } })
-    const options = { engine, rootAdministrator: ROOT_KEY }
+    const options = { engine, rootPrincipal: ROOT_KEY }
     const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'enforcement.db') })
     const browser = await DeterministicMaterializer.open({ ...options, path: '/enforcement.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
@@ -143,7 +143,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
         try {
           return [...new Set(statement.all().map((row) => {
             const { name, narg } = row as { name: string; narg: number }
-            return CONSENSUS_DENIED_FUNCTIONS.has(name) || name.startsWith('dolt_') ? '' : `${name}:${narg}`
+            return REPLICATED_DENIED_FUNCTIONS.has(name) || name.startsWith('dolt_') ? '' : `${name}:${narg}`
           }))].filter(Boolean)
         } finally { statement.finalize?.() }
       }
@@ -200,7 +200,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
 
   it('enforces sealed writes and closes a deleted row policy identically across engines', async () => {
     const engine = createNativeSqlEngine()
-    const options = { engine, rootAdministrator: ROOT_KEY }
+    const options = { engine, rootPrincipal: ROOT_KEY }
     const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'sealed-lifecycle.db') })
     const browser = await DeterministicMaterializer.open({ ...options, path: '/sealed-lifecycle.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {
@@ -255,7 +255,7 @@ describe.skipIf(!built)('native/WASM deterministic engine qualification', () => 
 
   it('executes mixed SQL/events atomically and retains a read view across later accepted changes', async () => {
     const engine = createNativeSqlEngine()
-    const options = { engine, rootAdministrator: ROOT_KEY, checkpointEvery: 1 }
+    const options = { engine, rootPrincipal: ROOT_KEY, checkpointEvery: 1 }
     const native = await DeterministicMaterializer.open({ ...options, path: join(nativeDirectory, 'events.db') })
     const browser = await DeterministicMaterializer.open({ ...options, path: '/events.db', engine: { ...browserEngine, executionManifest: engine.executionManifest } })
     try {

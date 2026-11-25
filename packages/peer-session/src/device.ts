@@ -1,10 +1,10 @@
 import { useDeviceStore } from './checkpoint-lifecycle.js'
 import type { BytesStore } from '@chronolog/records'
-import { createPeerIdentity, type PeerIdentity } from '@chronolog/peer-generation/control'
+import { createSigningIdentity, type SigningIdentity } from '@chronolog/authority'
 import { assertCanonicalCbor, encodeCanonicalCbor, exportEd25519PrivateKey, hexToBytes, importEd25519PrivateKey, importEd25519PublicKey } from '@chronolog/protocol'
 
 export interface ApplicationDevice {
-  readonly identity: PeerIdentity
+  readonly identity: SigningIdentity
   readonly storageId: string
   /** Small identity and verified-control metadata, independent of application data. */
   readonly store: BytesStore
@@ -30,7 +30,7 @@ export async function openApplicationDevice(options: {
   readonly store: DeviceMetadataStore
   readonly create?: true
   /** A host-managed signer is resolved on every activation and never serialized. */
-  readonly managedSigner?: PeerIdentity
+  readonly managedSigner?: SigningIdentity
   readonly openStorage?: () => ApplicationStorage | Promise<ApplicationStorage>
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {
@@ -44,11 +44,11 @@ export async function openApplicationDevice(options: {
   // Its immutable binding confirms creation finished; check the signer again
   // before treating an earlier missing value as lost keys.
   if (raw === null && binding !== null) raw = await options.store.get(DEVICE_KEY)
-  let identity: PeerIdentity, storageId: string
+  let identity: SigningIdentity, storageId: string
   if (raw === null) {
     if (binding !== null) throw new Error('APPLICATION_DEVICE_KEYS_MISSING')
     if (options.create !== true) throw new Error('APPLICATION_DEVICE_NOT_FOUND')
-    const candidate = managedSigner ?? await createPeerIdentity()
+    const candidate = managedSigner ?? await createSigningIdentity()
     const candidateStorageId = crypto.randomUUID()
     const record = managedSigner
       ? [2n, candidate.publicKey, candidateStorageId]
@@ -132,7 +132,7 @@ export function claimApplicationDevice(device: ApplicationDevice): () => void {
 function validStorageId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 128
 }
-export async function verifyDeviceSigner(identity: PeerIdentity): Promise<void> {
+export async function verifyDeviceSigner(identity: SigningIdentity): Promise<void> {
   if (!/^[0-9a-f]{64}$/u.test(identity.publicKey)) throw new Error('APPLICATION_DEVICE_KEY_MISMATCH')
   const proof = new TextEncoder().encode('chronolog/device-resume/v1')
   const signature = await crypto.subtle.sign('Ed25519', identity.privateKey, proof)

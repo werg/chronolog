@@ -6,7 +6,6 @@ import {
   encodeTransactionCore,
   sqlStatement,
   transactionDigest,
-  utf8,
   type ExecutionLimits,
   type ExecutionManifest,
   type ProgramStep,
@@ -30,7 +29,7 @@ export class MaterializerFixture {
 
   async open(options: {
     readonly limits?: Partial<ExecutionLimits>
-    readonly rootAdministrator?: Uint8Array
+    readonly rootPrincipal?: Uint8Array
     readonly forkSeeding?: boolean
     readonly checkpointEvery?: number
     readonly path?: string
@@ -41,7 +40,7 @@ export class MaterializerFixture {
     const materializerOptions: MaterializerOptions = {
       path,
       engine,
-      rootAdministrator: options.rootAdministrator ?? ROOT_KEY,
+      rootPrincipal: options.rootPrincipal ?? ROOT_KEY,
       ...(options.forkSeeding === undefined ? {} : { forkSeeding: options.forkSeeding }),
       ...(options.checkpointEvery === undefined ? {} : { checkpointEvery: options.checkpointEvery }),
     }
@@ -78,7 +77,7 @@ export async function replayProposal(
   }
   const canonicalCandidate = encodeTransactionCore(core)
   return {
-    txId: utf8(id),
+    txId: await transactionDigest(canonicalCandidate),
     candidateDigest: await transactionDigest(canonicalCandidate),
     canonicalCandidate,
     core,

@@ -1,36 +1,27 @@
-import type { AuthorityBundle } from '@chronolog/peer-generation/control'
-import type { SignalLimits } from '@chronolog/signals'
+import type { BytesStore } from '@chronolog/records'
 import type { ChronologMaterializationRuntime } from '@chronolog/materializer'
-import { applicationDefinitionDigest, type ApplicationDefinition } from './definition.js'
+import type { AuthorityProvider, AuthorityBundle } from '@chronolog/authority'
+import { createAuthorityProvider } from '@chronolog/authority'
 import { claimApplicationDevice, type ApplicationDevice } from './device.js'
+import type { ApplicationDefinition } from './definition.js'
 import { ApplicationSession } from './session.js'
-import { retainApplicationAuthority } from './session-authority.js'
-
-export interface OpenPeerApplicationOptions<D extends ApplicationDefinition = ApplicationDefinition> {
+export interface CreateApplicationSessionOptions<D extends ApplicationDefinition = ApplicationDefinition> {
   readonly device: ApplicationDevice
   readonly definition: D
-  readonly authority: AuthorityBundle
-  /** Optional explicit bootstrap. Enrolled keys persist when the durable facet opens. */
+  readonly authority?: AuthorityProvider | AuthorityBundle
+  readonly applicationId?: string
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
-  /** Invoked only on durable demand. Import the SQL implementation inside this factory. */
-  readonly createMaterializer?: (options: { readonly signal: AbortSignal }) => ChronologMaterializationRuntime | Promise<ChronologMaterializationRuntime>
-  /** Explicit live reach. Application mode forwards signed frames with bounded replay protection. */
-  readonly signals?: { readonly delivery?: 'neighbors' | 'application'; readonly localEcho?: boolean; readonly limits?: SignalLimits }
-  readonly maxRecords?: number
+  readonly createMaterializer?: (options: { readonly signal: AbortSignal; readonly rootPrincipal: Uint8Array; readonly store: BytesStore }) => ChronologMaterializationRuntime | Promise<ChronologMaterializationRuntime>
+  readonly maxOperations?: number
   readonly maxHistoryBytes?: number
 }
-
-/** Start the protocol participant; database code and storage remain unopened. */
-export async function openPeerApplication<const D extends ApplicationDefinition>(options: OpenPeerApplicationOptions<D>): Promise<ApplicationSession<D>> {
+/** Opens cached authority/identity first, without host discovery or transport. */
+export async function createApplicationSession<const D extends ApplicationDefinition>(options: CreateApplicationSessionOptions<D>): Promise<ApplicationSession<D>> {
   const release = claimApplicationDevice(options.device)
   try {
-    const requiresSql = options.definition.schema !== undefined || options.authority.descriptor.payload.schemaDigest !== null
-    if (requiresSql && options.createMaterializer === undefined) throw new Error('APPLICATION_SCHEMA_REQUIRES_SQL')
-    const authority = await retainApplicationAuthority(options.device, options.authority)
-    if (await applicationDefinitionDigest(options.definition) !== authority.currentDefinitionDigest) throw new Error('APPLICATION_DEFINITION_MISMATCH')
-    if (authority.current === null) throw new Error('PEER_NO_SELECTED_GENERATION')
-    const captured = { ...options, ...(options.epochKeys === undefined ? {} : {
-      epochKeys: new Map([...options.epochKeys].map(([epoch, key]) => [epoch, key.slice()])) }) }
-    return new ApplicationSession(captured, authority, async () => { release(); await options.device.close() })
+    const authority = options.authority !== undefined && 'grant' in options.authority ? options.authority : await createAuthorityProvider({ store: options.device.store, ...(options.authority === undefined ? {} : { bundle: options.authority }), ...(options.applicationId === undefined ? {} : { applicationId: options.applicationId }), ...(options.epochKeys === undefined ? {} : { epochKeys: options.epochKeys }) })
+    if (options.epochKeys !== undefined) for (const [epoch, key] of options.epochKeys) await authority.installEpochKey(epoch, key)
+    const storage = await options.device.openStorage()
+    return await ApplicationSession.open({ ...options, authority, store: storage.store, async release() { release(); await options.device.close() } })
   } catch (error) { release(); await options.device.close(); throw error }
 }
