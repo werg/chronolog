@@ -16,15 +16,37 @@ self-contained declarations and source/byte provenance.
   key commitments. They do not overwrite SQL permissions or collective membership.
 - Publication authority is independent: a publisher can release the signed UI
   before the first data browser exists, without obtaining data keys.
-- Enrollment proofs bind the application, device key, challenge, epoch and key
-  commitment. Raw private signing and epoch keys do not belong in published assets.
+- Enrollment proofs bind the application, device signing key, key-wrap key and host
+  challenge. Raw private signing, wrap and epoch keys do not belong in published assets.
+
+## Admission
+
+The creator signs the descriptor (`authorityPublicKey === rootPrincipal`) and genesis
+membership. Every membership revision carries an `AdmissionPolicy`
+(`mode: 'attested' | 'strict'`, the pinned host attestation key, the authorized host
+account principals and the grant for owner devices), the `invites` recorded by
+administrators, and `admitted` evidence for members it adds. A host attestation
+(`signHostAttestation`) states that an authenticated account proved a device or agent
+key for one page; it is evidence, never membership. `verifyAuthorityBundle` accepts:
+
+- any change signed by the creator key or a prior administrator (`approved` admissions
+  still carry a valid attestation); and
+- from any other reader, only appended members carrying `attested` evidence (an
+  authorized account, attested mode, exactly the policy grant) or `invited` evidence
+  (a recorded unrevoked invite whose email binding, expiry, role grant and redemption
+  capacity hold), with policy, invites, epoch and existing members unchanged.
+
+Attestation freshness is checked deterministically: the revision's signed activation
+floor lies within the attestation window, and nonces are never reused in a chain. A
+host that is not a member cannot sign membership; at most it can attest a key that an
+online member then admits visibly and an administrator can revoke.
 
 `createAuthorityProvider` accepts a caller-owned byte store and opens cached
 verified authority and keys locally. The caller must authenticate the initial
 trust root through its configured service/account or explicit out-of-band policy;
 a self-consistent signature alone does not identify the intended application.
-Later bundles remain pinned to that root. Additional devices require explicit
-recipient-authenticated key provisioning.
+Later bundles remain pinned to that root. Additional devices receive keys only from
+an existing member, wrapped to the wrap key recorded in their signed membership grant.
 
 Application data is an authenticated operation-set CRDT, ordered only by signed
 author timestamp, author public key and stable proposal ID. Ordinary permissioned

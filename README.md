@@ -43,7 +43,7 @@ Native peers store data in SQLite under an exclusive writer lock; browser peers 
 
 | Package | Responsibility |
 | --- | --- |
-| `peer-session` | Public session lifecycle, authored operations, queries, content, keys, provisioning, participation, finality driving and tools |
+| `peer-session` | Public session lifecycle, authored operations, queries, content, keys, key wrapping, owner extensions, participation, finality driving and tools |
 | `authority` | Portable signed application metadata, membership windows, grants, publications and optional finality proofs |
 | `records` | Bounded byte stores (native SQLite, browser OPFS/IndexedDB), framing, and flow-controlled channels |
 | `materializer` | Execution contract and SQL-free event materializer |

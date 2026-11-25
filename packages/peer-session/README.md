@@ -55,9 +55,9 @@ export const notes = defineApplication({
 
 Definition versions describe an API; they are not admission locks or database schema hashes. A named `session.query(name, input)` returns `{ applicationId, revision, value }`. A captured `view.query(sql, parameters)` returns rows directly, with its revision on the view.
 
-## Explicit enrollment, then local reopening
+## Creation, admission, then local reopening
 
-First setup creates a device only when explicitly requested. The owner signs in and completes enrollment/key provisioning. For a fresh browser-first application, `rootPrincipal` is the actual first owning browser key, not an invented native identity. Signing identities, epoch keys and private setup state stay in the owning Worker or native profile, never in published assets.
+First setup creates a device only when explicitly requested. Whoever creates the application (a browser or a native agent) signs its descriptor and genesis membership with its own key (`rootPrincipal === authorityPublicKey`) and generates the first epoch key locally. Every later device or agent is admitted into signed membership by an existing member, which then wraps the keys to the newcomer's signed wrap key. Signing identities, epoch keys and private setup state stay in the owning Worker or native profile, never in published assets.
 
 ```ts
 import { createApplicationSession } from '@chronolog/peer-session'
@@ -66,7 +66,7 @@ import { openNativeDevice } from '@chronolog/peer-session/native'
 // Explicit first device creation; omit create when reopening an existing profile.
 const device = await openNativeDevice({ path: './private/device.sqlite', create: true })
 
-// verifiedAuthority and initialEpochKeys come from trusted enrollment/provisioning.
+// verifiedAuthority and initialEpochKeys come from local creation or a verified key wrap.
 const session = await createApplicationSession({
   device,
   definition: notes,
@@ -163,7 +163,7 @@ const stop = live.subscribe(snapshot => render(snapshot.value))
 
 `createViewStore({ storage, applicationId, profileId, viewId })` keeps local drafts and authenticated full proposal references separately from materialized data. Retained references preserve original submission context and reject conflicting replacements. Draft storage is not application authorization or a second application database. Event cursors are scoped to one captured revision/filter; a changed revision requires a fresh read.
 
-## Optional finality and provisioning
+## Optional finality and key wrapping
 
 `none` is complete local-first operation without a finalizer. Signed-frontier and fixed-validator policies authenticate first inclusion, complete historical admission scopes and closed author-time frontiers; they never provide a comparator or assign operation positions.
 
@@ -172,15 +172,18 @@ const stop = live.subscribe(snapshot => render(snapshot.value))
 - The signer must have an explicit finalizer grant and match the configured policy. Historical evidence survives valid later revocation; an old head cannot bypass revocation for a later author-time range.
 - Missing bodies, keys or authority predecessors remain pending. A blocker at T limits closure to T−1. Work first included behind a sealed frontier is explicitly excluded without changing its signed timestamp.
 
-The owning native session and page facade expose:
+Admission and key wrapping run inside the owning session (never in the page facade):
 
 ```ts
-const request = await recipient.provisioning.createProvisioningRequest()
-const encrypted = await source.provisioning.exportProvisioning(request)
-await recipient.provisioning.importProvisioning(encrypted)
+import { createWrapKeyPair, importWrapPrivateKey } from '@chronolog/peer-session'
+
+const wrap = await createWrapKeyPair() // retain wrap.privateKey beside the device signer
+// An existing reader seals every epoch key to the recipient's signed MemberGrant.wrapKey.
+const sealed = await source.provisioning.wrapKeys(recipientPublicKey)
+await recipient.provisioning.unwrapKeys(sealed, await importWrapPrivateKey(wrap.privateKey))
 ```
 
-A public signed request can precede enrollment. Export requires the enrolled recipient's reader grant; import verifies recipient/request/sender scope and signed epoch-key commitments. The recipient's agreement secret remains in its original private owner store. `mergeAuthority(bundle)` verifies and durably retains newer signed membership evidence without adding SQL permissions.
+`wrapKeys` requires both sender and recipient to be readers and seals to the wrap key named in signed membership, never one supplied by the carrier. `unwrapKeys` verifies the sender, the carried authority chain and each signed epoch-key commitment before installing keys. Epoch rotation is an administrator membership revision with a new epoch and commitment, wrapped only to the remaining members. Membership admission rules (host attestations, `attested`/`strict` policy and invites) live in `@chronolog/authority`. `mergeAuthority(bundle)` verifies and durably retains newer signed membership evidence without adding SQL permissions.
 
 ## Content, signals, tools and exporter effects
 
@@ -194,8 +197,8 @@ A public signed request can precede enrollment. Export requires the enrolled rec
 One agent program can hold one owned device file per application while sharing one retained
 `SigningIdentity`. Supply that identity as `managedSigner`; each device file records only its
 public key and storage binding, and every resume must supply the same private signer. Shared
-identity does not grant application access: authenticate/enroll that key and provision the
-explicit reader/writer permissions and epoch keys separately for each application. Publication,
+identity does not grant application access: each application admits that key into its own signed
+membership and wraps its epoch keys to the agent's wrap key separately. Publication,
 finalizer eligibility and SQL privileges remain independent grants.
 
 ```ts
@@ -207,7 +210,7 @@ const device = await openNativeDevice({
   path: `./private/apps/${applicationId}.sqlite`, create: true, managedSigner: agentSigner,
 })
 const session = await createApplicationSession({ device, definition, authority: verifiedAuthority })
-// Complete this application's explicit key provisioning before authoring encrypted work.
+// Author encrypted work once this application's members have wrapped its keys to the agent.
 
 const changes = mergeSessionChanges([session]) // also accepts an async session registry
 changes.add(otherSession)
@@ -252,7 +255,7 @@ being implied by the record-store pool.
 
 ## Attachment boundaries and lifetime
 
-Owner attachment capabilities independently name `commands`, `queries`, `events`, `content`, `signals`, `operations`, `diagnostics`, `finality`, `provisioning`, and `replication`. Diagnostic access only reads public authority/endpoint metadata; it does not grant private finalizer or key-provisioning actions. `replication` exposes `exportFacts()`/`mergeFacts()` so an attached page can relay the owner's signed, encrypted operation-set facts through an out-of-band replica; merged envelopes are verified against current authority and ordered only by signed author time. Configured command/query allowlists and captured raw-SQL/event checks remain independent. `prepareCommand` receives the actual owner-bound endpoint context, not an unverified document label.
+Owner attachment capabilities independently name `commands`, `queries`, `events`, `content`, `signals`, `operations`, `diagnostics`, `finality`, `extensions`, and `replication`. Diagnostic access only reads public authority/endpoint metadata; it does not grant private finalizer or extension actions. `extensions` reaches the owner-composed named actions and notices passed as `createApplicationOwner(session, { extensions: { call, subscribe } })`, exposed on the facade as `session.extensions.call(name, args)` and `session.extensions.subscribe(listener)`; they run inside the owner beside its keys. `replication` exposes `exportFacts()`/`mergeFacts()` so an attached page can relay the owner's signed, encrypted operation-set facts through an out-of-band replica; merged envelopes are verified against current authority and ordered only by signed author time. Configured command/query allowlists and captured raw-SQL/event checks remain independent. `prepareCommand` receives the actual owner-bound endpoint context, not an unverified document label.
 
 The owner reserves each live attachment's local `viewId`. A cloned tab requesting an already-held ID receives a fresh owner-issued ID; hidden/suspended attachments retain their reservations. Detach or physical close releases the claim so the original page can request its retained ID again. This fences local draft namespaces, not application authorization or operation identity.
 

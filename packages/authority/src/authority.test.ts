@@ -9,10 +9,10 @@ it('publishes and verifies signed assets under an independent publisher grant be
   await expect(verifyPublicationManifest(publication, { ...authority, publisherKeys: [] })).rejects.toThrow('PUBLICATION_PUBLISHER_REQUIRED')
   await expect(authorizePublication(publication, { ...authority, grantId: '04'.repeat(32) }, null)).rejects.toThrow('PUBLICATION_PUBLISHER_REQUIRED')
 })
-it('binds enrollment to the actual key and authenticated epoch commitment without disclosing that key', async () => {
-  const identity = await createSigningIdentity(), request = await signEnrollmentRequest({ applicationId: '05'.repeat(32), publicKey: identity.publicKey, challenge: 'owner-approved-proof', epoch: 0, epochKeyDigest: '06'.repeat(32) }, identity)
+it('binds enrollment to the actual signing key, its key-wrap key and the host challenge', async () => {
+  const identity = await createSigningIdentity(), request = await signEnrollmentRequest({ applicationId: '05'.repeat(32), publicKey: identity.publicKey, wrapKey: '06'.repeat(32), challenge: 'host-challenge' }, identity)
   await verifyEnrollmentRequest(request)
-  const changed = { ...request, payload: { ...request.payload, epochKeyDigest: '07'.repeat(32) } }
+  const changed = { ...request, payload: { ...request.payload, wrapKey: '07'.repeat(32) } }
   await expect(verifyEnrollmentRequest(changed)).rejects.toThrow('AUTHORITY_SIGNATURE_INVALID')
   const other = await createSigningIdentity(); await expect(signEnrollmentRequest(request.payload, other)).rejects.toThrow('ENROLLMENT_REQUEST_INVALID')
 })

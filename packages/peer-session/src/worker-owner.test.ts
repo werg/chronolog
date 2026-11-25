@@ -76,23 +76,26 @@ it('cancelling a warming captured read frees ordinary request quota so durable S
   const operation = await f.client.command('say', 'Save remains local', { operationId: 'not-engine-gated' }); expect(operation.stored).toBe(true); expect((await operation.materialized()).outcome).toBe('accepted')
   release(); f.session.readView = original; await new Promise<void>(resolve => setImmediate(resolve))
 })
-it('diagnostic-only attachments cannot exercise owner finalizer or key-provisioning authority', async () => {
-  const f = await fixture({ capabilities: ['diagnostics'] }), request = await f.session.provisioning.createProvisioningRequest(), packageValue = await f.session.provisioning.exportProvisioning(request)
+it('diagnostic-only attachments cannot exercise owner finalizer or extension authority', async () => {
+  const f = await fixture({ capabilities: ['diagnostics'] })
   expect(f.client.status.canAuthor).toBe(false); expect(await f.client.diagnostics()).toEqual([]); expect(await f.client.readAuthority()).toEqual(f.session.authority.bundle()); expect((await f.client.endpoints()).length).toBe(1)
   await expect(f.client.finality.closeAuthorTime({ throughMs: 1n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   await expect(f.client.finality.voteAuthorTime({ throughMs: 1n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   await expect(f.client.finality.submitProofs([])).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  await expect(f.client.provisioning.createProvisioningRequest()).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  await expect(f.client.provisioning.exportProvisioning(request)).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  await expect(f.client.provisioning.importProvisioning(packageValue)).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  await expect(f.client.extensions.call('admission.state')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
 })
-it('explicit finality and provisioning capabilities are independent and still require actual member/policy authority', async () => {
-  const { createSigningIdentity } = await import('@chronolog/authority'), identity = await createSigningIdentity(), f = await sessionFixture({ identities: [identity], finalityPolicy: { kind: 'signed-frontier', signer: identity.publicKey, scopes: [{ id: 'cd'.repeat(32), authorTimeAfterMs: -1n }] } }), session = await f.open(0), owner = createApplicationOwner(session); closes.push(() => owner.close())
+it('owner extensions are capability-scoped named actions with owner notices, independent of finality', async () => {
+  const { createSigningIdentity } = await import('@chronolog/authority'), identity = await createSigningIdentity(), f = await sessionFixture({ identities: [identity], finalityPolicy: { kind: 'signed-frontier', signer: identity.publicKey, scopes: [{ id: 'cd'.repeat(32), authorTimeAfterMs: -1n }] } }), session = await f.open(0)
+  const listeners = new Set<(value: unknown) => void>(), calls: unknown[] = []
+  const owner = createApplicationOwner(session, { extensions: { async call(name, args, context) { calls.push([name, args, context.endpoint.capabilities]); if (name === 'fail') throw new Error('EXTENSION_FAILED'); for (const listener of listeners) listener({ name }); return { ok: name } }, subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) } } }); closes.push(() => owner.close())
   const attach = async (capabilities: NonNullable<ApplicationAttachmentPolicy['capabilities']>) => { const channel = new MessageChannel(); owner.attach(channel.port1 as unknown as ApplicationWorkerEndpoint, { capabilities }); const client = await connectApplicationOwner(channel.port2 as unknown as ApplicationWorkerEndpoint, { applicationId: f.applicationId }); closes.push(() => client.detach()); return client }
-  const finalizer = await attach(['finality']), keys = await attach(['provisioning']), operation = await session.command('say', 'eligible finalizer', { authorTimestampMs: 1n }); await operation.materialized()
+  const finalizer = await attach(['finality']), extended = await attach(['extensions']), operation = await session.command('say', 'eligible finalizer', { authorTimestampMs: 1n }); await operation.materialized()
   expect((await finalizer.finality.closeAuthorTime({ throughMs: 2n })).closedThroughMs).toBe(2n); expect(operation.inspect().finalized).toBe(true)
-  await expect(finalizer.diagnostics()).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN'); await expect(finalizer.provisioning.createProvisioningRequest()).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN'); await expect(keys.finality.voteAuthorTime({ throughMs: 3n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  const request = await keys.provisioning.createProvisioningRequest(), packageValue = await keys.provisioning.exportProvisioning(request); await keys.provisioning.importProvisioning(packageValue)
+  await expect(finalizer.extensions.call('admission.state')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN'); await expect(extended.finality.voteAuthorTime({ throughMs: 3n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  const notices: unknown[] = [], heard = new Promise<void>(resolve => { extended.extensions.subscribe(value => { notices.push(value); resolve() }) }), muted: unknown[] = []; finalizer.extensions.subscribe(value => muted.push(value))
+  expect(await extended.extensions.call('admission.state', [1])).toEqual({ ok: 'admission.state' }); await heard
+  expect(notices).toEqual([{ name: 'admission.state' }]); expect(muted).toEqual([]); expect(calls).toEqual([['admission.state', [1], ['extensions']]])
+  await expect(extended.extensions.call('fail')).rejects.toThrow('EXTENSION_FAILED'); await expect(extended.extensions.call('bad name!')).rejects.toThrow('ENDPOINT_REQUEST_INVALID')
 })
 it('cancels an actual deferred named-query callback and promptly frees its ordinary RPC slot', async () => {
   const { defineApplication, defineQuery } = await import('./definition.js'), { createApplicationSession } = await import('./runtime.js'), { openApplicationDevice } = await import('./device.js')

@@ -7,7 +7,7 @@ All qualification targets the single owned-session composition: `@chronolog/peer
 | Command | Coverage |
 | --- | --- |
 | `pnpm lint && pnpm typecheck` | ESLint (zero warnings) and strict TypeScript across all packages |
-| `pnpm test` | Protocol and canonical transaction order, crypto, authority and finality proofs, author-time operation-set convergence, DDL replay, provisioning, signals, WebRTC/WebSocket transports, and sessions |
+| `pnpm test` | Protocol and canonical transaction order, crypto, authority and finality proofs, author-time operation-set convergence, DDL replay, admission and key wrapping, signals, WebRTC/WebSocket transports, and sessions |
 | `pnpm test:publication-crash` | Real process kill at publication boundaries with reopen verification |
 | `pnpm test:fuzz` | Canonical CBOR and SQL input fuzzing |
 | `pnpm test:soak` | Repeated materialization, late earlier-author-time insertion, and reopen stress characterization |
