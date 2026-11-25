@@ -57,6 +57,26 @@ A successful `send()` confirms only the configured local/route dispatch.
 it never establishes remote receipt or processing. Work that must survive an
 absent receiver belongs in durable application commands/events.
 
+## Worker presence
+
+A presence signal is an expiring statement by its authenticated signer, not proof
+that a particular request was read or answered. A native session owner, transport
+forwarder and assistant worker may share that signer while having different
+lifetimes. Advertise only the consumer/run and request topics that the actual
+worker can handle. Stop publishing when that worker exits, even if the owning
+session and other workers remain connected.
+
+Filter availability by verified `authorId` plus the intended consumer and handled
+topic; never let a payload's `author` replace authenticated origin. Bind timers,
+subscriptions and sends to the worker's cancellation scope. Send a stopped state
+on graceful shutdown when possible, and expire stale observations after a crash.
+Use receipt and answer commands for durable handling evidence; periodic durable
+heartbeats are unnecessary for an idle presence indicator. Neither a delivered
+signal nor an open peer route wakes an ended model conversation.
+
+When several local workers share the same signal topic, use stream context to
+keep their latest values independent before consumer-side filtering.
+
 ## Stream context (`v2`)
 
 When multiple local endpoints or runs share one signing identity, attach `stream: { streamId, endpointId, endpointIncarnation, target }` to `send()` and filter with `streams: [...]` in `subscribe()`. Coalescing and filtering apply per stream before queuing.
