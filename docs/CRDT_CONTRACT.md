@@ -1,6 +1,6 @@
 # Authored operation-set contract
 
-This branch replaces the selected-generation protocol. There is one new format and no migration, compatibility reader, legacy export or alternate ordering path.
+This contract replaces the removed selected-generation protocol. There is one format and no migration, compatibility reader, legacy export or alternate ordering path.
 
 ## Immutable facts and canonical application order
 
@@ -31,7 +31,7 @@ A blocker at time T limits safe closure to T−1. Preserve complete policy scope
 
 DDL, DML, ownership and permission changes use the same signed program, author-time replay, authorization and atomic rollback. No immutable application-schema digest, native-only schema path, global ordering pause or code publication is required. Keep engine/platform execution manifests and protected internal catalogs. Do not restore the old typed IR.
 
-Remove peer-execution `protectedChanges` blanket fences and external latest-control membership overlays. Enrollment/crypto/publication authority must not overwrite application permission state. Application membership/grant changes replay as authenticated authored transactions/facts.
+There are no peer-execution `protectedChanges` blanket fences or external latest-control membership overlays. Enrollment/crypto/publication authority must not overwrite application permission state. Application membership/grant changes replay as authenticated authored transactions/facts.
 
 Namespace/object DDL authorization is represented identically in the TypeScript/WASM and Celld native statement paths as the internal snapshot:
 
@@ -59,4 +59,4 @@ Render domain UI from coherent materialized snapshots plus separate local view/d
 
 Reuse canonical CBOR, signing/encryption, byte-store atomicity, device-local ownership, bounded RTC/relay transports, deterministic SQL/event execution, suffix replay, checkpoints and pinned read leases. No SQL-state merge is used. With finality disabled, keep replayable history; safe pruning requires a verified finalized prefix/checkpoint.
 
-Delete `peer-generation-v1`, `eligible-members-v1`, generation-order authority and their active tests/docs/exports. Do not delete local physical-store fencing or transport anti-replay counters. Preserve signed code publication and explicit account/device/publisher permissions separately from application operation ordering.
+`peer-generation-v1`, `eligible-members-v1` and generation-order authority are not supported profiles or APIs. Negative tests may name removed formats solely to reject them. Local physical-store fencing and transport anti-replay counters remain; they are device-local protections, not application order. Preserve signed code publication and explicit account/device/publisher permissions separately from application operation ordering.
