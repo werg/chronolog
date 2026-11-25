@@ -375,8 +375,11 @@ sink, SQL bytes are returned in memory. Streaming has no fixed aggregate quota;
 memory use follows one store value and bounded transport pages/frames. Individual
 values and the destination store remain subject to their configured quotas.
 
-Native records use stable prebuilt `better-sqlite3` bindings in a dedicated worker.
-Await `NativeBytesStore.open(path, options)` for acquisition and `await store.close()`
+Native records use stable prebuilt `better-sqlite3` bindings in one process-wide
+pool worker. Every `NativeBytesStore` remains its own SQLite file with its own
+exclusive lock; the worker multiplexes their handles, starts with the first open
+store and exits after the last one closes. `NativeBytesStore.poolStatus()` reports
+the serving `threadId` and open store count. Await `NativeBytesStore.open(path, options)` for acquisition and `await store.close()`
 for durable release before reopening or deleting the file. `checkpointWal()` also
 returns a promise; `usageBytes()` reports the last completed worker operation.
 Existing `node:sqlite`-created stores reopen without conversion. No native C/C++

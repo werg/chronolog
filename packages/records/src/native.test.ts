@@ -95,3 +95,37 @@ it('deletes durable local bytes, reclaims quota, and preserves absent keys on re
     expect(store.usageBytes()).toBe(4)
   } finally { await store.close(); await rm(directory, { recursive: true, force: true }) }
 })
+
+it('serves many separate SQLite files from one pool worker that exits after the last close', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chronolog-pool-'))
+  const stores: NativeBytesStore[] = []
+  try {
+    expect(NativeBytesStore.poolStatus()).toEqual({ threadId: null, stores: 0 })
+    for (let index = 0; index < 16; index++) stores.push(await NativeBytesStore.open(join(directory, `store-${index}.sqlite`), { quotaBytes: 64 }))
+    const { threadId } = NativeBytesStore.poolStatus()
+    expect(threadId).not.toBeNull()
+    expect(NativeBytesStore.poolStatus()).toEqual({ threadId, stores: 16 })
+    await Promise.all(stores.map((store, index) => store.put('value', Uint8Array.of(index))))
+    expect(await Promise.all(stores.map(store => store.get('value')))).toEqual(stores.map((_, index) => Uint8Array.of(index)))
+    await expect(stores[3]!.put('large', new Uint8Array(64))).rejects.toThrow('BYTES_STORE_QUOTA_EXCEEDED')
+    expect(stores.map(store => store.usageBytes())).toEqual(stores.map(() => 1))
+    await expect(NativeBytesStore.open(join(directory, 'store-0.sqlite'))).rejects.toThrow('BYTES_STORE_IN_USE')
+    expect(NativeBytesStore.poolStatus().stores).toBe(16)
+    await stores.shift()!.close()
+    await expect(NativeBytesStore.open(join(directory, 'missing', 'x.sqlite'), { quotaBytes: 1 }).then(store => store.close())).resolves.toBeUndefined()
+    const reopened = await NativeBytesStore.open(join(directory, 'store-0.sqlite'))
+    expect(await reopened.get('value')).toEqual(Uint8Array.of(0))
+    expect(NativeBytesStore.poolStatus()).toEqual({ threadId, stores: 16 })
+    stores.push(reopened)
+    await Promise.all(stores.splice(0).map(store => store.close()))
+    expect(NativeBytesStore.poolStatus()).toEqual({ threadId: null, stores: 0 })
+    const fresh = await NativeBytesStore.open(join(directory, 'store-1.sqlite'))
+    try {
+      expect(NativeBytesStore.poolStatus().threadId).not.toBe(threadId)
+      expect(await fresh.get('value')).toEqual(Uint8Array.of(1))
+    } finally { await fresh.close() }
+  } finally {
+    await Promise.all(stores.map(store => store.close()))
+    await rm(directory, { recursive: true, force: true })
+  }
+})
