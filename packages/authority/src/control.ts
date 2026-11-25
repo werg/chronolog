@@ -216,7 +216,9 @@ export async function verifyAuthorityBundle(input: AuthorityBundle, pinned?: Sig
         check(inviteRedemptions(bundle.memberships.slice(0, revision + 1), invite.inviteId) <= inviteCapacity(invite), 'AUTHORITY_INVITE_EXHAUSTED')
         return inviteGrant(invite.role)
       }
-      check(prior.members.some(member => member.publicKey === signed.signer && member.reader) && prior.admission.mode === 'attested' && value.admitted.length > 0 && value.admitted.every(item => item.via !== 'approved') &&
+      // A removed key never re-enters automatically: re-admission is an administrator decision.
+      const everMember = new Set(bundle.memberships.slice(0, revision).flatMap(item => item.payload.members.map(member => member.publicKey)))
+      check(prior.members.some(member => member.publicKey === signed.signer && member.reader) && prior.admission.mode === 'attested' && value.admitted.length > 0 && value.admitted.every(item => item.via !== 'approved' && !everMember.has(item.publicKey)) &&
         value.epoch === prior.epoch && equalRecord(value.admission, prior.admission) && equalRecord(value.invites, prior.invites) && value.members.length === prior.members.length + value.admitted.length &&
         prior.members.every((member, index) => sameGrant(member, value.members[index]!)) &&
         value.admitted.every((item, index) => sameGrant(value.members[prior.members.length + index]!, { publicKey: item.publicKey, wrapKey: item.attestation.payload.wrapKey, ...grantFor(item), publisher: false, finalizer: false })), 'AUTHORITY_ADMIN_REQUIRED')

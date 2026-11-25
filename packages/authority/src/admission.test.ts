@@ -60,6 +60,10 @@ it('replayed attestations and re-admission of a member are rejected deterministi
   await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: removed })
   const replay = await c.extend(removed, head => ({ members: [...head.members, c.grant(device.publicKey, hex('e6'), false)], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }] }), c.agent)
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: replay })).rejects.toThrow('AUTHORITY_ADMISSION_REPLAYED')
+  // A fresh attestation still cannot automatically readmit a removed key; an administrator can.
+  const fresh = await c.attest(device), readmit = (signer: SigningIdentity, via: 'attested' | 'approved') => c.extend(removed, head => ({ members: [...head.members, c.grant(device.publicKey, hex('e6'), false)], admitted: [{ publicKey: device.publicKey, via, attestation: fresh }] }), signer)
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await readmit(c.agent, 'attested') })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
+  await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await readmit(c.creator, 'approved') })
   const duplicate = await c.extend(admitted, head => ({ members: [...head.members], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }] }), c.creator)
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: duplicate })).rejects.toThrow('AUTHORITY_ADMISSION_INVALID')
 })

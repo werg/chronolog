@@ -34,7 +34,9 @@ key for one page; it is evidence, never membership. `verifyAuthorityBundle` acce
 - from any other reader, only appended members carrying `attested` evidence (an
   authorized account, attested mode, exactly the policy grant) or `invited` evidence
   (a recorded unrevoked invite whose email binding, expiry, role grant and redemption
-  capacity hold), with policy, invites, epoch and existing members unchanged.
+  capacity hold), with policy, invites, epoch and existing members unchanged. A key
+  that was ever a member is never re-admitted this way; re-admission after removal is
+  an administrator decision.
 
 Attestation freshness is checked deterministically: the revision's signed activation
 floor lies within the attestation window, and nonces are never reused in a chain. A
