@@ -108,3 +108,20 @@ it('cancels an actual deferred named-query callback and promptly frees its ordin
   const abort = new AbortController(), held = client.request('query', ['hold', null], { signal: abort.signal }); await started; abort.abort(new Error('stop actual callback')); await expect(held).rejects.toThrow('stop actual callback')
   try { expect((await client.query('ready', null)).value).toBe('ready') } finally { release() }
 })
+it('fences copied active view namespaces across real attachments while retaining suspended claims and releasing detach', async () => {
+  const f = await fixture({ context: { viewId: 'copied-view', documentPath: 'owner-document' }, contextEvidence: 'owner-validated' })
+  const attach = async () => {
+    const channel = new MessageChannel(); f.owner.attach(channel.port1 as unknown as ApplicationWorkerEndpoint)
+    const client = await connectApplicationOwner(channel.port2 as unknown as ApplicationWorkerEndpoint, { applicationId: f.applicationId, context: { viewId: 'copied-view', documentPath: 'caller-document' } }); closes.push(() => client.detach()); return client
+  }
+  expect(f.client.endpoint?.context.viewId).toBe('copied-view')
+  const copied = await attach(); expect(copied.endpoint?.context.viewId).toBeTruthy(); expect(copied.endpoint?.context.viewId).not.toBe('copied-view')
+  expect(copied.endpoint?.context.documentPath).toBe('caller-document'); expect(copied.endpoint?.contextEvidence).toBe('caller-asserted')
+  await f.client.suspendAttachment(); const whileHidden = await attach(); expect(whileHidden.endpoint?.context.viewId).not.toBe('copied-view')
+  expect(new Set(f.owner.endpoints().map(endpoint => endpoint.context.viewId)).size).toBe(3)
+  expect(f.owner.endpoints().find(endpoint => endpoint.endpointId === f.client.endpoint?.endpointId)?.state).toBe('suspended')
+  await f.client.resumeAttachment(); expect(f.client.endpoint?.context.viewId).toBe('copied-view')
+  await f.client.detach(); const resumedPage = await attach(); expect(resumedPage.endpoint?.context.viewId).toBe('copied-view')
+  const detachedEndpoint = f.owner.endpoints().find(endpoint => endpoint.endpointId === copied.endpoint?.endpointId)!; expect(detachedEndpoint.context.viewId).toBe(copied.endpoint?.context.viewId)
+  await copied.detach(); expect(f.owner.endpoints().some(endpoint => endpoint.endpointId === detachedEndpoint.endpointId)).toBe(false)
+})

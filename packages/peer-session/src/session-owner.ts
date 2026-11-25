@@ -25,11 +25,16 @@ function requestBudget(value: unknown): void {
     check(bytes <= 4 * 1024 * 1024, 'ENDPOINT_REQUEST_SIZE_LIMIT')
   }; walk(value, 0)
 }
+function checkedContext(value: ApplicationEndpointContext): ApplicationEndpointContext {
+  check(value !== null && typeof value === 'object' && !Array.isArray(value) && Object.entries(value).every(([key, item]) => ['viewId', 'documentPath', 'publicationId', 'runId'].includes(key) && typeof item === 'string' && item.length > 0 && item.length <= (key === 'documentPath' ? 1024 : 128) && ![...item].some(character => character.charCodeAt(0) < 32)), 'APPLICATION_ENDPOINT_CONTEXT_INVALID')
+  return structuredClone(value)
+}
 function limit(value: number | undefined, fallback: number, maximum: number): number { const result = value ?? fallback; check(Number.isSafeInteger(result) && result > 0 && result <= maximum, 'OWNER_CONFIGURATION_INVALID'); return result }
 /** One fenced signer/storage owner, with independent bounded and cancellable client attachments. */
 export function createApplicationOwner(session: ApplicationSession, options: ApplicationOwnerOptions = {}): ApplicationSessionOwner {
   const ownerInstanceId = crypto.randomUUID(), maxAttachments = limit(options.maxAttachments, 16, 64)
   const attachments = new Map<string, { binding(): ApplicationEndpointBinding; state(): 'active' | 'suspended'; close(): void }>()
+  const heldViewIds = new Map<string, string>()
   let closed = false, closing: Promise<void> | undefined
   const owner: ApplicationSessionOwner = {
     ownerInstanceId, session,
@@ -40,6 +45,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
       const endpointId = crypto.randomUUID(), endpointIncarnation = crypto.randomUUID(), lifetime = new AbortController()
       const views = new Map<string, ApplicationReadView>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
       let effective = policy, attachment = '', initialized = false, detached = false, suspended = false, highestRequest = 0, viewReservations = 0, uploadReservations = 0, lastReceived = performance.now(), context: ApplicationEndpointContext = policy.context ?? {}
+      let claimedViewId: string | undefined
       let stopStatus: (() => void) | undefined, stopChange: (() => void) | undefined
       const physical = endpoint as unknown as { addEventListener(type: string, listener: EventListener): void; removeEventListener(type: string, listener: EventListener): void; on?(type: string, listener: () => void): void; off?(type: string, listener: () => void): void }
       const binding = (): ApplicationEndpointBinding => ({ ownerInstanceId, endpointId, endpointIncarnation, context: structuredClone(context), evidence: 'owner-bound', contextEvidence: effective.contextEvidence ?? 'caller-asserted', capabilities: [...(effective.capabilities ?? APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES)], ...(effective.identity === undefined ? {} : { identity: structuredClone(effective.identity) }) })
@@ -57,6 +63,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         detached = true; clearInterval(expiry); lifetime.abort(new Error('ENDPOINT_CLOSED'))
         for (const request of pending.values()) request.lifetime.abort(new Error('ENDPOINT_CLOSED')); pending.clear()
         endpoint.removeEventListener('message', receive); physical.removeEventListener('close', physicalClose); physical.removeEventListener('messageerror', physicalClose); physical.off?.('close', close); physical.off?.('messageerror', close)
+        if (claimedViewId !== undefined && heldViewIds.get(claimedViewId) === endpointId) heldViewIds.delete(claimedViewId)
         stopStatus?.(); stopChange?.(); releaseResources(); uploads.clear(); completedUploads.clear(); attachments.delete(endpointId); endpoint.close?.()
         if (!closed && attachments.size === 0 && options.lastClient === 'shutdown') void owner.close()
       }
@@ -70,7 +77,11 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           check(handshake.applicationId === session.applicationId, 'ENDPOINT_APPLICATION_MISMATCH')
           effective = { ...policy, ...options.authorize?.(handshake) }; limit(effective.maxRequests, 32, 64); limit(effective.maxViews, 8, 32)
           check(effective.capabilities === undefined || isArray(effective.capabilities) && effective.capabilities.length <= APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES.length && new Set(effective.capabilities).size === effective.capabilities.length && effective.capabilities.every(capability => APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES.includes(capability)), 'OWNER_CONFIGURATION_INVALID')
-          context = effective.context ?? handshake.context ?? {}; initialized = true
+          const requested = checkedContext(effective.context ?? handshake.context ?? {})
+          let viewId = requested.viewId ?? crypto.randomUUID()
+          while (heldViewIds.has(viewId)) viewId = crypto.randomUUID()
+          heldViewIds.set(viewId, endpointId); claimedViewId = viewId
+          context = { ...requested, viewId }; initialized = true
           stopStatus = session.onStatus(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'status', value }) })
           stopChange = session.onChange(value => { if (!suspended) post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'notice', topic: 'change', value }) })
           return { applicationId: session.applicationId, identity: session.identity, definition: describeApplication(session.definition), status: session.status, binding: binding() }

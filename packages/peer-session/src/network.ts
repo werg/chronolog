@@ -3,11 +3,18 @@ import type { FramedPeerConnection } from '@chronolog/records'
 import { check, signRecord, verifyRecord, recordDigest, type Signed, type AuthorityBundle } from '@chronolog/authority'
 import { createNetworkContent, type ContentWireMessage } from './network-content.js'
 import { ApplicationSecureChannel, type ApplicationChannelHello } from './secure-channel.js'
-import type { SignalRoute } from '@chronolog/signals'
+import type { SignalRoute, SignalReceiveDiagnostics } from '@chronolog/signals'
 import { ApplicationMessageWire } from './network-wire.js'
 export interface ApplicationPeerConnectOptions { readonly connection: FramedPeerConnection; readonly peerIdentity?: string; readonly signal?: AbortSignal; readonly handshakeTimeoutMs?: number }
-export interface ApplicationPeerLink { readonly peerIdentity: string; readonly signal: AbortSignal; readonly completion: Promise<void>; readonly stats: { readonly sentBytes: number; readonly receivedBytes: number }; synchronize(): Promise<void>; close(): Promise<void> }
-export interface ApplicationPeerDiagnostics { readonly connectionId: string; readonly peerId: string; readonly kind: 'unknown'; readonly sentReliableBytes: number; readonly receivedReliableBytes: number }
+export interface ApplicationPeerLiveDiagnostics {
+  /** Signed live protocol-frame bytes; excludes channel encryption and transport overhead. */
+  readonly sentLiveBytes: number
+  readonly receivedLiveBytes: number
+  readonly signalRejections: SignalReceiveDiagnostics
+}
+export interface ApplicationPeerLinkStats extends Partial<ApplicationPeerLiveDiagnostics> { readonly sentBytes: number; readonly receivedBytes: number }
+export interface ApplicationPeerLink { readonly peerIdentity: string; readonly signal: AbortSignal; readonly completion: Promise<void>; readonly stats: ApplicationPeerLinkStats; synchronize(): Promise<void>; close(): Promise<void> }
+export interface ApplicationPeerDiagnostics extends Partial<ApplicationPeerLiveDiagnostics> { readonly connectionId: string; readonly peerId: string; readonly kind: 'unknown'; readonly sentReliableBytes: number; readonly receivedReliableBytes: number }
 const tracked = new WeakMap<ApplicationSession, Map<string, () => ApplicationPeerDiagnostics>>()
 export function applicationPeerDiagnostics(session: ApplicationSession): readonly ApplicationPeerDiagnostics[] { return [...(tracked.get(session)?.values() ?? [])].map(snapshot => snapshot()) }
 interface Hello { readonly applicationId: string; readonly nonce: string; readonly authority: AuthorityBundle; readonly channel: ApplicationChannelHello }
@@ -22,6 +29,8 @@ export async function connectApplicationPeer(session: ApplicationSession, option
   const iterator = wire.messages()[Symbol.asyncIterator](), localNonce = crypto.randomUUID(), connectionId = crypto.randomUUID()
   const timeout = setTimeout(() => lifetime.abort(new Error('PEER_HANDSHAKE_TIMEOUT')), options.handshakeTimeoutMs ?? 30_000)
   let authenticated = false, stopping: Promise<void> | undefined, stopFacts: (() => void) | undefined, signalRoute: SignalRoute | undefined, contentLink: ReturnType<typeof createNetworkContent> | undefined
+  let sentLiveBytes = 0, receivedLiveBytes = 0
+  const liveDiagnostics = (): Partial<ApplicationPeerLiveDiagnostics> => signalRoute === undefined ? {} : { sentLiveBytes, receivedLiveBytes, signalRejections: signalRoute.diagnostics }
   const pending = new Map<string, { resolve(): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout> }>()
   const close = (): Promise<void> => stopping ??= (async () => { lifetime.abort(new Error('PEER_CLOSED')); stopFacts?.(); signalRoute?.close(); contentLink?.close(); secure.clear(); for (const value of pending.values()) { clearTimeout(value.timer); value.reject(signal.reason) }; pending.clear(); if (authenticated) { authenticated = false; tracked.get(session)?.delete(connectionId); session.setConnectedPeers(tracked.get(session)?.size ?? 0) }; await options.connection.close(); void iterator.return?.() })()
   signal.addEventListener('abort', () => { void close().catch(() => undefined) }, { once: true })
@@ -42,12 +51,16 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     await secure.accept(proof.value.payload.encapsulatedKey, peerContext, localContext)
     clearTimeout(timeout)
     const connections = tracked.get(session) ?? new Map<string, () => ApplicationPeerDiagnostics>(); check(connections.size < 8, 'SESSION_PEER_LIMIT'); tracked.set(session, connections); authenticated = true
-    connections.set(connectionId, () => ({ connectionId, peerId: hello.value.signer, kind: 'unknown', sentReliableBytes: wire.stats.sentBytes, receivedReliableBytes: wire.stats.receivedBytes }))
+    connections.set(connectionId, () => ({ connectionId, peerId: hello.value.signer, kind: 'unknown', sentReliableBytes: wire.stats.sentBytes, receivedReliableBytes: wire.stats.receivedBytes, ...liveDiagnostics() }))
     session.setConnectedPeers(connections.size)
     if (secure.connection.live !== undefined && session.authority.grant(hello.value.signer)?.reader) {
       const live = secure.connection.live
-      signalRoute = session.signals.attachRoute({ trySend: (frame, input) => live.trySend(frame, input) })
-      void (async () => { try { for await (const frame of live.frames(signal)) { if (!session.authority.grant(hello.value.signer)?.reader) break; await signalRoute?.receive(frame) } } catch { /* Independent live lane is disposable. */ } })()
+      signalRoute = session.signals.attachRoute({ async trySend(frame, input) {
+        const accepted = await live.trySend(frame, input)
+        if (accepted) sentLiveBytes = Math.min(Number.MAX_SAFE_INTEGER, sentLiveBytes + frame.length)
+        return accepted
+      } })
+      void (async () => { try { for await (const frame of live.frames(signal)) { if (!session.authority.grant(hello.value.signer)?.reader) break; receivedLiveBytes = Math.min(Number.MAX_SAFE_INTEGER, receivedLiveBytes + frame.length); await signalRoute?.receive(frame) } } catch { /* Independent live lane is disposable. */ } })()
     }
     contentLink = createNetworkContent({ content: session.content, peerId: hello.value.signer, signal, authorize: () => session.authority.grant(hello.value.signer)?.reader === true && session.authority.grant(session.device.identity.publicKey)?.reader === true, send: message => wire.send({ kind: 'content', message } satisfies Message, () => check(session.authority.grant(hello.value.signer)?.reader === true && session.authority.grant(session.device.identity.publicKey)?.reader === true, 'CONTENT_FORBIDDEN')) })
     let flushing = false, dirty = false
@@ -80,7 +93,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     })()
     await publish()
     const completion = signal.aborted ? Promise.resolve() : new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
-    return { peerIdentity: hello.value.signer, signal, completion, get stats() { return wire.stats }, close, synchronize() {
+    return { peerIdentity: hello.value.signer, signal, completion, get stats() { return { ...wire.stats, ...liveDiagnostics() } }, close, synchronize() {
       check(!signal.aborted && pending.size < 4, 'PEER_REQUEST_LIMIT'); const requestId = crypto.randomUUID()
       return new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('PEER_SYNC_TIMEOUT')); void close() }, 30_000)

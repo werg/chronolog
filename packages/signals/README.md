@@ -47,8 +47,10 @@ relayed, and do not consume replay identities.
 saturates at `Number.MAX_SAFE_INTEGER`. Fatal errors retain their failure path and
 are not counted as these drops. Counters describe this receive route,
 contain no signal payloads or per-author history, and are not an estimate of a
-remote clock offset. These counters are available on the owning `SignalRoute`;
-implementations that do not expose a receive-route diagnostic must not invent one.
+remote clock offset. These counters are available on the owning `SignalRoute` and
+an instrumented `ApplicationPeerLink.stats.signalRejections` or `session.diagnostics()`
+entry. Receive snapshots are detached and contain no payloads. A link without an
+instrumented live route omits these fields; implementations must not invent counters.
 
 A successful `send()` confirms only the configured local/route dispatch.
 `localEcho: true` can succeed from local delivery even without a remote route;
