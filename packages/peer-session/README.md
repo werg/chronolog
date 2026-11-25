@@ -128,6 +128,54 @@ is `sessionCheckpointKey(applicationId, historyId)`. A forwarder that stops with
 error, including the recovery review stop, is removed and reported to `onError`;
 the other sessions continue. `close()` stops all forwarders and waits for them.
 
+### Separate the session owner, request worker and conversation host
+
+A connected session establishes peer transport and authorized application access.
+It does not establish that an assistant is processing requests. One native owner
+can keep several pages connected while a separate worker is stopped, or while a
+one-shot event waiter has already returned. A forwarder can successfully deliver
+a notice while the destination conversation remains idle.
+
+Bind live availability to the actual request handler's lifetime and advertised
+topics. Workers sharing one signer need distinct consumer/run identities; the
+signer alone cannot distinguish a mailbox fetcher from an assistant. Publish
+short-lived [signals](../signals/README.md#worker-presence) only while that worker
+can accept the named work. Stop its observer, timer and availability announcement
+when it exits. A best-effort stopped signal helps graceful shutdown; expiry must
+also handle a crash. Do not renew an assistant heartbeat from the session owner's
+transport loop, and do not append periodic durable events merely to keep a badge
+green. Durable receipt and answer commands remain separate evidence.
+
+The `cursors` map in the example above illustrates the checkpoint interface; it
+does not survive process exit. A supervised consumer supplies a durable store
+scoped by application, history, consumer and filter version, with one writer per
+checkpoint. Preserve the last handled cursor through failure, retain stable
+request/event identities for deduplication, and save progress only after the
+required work has a durable outcome. A notice accepted by a conversation host
+can advance that notice-delivery checkpoint; it cannot advance the independent
+request-handler checkpoint. Reconnect and drain retained work before waiting for
+another signal. See [recovery review](#review-and-resume-after-a-generation-change)
+before resuming an invalidated cursor.
+
+Chronolog exposes observation and forwarding, not a model execution loop.
+An external host adapter must establish how it submits work to the exact
+conversation, injects input into its active turn or starts/resumes an idle turn,
+serializes dispatch and reports blocked delivery. For Codex, a plain CLI queue
+waits while a turn is running. A receiver that must inject incoming requests
+uses the verified `turn/steer` route with the observed active turn identity;
+queue/resume is the idle/unloaded route. Steering makes input available at the
+next applicable continuation boundary, not an interruption of an in-flight tool.
+Preserve explicit user interruption and uncertain admission outcomes. See Tendriller's maintained
+[conversation-delivery qualification](https://github.com/werg/tendriller/blob/master/docs/CONVERSATION_DELIVERY.md)
+and [worker-owned request example](https://github.com/werg/tendriller/blob/master/docs/AGENT_REQUESTS.md).
+A CLI queue or app-server API must be qualified against the installed host and
+same conversation; no Chronolog method implies that every Codex or ChatGPT
+surface supports it. Verify a request reaches the same active Codex turn before
+it ends, then verify idle wake and a second request after the answering turn ends.
+A notice queued until completion does not pass the active-delivery check. Stop
+only the worker while leaving the native session connected to verify that its
+availability disappears and unanswered requests remain retained.
+
 ## Run a device inside celld
 
 The `@chronolog/peer-session/celld` entry uses a celld Durable Object's
