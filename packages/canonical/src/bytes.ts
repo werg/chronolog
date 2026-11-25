@@ -49,8 +49,11 @@ export function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   return difference === 0
 }
 
+const hexPairs = Array.from({ length: 256 }, (_, byte) => byte.toString(16).padStart(2, '0'))
 export function bytesToHex(value: Uint8Array): string {
-  return [...value].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  let result = ''
+  for (const byte of value) result += hexPairs[byte]!
+  return result
 }
 
 export function hexToBytes(value: string): Uint8Array {

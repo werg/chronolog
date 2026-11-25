@@ -1,4 +1,4 @@
-import { bytesToHex, hexToBytes, sha256 } from '@chronolog/canonical'
+import { bytesToHex, hexToBytes, equalBytes, sha256 } from '@chronolog/canonical'
 import { generateEd25519KeyPair, importEd25519PublicKey, exportEd25519PrivateKey, importEd25519PrivateKey } from '@chronolog/protocol'
 export { bytesToHex, hexToBytes }
 export interface SigningIdentity { readonly publicKey: string; readonly privateKey: CryptoKey }
@@ -30,11 +30,11 @@ export function decodeRecord<T>(bytes: Uint8Array): T {
     return item
   })
   check(equalRecord(value, decodeUncanonical(bytes)), 'RECORD_INVALID')
-  check(bytesToHex(encodeRecord(value)) === bytesToHex(bytes), 'RECORD_NOT_CANONICAL')
+  check(equalBytes(encodeRecord(value), bytes), 'RECORD_NOT_CANONICAL')
   return value as T
 }
 function decodeUncanonical(bytes: Uint8Array): unknown { return JSON.parse(new TextDecoder().decode(bytes)) as unknown }
-export function equalRecord(a: unknown, b: unknown): boolean { return bytesToHex(encodeRecord(a)) === bytesToHex(encodeRecord(b)) }
+export function equalRecord(a: unknown, b: unknown): boolean { return equalBytes(encodeRecord(a), encodeRecord(b)) }
 export async function recordDigest(value: unknown): Promise<string> { return bytesToHex(await sha256(encodeRecord(value))) }
 function signedBytes(domain: string, payload: unknown): Uint8Array { return encodeRecord(['chronolog/authored/v1', domain, payload]) }
 export async function signRecord<T>(domain: string, payload: T, identity: SigningIdentity): Promise<Signed<T>> {

@@ -3,7 +3,7 @@ import type { ApplicationPeerConnectOptions as InlineApplicationPeerConnectOptio
 import type { ApplicationPeerDiagnostics as InlineApplicationPeerDiagnostics } from './network.js'
 import type { ApplicationPeerLink as InlineApplicationPeerLink } from './network.js'
 import { createEventMaterializationRuntime, type ChronologMaterializationRuntime, type ReplayProposal, type MaterializedLocalSqlValue } from '@chronolog/materializer'
-import { bytesToHex, hexToBytes, check, decodeRecord, encodeRecord, recordDigest, signRecord, verifyRecord, finalityPolicyDigest, verifyFinalityProofs, mergeFinalityProofs, finalityAdmissionScopes, signFinalityStatement, type FinalityStatement, type Signed, type AuthorityProvider, type FinalityProof, type VerifiedFinality } from '@chronolog/authority'
+import { bytesToHex, hexToBytes, check, equalRecord, decodeRecord, encodeRecord, recordDigest, signRecord, verifyRecord, finalityPolicyDigest, verifyFinalityProofs, mergeFinalityProofs, finalityAdmissionScopes, signFinalityStatement, type FinalityStatement, type Signed, type AuthorityProvider, type FinalityProof, type VerifiedFinality } from '@chronolog/authority'
 import { compareTransactionOrder, encodeChangeProgram, decodeTransactionCore, isEmitStep, transactionOrderKey, type TransactionCore } from '@chronolog/protocol'
 import { createApplicationProvisioning, type ApplicationProvisioning } from './provisioning.js'
 import { awaitOwnedTask } from './lifetime.js'
@@ -220,16 +220,20 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (facts.authority !== undefined) await this.mergeAuthority(facts.authority)
     return this.#serial(async () => {
       const envelopes = [...this.#journal.envelopes], retentions = [...this.#journal.retentions]
-      const known = new Set(await Promise.all(envelopes.map(item => recordDigest(item))))
+      const known = new Set(this.#envelopesByDigest.keys())
       for (const envelope of facts.envelopes) { await verifyEnvelope(envelope, this.authority); const id = await recordDigest(envelope); if (!known.has(id)) { check(envelopes.filter(item => item.payload.proposalId === envelope.payload.proposalId && item.payload.author === envelope.payload.author).length < 8, 'OPERATION_ENVELOPE_LIMIT'); known.add(id); envelopes.push(envelope) } }
       const receipts = new Set(await Promise.all(retentions.map(item => recordDigest(item))))
       for (const receipt of facts.retentions) { await this.#verifyRetention(receipt); const id = await recordDigest(receipt); if (!receipts.has(id)) { receipts.add(id); retentions.push(receipt) } }
-      const proofs = await mergeFinalityProofs(this.#journal.finality, facts.finality)
-      const verified = await verifyFinalityProofs(this.authority.descriptor, proofs, this.authority)
+      const proofs = facts.finality.length === 0 ? this.#journal.finality : await mergeFinalityProofs(this.#journal.finality, facts.finality)
+      const envelopesChanged = envelopes.length !== this.#journal.envelopes.length, finalityChanged = !equalRecord(proofs, this.#journal.finality)
+      if (!envelopesChanged && !finalityChanged && retentions.length === this.#journal.retentions.length) return
+      const verified = finalityChanged ? await verifyFinalityProofs(this.authority.descriptor, proofs, this.authority) : this.#finality
       const journal = { ...this.#journal, envelopes, retentions, finality: proofs }
-      if (await recordDigest(journal) === await recordDigest(this.#journal)) return
-      await this.#persist(journal); this.#finality = verified
-      this.#notify(); this.#factsChanged(); this.#scheduleReplay()
+      await this.#persist(journal); if (finalityChanged) this.#finality = verified
+      this.#notify(); this.#factsChanged()
+      // Retention is availability evidence, not an execution input. Its durable
+      // observers still run, but it cannot require decrypting/replaying history.
+      if (envelopesChanged || finalityChanged) this.#scheduleReplay()
     })
   }
   async retain(proposalId: string, subject?: { readonly author: string; readonly envelopeDigest: string }): Promise<RetentionEvidence> {

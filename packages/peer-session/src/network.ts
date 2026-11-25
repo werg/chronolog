@@ -5,6 +5,7 @@ import { createNetworkContent, type ContentWireMessage } from './network-content
 import { ApplicationSecureChannel, type ApplicationChannelHello } from './secure-channel.js'
 import type { SignalRoute, SignalReceiveDiagnostics } from '@chronolog/signals'
 import { ApplicationMessageWire } from './network-wire.js'
+import { PeerFactKnowledge } from './network-facts.js'
 export interface ApplicationPeerConnectOptions { readonly connection: FramedPeerConnection; readonly peerIdentity?: string; readonly signal?: AbortSignal; readonly handshakeTimeoutMs?: number }
 export interface ApplicationPeerLiveDiagnostics {
   /** Signed live protocol-frame bytes; excludes channel encryption and transport overhead. */
@@ -63,11 +64,37 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       void (async () => { try { for await (const frame of live.frames(signal)) { if (!session.authority.grant(hello.value.signer)?.reader) break; receivedLiveBytes = Math.min(Number.MAX_SAFE_INTEGER, receivedLiveBytes + frame.length); await signalRoute?.receive(frame) } } catch { /* Independent live lane is disposable. */ } })()
     }
     contentLink = createNetworkContent({ content: session.content, peerId: hello.value.signer, signal, authorize: () => session.authority.grant(hello.value.signer)?.reader === true && session.authority.grant(session.device.identity.publicKey)?.reader === true, send: message => wire.send({ kind: 'content', message } satisfies Message, () => check(session.authority.grant(hello.value.signer)?.reader === true && session.authority.grant(session.device.identity.publicKey)?.reader === true, 'CONTENT_FORBIDDEN')) })
-    let flushing = false, dirty = false
-    const publish = async (): Promise<void> => {
-      dirty = true; if (flushing) return; flushing = true
-      try { while (dirty && !signal.aborted) { dirty = false; await wire.send({ kind: 'facts', requestId: '', facts: session.exportFacts() } satisfies Message) } }
-      finally { flushing = false }
+    const knowledge = new PeerFactKnowledge()
+    const retainEnvelopes = async (facts: SessionFacts): Promise<void> => {
+      for (const envelope of facts.envelopes) {
+        try { await session.retain(envelope.payload.proposalId, { author: envelope.payload.author, envelopeDigest: await recordDigest(envelope) }) }
+        catch (error) { if (!(error instanceof Error) || !['RETENTION_SUBJECT_MISSING', 'RETENTION_SUBJECT_INVALID'].includes(error.message)) throw error }
+      }
+    }
+    let sendTail: Promise<void> = Promise.resolve()
+    const sendFacts = (requestId = ''): Promise<void> => {
+      // Share a writer with explicit fences: a fence cannot overtake a snapshot
+      // whose successful send is about to advance this connection's knowledge.
+      const task = sendTail.then(async () => {
+        signal.throwIfAborted()
+        let facts = await knowledge.missing(session.exportFacts())
+        // Retention cannot depend on an echo: deltas deliberately do not echo
+        // bodies the sender already knows. Include our genuine local evidence.
+        if (facts.envelopes.length > 0) { await retainEnvelopes(facts); facts = await knowledge.missing(session.exportFacts()) }
+        if (requestId === '' && facts.authority === undefined && facts.envelopes.length + facts.retentions.length + facts.finality.length === 0) return
+        await wire.send({ kind: 'facts', requestId, facts } satisfies Message)
+        await knowledge.remember(facts)
+      })
+      sendTail = task.catch(() => undefined)
+      return task
+    }
+    let flushing: Promise<void> | undefined, dirty = false
+    const publish = (): Promise<void> => {
+      dirty = true
+      return flushing ??= (async () => {
+        try { while (dirty && !signal.aborted) { dirty = false; await sendFacts() } }
+        finally { flushing = undefined }
+      })()
     }
     stopFacts = session.onFacts(() => { void publish().catch(() => close()) })
     void (async () => {
@@ -79,10 +106,8 @@ export async function connectApplicationPeer(session: ApplicationSession, option
           if (message.kind === 'facts') {
             check(typeof message.requestId === 'string' && message.requestId.length <= 128, 'PEER_REQUEST_INVALID')
             await session.mergeFacts(message.facts)
-            for (const envelope of message.facts.envelopes) {
-              try { await session.retain(envelope.payload.proposalId, { author: envelope.payload.author, envelopeDigest: await recordDigest(envelope) }) }
-              catch (error) { if (!(error instanceof Error) || !['RETENTION_SUBJECT_MISSING', 'RETENTION_SUBJECT_INVALID'].includes(error.message)) throw error }
-            }
+            await knowledge.remember(message.facts)
+            await retainEnvelopes(message.facts)
             if (message.requestId !== '') await wire.send({ kind: 'ack', requestId: message.requestId } satisfies Message)
           } else if (message.kind === 'content') await contentLink.handle(message.message)
           else if (message.kind === 'ack') { const waiter = pending.get(message.requestId); if (waiter !== undefined) { pending.delete(message.requestId); clearTimeout(waiter.timer); waiter.resolve() } }
@@ -98,7 +123,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       return new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('PEER_SYNC_TIMEOUT')); void close() }, 30_000)
         pending.set(requestId, { resolve, reject, timer })
-        void wire.send({ kind: 'facts', requestId, facts: session.exportFacts() } satisfies Message).catch(error => { clearTimeout(timer); pending.delete(requestId); reject(error) })
+        void sendFacts(requestId).catch(error => { clearTimeout(timer); pending.delete(requestId); reject(error); void close() })
       })
     } }
   } catch (error) { await close(); throw error }
