@@ -9,7 +9,7 @@ import type { DatabaseLike, MaterializerOptions } from './types.js'
 const fixtures = new MaterializerFixture()
 afterEach(async () => fixtures.cleanup())
 
-async function fixture() {
+async function fixture(idleReaderConnections = 0) {
   const calls: Array<{ id: number; method: string; args: unknown[] }> = []
   const databases: DatabaseLike[] = []
   const native = createNativeSqlEngine()
@@ -31,7 +31,7 @@ async function fixture() {
     } }) }
   } }
   const options: MaterializerOptions = { engine, path: join(await fixtures.directory(), 'leases.db'),
-    rootPrincipal: ROOT_KEY, checkpointEvery: 1, retainCheckpoints: 1 }
+    rootPrincipal: ROOT_KEY, checkpointEvery: 1, retainCheckpoints: 1, idleReaderConnections }
   const materializer = await DeterministicMaterializer.open(options)
   const proposal = (id: number, sql: string) => replayProposal(BigInt(id), String(id), [sql], materializer.executionManifestDigest)
   const setup = await proposal(1, 'CREATE TABLE drafts (id INTEGER PRIMARY KEY, value TEXT)')
@@ -46,6 +46,8 @@ const value = (handle: { query(sql: string): { rows: readonly unknown[] } }) => 
 const liveValue = (materializer: DeterministicMaterializer) => materializer.localSql('SELECT value FROM drafts').rows
 const pinned = [[{ kind: 'text', value: 'first' }]]
 
+// Lifecycle tests below pin the close-on-retirement path (idleReaderConnections: 0);
+// 'retained idle reader connections' covers the default reuse path.
 describe('publication-owned SQL reader leases', () => {
   it('captures/releases sixteen views with no opens, branches, checkout, listing or close', async () => {
     const f = await fixture(), m = f.materializer
@@ -246,5 +248,86 @@ describe('publication-owned SQL reader leases', () => {
       for (const view of views) view.release()
       f.inject(undefined)
     } finally { f.inject(undefined); m.close() }
+  })
+})
+
+describe('retained idle reader connections', () => {
+  const readerBranches = (f: Awaited<ReturnType<typeof fixture>>) =>
+    f.databases[0]!.doltBranches().map(ref => ref.name).filter(name => name.startsWith('chronolog_read_')).sort()
+
+  it('reuses an unleased retired connection for the next publication without opening another', async () => {
+    const f = await fixture(2), m = f.materializer
+    try {
+      await m.materialize([f.setup, f.first])
+      const opened = f.databases.length
+      const history = [f.setup, f.first]
+      for (let i = 0; i < 6; i++) {
+        history.push(await f.proposal(i + 10, `UPDATE drafts SET value = 'revision${i}' WHERE id = 1`))
+        await m.materialize(history)
+        expect(liveValue(m)).toEqual([[{ kind: 'text', value: `revision${i}` }]])
+      }
+      expect(f.databases).toHaveLength(opened)
+      // Current local and final readers plus at most two idle connections.
+      expect(readerBranches(f).length).toBeLessThanOrEqual(4)
+    } finally { m.close() }
+  })
+
+  it('never moves a connection that still has a lease, and reuses it only after release', async () => {
+    const f = await fixture(2), m = f.materializer
+    try {
+      await m.materialize([f.setup, f.first])
+      const held = m.captureRead()
+      const history = [f.setup, f.first]
+      for (let i = 0; i < 4; i++) {
+        history.push(await f.proposal(i + 10, `UPDATE drafts SET value = 'revision${i}' WHERE id = 1`))
+        await m.materialize(history)
+        expect(value(held)).toEqual(pinned)
+      }
+      f.calls.length = 0
+      expect(value(held)).toEqual(pinned)
+      const leased = new Set(f.calls.map(call => call.id))
+      expect(leased.size).toBe(1)
+      const [leasedId] = leased
+      expect(leasedId).toBeGreaterThan(0)
+      // Four publications happened while it was leased: it was never moved.
+      f.calls.length = 0
+      held.release()
+      expect(f.calls.filter(call => call.method === 'close')).toEqual([])
+      history.push(await f.proposal(30, "UPDATE drafts SET value = 'after' WHERE id = 1"))
+      await m.materialize(history)
+      const live = m.captureRead()
+      try { expect(value(live)).toEqual([[{ kind: 'text', value: 'after' }]]) } finally { live.release() }
+      expect(f.calls.some(call => call.id === leasedId && call.method === 'close')).toBe(false)
+    } finally { m.close() }
+  })
+
+  it('closes a reused connection whose checkout fails and preserves the published readers', async () => {
+    const f = await fixture(2), m = f.materializer
+    try {
+      await m.materialize([f.setup, f.first])
+      const held = m.captureRead(), opened = f.databases.length
+      // Only retained connections exist: the candidate must be a reused one.
+      f.inject((id, name) => id > 0 && id < opened && name === 'doltCheckout')
+      await expect(m.materialize([f.setup, f.first, f.second])).rejects.toThrow('INJECTED_READER_FAILURE')
+      expect(f.databases).toHaveLength(opened)
+      expect(value(held)).toEqual(pinned)
+      expect(liveValue(m)).toEqual(pinned)
+      expect(m.orderLength).toBe(2)
+      f.inject(undefined)
+      await m.materialize([f.setup, f.first, f.second])
+      expect(value(held)).toEqual(pinned)
+      expect(liveValue(m)).toEqual([[{ kind: 'text', value: 'second' }]])
+      held.release()
+    } finally { f.inject(undefined); m.close() }
+  })
+
+  it('closes retained idle connections with the materializer', async () => {
+    const f = await fixture(2), m = f.materializer
+    await m.materialize([f.setup, f.first])
+    await m.materialize([f.setup, f.first, f.second])
+    f.calls.length = 0
+    m.close()
+    const closed = new Set(f.calls.filter(call => call.method === 'close').map(call => call.id))
+    expect(closed.size).toBe(f.databases.length)
   })
 })

@@ -234,6 +234,12 @@ export interface MaterializerOptions {
   readonly checkpointEvery?: number
   readonly retainCheckpoints?: number
   /**
+   * Unleased retired reader connections kept for reuse (default 2). Opening a
+   * connection replays the whole chunk store; a retained connection catches
+   * up on appended bytes only. 0 closes every retired reader immediately.
+   */
+  readonly idleReaderConnections?: number
+  /**
    * Test and operator-diagnostic seam for reproducible process termination at
    * durable publication boundaries. Production callers normally omit it.
    */

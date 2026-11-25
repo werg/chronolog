@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, cpSync, rmSync, statSync, utimesSync, existsSync, chmodSync } from 'node:fs'
 import { dirname, relative, resolve, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { applyIncrementalReloadPatch, INCREMENTAL_RELOAD_PATCH } from './lib/wasm-incremental-reload.mjs'
 
 const workspace = resolve(import.meta.dirname, '..')
 const arguments_ = process.argv.slice(2)
@@ -140,9 +141,11 @@ if (amalgamation.split(sectorCall).length !== 3) throw new Error('WASM_SECTOR_SI
 const movedCheck = 'rc = sqlite3OsFileControl(cs->file.pFile, SQLITE_FCNTL_HAS_MOVED, &bMoved);\n  if( rc!=SQLITE_OK ) return rc;'
 if (amalgamation.split(movedCheck).length !== 2) throw new Error('WASM_HAS_MOVED_SOURCE_ANCHOR_MISSING')
 const portableAmalgamation = join(output, 'doltlite-wasm.c')
-writeIfChanged(portableAmalgamation, amalgamation
+// A whole-store reload per version-control write rereads O(history) bytes
+// through synchronous OPFS calls. See tools/lib/wasm-incremental-reload.mjs.
+writeIfChanged(portableAmalgamation, applyIncrementalReloadPatch(amalgamation
   .replaceAll(sectorCall, 'sqlite3OsSectorSize(cs->file.pFile)')
-  .replace(movedCheck, movedCheck.replace('if( rc!=SQLITE_OK )', 'if( rc!=SQLITE_OK && rc!=SQLITE_NOTFOUND )')))
+  .replace(movedCheck, movedCheck.replace('if( rc!=SQLITE_OK )', 'if( rc!=SQLITE_OK && rc!=SQLITE_NOTFOUND )'))))
 for (const header of ['sqlite3.h', 'sqlite3ext.h']) {
   const destination = join(output, header)
   const bytes = readFileSync(join(nativeRoot, 'amalgamation', header))
@@ -207,7 +210,7 @@ copyArtifact(join(wasmRoot, 'jswasm/sqlite3-opfs-async-proxy.js'), join(output, 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
 writeFileSync(join(output, 'manifest.json'), JSON.stringify({
   format: 1, toolchain: 'emscripten-4.0.20', nativeManifest, runtimeVersions,
-  portabilityPatches: ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1'],
+  portabilityPatches: ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1', INCREMENTAL_RELOAD_PATCH],
   deterministicSourceSha256: digest(deterministic), wasmSha256: digest(readFileSync(join(output, 'sqlite3.wasm'))),
   loaderSha256: digest(readFileSync(join(output, 'sqlite3.mjs'))),
   wasmBytes: statSync(join(output, 'sqlite3.wasm')).size,

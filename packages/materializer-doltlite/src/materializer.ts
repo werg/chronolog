@@ -85,7 +85,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   #finalPublished: PublishedRef
   #finalLog: TransactionLogRow[]
   readonly #sourceOptions: MaterializerOptions
-  readonly #options: Required<Pick<MaterializerOptions, 'checkpointEvery' | 'retainCheckpoints'>>
+  readonly #options: Required<Pick<MaterializerOptions, 'checkpointEvery' | 'retainCheckpoints' | 'idleReaderConnections'>>
   readonly #backend: MaterializerBackendInfo
   readonly #executionManifest: ExecutionManifest
   readonly #artifacts: ManifestArtifacts
@@ -132,6 +132,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
     this.#options = {
       checkpointEvery: validatePositiveInteger(options.checkpointEvery ?? 100, 'checkpointEvery'),
       retainCheckpoints: validatePositiveInteger(options.retainCheckpoints ?? 16, 'retainCheckpoints'),
+      idleReaderConnections: validateIdleReaders(options.idleReaderConnections ?? IDLE_READER_CONNECTIONS),
     }
   }
 
@@ -357,7 +358,12 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       verifyDatabaseState(this.#writer, this.#expected)
       verifyReplayBase(readSystemLog(this.#writer), transactions, replayFrom)
 
+      let yieldedAt = performance.now()
       for (let index = replayFrom; index < transactions.length; index += 1) {
+        // A rewind replays a suffix of committed SQL transactions. Let the
+        // owner answer requests between them; #materializing still excludes
+        // other writers, and readers keep the immutable published snapshot.
+        if (performance.now() - yieldedAt >= MATERIALIZE_YIELD_MS) { await yieldToHost(); this.#assertOpen(); yieldedAt = performance.now() }
         verifyNextLogIndex(this.#writer, index)
         this.#applyTransaction(transactions[index]!, index)
       }
@@ -384,7 +390,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       if (nextPublished.contentHash !== contentHash) throw new Error('MATERIALIZER_REVISION_CONTENT_MISMATCH')
       this.#publicationFault('after_revision_ref_created')
 
-      candidateReader = openPublishedReader(this.#sourceOptions, this.#writer, nextPublished.doltCommitHash)
+      candidateReader = this.#acquireReader(nextPublished.doltCommitHash)
       verifyDatabaseState(candidateReader.database, this.#expected)
       const readerLog = readSystemLog(candidateReader.database)
       verifyPublishedLog(nextPublished, readerLog)
@@ -436,6 +442,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
       return event
     } catch (error) {
       candidateReader?.database.close()
+      if (this.#closed) throw error
       rollbackIfActive(this.#writer)
       if (!publishedMoved) {
         try {
@@ -487,7 +494,9 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         const baseLog = readSystemLog(this.#writer)
         verifyReplayBase(baseLog, transactions, base.prefixLength)
         verifyFinalPrefix(this.#finalLog, baseLog)
+        let yieldedAt = performance.now()
         for (let index = base.prefixLength; index < prefixLength; index += 1) {
+          if (performance.now() - yieldedAt >= MATERIALIZE_YIELD_MS) { await yieldToHost(); this.#assertOpen(); yieldedAt = performance.now() }
           const transaction = transactions[index]!
           this.#applyTransaction(transaction, index)
         }
@@ -497,7 +506,7 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
         replayCommitted = true
       }
       // Read and validate the exact SQL commit before publishing its final ref.
-      reader = openPublishedReader(this.#sourceOptions, this.#writer, commitHash)
+      reader = this.#acquireReader(commitHash)
       verifyDatabaseState(reader.database, this.#expected)
       const log = readSystemLog(reader.database)
       if (log.length !== prefixLength) throw new Error('MATERIALIZER_FINAL_LOG_LENGTH_MISMATCH')
@@ -553,9 +562,26 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
 
   #closeRetiredReader(reader: PublishedReader): void {
     if (!reader.retired || reader.leases !== 0) return
+    // Keep a few unleased connections. Opening a new connection replays the
+    // whole chunk store; a retained one only catches up on appended bytes.
+    // Its branch stays retained (it is in #readers) until it is reused.
+    const idle = [...this.#readers].filter((entry) => entry !== reader && entry.retired && entry.leases === 0).length
+    if (idle < this.#options.idleReaderConnections) return
     reader.database.close()
     this.#readers.delete(reader)
     // Branch reclamation belongs to publication/startup cleanup, not a read.
+  }
+
+  /** A fresh immutable reader at `commit`, reusing an unleased retired connection when one exists. */
+  #acquireReader(commit: string): PublishedReader {
+    const idle = [...this.#readers].find((entry) => entry.retired && entry.leases === 0)
+    if (idle === undefined) return openPublishedReader(this.#sourceOptions, this.#writer, commit)
+    this.#readers.delete(idle)
+    try { return reusePublishedReader(this.#writer, idle.database, commit) }
+    catch (error) {
+      try { idle.database.close() } catch { /* Preserve the reader-opening failure. */ }
+      throw error
+    }
   }
 
   #applyTransaction(transaction: ReplayProposal, orderIndex: number): void {
@@ -627,6 +653,32 @@ export class DeterministicMaterializer implements MaterializerSqlBackend {
   }
 
   #assertOpen(): void { if (this.#closed) throw new Error('MATERIALIZER_CLOSED') }
+}
+
+const IDLE_READER_CONNECTIONS = 2
+
+function validateIdleReaders(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 8) throw new MaterializerInputError('MATERIALIZER_IDLE_READERS_INVALID')
+  return value
+}
+const MATERIALIZE_YIELD_MS = 25
+
+function yieldToHost(): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, 0) })
+}
+
+/** Move an unleased read-only connection to a new private read ref. Its prior
+ * ref is no longer retained and is reclaimed by publication cleanup. */
+function reusePublishedReader(writer: DatabaseLike, database: DatabaseLike, commit: string): PublishedReader {
+  const branchRef = `chronolog_read_${crypto.randomUUID().replaceAll('-', '')}`
+  writer.doltBranch(branchRef, commit)
+  try {
+    database.doltCheckout(branchRef)
+    return { database, branchRef, leases: 0, retired: false }
+  } catch (error) {
+    try { removeBranchIfPresent(writer, branchRef) } catch { /* Startup reclaims crash leftovers. */ }
+    throw error
+  }
 }
 
 /** Private read refs avoid retaining duplicate revision markers after rollback.

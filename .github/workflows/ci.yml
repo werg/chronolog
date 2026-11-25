@@ -27,7 +27,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: node --test tools/run-fast-tests.test.mjs tools/npm-cli.test.mjs
+      - run: node --test tools/run-fast-tests.test.mjs tools/npm-cli.test.mjs tools/wasm-incremental-reload.test.mjs
       - run: pnpm test:fast
 
   verify:

@@ -71,7 +71,7 @@ export interface WasmBuildManifest {
   readonly toolchain: 'emscripten-4.0.20'
   readonly nativeManifest: EngineBuildManifest
   readonly runtimeVersions: { readonly doltlite: string; readonly sqlite: string; readonly vec: string }
-  readonly portabilityPatches: readonly ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1']
+  readonly portabilityPatches: readonly ['chunk-store-optional-sector-size-v1', 'chunk-store-optional-has-moved-v1', 'vfs-identity-forwarding-v1', 'chunk-store-incremental-reload-v1']
   readonly deterministicSourceSha256: string
   readonly loaderSha256: string
   readonly wasmSha256: string
@@ -91,8 +91,9 @@ const PATCH_PROFILE = 'authorizer-progress-limits-tailoffset-dolt-refs-static-ve
 export function verifyWasmBuild(bytes: Uint8Array, manifest: WasmBuildManifest): void {
   if (manifest.format !== 1 || manifest.toolchain !== 'emscripten-4.0.20' || bytes.length !== manifest.wasmBytes ||
       bytesToHex(sha256Sync(bytes)) !== manifest.wasmSha256) throw new Error('WASM_ENGINE_BUILD_MISMATCH')
-  if (manifest.portabilityPatches?.length !== 3 || manifest.portabilityPatches[0] !== 'chunk-store-optional-sector-size-v1' ||
-      manifest.portabilityPatches[1] !== 'chunk-store-optional-has-moved-v1' || manifest.portabilityPatches[2] !== 'vfs-identity-forwarding-v1') {
+  if (manifest.portabilityPatches?.length !== 4 || manifest.portabilityPatches[0] !== 'chunk-store-optional-sector-size-v1' ||
+      manifest.portabilityPatches[1] !== 'chunk-store-optional-has-moved-v1' || manifest.portabilityPatches[2] !== 'vfs-identity-forwarding-v1' ||
+      manifest.portabilityPatches[3] !== 'chunk-store-incremental-reload-v1') {
     throw new Error('WASM_ENGINE_PORTABILITY_PROFILE_UNSUPPORTED')
   }
   const nativeManifest = normalizeEngineManifest(manifest.nativeManifest)
