@@ -1,34 +1,143 @@
 # Chronolog-DB
 
-**A local-first Merkle-DAG CRDT database where your application logic, permissions, SQL tables, and UI live as hash-pinned ES Modules over a flat timestamp-ordered operation set — with zero native C/C++ builds.**
+**Universal deterministic undo-do-redo over a flat set of signed operations — a minimally bootstrapped reducer of reducers, with a full vanilla SQLite database as a CRDT, malleable write RLS, declarative transaction preconditions, and a consensus-agnostic finality layer.**
 
-Chronolog-DB lets browsers, Node.js agents, and blind edge hosts (such as Cloudflare Workers) collaborate offline-first and converge deterministically to the exact same state, without a central sequencing server or a blockchain consensus requirement.
+Chronolog-DB lets browsers, Node.js agents, and blind edge hosts (such as Cloudflare Workers) author offline and converge bit-for-bit to the exact same state — with **zero native C/C++ builds**, no central sequencer, and no mandatory consensus protocol.
 
-## The Big Idea
+---
 
-Most collaborative databases force an awkward choice: either centralize ordering on a server, freeze your schema and permissions in rigid database catalogs, or fight custom CRDT data structures for every feature.
+## Why This Exists
 
-Chronolog-DB takes a much simpler, composable approach built on four ideas:
+Most distributed systems force an unnecessary fork in the road:
 
-1. **A Flat Timestamp-Ordered Operation Set ("Block Soup", Not Hash-Linked Blocks)**
-   Every mutation is an immutable, Ed25519-signed operation carrying `(authorTimestampMs, author, opId)`. There are no `parents` pointers and no forks to merge. Every replica sorts the set of known operations by `(authorTimestampMs, author, opId)` and folds them deterministically. Late earlier operations trigger a clean suffix replay from the nearest cached Merkle snapshot.
+- **Pick a CRDT**, and you are trapped designing bespoke algebraic data types (LWW registers, RGA lists, OR-Sets) that shatter the moment you want a unique constraint, a foreign key, a balance transfer, or a relational join.
+- **Pick a replicated SQL database**, and you end up wrapping a mutable native binary around a central leader or bolting on lossy per-column LWW merge hacks that silently break invariants.
+- **Pick a blockchain**, and you get deterministic state transitions and finality, but you pay for global consensus on every keystroke, lose offline authoring, and inherit a rigid virtual machine.
 
-2. **One Pure Content-Addressed Merkle-DAG (`CAS`)**
-   All large state — ES Module source code, SQLite database pages, binary assets, and replay metadata — lives in one content-addressed DAG (`ContentAddressedStore`) with explicit links, public/private partition isolation, LRU caching, and exact mark-and-sweep garbage collection.
+Chronolog-DB collapses all three into a single, radical abstraction:
 
-3. **One Global Reducer Calling Hash-Pinned ES Module Topic Reducers (`$reducers` Import Map)**
-   From a global perspective, Chronolog is a single deterministic reducer whose state is a map of topics. One of those topics (`$reducers`) maps each topic name to a hash-pinned ES Module (`cas:sha256-...`) executed in QuickJS-NG:
-   - **Self-evolving or frozen:** Bind `$reducers` to a governance reducer (such as `adminOnlyReducers`) for governed upgrades, or omit it to permanently freeze rules for the lifetime of the chain.
-   - **Fresh `QuickJSContext` per invocation:** Zero module-state leaks across `reduce()`, `query()`, or suffix replay; `Date`, `Math.random`, and `Intl` are stripped; reducers read cross-topic capabilities via partition-enforced `ctx.query(topic, input)`.
-   - **Pluggable permissions & authority:** `$permissions` is just another topic reducer answering a clean capability query interface (`{ check, actor }`, `{ list }`, `{ admission: true }`). Ship with `attestedMembers` (host-attested roles), `multisigMembers` (M-of-N threshold quorum with zero host attestation), `openMembers` (open public writers), or plug in your own custom `$permissions` reducer without host or runtime assumptions.
-   - **Strict blind-host partition:** On private chains, `$*` control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`) are mutated only by `visibility: 'public'` operations and can read/query only `$*` topics and public CAS. A blind Cloudflare Worker host with zero decryption keys derives the exact same control state as every full replica.
+> **What if a CRDT weren't a special data structure at all — just a pure, deterministic fold over a flat set of signed operations, where "undo-do-redo" applies to *anything*, and the rules of the fold live inside the state being folded?**
 
-4. **First-Class Declarative SQL Topic Reducer (`chronolog/sql`) + `chronolog:sqlite` + Write RLS (`chronolog/rls`)**
-   Bind any topic — or multiple topics for multiple independent hash-addressed databases in one chain — directly to `chronolog/sql` (`sqlite-cas.wasm`, 1.34 MB: stock SQLite + FTS5 + `sqlite-vec` over a 4 KiB Merkle-paged `CAS` VFS):
-   - **Declarative SQL transactions with atomic preconditions & rollback:** Submit `{ preconditions, statements, mode, events }` directly; if any precondition, constraint, or RLS trigger fails, the entire transaction rolls back atomically.
-   - **O(1) rollback & time travel:** A database snapshot is a single 32-byte `dbRoot` hash stored as a topic value.
-   - **Deterministic across timezones and platforms:** `random()`/`randomblob()` are disabled, `datetime('now')` and `localtime` are pinned to the signed operation's UTC `op_time()`, and `actor()`, `op_id()`, `op_time()` are bound by the host kernel.
-   - **Nimble Postgres-style write RLS + dynamic tables:** No rigid static schemas or bureaucratic catalogs. `chronolog/sql` uses `mode: 'admin' | 'user' | 'readonly'` + `chronolog/rls` (`applyRls`) to install validated `BEFORE INSERT/UPDATE/DELETE` triggers using arbitrary read-only SQL predicates, and safely lets non-admin users `CREATE TABLE` / `ALTER TABLE` / `DROP TABLE` on their own tables.
+---
+
+## 1. Generalized Undo-Do-Redo — Applied to *Anything*
+
+Inspired by Martin Kleppmann's work on timestamp-ordered operation logs with rollback-and-replay, Chronolog pushes the idea all the way to the bottom:
+
+- **A flat set of operations ("block soup", not hash-linked blocks):** Every mutation is an immutable, Ed25519-signed operation stamped with `(authorTimestampMs, author, opId)`. There are no `parents` pointers and no forks to merge.
+- **One total order, zero sequencers:** Every replica sorts the set of operations it has seen by `(authorTimestampMs, author, opId)` and folds them forward deterministically. No peer, relay, host, or validator ever assigns operation order.
+- **Offline first, O(1) rewind on late arrivals:** Author locally and durably without waiting for a network or quorum. When an earlier-timestamped operation arrives later from a reconnecting peer, Chronolog doesn't need inverse functions or custom merge logic — it jumps back in **O(1)** to the nearest content-addressed Merkle snapshot before that timestamp and deterministically replays the suffix.
+- **One pure Merkle-DAG CAS:** Every large artifact — reducer ES Module source code, SQLite database pages, binary blobs, and replay checkpoints — lives in one content-addressed DAG (`ContentAddressedStore`) with explicit links, strict public/private partitions, and exact mark-and-sweep garbage collection. Because snapshots are immutable hashes, "undo" is just holding a 32-byte pointer.
+
+---
+
+## 2. The Minimal Bootstrap: A Reducer of Reducers
+
+At the very bottom, Chronolog is gloriously minimal abstract nonsense: **one universal reducer** whose state is a map of named topics:
+
+```text
+State  = Map<TopicName, StateValue>
+Kernel : (State, Operation) -> State
+```
+
+Here is the trick that makes the whole machine self-describing:
+
+**One of those topics — `$reducers` — is itself a piece of state describing the reducers for every topic in the state.**
+
+Specifically, `$reducers` holds an **Import Map** of hash-pinned ES Modules (`specifier -> cas:sha256-...`) and a **topic registry** mapping each topic name to its reducer module. On every operation, the host `TopicKernel` reads `$reducers` from the *current* state, loads the target topic's hash-pinned ES Module from CAS into a fresh, deterministic QuickJS-NG WASM sandbox (with `Date`, `Math.random`, and `Intl` stripped), and executes `reduce(state, tx, ctx)`.
+
+Look at what falls out of reducing *state that contains the reducers over other topics of its own state*:
+
+- **Self-evolving or permanently frozen:** Bind `$reducers` itself to a governance reducer (such as `adminOnlyReducers`, or an M-of-N multisig governance module) and your database's own rules, migrations, and permissions evolve deterministically at exact points in authored history — and rewind cleanly during suffix replay! Or omit a reducer for `$reducers` at genesis to freeze the laws of physics for the lifetime of the chain.
+- **Permissions, keys, finality, and UI are just topics:**
+  - `$permissions` isn't hardcoded into the engine — it's a topic reducer answering a minimal capability query interface (`ctx.query('$permissions', { check: 'writer', actor })`). Ship with host-attested `attestedMembers`, zero-host M-of-N `multisigMembers`, public `openMembers`, or write your own capability system in 40 lines of JS.
+  - `$keys` manages HPKE (X25519 + AES-256-GCM) epoch key lockboxes and key rotation.
+  - `$finality` holds the chain's time-scoped finality schedule.
+  - `$publications` holds signed static web app release manifests referencing public CAS hashes.
+- **Strict blind-host partition:** On private chains (`privateChain: true`), `$*` control topics are mutated *only* by `visibility: 'public'` operations and can read *only* `$*` topics and public CAS. Private application topics are mutated *only* by `visibility: 'encrypted'` operations. A completely blind host (like a Cloudflare Worker with zero decryption keys) runs the exact same `TopicKernel` in `blindHostMode: true` and derives bit-for-bit identical control state (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`) as every full replica.
+
+---
+
+## 3. The Special Case: A Full Vanilla SQL Database as a CRDT
+
+Because undo-do-redo applies to *any* pure reducer over Merkle-DAG CAS, **a complete, real SQL database is just one standard topic reducer (`chronolog/sql`)**.
+
+Under the hood, `@chronolog/sqlite-cas` compiles **stock SQLite + FTS5 full-text search + `sqlite-vec` vector search** to a single static 1.34 MB `sqlite-cas.wasm` binary backed by a 4 KiB Merkle-paged `CAS` VFS:
+
+- **A whole SQL database is one 32-byte hash:** The topic state stores `{ dbRoot, schemaVersion, policies, allowUserDdl }`. Every `db.commit()` writes only dirty 4 KiB pages into CAS and returns the new 32-byte `dbRoot`. Rolling back a failed transaction or rewinding to replay an earlier offline operation across a `CREATE TABLE`, `ALTER TABLE`, `UNIQUE` constraint, foreign key, FTS5 index, or `sqlite-vec` table is **O(1)** — simply open the previous `dbRoot`.
+- **Multiple independent SQL databases per chain:** Bind `inventory`, `analytics`, and `scratch` to `chronolog/sql` in the same chain to get three isolated, hash-addressed relational databases sharing one identity, encryption, and permission boundary.
+- **Bit-for-bit deterministic everywhere:** Works identically in Chromium, WebKit, Node.js, and Cloudflare Workers. `random()` and `randomblob()` are disabled; `datetime('now')` and `localtime` are pinned to the signed operation's UTC `op_time()`; and `actor()`, `op_id()`, and `op_time()` are bound directly in the host kernel so reducers and SQL queries can never forge the caller.
+
+---
+
+## 4. Declarative SQL Preconditions & Malleable Write RLS
+
+Turning SQL into a local-first CRDT raises two real questions:
+1. *What happens when an offline operation replays against a different state than the author originally saw?*
+2. *How do untrusted or semi-trusted peers collaborate on shared tables without freezing the schema in concrete?*
+
+Chronolog answers both natively inside `chronolog/sql` and `chronolog/rls`:
+
+### Atomic Preconditions & Postconditions
+
+Every `chronolog/sql` transaction accepts declarative `preconditions` and `postconditions` — read-only SQL assertions evaluated immediately before and after the transaction's statements:
+
+```json
+{
+  "preconditions": [
+    {
+      "sql": "SELECT units >= ? AND units = ? FROM bins WHERE id = ?",
+      "params": [2, 10, "source"],
+      "code": "balance_changed"
+    }
+  ],
+  "statements": [
+    { "sql": "UPDATE bins SET units = units - ? WHERE id = ?", "params": [2, "source"] },
+    { "sql": "UPDATE bins SET units = units + ? WHERE id = ?", "params": [2, "destination"] },
+    { "sql": "INSERT INTO transfers (id, from_bin, to_bin, units, by_actor) VALUES (?, ?, ?, ?, actor())", "params": ["tx-42", "source", "destination", 2] }
+  ],
+  "postconditions": [
+    {
+      "sql": "SELECT NOT EXISTS (SELECT 1 FROM bins WHERE units < 0)",
+      "code": "negative_balance"
+    }
+  ]
+}
+```
+
+If **any** precondition, postcondition, SQL constraint, or RLS trigger fails, the transaction is deterministically rejected with its exact `code` and rolled back atomically (`dbRoot` stays untouched). Two peers concurrently claiming the last task or spending the same balance both succeed optimistically offline, and on convergence the canonical `(authorTimestampMs, author, opId)` order deterministically accepts the first and rejects the second — without losing the rejected operation's original signed intent or timestamp.
+
+### Malleable Postgres-Style Write RLS + User-Owned Dynamic DDL
+
+Instead of static, bureaucratic permission catalogs, `chronolog/sql` pairs SQLite's C-level authorizer (`mode: 'admin' | 'user' | 'readonly'`) with `chronolog/rls` (`applyRls`):
+
+- **Arbitrary read-only SQL write policies:** Administrators declare per-table `insert`, `update`, and `delete` predicates using `NEW.*`, `OLD.*`, `actor()`, `op_id()`, `op_time()`, and arbitrary subqueries against any table in the database (for example, checking a `grants` or `memberships` table!). Each predicate is validated through SQLite's `mode: 'readonly'` authorizer before `chronolog/rls` compiles it into tamper-proof `BEFORE INSERT/UPDATE/DELETE` triggers that `mode: 'user'` cannot alter or drop.
+- **Policies evolve on-chain:** Install or rewrite RLS policies at any time through ordinary signed `action: 'migrate'` or `action: 'setRls'` operations.
+- **Dynamic tables for non-admin users:** With `allowUserDdl: true`, regular writers in `mode: 'user'` can `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE INDEX`, and `CREATE VIEW` on tables they created (tracked in `_rls_table_owners`), while remaining strictly fenced out of admin tables and other users' DDL.
+- **Live schema introspection:** Query `{ query: 'schema' }` on any `chronolog/sql` topic to inspect every table, view, column list, table owner, and active RLS policy from the current deterministic snapshot.
+
+---
+
+## 5. A Consensus-Agnostic Core: A-la-Carte from Pure CRDT to Blockchain
+
+Chronolog deliberately separates **state transition & ordering** from **finality & inclusion**:
+
+- **Ordering is never decided by consensus.** `(authorTimestampMs, author, opId)` is always total and canonical.
+- **Finality is an optional, pluggable, time-scoped schedule** living in the `$finality` topic.
+
+Because the core reducer and Merkle-DAG CAS are completely consensus-agnostic, you choose *a-la-carte* how your application runs — and can even transition between modes over time (`none -> P1 -> P2`) while keeping the exact same `stateRoot` and `revision.digest`:
+
+| Mode | `$finality` Policy | What You Get |
+| --- | --- | --- |
+| **Pure CRDT** | `none` | Zero coordinators, zero consensus, pure local-first peer sync. Every operation is immediately live and always revisable if earlier offline work arrives. |
+| **Mostly-CRDT + Finality** | `signed-frontier` or `fixed-validator` | Collaborate offline at full CRDT speed while a trusted notary or M-of-N validator set periodically seals `closedThroughMs` checkpoints. History up to the frontier becomes irreversible; late operations claiming an already-closed timestamp are deterministically excluded (while retaining their original signed record). |
+| **Blockchain-Anchored** | `blockchain-anchor` | Anchor checkpoints and inclusion proofs to an external blockchain — gaining blockchain-grade finality and checkpoint-plus-suffix fast bootstrap over the exact same SQL/JS reducer model. |
+
+Authority (`$permissions`) is just as modular: choose `openMembers`, host-attested `attestedMembers`, zero-host M-of-N `multisigMembers`, or your own custom reducer.
+
+---
+
+## Architecture at a Glance
 
 ```text
 Signed Operations (flat set sorted by authorTimestampMs, author, opId)
@@ -36,31 +145,33 @@ Signed Operations (flat set sorted by authorTimestampMs, author, opId)
         ▼
   TopicKernel (TS) ──► QuickJS-NG WASM Sandbox (Import Map in $reducers)
         │                     │
-        │                     ├── chronolog/sql       (first-class declarative SQL + preconditions + RLS reducer)
-        │                     ├── chronolog:sqlite    (sqlite-cas.wasm: SQLite + FTS5 + sqlite-vec on Merkle-paged CAS)
+        │                     ├── chronolog/sql       (declarative SQL + preconditions/postconditions + RLS)
+        │                     ├── chronolog:sqlite    (sqlite-cas.wasm: SQLite + FTS5 + sqlite-vec on 4 KiB Merkle CAS)
         │                     ├── chronolog:crypto    (sha256, verifyEd25519, canonicalJson)
         │                     ├── chronolog:cas       (explicit-link put/get)
         │                     └── chronolog/{permissions,keys,finality,publications,rls}
         ▼
-  ContentAddressedStore (CAS) ──► BytesStore (Memory | IndexedDB | Node 22+ built-in node:sqlite)
+  ContentAddressedStore (CAS) ──► BytesStore (Memory | IndexedDB / OPFS | Node 22+ node:sqlite)
 ```
 
-## Six Audited Standard Modules
+### Six Audited Standard Modules
 
 Chronolog ships six small, audited ES Modules pinned into public CAS at genesis:
 
 | Module | Topic / Role | What It Does |
 | --- | --- | --- |
-| `chronolog/permissions` | `$permissions`, `$reducers`, `$signal_policy` | Pluggable authority presets (`attestedMembers`, `multisigMembers`, `openMembers`) answering capability queries (`{ check, actor }`, `{ list }`, `{ admission: true }`), admin-only `$reducers` upgrades, and ephemeral signal rules. |
+| `chronolog/permissions` | `$permissions`, `$reducers`, `$signal_policy` | Pluggable authority presets (`attestedMembers`, `multisigMembers`, `openMembers`) answering capability queries (`{ check, actor }`, `{ list }`, `{ admission: true }`), admin-only `$reducers` upgrades, and ephemeral signal policy. |
 | `chronolog/keys` | `$keys` | HPKE (X25519 + AES-256-GCM) epoch key lockboxes, key rotation, and fresh-device historical epoch grants (`grantBoxes`). |
-| `chronolog/finality` | `$finality` | Time-scoped optional finality schedule (`none`, `signed-frontier`, `fixed-validator`, `blockchain-anchor`) with clean `none -> P1` bootstrap and `P1 -> P2` handoffs. Finality decides inclusion and closed author-time, never order. |
+| `chronolog/finality` | `$finality` | Time-scoped optional finality schedule (`none`, `signed-frontier`, `fixed-validator`, `blockchain-anchor`) with clean `none -> P1` bootstrap and `P1 -> P2` handoffs. |
 | `chronolog/publications` | `$publications` | Signed static UI release manifests referencing public CAS hashes. |
-| `chronolog/rls` | Utility library | Postgres-style write RLS triggers validated through SQLite's `mode: 'readonly'` parser (`applyRls`) plus dynamic user-table ownership helpers. |
-| `chronolog/sql` | Any SQL topic(s) | First-class declarative SQLite-CAS topic reducer (`migrate`, `setRls`, `exec` with atomic preconditions + rollback, user-owned dynamic table DDL, `query({ sql, params })`, and `describe()`). |
+| `chronolog/rls` | Utility library | Postgres-style write RLS triggers validated via SQLite's `mode: 'readonly'` authorizer (`applyRls`) plus dynamic user-table ownership helpers. |
+| `chronolog/sql` | Any SQL topic(s) | First-class deterministic SQLite-CAS topic reducer (`migrate`, `setRls`, `setConfig`, `exec` with atomic preconditions/postconditions + rollback, user-owned dynamic DDL, `query({ sql, params, format })`, `schema`, and `describe()`). |
+
+---
 
 ## Quick Example
 
-Bind any topic directly to `chronolog/sql` — zero custom reducer boilerplate needed:
+Bind any topic directly to `chronolog/sql` (or drop in your own ES Module reducer in `imports`) — zero native builds, zero custom reducer boilerplate:
 
 ```ts
 import { createChainGenesis, createApplicationSession } from '@chronolog/peer-session'
@@ -68,7 +179,13 @@ import { openNativeDevice } from '@chronolog/peer-session/native'
 
 const device = await openNativeDevice({ path: './app.sqlite', create: true })
 const created = await createChainGenesis({
-  creator: { publicKey: device.identity.publicKey, wrapKey: device.wrapKey.publicKey, reader: true, writer: true, administrator: true },
+  creator: {
+    publicKey: device.identity.publicKey,
+    wrapKey: device.wrapKey.publicKey,
+    reader: true,
+    writer: true,
+    administrator: true,
+  },
   topics: {
     tasks: { module: 'chronolog/sql' },
   },
@@ -81,16 +198,19 @@ const session = await createApplicationSession({
   epochKeys: new Map([[0, created.epoch0Key!]]),
 })
 
+// 1. Ordinary signed DDL migration + malleable Postgres-style write RLS
 await (await session.submit({
   updates: [{
     topic: 'tasks',
     input: {
       action: 'migrate',
-      statements: ['CREATE TABLE tasks (id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL)'],
+      statements: [
+        'CREATE TABLE tasks (id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, claimed_by TEXT)',
+      ],
       policies: {
         tasks: {
           insert: 'NEW.owner = actor()',
-          update: 'OLD.owner = actor() AND NEW.owner = actor()',
+          update: 'OLD.owner = actor() OR OLD.claimed_by IS NULL OR OLD.claimed_by = actor()',
           delete: 'OLD.owner = actor()',
         },
       },
@@ -98,27 +218,37 @@ await (await session.submit({
   }],
 })).materialized()
 
+// 2. Declarative transaction with atomic preconditions & automatic rollback
 await (await session.submit({
   updates: [{
     topic: 'tasks',
     input: {
-      preconditions: [{ sql: "SELECT COUNT(*) = 0 FROM tasks WHERE id = ?", params: ['t1'], code: 'already_exists' }],
-      statements: [{ sql: 'INSERT INTO tasks (id, owner, title) VALUES (?, actor(), ?)', params: ['t1', 'Try Chronolog v2'] }],
+      preconditions: [
+        { sql: 'SELECT COUNT(*) = 0 FROM tasks WHERE id = ?', params: ['t1'], code: 'already_exists' },
+      ],
+      statements: [
+        { sql: 'INSERT INTO tasks (id, owner, title) VALUES (?, actor(), ?)', params: ['t1', 'Ship Chronolog v2'] },
+      ],
     },
   }],
 })).materialized()
 
+// 3. Deterministic read-only SQL query + live schema/RLS introspection
 console.log((await session.query('tasks', { sql: 'SELECT id, owner, title FROM tasks ORDER BY id', format: 'objects' })).value)
+console.log((await session.query('tasks', { query: 'schema' })).value)
 await session.close()
 ```
+
+---
 
 ## Zero Native Builds
 
 Chronolog-DB requires **Node.js >= 22.15** and has **zero `node-gyp` / C++ native dependencies**:
-- Node durable storage uses Node's built-in `node:sqlite` (`DatabaseSync`) on one pooled worker thread per process.
-- Browser storage uses IndexedDB / OPFS.
-- Reducer execution uses QuickJS-NG WASM (`quickjs-emscripten-core` + `@jitl/quickjs-ng-wasmfile-release-sync`).
-- Deterministic SQL uses stock SQLite + FTS5 + `sqlite-vec` compiled to static `sqlite-cas.wasm` (compatible with Node, browsers, and Cloudflare Workers via static `WebAssembly.Module` imports).
+
+- **Node durable storage:** Node's built-in `node:sqlite` (`DatabaseSync`) on one pooled worker thread per process.
+- **Browser durable storage:** IndexedDB and OPFS (`OpfsBytesStore`).
+- **Sandboxed ES Module reducers:** QuickJS-NG WASM (`quickjs-emscripten-core` + `@jitl/quickjs-ng-wasmfile-release-sync`).
+- **Deterministic SQL:** Stock SQLite + FTS5 + `sqlite-vec` compiled to static `sqlite-cas.wasm` (compatible with Node, browsers, and Cloudflare Workers via static `WebAssembly.Module` imports).
 
 ## Workspace Commands
 
