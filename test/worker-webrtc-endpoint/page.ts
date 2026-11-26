@@ -27,9 +27,11 @@ export async function qualify(mode: 'shared' | 'dedicated' | 'broadcast' | 'shar
     endpoint.addEventListener('message', event => {
       const value = event.data as { fixture?: string; id: number; description?: unknown; result?: unknown; error?: string }
       if (value.fixture === 'description') {
-        const description = value.description as { sdp: string }
-        descriptions.push({ gathering: peers[i]!.iceGatheringState, candidates: description.sdp.split(/\r?\n/u).filter(line => line.startsWith('a=candidate:')).length,
-          servers: peers[i]!.getConfiguration().iceServers?.length ?? 0 })
+        const message = value.description as { type?: string; sdp?: string; kind?: string }
+        if (typeof message?.sdp === 'string') {
+          descriptions.push({ gathering: peers[i]!.iceGatheringState, candidates: message.sdp.split(/\r?\n/u).filter(line => line.startsWith('a=candidate:')).length,
+            servers: peers[i]!.getConfiguration().iceServers?.length ?? 0 })
+        }
         endpoints[1 - i]!.postMessage({ fixture: 'command', action: 'remote', description: value.description })
       }
       if (value.fixture === 'reply') {
@@ -43,7 +45,7 @@ export async function qualify(mode: 'shared' | 'dedicated' | 'broadcast' | 'shar
     const started = performance.now()
     const ready = await Promise.all(endpoints.map((endpoint, index) => command(index, 'open', { role: index === 0 ? 'offerer' : 'answerer',
       broadcast: (endpoint as ApplicationWorkerEndpoint & { fixtureBroadcast?: string }).fixtureBroadcast,
-      ...(slowStun ? { timeoutMs: 5000, configuration: { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:192.0.2.1:3478' }] } } : {}) })))
+      ...(slowStun ? { trickle: false, timeoutMs: 5000, configuration: { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:192.0.2.1:3478' }] } } : {}) })))
     const negotiationMs = performance.now() - started
     await Promise.all([command(0, 'send', { count: 24, size: 65_536 }), command(1, 'send', { count: 24, size: 65_536 })])
     const live = await Promise.all([command(0, 'live'), command(1, 'live')])
