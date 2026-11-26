@@ -9,6 +9,8 @@ export interface CreateApplicationSessionOptions<D extends ApplicationDefinition
   readonly device: ApplicationDevice
   readonly genesis?: GenesisBlock | Uint8Array
   readonly chainId?: string
+  /** Optional host-level application scope ID (defaults to `chainId`). */
+  readonly applicationId?: string
   readonly casNodes?: readonly SessionCasNode[]
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
   readonly definition?: D

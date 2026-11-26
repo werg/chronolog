@@ -153,6 +153,8 @@ export interface OpenApplicationSessionOptions<D extends ApplicationDefinition =
   readonly store: BytesStore
   readonly genesis?: GenesisBlock | Uint8Array
   readonly chainId?: string
+  /** Optional host-level application scope ID (defaults to `chainId`). */
+  readonly applicationId?: string
   readonly casNodes?: readonly SessionCasNode[]
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
   readonly definition?: D
@@ -304,7 +306,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.genesisBytes = genesisBytes.slice()
     this.genesis = decodeGenesisBlock(this.genesisBytes)
     this.chainId = bytesToHex(genesisChainId(this.genesisBytes))
-    this.applicationId = this.chainId
+    this.applicationId = options.applicationId ?? this.chainId
     this.device = options.device
     this.identity = Object.freeze({ publicKey: options.device.identity.publicKey })
     if (options.definition !== undefined) this.definition = options.definition
