@@ -19,13 +19,17 @@ export interface MemberGrant { readonly publicKey: string; readonly wrapKey: str
  * Signed admission policy carried by every membership revision. `hostKey` pins the
  * host's Ed25519 attestation key; `accounts` names the host account principals
  * (`<accountId>` or `email:<address>`) whose attested devices any reader member may
- * admit in `attested` mode with exactly `grant`. `strict` requires an administrator.
+ * admit in `attested` mode with exactly `grant`, including `administrator` (an
+ * attested agent key receives `grant` without `administrator`; see `attestedGrant`). In
+ * attested mode a compromised host or account login can therefore admit a device
+ * with that grant; every admission stays visible in the signed chain and revocable
+ * by the other administrators. `strict` requires an administrator decision.
  */
 export interface AdmissionPolicy {
   readonly mode: 'attested' | 'strict'
   readonly hostKey: string
   readonly accounts: readonly string[]
-  readonly grant: { readonly reader: boolean; readonly writer: boolean }
+  readonly grant: { readonly reader: boolean; readonly writer: boolean; readonly administrator: boolean }
 }
 /** A host statement that an authenticated account proved possession of a device or agent key for one page. It is evidence, never membership. */
 export interface HostAttestation {
@@ -124,9 +128,9 @@ export function validateAdmissionPolicy(input: unknown): AdmissionPolicy {
   exactRecord(input, ['mode', 'hostKey', 'accounts', 'grant'], 'ADMISSION_POLICY_INVALID')
   check(input.mode === 'attested' || input.mode === 'strict', 'ADMISSION_POLICY_INVALID'); hex(input.hostKey)
   check(Array.isArray(input.accounts) && input.accounts.length <= 64 && (input.accounts as unknown[]).every(value => typeof value === 'string' && value.length > 0 && value.length <= 320) && new Set(input.accounts).size === input.accounts.length, 'ADMISSION_POLICY_INVALID')
-  exactRecord(input.grant, ['reader', 'writer'], 'ADMISSION_POLICY_INVALID')
-  check(typeof input.grant.reader === 'boolean' && typeof input.grant.writer === 'boolean', 'ADMISSION_POLICY_INVALID')
-  return { mode: input.mode, hostKey: input.hostKey, accounts: [...input.accounts as string[]], grant: { reader: input.grant.reader, writer: input.grant.writer } }
+  exactRecord(input.grant, ['reader', 'writer', 'administrator'], 'ADMISSION_POLICY_INVALID')
+  check(typeof input.grant.reader === 'boolean' && typeof input.grant.writer === 'boolean' && typeof input.grant.administrator === 'boolean', 'ADMISSION_POLICY_INVALID')
+  return { mode: input.mode, hostKey: input.hostKey, accounts: [...input.accounts as string[]], grant: { reader: input.grant.reader, writer: input.grant.writer, administrator: input.grant.administrator } }
 }
 export function validateInvites(input: unknown): readonly PageInvite[] {
   check(Array.isArray(input) && input.length <= 256, 'INVITE_INVALID')
@@ -169,6 +173,14 @@ export async function verifyHostAttestation(value: SignedHostAttestation, expect
 export function attestedAccountAuthorized(policy: AdmissionPolicy, attestation: HostAttestation): boolean {
   return policy.accounts.includes(attestation.accountId) || attestation.email !== null && policy.accounts.includes(`email:${attestation.email}`)
 }
+/**
+ * The exact grant an attested owner-account admission carries: the policy grant for a
+ * device; for an agent key, the policy grant without `administrator` (agents never
+ * become administrators automatically).
+ */
+export function attestedGrant(policy: AdmissionPolicy, attestation: HostAttestation): { readonly reader: boolean; readonly writer: boolean; readonly administrator: boolean } {
+  return { reader: policy.grant.reader, writer: policy.grant.writer, administrator: attestation.subject === 'device' && policy.grant.administrator }
+}
 function sameGrant(a: MemberGrant, b: MemberGrant): boolean { return a.publicKey === b.publicKey && a.wrapKey === b.wrapKey && a.reader === b.reader && a.writer === b.writer && a.administrator === b.administrator && a.publisher === b.publisher && a.finalizer === b.finalizer }
 export async function verifyAuthorityBundle(input: AuthorityBundle, pinned?: SignedAppDescriptor): Promise<void> {
   const bundle = structuredClone(input), descriptor = bundle.descriptor.payload
@@ -209,9 +221,10 @@ export async function verifyAuthorityBundle(input: AuthorityBundle, pinned?: Sig
     }
     if (prior !== null && signed.signer !== descriptor.authorityPublicKey && !prior.members.some(member => member.publicKey === signed.signer && member.administrator)) {
       // A non-administrator reader may only append attested or invited members with
-      // exactly the grant the signed policy or invite assigns, within invite capacity.
+      // exactly the grant their `via` prescribes (the signed policy grant, or the
+      // invite role), within invite capacity, and may change nothing else.
       const grantFor = (item: MemberAdmission): { reader: boolean; writer: boolean; administrator: boolean } => {
-        if (item.via === 'attested') return { ...prior.admission.grant, administrator: false }
+        if (item.via === 'attested') return attestedGrant(prior.admission, item.attestation.payload)
         const invite = prior.invites.find(entry => entry.inviteId === item.attestation.payload.inviteId)!
         check(inviteRedemptions(bundle.memberships.slice(0, revision + 1), invite.inviteId) <= inviteCapacity(invite), 'AUTHORITY_INVITE_EXHAUSTED')
         return inviteGrant(invite.role)

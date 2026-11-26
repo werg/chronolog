@@ -1,10 +1,10 @@
 import { expect, it } from 'vitest'
 import { bytesToHex, sha256 } from '@chronolog/canonical'
-import { createSigningIdentity, signAppDescriptor, signMembership, signHostAttestation, verifyHostAttestation, attestedAccountAuthorized, verifyAuthorityBundle, recordDigest, inviteRedemptions, type AdmissionPolicy, type HostAttestation, type Membership, type SignedMembership, type MemberGrant, type PageInvite, type SigningIdentity } from './index.js'
+import { createSigningIdentity, validateAdmissionPolicy, attestedGrant, signAppDescriptor, signMembership, signHostAttestation, verifyHostAttestation, attestedAccountAuthorized, verifyAuthorityBundle, recordDigest, inviteRedemptions, type AdmissionPolicy, type HostAttestation, type Membership, type SignedMembership, type MemberGrant, type PageInvite, type SigningIdentity } from './index.js'
 const applicationId = 'a1'.repeat(32), hex = (byte: string) => byte.repeat(32)
 async function chain(mode: AdmissionPolicy['mode'] = 'attested', invites: PageInvite[] = []) {
   const creator = await createSigningIdentity(), host = await createSigningIdentity(), agent = await createSigningIdentity()
-  const admission: AdmissionPolicy = { mode, hostKey: host.publicKey, accounts: ['acct_owner', 'email:owner@example.test'], grant: { reader: true, writer: true } }
+  const admission: AdmissionPolicy = { mode, hostKey: host.publicKey, accounts: ['acct_owner', 'email:owner@example.test'], grant: { reader: true, writer: true, administrator: true } }
   const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: creator.publicKey, authorityPublicKey: creator.publicKey, executionManifestDigest: hex('b2'), finalityPolicy: { kind: 'none' } }, creator)
   const grant = (publicKey: string, wrapKey: string, administrator: boolean): MemberGrant => ({ publicKey, wrapKey, reader: true, writer: true, administrator, publisher: false, finalizer: false })
   const genesis = await signMembership({ applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n, epoch: 0, epochKeyDigest: hex('c3'), members: [grant(creator.publicKey, hex('d4'), true), grant(agent.publicKey, hex('d5'), false)], admission, admitted: [], invites }, creator)
@@ -28,20 +28,62 @@ it('host attestations verify only against the pinned key, scope and authorized a
   expect(attestedAccountAuthorized(c.admission, { ...attestation.payload, accountId: 'acct_guest', email: 'guest@example.test' })).toBe(false)
   expect(attestedAccountAuthorized(c.admission, { ...attestation.payload, accountId: 'acct_new', email: 'owner@example.test' })).toBe(true)
 })
-it('any reader member admits an attested owner device with exactly the policy grant; the host cannot', async () => {
+it('the admission policy grant names reader, writer and administrator exactly', () => {
+  const policy = { mode: 'attested', hostKey: hex('aa'), accounts: ['acct_owner'] }
+  expect(validateAdmissionPolicy({ ...policy, grant: { reader: true, writer: true, administrator: true } }).grant).toEqual({ reader: true, writer: true, administrator: true })
+  expect(() => validateAdmissionPolicy({ ...policy, grant: { reader: true, writer: true } })).toThrow('ADMISSION_POLICY_INVALID')
+  expect(() => validateAdmissionPolicy({ ...policy, grant: { reader: true, writer: true, administrator: 'yes' } })).toThrow('ADMISSION_POLICY_INVALID')
+  expect(() => validateAdmissionPolicy({ ...policy, grant: { reader: true, writer: true, administrator: true, publisher: false } })).toThrow('ADMISSION_POLICY_INVALID')
+})
+it('a chain carrying a two-field admission grant does not verify', async () => {
+  const c = await chain(), legacy = { ...c.admission, grant: { reader: true, writer: true } } as unknown as AdmissionPolicy
+  const genesis = await signMembership({ ...c.genesis.payload, admission: legacy }, c.creator)
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: [genesis] })).rejects.toThrow('ADMISSION_POLICY_INVALID')
+})
+it('any reader member admits an attested owner device with exactly the policy grant, administrator included; the host cannot', async () => {
   const c = await chain(), device = await createSigningIdentity(), attestation = await c.attest(device)
-  const admit = (signer: SigningIdentity, grant = c.grant(device.publicKey, hex('e6'), false), via: 'attested' | 'approved' = 'attested', att = attestation) =>
+  const admit = (signer: SigningIdentity, grant = c.grant(device.publicKey, hex('e6'), true), via: 'attested' | 'approved' = 'attested', att = attestation) =>
     c.extend([c.genesis], head => ({ members: [...head.members, grant], admitted: [{ publicKey: device.publicKey, via, attestation: att }] }), signer)
-  await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent) })
+  const admitted = await admit(c.agent)
+  await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: admitted })
+  expect(admitted.at(-1)!.payload.members.find(member => member.publicKey === device.publicKey)?.administrator).toBe(true)
   await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.creator) })
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.host) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
-  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, c.grant(device.publicKey, hex('e6'), true)) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
+  // A non-administrator must use exactly the prescribed grant: neither less nor more.
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, c.grant(device.publicKey, hex('e6'), false)) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, { ...c.grant(device.publicKey, hex('e6'), true), publisher: true }) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, { ...c.grant(device.publicKey, hex('e6'), true), finalizer: true }) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, undefined, 'approved') })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, undefined, 'attested', await c.attest(device, { accountId: 'acct_guest', email: null })) })).rejects.toThrow('AUTHORITY_ADMISSION_ACCOUNT_FORBIDDEN')
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, undefined, 'attested', await c.attest(device, { issuedAt: 1n, expiresAt: 2_000n })) })).rejects.toThrow('AUTHORITY_ADMISSION_EXPIRED')
   await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.agent, undefined, 'attested', await c.attest(device, {}, await createSigningIdentity())) })).rejects.toThrow('AUTHORITY_SIGNER_MISMATCH')
   // A guest account still needs an administrator's explicit approval.
   await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(c.creator, undefined, 'approved', await c.attest(device, { accountId: 'acct_guest', email: null })) })
+})
+it('an attested agent key receives the policy grant without administrator', async () => {
+  const c = await chain(), agentKey = await createSigningIdentity(), attestation = await c.attest(agentKey, { subject: 'agent', label: '@atlas' })
+  expect(attestedGrant(c.admission, attestation.payload)).toEqual({ reader: true, writer: true, administrator: false })
+  const admit = (administrator: boolean) => c.extend([c.genesis], head => ({ members: [...head.members, c.grant(agentKey.publicKey, hex('e6'), administrator)], admitted: [{ publicKey: agentKey.publicKey, via: 'attested', attestation }] }), c.agent)
+  await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(false) })
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(true) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
+})
+it('an attested admission by a non-administrator cannot alter any other member or field', async () => {
+  const c = await chain(), device = await createSigningIdentity(), attestation = await c.attest(device), added = c.grant(device.publicKey, hex('e6'), true)
+  const admit = (change: (head: Membership) => Partial<Membership>) => c.extend([c.genesis], head => ({ members: [...head.members, added], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }], ...change(head) }), c.agent)
+  const bad = async (value: Promise<SignedMembership[]>) => expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await value })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
+  await bad(admit(head => ({ members: [...head.members.map(member => ({ ...member, administrator: true })), added] })))
+  await bad(admit(head => ({ members: [...head.members.filter(member => member.publicKey !== c.creator.publicKey), added] })))
+  await bad(admit(head => ({ admission: { ...head.admission, mode: 'strict' } })))
+  await bad(admit(head => ({ admission: { ...head.admission, accounts: [...head.admission.accounts, 'acct_guest'] } })))
+  await bad(admit(() => ({ epoch: 1, epochKeyDigest: hex('f7') })))
+})
+it('a policy grant without administrator admits non-administrator devices only', async () => {
+  const c = await chain(), device = await createSigningIdentity(), attestation = await c.attest(device)
+  const editors = await c.extend([c.genesis], head => ({ admission: { ...head.admission, grant: { reader: true, writer: true, administrator: false } } }), c.creator)
+  await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: editors })
+  const admit = (administrator: boolean) => c.extend(editors, head => ({ members: [...head.members, c.grant(device.publicKey, hex('e6'), administrator)], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }] }), c.agent)
+  await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(false) })
+  await expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await admit(true) })).rejects.toThrow('AUTHORITY_ADMIN_REQUIRED')
 })
 it('strict mode keeps attested devices pending until an administrator approves them', async () => {
   const c = await chain('strict'), device = await createSigningIdentity(), attestation = await c.attest(device)
@@ -55,7 +97,7 @@ it('strict mode keeps attested devices pending until an administrator approves t
 })
 it('replayed attestations and re-admission of a member are rejected deterministically', async () => {
   const c = await chain(), device = await createSigningIdentity(), attestation = await c.attest(device)
-  const admitted = await c.extend([c.genesis], head => ({ members: [...head.members, c.grant(device.publicKey, hex('e6'), false)], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }] }), c.agent)
+  const admitted = await c.extend([c.genesis], head => ({ members: [...head.members, c.grant(device.publicKey, hex('e6'), true)], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }] }), c.agent)
   const removed = await c.extend(admitted, head => ({ members: head.members.filter(member => member.publicKey !== device.publicKey), epoch: 1, epochKeyDigest: hex('f7') }), c.creator)
   await verifyAuthorityBundle({ descriptor: c.descriptor, memberships: removed })
   const replay = await c.extend(removed, head => ({ members: [...head.members, c.grant(device.publicKey, hex('e6'), false)], admitted: [{ publicKey: device.publicKey, via: 'attested', attestation }] }), c.agent)
@@ -75,11 +117,12 @@ it('invites admit only within binding, role, expiry and capacity; overuse by an 
     { inviteId: '33'.repeat(16), role: 'reader', binding: { kind: 'public', max: 2 }, expiresAt: 900_000n, secretDigest, revoked: false },
     { inviteId: '44'.repeat(16), role: 'reader', binding: { kind: 'open' }, expiresAt: 900_000n, secretDigest, revoked: true },
     { inviteId: '55'.repeat(16), role: 'reader', binding: { kind: 'open' }, expiresAt: 3_000n, secretDigest, revoked: false },
+    { inviteId: '77'.repeat(16), role: 'admin', binding: { kind: 'open' }, expiresAt: 900_000n, secretDigest, revoked: false },
   ]
   const c = await chain('attested', invites)
-  const redeem = async (memberships: SignedMembership[], inviteId: string, account: { accountId: string; email: string | null }, signer = c.agent, role: 'reader' | 'writer' = 'reader') => {
+  const redeem = async (memberships: SignedMembership[], inviteId: string, account: { accountId: string; email: string | null }, signer = c.agent, role: 'reader' | 'writer' | 'admin' = 'reader') => {
     const device = await createSigningIdentity(), attestation = await c.attest(device, { ...account, inviteId })
-    return c.extend(memberships, head => ({ members: [...head.members, { ...c.grant(device.publicKey, hex('e6'), false), writer: role === 'writer' }], admitted: [{ publicKey: device.publicKey, via: 'invited', attestation }] }), signer)
+    return c.extend(memberships, head => ({ members: [...head.members, { ...c.grant(device.publicKey, hex('e6'), role === 'admin'), writer: role !== 'reader' }], admitted: [{ publicKey: device.publicKey, via: 'invited', attestation }] }), signer)
   }
   const ok = async (value: Promise<SignedMembership[]>) => { const memberships = await value; await verifyAuthorityBundle({ descriptor: c.descriptor, memberships }); return memberships }
   const bad = async (value: Promise<SignedMembership[]>, code: string) => expect(verifyAuthorityBundle({ descriptor: c.descriptor, memberships: await value })).rejects.toThrow(code)
@@ -91,6 +134,11 @@ it('invites admit only within binding, role, expiry and capacity; overuse by an 
   const doubled = await ok(redeem(once, '22'.repeat(16), { accountId: 'acct_b', email: null }, c.creator, 'writer'))
   expect(inviteRedemptions(doubled, '22'.repeat(16))).toBe(2)
   await bad(redeem([c.genesis], '22'.repeat(16), { accountId: 'acct_a', email: null }, c.agent, 'reader'), 'AUTHORITY_ADMIN_REQUIRED')
+  // Invite roles, not the policy grant, prescribe invited rights.
+  await bad(redeem([c.genesis], '11'.repeat(16), { accountId: 'acct_friend', email: 'friend@example.test' }, c.agent, 'admin'), 'AUTHORITY_ADMIN_REQUIRED')
+  await bad(redeem([c.genesis], '22'.repeat(16), { accountId: 'acct_a', email: null }, c.agent, 'admin'), 'AUTHORITY_ADMIN_REQUIRED')
+  await ok(redeem([c.genesis], '77'.repeat(16), { accountId: 'acct_a', email: null }, c.agent, 'admin'))
+  await bad(redeem([c.genesis], '77'.repeat(16), { accountId: 'acct_a', email: null }, c.agent, 'writer'), 'AUTHORITY_ADMIN_REQUIRED')
   const first = await ok(redeem([c.genesis], '33'.repeat(16), { accountId: 'acct_1', email: null })), second = await ok(redeem(first, '33'.repeat(16), { accountId: 'acct_2', email: null }))
   await bad(redeem(second, '33'.repeat(16), { accountId: 'acct_3', email: null }), 'AUTHORITY_INVITE_EXHAUSTED')
   await bad(redeem([c.genesis], '44'.repeat(16), { accountId: 'acct_1', email: null }), 'AUTHORITY_INVITE_INVALID')

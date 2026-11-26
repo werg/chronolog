@@ -34,7 +34,7 @@ async function openSession(device: ApplicationDevice, applicationId: string) {
   const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: device.identity.publicKey,
     authorityPublicKey: authoritySigner.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest),
     finalityPolicy: { kind: 'none' } }, authoritySigner)
-  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n,
+  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true, administrator: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n,
     epoch: 0, epochKeyDigest: await epochKeyCommitment(applicationId, 0, key),
     members: [{ publicKey: device.identity.publicKey, wrapKey: null, reader: true, writer: true, administrator: true, publisher: false, finalizer: false }] }, authoritySigner)
   return createApplicationSession({ device, definition, authority: { descriptor, memberships: [membership] }, epochKeys: new Map([[0, key]]) })

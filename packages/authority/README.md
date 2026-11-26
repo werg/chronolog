@@ -24,7 +24,8 @@ self-contained declarations and source/byte provenance.
 The creator signs the descriptor (`authorityPublicKey === rootPrincipal`) and genesis
 membership. Every membership revision carries an `AdmissionPolicy`
 (`mode: 'attested' | 'strict'`, the pinned host attestation key, the authorized host
-account principals and the grant for owner devices), the `invites` recorded by
+account principals and the exact `grant` — `{ reader, writer, administrator }`, all
+booleans — for owner-account devices), the `invites` recorded by
 administrators, and `admitted` evidence for members it adds. A host attestation
 (`signHostAttestation`) states that an authenticated account proved a device or agent
 key for one page; it is evidence, never membership. `verifyAuthorityBundle` accepts:
@@ -36,7 +37,13 @@ key for one page; it is evidence, never membership. `verifyAuthorityBundle` acce
   (a recorded unrevoked invite whose email binding, expiry, role grant and redemption
   capacity hold), with policy, invites, epoch and existing members unchanged. A key
   that was ever a member is never re-admitted this way; re-admission after removal is
-  an administrator decision.
+  an administrator decision. Strict mode accepts no automatic admission.
+
+When the policy grant includes `administrator`, an attested owner-account device
+becomes an administrator; an attested agent key receives the policy grant without
+`administrator` (`attestedGrant`). The trade-off: in attested mode a compromised host or
+account login could admit an administrator device; that admission is visible in the
+signed chain and revocable by the other administrators.
 
 Attestation freshness is checked deterministically: the revision's signed activation
 floor lies within the attestation window, and nonces are never reused in a chain. A

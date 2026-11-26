@@ -40,7 +40,7 @@ try {
   const { executionManifestDigest } = await executionManifestArtifacts(engine.executionManifest);
   const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: aDevice.identity.publicKey,
     authorityPublicKey: issuer.publicKey, executionManifestDigest: bytesToHex(executionManifestDigest), finalityPolicy: { kind: 'none' } }, issuer);
-  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n,
+  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true, administrator: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n,
     epoch: 0, epochKeyDigest: await epochKeyCommitment(applicationId, 0, key), members: [aDevice, bDevice].map((device, index) => ({
       publicKey: device.identity.publicKey, wrapKey: null, reader: true, writer: true, administrator: index === 0, publisher: index === 0, finalizer: false,
     })) }, issuer);
