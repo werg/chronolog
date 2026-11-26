@@ -51,6 +51,8 @@ export interface SqliteExecResult {
   readonly lastInsertRowid: number
   readonly createdTables: readonly string[]
   readonly droppedTables: readonly string[]
+  readonly createdViews?: readonly string[]
+  readonly droppedViews?: readonly string[]
 }
 
 export interface SqliteQueryResult {

@@ -226,6 +226,66 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
     // Also verify dotted command/query dispatch works end-to-end
     const viaQ = await sessBob.query('inventory.sql', { sql: 'SELECT id, qty FROM items', format: 'objects' })
     expect(viaQ.value).toEqual({ columns: ['id', 'qty'], rows: [{ id: 'widget', qty: 2 }] })
+
+    // 9. Postconditions enforce whole-transaction invariants with atomic rollback + expect.exists
+    const postFail = await sessAlice.submit({
+      authorTimestampMs: 700n,
+      updates: [{
+        topic: 'inventory',
+        input: {
+          preconditions: [{ sql: 'SELECT 1 FROM items WHERE id = ?', params: ['widget'], expect: { exists: true } }],
+          statements: [{ sql: 'UPDATE items SET qty = 999 WHERE id = ?', params: ['widget'] }],
+          postconditions: [{ sql: 'SELECT SUM(qty) <= 10 FROM items', code: 'cap_exceeded' }],
+        },
+      }],
+    })
+    expect((await postFail.materialized()).rejectionCode).toBe('cap_exceeded')
+    expect((await sessAlice.query('inventory', { sql: 'SELECT qty FROM items WHERE id = ?', params: ['widget'] })).value).toEqual({
+      columns: ['qty'],
+      rows: [[2]],
+    })
+
+    // 10. Non-admin user creates a VIEW in op 1, Bob cannot drop it, Alice drops her own VIEW in op 2!
+    const createViewOp = await sessAlice.submit({
+      authorTimestampMs: 710n,
+      updates: [{
+        topic: 'inventory',
+        input: { statements: ['CREATE VIEW alice_view AS SELECT id, qty FROM items'] },
+      }],
+    })
+    expect((await createViewOp.materialized()).outcome).toBe('accepted')
+    await sessBob.mergeFacts(await sessAlice.exportFacts())
+    const bobDropView = await sessBob.submit({
+      authorTimestampMs: 720n,
+      updates: [{ topic: 'inventory', input: { statements: ['DROP VIEW alice_view'] } }],
+    })
+    expect((await bobDropView.materialized()).outcome).toBe('rejected')
+    const aliceDropView = await sessAlice.submit({
+      authorTimestampMs: 730n,
+      updates: [{ topic: 'inventory', input: { statements: ['DROP VIEW alice_view'] } }],
+    })
+    expect((await aliceDropView.materialized()).outcome).toBe('accepted')
+
+    // 11. Partial setRls merge preserves unmodified triggers on the same table!
+    await sessAdmin.mergeFacts(await sessAlice.exportFacts())
+    const partialRls = await sessAdmin.submit({
+      authorTimestampMs: 740n,
+      updates: [{
+        topic: 'inventory',
+        input: {
+          action: 'setRls',
+          policies: { items: { delete: 'OLD.owner = actor() AND OLD.qty = 0' } },
+        },
+      }],
+    })
+    expect((await partialRls.materialized()).outcome).toBe('accepted')
+    await sessBob.mergeFacts(await sessAdmin.exportFacts())
+    // Bob STILL cannot update Alice's item because the existing `update` trigger was preserved!
+    const stillBlocked = await sessBob.submit({
+      authorTimestampMs: 750n,
+      updates: [{ topic: 'inventory', input: { statements: [{ sql: 'UPDATE items SET qty = 50 WHERE id = ?', params: ['widget'] }] } }],
+    })
+    expect((await stillBlocked.materialized()).rejectionCode).toBe('rls_denied:items:update')
   })
 
   it('supports openMembers (unregistered strangers write) and multisigMembers end-to-end across ApplicationSession', async () => {

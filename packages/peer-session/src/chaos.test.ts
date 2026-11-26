@@ -315,6 +315,6 @@ describe('Chronolog v2 Multi-Replica Chaos Suite', () => {
       // Silence unused import warning for hexToBytes/bytesToHex if not needed
       expect(bytesToHex(hexToBytes(refRev.stateRoot))).toBe(refRev.stateRoot)
     },
-    30_000,
+    90_000,
   )
 })

@@ -311,7 +311,12 @@ function applyMultisigProposal(cur, prop) {
         finalizer: m.finalizer,
       },
     };
-    const nextSigners = m.administrator ? sortedKeys(cur.signers.concat([m.publicKey])) : cur.signers;
+    const nextSigners = m.administrator
+      ? sortedKeys(cur.signers.concat([m.publicKey]))
+      : cur.signers.filter(k => k !== m.publicKey);
+    if (nextSigners.length === 0 || nextSigners.length < cur.threshold) {
+      return { ok: false, code: 'threshold_unsatisfiable' };
+    }
     return { ok: true, state: { ...cur, signers: nextSigners, members: nextMembers }, event: { topic: '$permissions.member', payload: { publicKey: m.publicKey } } };
   }
   if (prop.kind === 'removeMember') {
@@ -377,6 +382,18 @@ export const multisigMembers = {
         ok: true,
         state: { ...cur, proposals: { ...cur.proposals, [id]: updated } },
         events: [{ topic: '$permissions.approved', payload: { proposalId: id, approvals: approvals.length, threshold: cur.threshold } }],
+      };
+    }
+
+    if (input.action === 'cancel') {
+      const id = input.proposalId;
+      if (typeof id !== 'string' || !cur.proposals[id]) return { ok: false, code: 'proposal_not_found' };
+      const nextProposals = { ...cur.proposals };
+      delete nextProposals[id];
+      return {
+        ok: true,
+        state: { ...cur, proposals: nextProposals },
+        events: [{ topic: '$permissions.cancelled', payload: { proposalId: id } }],
       };
     }
 
@@ -757,6 +774,12 @@ function checkPreconditions(db, preconditions) {
     if (typeof exp !== 'object') {
       return { ok: false, code: 'sql:invalid_precondition', detail: 'Precondition ' + i + ' expect must be an object' };
     }
+    if (exp.exists !== undefined) {
+      const hasRows = res.rows.length > 0;
+      if (hasRows !== Boolean(exp.exists)) {
+        return { ok: false, code: failCode, detail: 'Expected exists=' + Boolean(exp.exists) + ', got ' + hasRows };
+      }
+    }
     if (exp.rowCount !== undefined && res.rows.length !== exp.rowCount) {
       return { ok: false, code: failCode, detail: 'Expected rowCount ' + exp.rowCount + ', got ' + res.rows.length };
     }
@@ -812,11 +835,39 @@ function rowsToObjects(res) {
   });
 }
 
+function mergeRlsPolicies(existing, incoming) {
+  const next = { ...existing };
+  const toApply = {};
+  for (const [table, rule] of Object.entries(incoming)) {
+    if (rule === null) {
+      delete next[table];
+      toApply[table] = { insert: null, update: null, delete: null };
+      continue;
+    }
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+      throw new Error('RLS_POLICIES_INVALID');
+    }
+    const merged = { ...(existing[table] || {}), ...rule };
+    const clean = {};
+    for (const op of ['insert', 'update', 'delete']) {
+      if (merged[op] !== undefined && merged[op] !== null) clean[op] = merged[op];
+    }
+    if (Object.keys(clean).length === 0) delete next[table];
+    else next[table] = clean;
+    toApply[table] = {
+      insert: merged.insert ?? null,
+      update: merged.update ?? null,
+      delete: merged.delete ?? null,
+    };
+  }
+  return { nextPolicies: next, toApply };
+}
+
 /**
  * First-class deterministic Merkle-paged SQLite topic reducer.
- * - Declarative SQL transactions with atomic preconditions and automatic rollback on failure
+ * - Declarative SQL transactions with atomic preconditions, postconditions, and automatic rollback on failure
  * - Postgres-style write RLS policies (chronolog/rls) + host-bound actor()/op_id()/op_time()
- * - Admin DDL (mode:'admin') and non-admin user-owned dynamic table DDL (mode:'user')
+ * - Admin DDL (mode:'admin') and non-admin user-owned dynamic table & view DDL (mode:'user')
  * - Multiple topics in one chain can each bind chronolog/sql for independent hash-addressed databases
  */
 export const sqlDatabase = {
@@ -849,9 +900,9 @@ export const sqlDatabase = {
       }
       const db = openDb(cur.dbRoot);
       try {
-        applyRls(db, input.policies);
+        const { nextPolicies, toApply } = mergeRlsPolicies(cur.policies, input.policies);
+        applyRls(db, toApply);
         const dbRoot = db.commit();
-        const nextPolicies = { ...cur.policies, ...input.policies };
         return {
           ok: true,
           state: { ...cur, dbRoot, policies: nextPolicies },
@@ -878,9 +929,12 @@ export const sqlDatabase = {
         }
         let nextPolicies = cur.policies;
         if (input.policies && typeof input.policies === 'object' && !Array.isArray(input.policies)) {
-          applyRls(db, input.policies);
-          nextPolicies = { ...cur.policies, ...input.policies };
+          const merged = mergeRlsPolicies(cur.policies, input.policies);
+          applyRls(db, merged.toApply);
+          nextPolicies = merged.nextPolicies;
         }
+        const postCheck = checkPreconditions(db, input.postconditions);
+        if (!postCheck.ok) return postCheck;
         const dbRoot = db.commit();
         const schemaVersion = Number.isSafeInteger(input.schemaVersion) ? input.schemaVersion : cur.schemaVersion + 1;
         const allowUserDdl = input.allowUserDdl === undefined ? cur.allowUserDdl : Boolean(input.allowUserDdl);
@@ -934,11 +988,16 @@ export const sqlDatabase = {
                 }
               : { mode: 'user' };
           const res = db.exec(stmt.sql, stmt.params, execOpts);
-          if (mode === 'user' && cur.allowUserDdl && (res.createdTables.length > 0 || res.droppedTables.length > 0)) {
-            recordTableOwners(db, res.createdTables, res.droppedTables, tx.author);
+          const created = (res.createdTables || []).concat(res.createdViews || []);
+          const dropped = (res.droppedTables || []).concat(res.droppedViews || []);
+          if (mode === 'user' && cur.allowUserDdl && (created.length > 0 || dropped.length > 0)) {
+            recordTableOwners(db, created, dropped, tx.author);
             owned = getOwnedTables(db, tx.author);
           }
         }
+
+        const postCheck = checkPreconditions(db, input.postconditions);
+        if (!postCheck.ok) return postCheck;
 
         const dbRoot = db.commit();
         return {
@@ -1037,6 +1096,18 @@ export const sqlDatabase = {
             properties: {
               mode: { type: 'string', enum: ['user', 'admin'] },
               preconditions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    sql: { type: 'string' },
+                    params: { type: 'array', items: scalarParam },
+                    code: { type: 'string' },
+                  },
+                  required: ['sql'],
+                },
+              },
+              postconditions: {
                 type: 'array',
                 items: {
                   type: 'object',

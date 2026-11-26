@@ -128,6 +128,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
       droppedTables: Set<string>
       createdIndexes: Set<string>
       createdViews: Set<string>
+      droppedViews: Set<string>
     } | null = null
 
     mod._casHooks = {
@@ -186,7 +187,9 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
           return 1
         }
         if (action === SQLITE_DROP_VIEW) {
-          return (createdViews.has(arg1) || (allow.dropView?.includes(arg1) ?? false)) ? 1 : 0
+          const ok = createdViews.has(arg1) || (allow.dropView?.includes(arg1) ?? false)
+          if (ok) { createdViews.delete(arg1); activeDdl.droppedViews.add(arg1) }
+          return ok ? 1 : 0
         }
         return 0
       },
@@ -261,11 +264,14 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
         })
         activeFile = pageFile
 
-        withCString(mod, openOpts.actor, actorPtr => {
-          withCString(mod, openOpts.opId, opIdPtr => {
-            mod._chronolog_set_context(actorPtr, opIdPtr, Number(openOpts.opTimeMs))
+        const setContext = (): void => {
+          withCString(mod, openOpts.actor, actorPtr => {
+            withCString(mod, openOpts.opId, opIdPtr => {
+              mod._chronolog_set_context(actorPtr, opIdPtr, Number(openOpts.opTimeMs))
+            })
           })
-        })
+        }
+        setContext()
 
         const db = mod._chronolog_open()
         throwIfMissing()
@@ -275,6 +281,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
         const ensureOpen = (): void => {
           if (closed) throw new Error('SQLITE_HANDLE_CLOSED')
           activeFile = pageFile
+          setContext()
         }
 
         const runSql = (
@@ -283,12 +290,14 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
           modeNum: number,
           ddl: SqliteDdlAllowlist | undefined,
           requireSingle: boolean,
-        ): { readonly columns: string[]; readonly rows: JsonValue[][]; readonly changes: number; readonly lastInsertRowid: number; readonly createdTables: string[]; readonly droppedTables: string[] } => {
+        ): { readonly columns: string[]; readonly rows: JsonValue[][]; readonly changes: number; readonly lastInsertRowid: number; readonly createdTables: string[]; readonly droppedTables: string[]; readonly createdViews: string[]; readonly droppedViews: string[] } => {
           ensureOpen()
           mod._chronolog_set_mode(modeNum)
           const createdTables = new Set<string>()
           const droppedTables = new Set<string>()
-          activeDdl = modeNum === 1 ? { allow: ddl ?? {}, createdTables, droppedTables, createdIndexes: new Set(), createdViews: new Set() } : null
+          const createdViews = new Set<string>()
+          const droppedViews = new Set<string>()
+          activeDdl = modeNum === 1 ? { allow: ddl ?? {}, createdTables, droppedTables, createdIndexes: new Set(), createdViews, droppedViews } : null
 
           const outStmtPtr = mod._malloc(4)
           const outTailPtr = mod._malloc(4)
@@ -339,6 +348,8 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
               lastInsertRowid: mod._chronolog_last_insert_rowid(db),
               createdTables: [...createdTables].sort(),
               droppedTables: [...droppedTables].sort(),
+              createdViews: [...createdViews].sort(),
+              droppedViews: [...droppedViews].sort(),
             }
           } finally {
             activeDdl = null
@@ -359,6 +370,8 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
               lastInsertRowid: res.lastInsertRowid,
               createdTables: res.createdTables,
               droppedTables: res.droppedTables,
+              createdViews: res.createdViews,
+              droppedViews: res.droppedViews,
             }
           },
           query(sql: string, params: readonly JsonValue[] = []): SqliteQueryResult {
