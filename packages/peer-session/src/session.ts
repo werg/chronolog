@@ -401,7 +401,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     } else if (options.chainId !== undefined) {
       genesisBytes = await options.store.get(`v2/${options.chainId}/genesis`)
     } else {
-      const all = options.store.entries ? await options.store.entries() : []
+      const all = await readAllStoreEntries(options.store)
       for (const entry of all) {
         if (entry.key.startsWith('v2/') && entry.key.endsWith('/genesis')) {
           genesisBytes = entry.value
@@ -838,7 +838,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   async #hydrateFromStore(): Promise<void> {
-    const entries = this.#store.entries ? await this.#store.entries() : []
+    const entries = await readAllStoreEntries(this.#store)
     const prefix = `${this.#prefix}/`
     for (const entry of entries) {
       if (!entry.key.startsWith(prefix)) continue
@@ -2076,6 +2076,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       await this.#release()
     })()
   }
+}
+
+async function readAllStoreEntries(store: BytesStore): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {
+  if (store.iterateEntries !== undefined) {
+    const entries: { readonly key: string; readonly value: Uint8Array }[] = []
+    for await (const entry of store.iterateEntries()) entries.push(entry)
+    return entries
+  }
+  if (store.entries !== undefined) {
+    return store.entries()
+  }
+  return []
 }
 
 function sliceEvents(

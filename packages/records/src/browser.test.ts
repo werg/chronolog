@@ -120,4 +120,20 @@ describe('OPFS atomic bytes', () => {
     values.set(key, damaged)
     await expect(store.get('a')).rejects.toThrow('OPFS_VALUE_CORRUPT')
   })
+
+  it('exposes sorted deterministic entries() snapshots across reopen', async () => {
+    const { handles } = directory()
+    const store = new OpfsBytesStore(handles)
+    await store.put('v2/chain/enc-env/b', Uint8Array.of(2))
+    await store.put('v2/chain/epoch-key/0', Uint8Array.of(9))
+    await store.put('v2/chain/enc-env/a', Uint8Array.of(1))
+    await store.close()
+    const reopened = new OpfsBytesStore(handles)
+    expect(await reopened.entries()).toEqual([
+      { key: 'v2/chain/enc-env/a', value: Uint8Array.of(1) },
+      { key: 'v2/chain/enc-env/b', value: Uint8Array.of(2) },
+      { key: 'v2/chain/epoch-key/0', value: Uint8Array.of(9) },
+    ])
+    await reopened.close()
+  })
 })

@@ -439,19 +439,18 @@ export class QuickJsSandbox {
           '__bootstrap__.mjs',
           { type: 'module' },
         )
-        if (missingDep !== null) throw missingDep as Error
-        if (timedOut) throw new OperationalTimeoutError()
         if (loadRes.error) {
           const dumped = ctx.dump(loadRes.error) as unknown
           loadRes.error.dispose()
           if (missingDep !== null) throw missingDep as Error
+          if (timedOut) throw new OperationalTimeoutError()
           return { ok: false, code: 'vm:module_load_error', detail: formatJsError(dumped) }
         }
         loadRes.value.dispose()
-
-        const runRes = ctx.evalCode('globalThis.__chronologRun()', '__run__.js')
         if (missingDep !== null) throw missingDep as Error
         if (timedOut) throw new OperationalTimeoutError()
+
+        const runRes = ctx.evalCode('globalThis.__chronologRun()', '__run__.js')
         if (runRes.error) {
           const dumped = ctx.dump(runRes.error) as unknown
           runRes.error.dispose()

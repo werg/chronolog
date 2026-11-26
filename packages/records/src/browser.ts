@@ -82,6 +82,12 @@ export class OpfsBytesStore implements BytesStore {
     } finally { release(); await owner }
   }
 
+  async entries(): Promise<readonly BytesStoreEntry[]> {
+    const entries: BytesStoreEntry[] = []
+    for await (const entry of this.iterateEntries()) entries.push(entry)
+    return entries.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  }
+
   async delete(key: string): Promise<void> {
     assertRecordKey(key)
     const remove = this.#directory.removeEntry?.bind(this.#directory)
