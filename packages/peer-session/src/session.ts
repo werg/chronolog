@@ -1903,18 +1903,43 @@ function sliceEvents(
 ): ApplicationEventBatch {
   const limit = options.limit ?? 64
   check(Number.isSafeInteger(limit) && limit >= 1 && limit <= 512, 'EVENT_LIMIT_INVALID')
-  const topicFilter = options.topics === undefined ? null : new Set(options.topics)
+  const normalizedTopics = options.topics === undefined ? null : [...new Set(options.topics)].sort()
+  const topicFilter = normalizedTopics === null ? null : new Set(normalizedTopics)
   const filtered = topicFilter === null ? events : events.filter(ev => topicFilter.has(ev.topic))
 
   let start = 0
   if (options.cursor !== undefined && options.cursor !== '') {
     check(options.cursor.length <= APPLICATION_EVENT_CURSOR_LIMIT, 'EVENT_CURSOR_INVALID')
-    const idx = filtered.findIndex(ev => ev.id === options.cursor)
-    start = idx >= 0 ? idx + 1 : filtered.length
+    let parsed: { readonly revision?: unknown; readonly view?: unknown; readonly topics?: unknown; readonly after?: unknown }
+    try {
+      parsed = JSON.parse(options.cursor) as { readonly revision?: unknown; readonly view?: unknown; readonly topics?: unknown; readonly after?: unknown }
+    } catch {
+      throw Object.assign(new Error('EVENT_CURSOR_INVALID'), { code: 'EVENT_CURSOR_INVALID' })
+    }
+    if (
+      parsed === null || typeof parsed !== 'object' ||
+      typeof parsed.after !== 'number' || !Number.isSafeInteger(parsed.after) || parsed.after < 0
+    ) {
+      throw Object.assign(new Error('EVENT_CURSOR_INVALID'), { code: 'EVENT_CURSOR_INVALID' })
+    }
+    if (
+      parsed.revision !== revision.digest ||
+      parsed.view !== revision.view ||
+      JSON.stringify(parsed.topics ?? null) !== JSON.stringify(normalizedTopics)
+    ) {
+      throw Object.assign(new Error('EVENT_CURSOR_STALE'), { code: 'EVENT_CURSOR_STALE' })
+    }
+    start = parsed.after
   }
   const page = filtered.slice(start, start + limit)
-  const hasMore = start + page.length < filtered.length
-  const cursor = page.length > 0 ? page[page.length - 1]!.id : (options.cursor ?? '')
+  const nextAfter = start + page.length
+  const hasMore = nextAfter < filtered.length
+  const cursor = JSON.stringify({
+    revision: revision.digest,
+    view: revision.view,
+    topics: normalizedTopics,
+    after: nextAfter,
+  })
   return { revision, events: page, cursor, hasMore }
 }
 
