@@ -184,6 +184,9 @@ export class TopicKernel {
   #pendingDependencies = new Set<string>()
   #skippedOpIds = new Set<string>()
   #snapshots = new Map<number, KernelSnapshot>()
+  #cachedDescribe: { stateRoot: string; value: Readonly<Record<string, JsonValue>> } | null = null
+  #queryCacheStateRoot = ''
+  #queryCache = new Map<string, JsonValue>()
 
   constructor(options: TopicKernelOptions) {
     this.genesisBytes = options.genesis instanceof Uint8Array
@@ -601,6 +604,22 @@ export class TopicKernel {
   /** Execute a pure read-only query against a topic's query() export (or return raw topic state if no query export). */
   async query(topic: string, input: JsonValue = null, topicsOverride?: Readonly<Record<string, JsonValue>>): Promise<JsonValue> {
     const sourceTopics = topicsOverride ?? this.#topics
+    const normalizedInput = normalizeJsonValue(input)
+    let cacheKey: string | null = null
+    if (topicsOverride === undefined) {
+      if (this.#queryCacheStateRoot !== this.#stateRoot) {
+        this.#queryCache.clear()
+        this.#queryCacheStateRoot = this.#stateRoot
+      }
+      cacheKey = `${topic}\0${bytesToHex(encodeCanonicalJsonCbor(normalizedInput))}`
+      const hit = this.#queryCache.get(cacheKey)
+      if (hit !== undefined) {
+        // Refresh LRU order and return a defensive clone so callers cannot mutate cached snapshots.
+        this.#queryCache.delete(cacheKey)
+        this.#queryCache.set(cacheKey, hit)
+        return structuredClone(hit)
+      }
+    }
     const reducersConfig = assertValidReducersConfig(sourceTopics.$reducers)
     const binding = reducersConfig.topics[topic]
     const state = Object.hasOwn(sourceTopics, topic) ? sourceTopics[topic]! : null
@@ -617,7 +636,7 @@ export class TopicKernel {
       exportName: binding.export ?? 'default',
       method: 'query',
       state,
-      payload: normalizeJsonValue(input),
+      payload: normalizedInput,
       topics: visibleTopics,
       ...(binding.config === undefined ? {} : { config: binding.config }),
       cas: this.cas,
@@ -629,11 +648,21 @@ export class TopicKernel {
       if (res.code === 'vm:missing_method:query') return structuredClone(state)
       throw new Error(`KERNEL_QUERY_FAILED:${res.code}:${res.detail ?? ''}`)
     }
+    if (cacheKey !== null && this.#queryCacheStateRoot === this.#stateRoot) {
+      this.#queryCache.set(cacheKey, structuredClone(res.value))
+      if (this.#queryCache.size > 128) {
+        const oldest = this.#queryCache.keys().next().value
+        if (oldest !== undefined) this.#queryCache.delete(oldest)
+      }
+    }
     return res.value
   }
 
   /** Collect exported command/query descriptions across all bound topics (for MCP & scoped tools). */
   async describe(): Promise<Readonly<Record<string, JsonValue>>> {
+    if (this.#cachedDescribe !== null && this.#cachedDescribe.stateRoot === this.#stateRoot) {
+      return structuredClone(this.#cachedDescribe.value)
+    }
     const reducersConfig = assertValidReducersConfig(this.#topics.$reducers)
     const out: Record<string, JsonValue> = {}
     for (const [topic, binding] of Object.entries(reducersConfig.topics)) {
@@ -658,6 +687,7 @@ export class TopicKernel {
       })
       if (res.ok) out[topic] = res.value
     }
+    this.#cachedDescribe = { stateRoot: this.#stateRoot, value: structuredClone(out) }
     return out
   }
 

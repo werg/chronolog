@@ -1086,7 +1086,7 @@ export const sqlDatabase = {
         allowUserDdl: cur.allowUserDdl,
       };
     }
-    const kind = typeof input === 'object' ? (input.query || input.kind) : null;
+    const kind = typeof input === 'object' ? (input.query || input.kind || input.action) : null;
     if (typeof input === 'object' && typeof input.sql === 'string') {
       const db = openDb(cur.dbRoot);
       try {
@@ -1111,12 +1111,38 @@ export const sqlDatabase = {
       const db = openDb(cur.dbRoot);
       try {
         const res = db.query("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name", []);
+        const objects = res.rows.map(r => ({ type: r[0], name: r[1], table: r[2], sql: r[3] }));
+        const owners = {};
+        const hasOwners = objects.some(o => o.type === 'table' && o.name === '_rls_table_owners');
+        if (hasOwners) {
+          const ownRes = db.query('SELECT name, owner FROM _rls_table_owners ORDER BY name', []);
+          for (const row of ownRes.rows) owners[String(row[0])] = String(row[1]);
+        }
+        const tables = [];
+        for (const obj of objects) {
+          if ((obj.type !== 'table' && obj.type !== 'view') || String(obj.name).startsWith('_rls_')) continue;
+          const quoted = '"' + String(obj.name).replace(/"/g, '""') + '"';
+          let columns = [];
+          try {
+            const info = db.query('SELECT * FROM ' + quoted + ' LIMIT 0', []);
+            columns = Array.isArray(info.columns) ? info.columns.slice() : [];
+          } catch {}
+          tables.push({
+            name: obj.name,
+            type: obj.type,
+            owner: Object.prototype.hasOwnProperty.call(owners, obj.name) ? owners[obj.name] : null,
+            columns,
+            rls: Object.prototype.hasOwnProperty.call(cur.policies, obj.name) ? cur.policies[obj.name] : null,
+          });
+        }
         return {
           dbRoot: cur.dbRoot,
           schemaVersion: cur.schemaVersion,
           policies: cur.policies,
           allowUserDdl: cur.allowUserDdl,
-          objects: res.rows.map(r => ({ type: r[0], name: r[1], table: r[2], sql: r[3] })),
+          userOwnedObjects: owners,
+          tables,
+          objects,
         };
       } finally {
         db.close();

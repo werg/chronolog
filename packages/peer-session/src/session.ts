@@ -293,6 +293,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     verifiedCheckpoints: [],
   }
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
+  #cachedDescription: { stateRoot: string; value: ApplicationDescription } | null = null
   #evaluatedPermissions: EvaluatedPermissionsSummary | null = null
   #closed = false
   #closing?: Promise<void>
@@ -1320,6 +1321,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   /** Describe available commands and queries (from local definition or in-chain reducer describe() exports). */
   async describe(): Promise<ApplicationDescription> {
     if (this.definition !== undefined) return describeApplication(this.definition)
+    const stateRoot = this.#lastLocalRevision.stateRoot
+    if (this.#cachedDescription !== null && this.#cachedDescription.stateRoot === stateRoot) {
+      return structuredClone(this.#cachedDescription.value)
+    }
     const raw = await this.#kernel.describe()
     const commands: { readonly name: string; readonly description: string; readonly input: ApplicationDescription['commands'][number]['input'] }[] = []
     const queries: { readonly name: string; readonly description: string; readonly input: ApplicationDescription['queries'][number]['input'] }[] = []
@@ -1356,12 +1361,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     commands.sort((a, b) => a.name.localeCompare(b.name))
     queries.sort((a, b) => a.name.localeCompare(b.name))
-    return validateApplicationDescription({
+    const description = validateApplicationDescription({
       id: `chain-${this.chainId.slice(0, 16)}`,
       version: '2.0.0',
       commands,
       queries,
     })
+    this.#cachedDescription = { stateRoot, value: structuredClone(description) }
+    return description
   }
 
   #hasActiveFinalityPolicy(): boolean {

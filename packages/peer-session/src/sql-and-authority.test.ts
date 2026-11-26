@@ -286,6 +286,28 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
       updates: [{ topic: 'inventory', input: { statements: [{ sql: 'UPDATE items SET qty = 50 WHERE id = ?', params: ['widget'] }] } }],
     })
     expect((await stillBlocked.materialized()).rejectionCode).toBe('rls_denied:items:update')
+
+    // 12. Rich `schema` introspection returns tables, columns, user owners, and active RLS policies (and caches per stateRoot)
+    const schema1 = await sessBob.query('inventory', { action: 'schema' })
+    const schemaVal = schema1.value as {
+      readonly dbRoot: string
+      readonly userOwnedObjects: Record<string, string>
+      readonly tables: { readonly name: string; readonly type: string; readonly owner: string | null; readonly columns: readonly string[]; readonly rls: { readonly insert?: string | null; readonly update?: string | null; readonly delete?: string | null } | null }[]
+    }
+    expect(schemaVal.dbRoot).toMatch(/^[0-9a-f]{64}$/u)
+    expect(schemaVal.userOwnedObjects.alice_notes).toBe(devAlice.identity.publicKey)
+    const itemsMeta = schemaVal.tables.find(t => t.name === 'items')
+    expect(itemsMeta).toBeDefined()
+    expect(itemsMeta?.owner).toBeNull()
+    expect(itemsMeta?.columns).toEqual(['id', 'owner', 'qty'])
+    expect(itemsMeta?.rls?.delete).toBe('OLD.owner = actor() AND OLD.qty = 0')
+    expect(itemsMeta?.rls?.update).toBe('OLD.owner = actor() AND NEW.owner = actor()')
+    const aliceNotesMeta = schemaVal.tables.find(t => t.name === 'alice_notes')
+    expect(aliceNotesMeta?.owner).toBe(devAlice.identity.publicKey)
+    // Repeated identical query & describe return isolated defensive clones from the stateRoot cache
+    const schema2 = await sessBob.query('inventory', { action: 'schema' })
+    expect(schema2.value).toEqual(schema1.value)
+    expect(await sessBob.describe()).toEqual(desc)
   })
 
   it('supports openMembers (unregistered strangers write) and multisigMembers end-to-end across ApplicationSession', async () => {
