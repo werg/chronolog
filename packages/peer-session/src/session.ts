@@ -1429,6 +1429,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async admitMember(options: {
     readonly publicKey: string
     readonly wrapKey?: string
+    readonly label?: string
+    readonly subject?: string
     readonly reader?: boolean
     readonly writer?: boolean
     readonly administrator?: boolean
@@ -1442,6 +1444,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const memberPayload: Record<string, JsonValue> = {
       publicKey: options.publicKey,
       ...(options.wrapKey ? { wrapKey: options.wrapKey } : {}),
+      ...(options.label ? { label: options.label } : {}),
+      ...(options.subject ? { subject: options.subject } : {}),
       reader: options.reader ?? true,
       writer: options.writer ?? true,
       administrator: options.administrator ?? false,

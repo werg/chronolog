@@ -37,6 +37,8 @@ function normalizeMember(m) {
   return {
     publicKey: m.publicKey,
     ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+    ...(typeof m.label === 'string' && m.label.length > 0 ? { label: m.label } : {}),
+    ...(typeof m.subject === 'string' && m.subject.length > 0 ? { subject: m.subject } : {}),
     reader: Boolean(m.reader),
     writer: Boolean(m.writer),
     administrator: Boolean(m.administrator),
@@ -67,14 +69,56 @@ function checkMembersCapability(members, capability, actor) {
   return false;
 }
 
+function isLegacyReader(perms, author) {
+  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.reader === true));
+}
+
+function attestedMatchesPolicy(cur, attPayload, member) {
+  const adm = cur.admission;
+  if (!adm || adm.mode === 'strict') return false;
+  if (Array.isArray(adm.removed) && adm.removed.includes(member.publicKey)) return false;
+  if (cur.members.some(m => m.publicKey === member.publicKey)) return false;
+  const accounts = Array.isArray(adm.accounts) ? adm.accounts : [];
+  const email = typeof attPayload.email === 'string' ? attPayload.email.toLowerCase() : null;
+  const accountOk = accounts.includes(attPayload.accountId) || (email !== null && accounts.includes('email:' + email));
+  if (accountOk) {
+    if (attPayload.subject === 'agent') {
+      return member.administrator !== true && member.finalizer !== true;
+    }
+    const grant = adm.grant || { reader: true, writer: true, administrator: true };
+    return Boolean(member.reader) === Boolean(grant.reader) &&
+      Boolean(member.writer) === Boolean(grant.writer) &&
+      Boolean(member.administrator) === Boolean(grant.administrator);
+  }
+  if (attPayload.inviteId && Array.isArray(adm.invites)) {
+    const inv = adm.invites.find(i => i.inviteId === attPayload.inviteId && !i.revoked);
+    if (!inv) return false;
+    if (inv.binding && inv.binding.kind === 'email' && email !== inv.binding.email) return false;
+    const expected = inv.role === 'admin'
+      ? { reader: true, writer: true, administrator: true }
+      : inv.role === 'reader'
+        ? { reader: true, writer: false, administrator: false }
+        : { reader: true, writer: true, administrator: false };
+    return Boolean(member.reader) === expected.reader &&
+      Boolean(member.writer) === expected.writer &&
+      Boolean(member.administrator) === expected.administrator;
+  }
+  return false;
+}
+
 export const attestedMembers = {
   reduce(state, tx) {
     const cur = state && typeof state === 'object' ? state : { members: [], admission: null };
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-    if (!isLegacyAdmin(cur, tx.author)) return { ok: false, code: 'admin_required' };
+    const authorIsAdmin = isLegacyAdmin(cur, tx.author);
 
     if (input.action === 'setMember') {
+      if (!authorIsAdmin) {
+        if (!isLegacyReader(cur, tx.author) || !input.attestation) {
+          return { ok: false, code: 'admin_required' };
+        }
+      }
       if (input.attestation) {
         const att = input.attestation;
         const hostKey = cur.admission && cur.admission.hostKey;
@@ -88,12 +132,17 @@ export const attestedMembers = {
         if (att.payload.publicKey !== input.member.publicKey) {
           return { ok: false, code: 'attestation_subject_mismatch' };
         }
+        if (!authorIsAdmin && !attestedMatchesPolicy(cur, att.payload, input.member)) {
+          return { ok: false, code: 'admin_required' };
+        }
       }
       const next = normalizeMember(input.member);
       const members = cur.members.filter(m => m.publicKey !== next.publicKey).concat([next]);
       members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
       return { ok: true, state: { ...cur, members }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
     }
+
+    if (!authorIsAdmin) return { ok: false, code: 'admin_required' };
 
     if (input.action === 'removeMember') {
       if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
@@ -489,14 +538,21 @@ function isAdmin(ctx, author) {
   return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.administrator === true));
 }
 
+function isReader(ctx, author) {
+  const checked = ctx.query('$permissions', { check: 'reader', actor: author });
+  if (typeof checked === 'boolean') return checked;
+  const perms = ctx.topic('$permissions');
+  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.reader === true));
+}
+
 export const hpkeEpochs = {
   reduce(state, tx, ctx) {
-    if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
     const cur = state && typeof state === 'object' ? state : { currentEpoch: -1, epochs: {} };
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
 
     if (input.action === 'rotateEpoch') {
+      if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
       const epoch = input.epoch;
       if (!Number.isSafeInteger(epoch) || epoch !== cur.currentEpoch + 1) return { ok: false, code: 'epoch_sequence_invalid' };
       if (!HEX32.test(input.keyCommitment || '')) return { ok: false, code: 'key_commitment_invalid' };
@@ -517,9 +573,14 @@ export const hpkeEpochs = {
     }
 
     // Grant a newly admitted fresh device lockboxes for one or more retained historical epochs (0..N or checkpointEpoch..N).
+    // Any existing reader holding the epoch keys may seal lockboxes for an already-authorized reader in $permissions.
     if (input.action === 'grantBoxes') {
+      if (!isAdmin(ctx, tx.author) && !isReader(ctx, tx.author)) return { ok: false, code: 'reader_required' };
       if (!HEX32.test(input.member || '') || !input.epochBoxes || typeof input.epochBoxes !== 'object') {
         return { ok: false, code: 'grant_boxes_invalid' };
+      }
+      if (!isAdmin(ctx, tx.author) && !isReader(ctx, input.member)) {
+        return { ok: false, code: 'member_not_authorized' };
       }
       const nextEpochs = { ...cur.epochs };
       for (const [epKey, box] of Object.entries(input.epochBoxes)) {
