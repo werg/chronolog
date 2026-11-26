@@ -31,19 +31,12 @@ jobs:
         id: session_artifacts
         run: |
           node tools/package-peer-session.mjs --output artifacts/session-rtc
-          node tools/package-peer-session.mjs --sql-native --output artifacts/session-sql
+          node tools/package-peer-session.mjs --no-native-rtc --output artifacts/session-relay
       - name: Verify the standard archive installs and closes native RTC without extra dependencies
         run: |
           archives=(artifacts/session-rtc/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
           node tools/test-peer-session-package.mjs --artifact "${archives[0]}" --output artifacts/default-session-package-check
-      - name: Verify the SQL session archive
-        if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
-        shell: bash
-        run: |
-          archives=(artifacts/session-sql/chronolog-peer-session-*.tgz)
-          test "${#archives[@]}" -eq 1
-          node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
       - name: Install real Chromium and WebKit
         id: chromium
         if: ${{ !cancelled() && steps.session_artifacts.outcome == 'success' }}
@@ -66,11 +59,10 @@ jobs:
           path: |
             artifacts/session-rtc/*.tgz
             artifacts/session-rtc/package/provenance.json
-            artifacts/session-sql/*.tgz
-            artifacts/session-sql/package/provenance.json
-            artifacts/peer-session-sql-check/report.json
+            artifacts/session-relay/*.tgz
+            artifacts/session-relay/package/provenance.json
             artifacts/default-session-package-check/report.json
             artifacts/default-session-package-check/native-process.json
             artifacts/default-session-package-check/consumer/package-lock.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30

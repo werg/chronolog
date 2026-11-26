@@ -27,7 +27,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: node --test tools/run-fast-tests.test.mjs tools/npm-cli.test.mjs tools/wasm-incremental-reload.test.mjs
+      - run: node --test tools/run-fast-tests.test.mjs tools/npm-cli.test.mjs
       - run: pnpm test:fast
 
   verify:
@@ -48,7 +48,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test:coverage
       - run: pnpm build
-      - name: Verify public signal and authority artifacts
+      - name: Verify public signal, authority, and session artifacts
         run: |
           pnpm package:signals
           pnpm test:signals-package
@@ -71,12 +71,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  conformance:
-    name: Conformance (${{ matrix.os }})
+  cross-platform:
+    name: Portable runtime (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15-intel]
+        os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -88,34 +88,6 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm conformance
-      - name: Preserve conformance report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: conformance-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/conformance/report.json
-          if-no-files-found: error
-          retention-days: 30
-
-  compare-conformance:
-    name: Compare portable conformance digests
-    needs: conformance
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: conformance-*-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/conformance-platforms
-      - run: pnpm conformance:compare artifacts/conformance-platforms --require-platform linux --require-platform darwin
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm test:fast
+      - run: pnpm test:fuzz

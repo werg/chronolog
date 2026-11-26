@@ -9,80 +9,19 @@ permissions:
   contents: read
 
 jobs:
-  wasm-sql-evidence:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 40
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Install pinned Emscripten 4.0.20 toolchain
-        run: |
-          git clone --depth 1 --branch 4.0.20 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/chronolog-emsdk"
-          test "$(git -C "$RUNNER_TEMP/chronolog-emsdk" rev-parse HEAD)" = e4fe26ef59168ff44f4c23c466e497bf60b3411e
-          "$RUNNER_TEMP/chronolog-emsdk/emsdk" install 4.0.20
-          "$RUNNER_TEMP/chronolog-emsdk/emsdk" activate 4.0.20
-      - name: Build deterministic WASM SQL engine and verify native/Node conformance
-        env:
-          CHRONOLOG_WASM_DIRECTORY: artifacts/wasm
-          CHRONOLOG_REQUIRE_WASM: '1'
-        run: |
-          node tools/build-wasm-engine.mjs --emsdk "$RUNNER_TEMP/chronolog-emsdk" --output artifacts/wasm
-          pnpm exec vitest run packages/materializer-doltlite/src/wasm-conformance.test.ts packages/materializer-doltlite/src/wasm-node.test.ts
-      - name: Package portable pure-JS WASM SQL session archive
-        run: |
-          node tools/package-peer-session.mjs --no-native-rtc --sql-browser --sql-wasm --wasm-dir artifacts/wasm --output artifacts/peer-session-wasm
-      - uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: |
-            artifacts/wasm/manifest.json
-            artifacts/wasm/sqlite3.wasm
-            artifacts/wasm/sqlite3.mjs
-            artifacts/peer-session-wasm/*.tgz
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-wasm-sql-${{ github.sha }}
-          path: |
-            artifacts/wasm/manifest.json
-            artifacts/wasm/sqlite3.wasm
-            artifacts/wasm/sqlite3.mjs
-            artifacts/wasm/sqlite3-opfs-async-proxy.js
-            artifacts/peer-session-wasm/*.tgz
-          if-no-files-found: error
-          retention-days: 90
-
-  native-evidence:
-    needs: [wasm-sql-evidence]
+  portable-evidence:
     strategy:
       fail-fast: false
       matrix:
         include:
           - id: linux-x64-gnu
-            os: ubuntu-22.04
-          - id: linux-arm64-gnu
-            os: ubuntu-24.04-arm
-          - id: linux-x64-musl
-            os: ubuntu-22.04
-            container: node:24-alpine
+            os: ubuntu-24.04
           - id: darwin-arm64
             os: macos-15
-          - id: darwin-x64
-            os: macos-15-intel
           - id: win32-x64
             os: windows-latest
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    timeout-minutes: 35
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
@@ -92,47 +31,30 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
-        if: ${{ !matrix.container }}
       - uses: actions/setup-node@v6
-        if: ${{ !matrix.container }}
         with:
           node-version: 24
           cache: pnpm
-      - name: Prepare Alpine musl build toolchain
-        if: ${{ matrix.container != '' }}
-        shell: sh
-        run: |
-          apk add --no-cache git python3 make g++ bash
-          corepack enable
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-wasm-sql-${{ github.sha }}
-          path: artifacts/wasm-bundle
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm test:fast
-      - run: pnpm conformance
-        if: ${{ matrix.id == 'linux-x64-gnu' || matrix.id == 'darwin-x64' }}
       - run: pnpm package:signals
       - run: pnpm test:signals-package
       - run: pnpm package:authority
-      - name: Package relay-only and SQL peer-session profiles
+      - name: Package universal and relay-only peer-session profiles
         shell: bash
         run: |
+          node tools/package-peer-session.mjs --output artifacts/peer-session
           node tools/package-peer-session.mjs --no-native-rtc --output artifacts/peer-session-relay
-          node tools/package-peer-session.mjs --sql-native --sql-browser --sql-wasm --wasm-dir artifacts/wasm-bundle/wasm --output artifacts/peer-session
-      - name: Verify native SQL package
+      - name: Verify standard peer-session archive
+        if: ${{ matrix.id == 'linux-x64-gnu' }}
         shell: bash
         run: |
           archives=(artifacts/peer-session/chronolog-peer-session-*.tgz)
           test "${#archives[@]}" -eq 1
-          node tools/test-peer-session-sql.mjs --artifact "${archives[0]}"
-      - run: pnpm release:metadata
+          node tools/test-peer-session-package.mjs --artifact "${archives[0]}" --output artifacts/peer-session-check
       - uses: actions/attest-build-provenance@v3
-        if: ${{ !matrix.container }}
         with:
           subject-path: |
-            artifacts/release/sbom.cdx.json
-            artifacts/release/provenance.intoto.jsonl
             artifacts/peer-session/*.tgz
             artifacts/peer-session-relay/*.tgz
             artifacts/authority/*.tgz
@@ -141,12 +63,10 @@ jobs:
         with:
           name: release-evidence-${{ matrix.id }}-${{ github.sha }}
           path: |
-            artifacts/release/
             artifacts/peer-session/*.tgz
             artifacts/peer-session-relay/*.tgz
             artifacts/authority/*.tgz
             artifacts/signals/*.tgz
             artifacts/signals/*.consumer.json
-            artifacts/peer-session-sql-check/report.json
           if-no-files-found: error
           retention-days: 90

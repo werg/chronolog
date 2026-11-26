@@ -21,13 +21,13 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Package the celld workspace runtime
-        run: pnpm package:session --no-native-rtc --sql-celld --output artifacts/celld-peer-session
-      - name: Attest the celld workspace runtime
+      - name: Package the portable relay-only peer-session runtime
+        run: node tools/package-peer-session.mjs --no-native-rtc --output artifacts/celld-peer-session
+      - name: Attest the portable peer-session runtime
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: artifacts/celld-peer-session/*.tgz
-      - name: Upload the celld workspace runtime
+      - name: Upload the portable peer-session runtime
         uses: actions/upload-artifact@v6
         with:
           name: celld-peer-session-${{ github.sha }}
