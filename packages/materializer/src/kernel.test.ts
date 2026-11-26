@@ -426,4 +426,101 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     expect(res.outcomes[0]!.outcome).toBe('accepted')
     expect(await kernel.query('$permissions', { publicKey: newcomerHex })).toMatchObject({ publicKey: newcomerHex, writer: true })
   })
+
+  it('enforces public-only partition on ctx.query() and supports multisigMembers + openMembers without hardcoded state shape', async () => {
+    const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
+    const stdImports = await seedStandardModules(cas)
+    const s1 = await generateEd25519KeyPair()
+    const s2 = await generateEd25519KeyPair()
+    const s3 = await generateEd25519KeyPair()
+    const guest = await generateEd25519KeyPair()
+    const s1Hex = bytesToHex(s1.publicKeyBytes)
+    const s2Hex = bytesToHex(s2.publicKeyBytes)
+    const s3Hex = bytesToHex(s3.publicKeyBytes)
+    const guestHex = bytesToHex(guest.publicKeyBytes)
+
+    // Probe reducer that tries to ctx.query('secret') from a public control topic
+    const probeSource = `
+      export default {
+        reduce(state, tx, ctx) {
+          const leaked = ctx.query('secret', { ping: true });
+          const isAdmin = ctx.query('$permissions', { check: 'administrator', actor: tx.author });
+          return { ok: true, state: { leaked, isAdmin } };
+        },
+      };
+    `
+    const secretSource = `
+      export default {
+        reduce(state, tx) { return { ok: true, state: tx.payload }; },
+        query(state) { return { secretValue: state }; },
+      };
+    `
+    const probeHash = await cas.put(utf8(probeSource), [], 'public')
+    const secretHash = await cas.put(utf8(secretSource), [], 'public')
+
+    const genesis: GenesisBlock = {
+      version: 1,
+      privateChain: true,
+      initialTopics: {
+        $reducers: {
+          runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } },
+          imports: {
+            ...stdImports,
+            'app/probe': `cas:sha256-${probeHash}`,
+            'app/secret': `cas:sha256-${secretHash}`,
+          },
+          topics: {
+            $permissions: { module: 'chronolog/permissions', export: 'multisigMembers' },
+            $reducers: { module: 'chronolog/permissions', export: 'adminOnlyReducers' },
+            $signal_policy: { module: 'app/probe' },
+            secret: { module: 'app/secret' },
+          },
+        },
+        $permissions: {
+          threshold: 2,
+          signers: [s1Hex, s2Hex, s3Hex],
+          members: {},
+          proposals: {},
+        },
+        secret: 'TOP_SECRET',
+      },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      salt: new Uint8Array(16).fill(11),
+    }
+
+    const full = new TopicKernel({ genesis, cas, blindHostMode: false })
+    const blind = new TopicKernel({ genesis, cas, blindHostMode: true })
+
+    // 1. Public control op probing 'secret' via ctx.query() MUST see null (identical on full & blind host)
+    const opProbe = makeOp(full.chainId, s1.publicKeyBytes, 'probe-1', 10n, 'public', [{ topic: '$signal_policy', input: {} }])
+    // 2. Multisig 2-of-3 proposal to admit guest
+    const opPropose = makeOp(full.chainId, s1.publicKeyBytes, 'ms-prop-1', 20n, 'public', [{
+      topic: '$permissions',
+      input: {
+        action: 'propose',
+        proposalId: 'admit-guest',
+        kind: 'setMember',
+        member: { publicKey: guestHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
+      },
+    }])
+    // 3. Second signer approves -> executes atomically!
+    const opApprove = makeOp(full.chainId, s2.publicKeyBytes, 'ms-app-1', 30n, 'public', [{
+      topic: '$permissions',
+      input: { action: 'approve', proposalId: 'admit-guest' },
+    }])
+
+    await full.materialize([opProbe, opPropose])
+    expect(full.topic('$signal_policy')).toEqual({ leaked: null, isAdmin: true })
+    // Not admitted after 1 approval (threshold = 2)
+    expect(await full.query('$permissions', { check: 'writer', actor: guestHex })).toBe(false)
+
+    await full.materialize([opProbe, opPropose, opApprove])
+    await blind.materialize([opProbe, opPropose, opApprove])
+
+    expect(await full.query('$permissions', { check: 'writer', actor: guestHex })).toBe(true)
+    expect(await blind.query('$permissions', { check: 'writer', actor: guestHex })).toBe(true)
+    expect(await full.query('$permissions', { admission: true })).toBeNull()
+    expect(full.topic('$signal_policy')).toEqual(blind.topic('$signal_policy'))
+    expect(full.topic('$permissions')).toEqual(blind.topic('$permissions'))
+  })
 })

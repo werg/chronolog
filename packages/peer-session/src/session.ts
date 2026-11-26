@@ -184,6 +184,17 @@ interface LocalPendingOp {
   currentEpoch: number
 }
 
+interface EvaluatedPermissionsSummary {
+  readonly members: readonly MemberRecord[]
+  readonly readers: ReadonlySet<string>
+  readonly writers: ReadonlySet<string>
+  readonly administrators: ReadonlySet<string>
+  readonly publishers: ReadonlySet<string>
+  readonly openReaders: boolean
+  readonly openWriters: boolean
+  readonly admission: { readonly hostKey?: string } | null
+}
+
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
@@ -280,6 +291,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     verifiedCheckpoints: [],
   }
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
+  #evaluatedPermissions: EvaluatedPermissionsSummary | null = null
   #closed = false
   #closing?: Promise<void>
   #tail: Promise<unknown> = Promise.resolve()
@@ -343,7 +355,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const policy = await this.#resolveSignalPolicy()
         for (const rule of policy.rules) {
           if (!globMatches(rule.topicPattern, auth.topic)) continue
-          if (!rule.allowedAuthors.includes(authorHex)) continue
+          if (!rule.allowedAuthors.includes('*') && !rule.allowedAuthors.includes(authorHex)) continue
           return true
         }
         return false
@@ -427,6 +439,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   permissions(): PermissionsTopicState {
+    if (this.#evaluatedPermissions !== null) {
+      return {
+        members: this.#evaluatedPermissions.members,
+        admission: this.#evaluatedPermissions.admission,
+      }
+    }
     const raw = this.#kernel.topic('$permissions') as PermissionsTopicState | null
     if (raw === null || typeof raw !== 'object' || !Array.isArray(raw.members)) {
       return { members: [], admission: null }
@@ -439,20 +457,54 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   isMember(publicKey: string): boolean {
+    if (this.#evaluatedPermissions !== null) {
+      if (this.#evaluatedPermissions.openWriters || this.#evaluatedPermissions.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
+      return this.#evaluatedPermissions.members.some(m => m.publicKey === publicKey) ||
+        this.#evaluatedPermissions.readers.has(publicKey) ||
+        this.#evaluatedPermissions.writers.has(publicKey) ||
+        this.#evaluatedPermissions.administrators.has(publicKey)
+    }
     return this.member(publicKey) !== null
   }
 
   isReader(publicKey: string): boolean {
     if (!this.genesis.privateChain) return true
+    if (this.#evaluatedPermissions !== null) {
+      if (this.#evaluatedPermissions.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
+      return this.#evaluatedPermissions.readers.has(publicKey)
+    }
     return this.member(publicKey)?.reader === true
   }
 
   isWriter(publicKey: string): boolean {
+    if (this.#evaluatedPermissions !== null) {
+      if (this.#evaluatedPermissions.openWriters) return /^[0-9a-f]{64}$/u.test(publicKey)
+      return this.#evaluatedPermissions.writers.has(publicKey) || this.#evaluatedPermissions.administrators.has(publicKey)
+    }
     return this.member(publicKey)?.writer === true || this.member(publicKey)?.administrator === true
   }
 
   isAdministrator(publicKey: string): boolean {
+    if (this.#evaluatedPermissions !== null) {
+      return this.#evaluatedPermissions.administrators.has(publicKey)
+    }
     return this.member(publicKey)?.administrator === true
+  }
+
+  /** Query an arbitrary capability (standard or custom) against the chain's `$permissions` reducer. */
+  async checkPermission(capability: string, actor = this.identity.publicKey): Promise<boolean> {
+    const res = await this.#kernel.query('$permissions', { check: capability, actor }).catch(() => null)
+    if (typeof res === 'boolean') return res
+    if (capability === 'reader') return this.isReader(actor)
+    if (capability === 'writer') return this.isWriter(actor)
+    if (capability === 'administrator') return this.isAdministrator(actor)
+    if (capability === 'publisher') {
+      return this.#evaluatedPermissions !== null
+        ? this.#evaluatedPermissions.publishers.has(actor) || this.#evaluatedPermissions.administrators.has(actor)
+        : this.member(actor)?.publisher === true || this.member(actor)?.administrator === true
+    }
+    if (capability === 'member') return this.isMember(actor)
+    return false
   }
 
   keysState(): KeysTopicState {
@@ -533,11 +585,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   #canLocallyAuthor(): boolean {
-    const m = this.member(this.identity.publicKey)
-    if (m === null) return false
-    if (!m.writer && !m.administrator && !m.publisher) return false
+    const pk = this.identity.publicKey
+    const isAdmin = this.isAdministrator(pk)
+    const isPub = this.#evaluatedPermissions !== null
+      ? this.#evaluatedPermissions.publishers.has(pk)
+      : this.member(pk)?.publisher === true
+    if (!this.isWriter(pk) && !isAdmin && !isPub) return false
     if (this.genesis.privateChain && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())) {
-      return m.administrator === true
+      return isAdmin
     }
     return true
   }
@@ -627,15 +682,37 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     let needsSqlite = false
     try {
       const cfg = assertValidReducersConfig(reducersRaw)
-      for (const spec of Object.values(cfg.imports)) {
-        if (!spec.startsWith('cas:sha256-')) continue
-        const hash = spec.slice(11)
+      const queue: string[] = []
+      const visited = new Set<string>()
+      for (const [topicName, binding] of Object.entries(cfg.topics)) {
+        if (this.#blindHostMode && this.genesis.privateChain && !isControlTopic(topicName)) continue
+        queue.push(binding.module)
+      }
+      const importSpecRe = /\bfrom\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gu
+      while (queue.length > 0) {
+        const modSpec = queue.shift()!
+        if (visited.has(modSpec)) continue
+        visited.add(modSpec)
+        if (modSpec === 'chronolog:sqlite' || modSpec === 'chronolog/sql') {
+          needsSqlite = true
+          break
+        }
+        const ref = cfg.imports[modSpec]
+        if (ref === undefined || !ref.startsWith('cas:sha256-')) continue
+        const hash = ref.slice(11)
         const node = await this.cas.get(hash, 'any')
-        if (node !== null) {
-          const text = new TextDecoder().decode(node.bytes)
-          if (text.includes('chronolog:sqlite')) {
-            needsSqlite = true
-            break
+        if (node === null) continue
+        const text = new TextDecoder().decode(node.bytes)
+        if (text.includes('chronolog:sqlite') || text.includes('chronolog/sql')) {
+          needsSqlite = true
+          break
+        }
+        importSpecRe.lastIndex = 0
+        let match: RegExpExecArray | null
+        while ((match = importSpecRe.exec(text)) !== null) {
+          const dep = match[1] ?? match[2]
+          if (dep !== undefined && !visited.has(dep) && Object.hasOwn(cfg.imports, dep)) {
+            queue.push(dep)
           }
         }
       }
@@ -659,6 +736,103 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       return driver
     })()
     await this.#sqliteLoadPromise
+  }
+
+  async #refreshPermissionsCache(): Promise<void> {
+    const parseStringList = (val: unknown): { readonly keys: Set<string>; readonly open: boolean } => {
+      const keys = new Set<string>()
+      let open = false
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          if (item === '*') open = true
+          else if (typeof item === 'string') keys.add(item)
+        }
+      }
+      return { keys, open }
+    }
+    const parseMembers = (val: unknown): MemberRecord[] => {
+      if (!Array.isArray(val)) return []
+      return val.filter((m): m is MemberRecord => m !== null && typeof m === 'object' && typeof (m as MemberRecord).publicKey === 'string')
+    }
+
+    try {
+      const summary = await this.#kernel.query('$permissions', { summary: true })
+      if (
+        summary !== null &&
+        typeof summary === 'object' &&
+        !Array.isArray(summary) &&
+        Array.isArray((summary as Record<string, unknown>).administrators) &&
+        Array.isArray((summary as Record<string, unknown>).readers)
+      ) {
+        const s = summary as Record<string, unknown>
+        const readers = parseStringList(s.readers)
+        const writers = parseStringList(s.writers)
+        const admins = parseStringList(s.administrators)
+        const pubs = parseStringList(s.publishers)
+        const admission = (s.admission !== null && typeof s.admission === 'object' && !Array.isArray(s.admission))
+          ? s.admission as { readonly hostKey?: string }
+          : null
+        this.#evaluatedPermissions = {
+          members: parseMembers(s.members),
+          readers: readers.keys,
+          writers: writers.keys,
+          administrators: admins.keys,
+          publishers: pubs.keys,
+          openReaders: s.openReaders === true || readers.open,
+          openWriters: s.openWriters === true || writers.open,
+          admission,
+        }
+        return
+      }
+
+      const [rRaw, wRaw, aRaw, pRaw, mRaw, admRaw] = await Promise.all([
+        this.#kernel.query('$permissions', { list: 'readers' }).catch(() => null),
+        this.#kernel.query('$permissions', { list: 'writers' }).catch(() => null),
+        this.#kernel.query('$permissions', { list: 'administrators' }).catch(() => null),
+        this.#kernel.query('$permissions', { list: 'publishers' }).catch(() => null),
+        this.#kernel.query('$permissions', { list: 'members' }).catch(() => null),
+        this.#kernel.query('$permissions', { admission: true }).catch(() => null),
+      ])
+      if (Array.isArray(rRaw) || Array.isArray(wRaw) || Array.isArray(aRaw)) {
+        const readers = parseStringList(rRaw)
+        const writers = parseStringList(wRaw)
+        const admins = parseStringList(aRaw)
+        const pubs = parseStringList(pRaw)
+        const admission = (admRaw !== null && typeof admRaw === 'object' && !Array.isArray(admRaw))
+          ? admRaw as { readonly hostKey?: string }
+          : null
+        this.#evaluatedPermissions = {
+          members: parseMembers(mRaw),
+          readers: readers.keys,
+          writers: writers.keys,
+          administrators: admins.keys,
+          publishers: pubs.keys,
+          openReaders: readers.open,
+          openWriters: writers.open,
+          admission,
+        }
+        return
+      }
+    } catch {
+      // Fall through to legacy raw topic inspection
+    }
+
+    const raw = this.#kernel.topic('$permissions') as PermissionsTopicState | null
+    if (raw !== null && typeof raw === 'object' && Array.isArray(raw.members)) {
+      const members = parseMembers(raw.members)
+      this.#evaluatedPermissions = {
+        members,
+        readers: new Set(members.filter(m => m.reader).map(m => m.publicKey)),
+        writers: new Set(members.filter(m => m.writer || m.administrator).map(m => m.publicKey)),
+        administrators: new Set(members.filter(m => m.administrator).map(m => m.publicKey)),
+        publishers: new Set(members.filter(m => m.publisher || m.administrator).map(m => m.publicKey)),
+        openReaders: false,
+        openWriters: false,
+        admission: raw.admission ?? null,
+      }
+    } else {
+      this.#evaluatedPermissions = null
+    }
   }
 
   async #hydrateFromStore(): Promise<void> {
@@ -860,6 +1034,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         publicInputs.push({ opId: hexToBytes(opId), core: entry.core })
       }
       await this.#kernel.materialize(publicInputs)
+      await this.#refreshPermissionsCache()
 
       await this.#unsealAvailableEpochKeys()
       await this.#decryptPendingEnvelopes()
@@ -885,6 +1060,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
       await this.#ensureSqliteIfNeeded()
       const localResult = await this.#kernel.materialize(eligibleLocal)
+      await this.#refreshPermissionsCache()
       this.#lastLocalRevision = toMaterializedRevision(localResult.revision)
 
       if (this.#verifiedFinality.closedThroughMs !== null) {
@@ -1064,10 +1240,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (Object.hasOwn(topics, name)) {
       return this.submit({ ...options, updates: [{ topic: name, input: normalizeJsonValue(input) }] })
     }
-    const colon = name.indexOf(':')
-    if (colon > 0) {
-      const topic = name.slice(0, colon)
-      const action = name.slice(colon + 1)
+    const sep = name.includes('.') ? name.indexOf('.') : name.indexOf(':')
+    if (sep > 0) {
+      const topic = name.slice(0, sep)
+      const action = name.slice(sep + 1)
       if (Object.hasOwn(topics, topic)) {
         const body = (input !== null && typeof input === 'object' && !Array.isArray(input))
           ? { action, ...(input as Record<string, JsonValue>) }
@@ -1111,10 +1287,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const value = await this.#kernel.query(name, normalizeJsonValue(input))
       return { applicationId: this.applicationId, revision: this.#lastLocalRevision, value }
     }
-    const colon = name.indexOf(':')
-    if (colon > 0) {
-      const topic = name.slice(0, colon)
-      const queryName = name.slice(colon + 1)
+    const sep = name.includes('.') ? name.indexOf('.') : name.indexOf(':')
+    if (sep > 0) {
+      const topic = name.slice(0, sep)
+      const queryName = name.slice(sep + 1)
       if (Object.hasOwn(topics, topic)) {
         const body = (input !== null && typeof input === 'object' && !Array.isArray(input))
           ? { query: queryName, ...(input as Record<string, JsonValue>) }
@@ -1150,7 +1326,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     for (const [topic, entry] of Object.entries(raw)) {
       if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
       const obj = entry as Record<string, unknown>
-      const prefix = multiTopic ? `${topic}:` : ''
+      const prefix = multiTopic ? `${topic}.` : ''
       if (Array.isArray(obj.commands)) {
         for (const c of obj.commands) {
           if (c && typeof c === 'object' && typeof (c as { name?: unknown }).name === 'string') {

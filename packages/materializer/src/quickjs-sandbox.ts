@@ -8,7 +8,7 @@ import {
 import baseVariant from '@jitl/quickjs-ng-wasmfile-release-sync'
 import { bytesToHex, decodeUtf8, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
 import { verifyEd25519Sync } from '@chronolog/crypto'
-import { canonicalEventPayload, normalizeJsonValue, type JsonValue } from '@chronolog/protocol'
+import { canonicalEventPayload, isControlTopic, normalizeJsonValue, type JsonValue } from '@chronolog/protocol'
 import type { CasPartition, ContentAddressedStore } from '@chronolog/records'
 
 export const QUICKJS_RUNTIME_ID = 'quickjs-ng@0.32.0'
@@ -90,6 +90,7 @@ export interface QuickJsSandboxOptions {
 export interface ReducerInvocationInput {
   readonly imports: Readonly<Record<string, string>>
   readonly builtins: Readonly<Record<string, string>>
+  readonly topicBindings?: Readonly<Record<string, { readonly module: string; readonly export?: string; readonly config?: JsonValue }>>
   readonly moduleSpecifier: string
   readonly exportName: string
   readonly method: 'reduce' | 'query' | 'describe'
@@ -193,6 +194,10 @@ export class QuickJsSandbox {
    */
   async invoke(input: ReducerInvocationInput): Promise<ReducerInvocationResult> {
     const qjs = await this.#wasmPromise
+    return this.#invokeSync(qjs, input, 0)
+  }
+
+  #invokeSync(qjs: QuickJSWASMModule, input: ReducerInvocationInput, depth: number): ReducerInvocationResult {
     const runtime = qjs.newRuntime()
     const openDbs = new Map<number, SqliteDbHandle>()
     let nextDbId = 1
@@ -239,7 +244,7 @@ export class QuickJsSandbox {
           const exp = input.exportName === 'default'
             ? `import __target from ${JSON.stringify(input.moduleSpecifier)};`
             : `import { ${input.exportName} as __target } from ${JSON.stringify(input.moduleSpecifier)};`
-          return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const ctx = Object.freeze({ topic(name) { return Object.prototype.hasOwnProperty.call(env.topics, name) ? env.topics[name] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${input.method === 'reduce' ? 'fn(env.state, env.tx, ctx)' : input.method === 'query' ? 'fn(env.state, env.payload, ctx)' : 'fn(env.state, ctx)'}; return JSON.stringify({ __ok: true, value: out }); };`
+          return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const ctx = Object.freeze({ topic(name) { return Object.prototype.hasOwnProperty.call(env.topics, name) ? env.topics[name] : null; }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${input.method === 'reduce' ? 'fn(env.state, env.tx, ctx)' : input.method === 'query' ? 'fn(env.state, env.payload, ctx)' : 'fn(env.state, ctx)'}; return JSON.stringify({ __ok: true, value: out }); };`
         }
         const ref = input.imports[moduleName]
         if (ref === undefined) return { error: new Error(`MODULE_NOT_FOUND:${moduleName}`) }
@@ -270,6 +275,53 @@ export class QuickJsSandbox {
           ctx.setProp(hostObj, name, handle)
           handle.dispose()
         }
+
+        bindFn('queryTopic', (topicH, inputJsonH) => {
+          if (depth >= 4) throw new Error('TOPIC_QUERY_DEPTH_EXCEEDED')
+          const topicName = ctx.getString(topicH)
+          if (readPartition === 'public' && !isControlTopic(topicName)) {
+            return ctx.newString('null')
+          }
+          const rawQueryInput = JSON.parse(ctx.getString(inputJsonH)) as unknown
+          const topicState: JsonValue = Object.hasOwn(input.topics, topicName) ? input.topics[topicName]! : null
+          const binding = input.topicBindings?.[topicName]
+          if (binding === undefined) {
+            return ctx.newString(JSON.stringify(topicState))
+          }
+          const nestedPartition: CasPartition = (readPartition === 'public' || isControlTopic(topicName)) ? 'public' : input.casPartition
+          let nestedRes: ReducerInvocationResult
+          try {
+            nestedRes = this.#invokeSync(qjs, {
+              imports: input.imports,
+              builtins: input.builtins,
+              ...(input.topicBindings === undefined ? {} : { topicBindings: input.topicBindings }),
+              moduleSpecifier: binding.module,
+              exportName: binding.export ?? 'default',
+              method: 'query',
+              state: topicState,
+              payload: normalizeJsonValue(rawQueryInput),
+              topics: input.topics,
+              ...(binding.config === undefined ? {} : { config: binding.config }),
+              cas: input.cas,
+              casPartition: nestedPartition,
+              readOnly: true,
+              maxMemoryBytes: input.maxMemoryBytes,
+            }, depth + 1)
+          } catch (err) {
+            if (err instanceof MissingDependencyError) {
+              missingDep ??= err
+              throw err
+            }
+            throw err
+          }
+          if (!nestedRes.ok) {
+            if (nestedRes.code === 'vm:missing_method:query') {
+              return ctx.newString(JSON.stringify(topicState))
+            }
+            throw new Error(`TOPIC_QUERY_FAILED:${nestedRes.code}:${nestedRes.detail ?? ''}`)
+          }
+          return ctx.newString(JSON.stringify(nestedRes.value))
+        })
 
         bindFn('sha256', (dataHandle) => {
           const raw = ctx.dump(dataHandle) as unknown

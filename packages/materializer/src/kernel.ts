@@ -477,6 +477,7 @@ export class TopicKernel {
         res = await this.sandbox.invoke({
           imports: reducersConfig.imports,
           builtins: reducersConfig.runtime.builtins,
+          topicBindings: reducersConfig.topics,
           moduleSpecifier: binding.module,
           exportName: binding.export ?? 'default',
           method: 'reduce',
@@ -611,6 +612,7 @@ export class TopicKernel {
     const res = await this.sandbox.invoke({
       imports: reducersConfig.imports,
       builtins: reducersConfig.runtime.builtins,
+      topicBindings: reducersConfig.topics,
       moduleSpecifier: binding.module,
       exportName: binding.export ?? 'default',
       method: 'query',
@@ -641,6 +643,7 @@ export class TopicKernel {
       const res = await this.sandbox.invoke({
         imports: reducersConfig.imports,
         builtins: reducersConfig.runtime.builtins,
+        topicBindings: reducersConfig.topics,
         moduleSpecifier: binding.module,
         exportName: binding.export ?? 'default',
         method: 'describe',
@@ -665,6 +668,12 @@ export class TopicKernel {
       const val = await this.query('$signal_policy', null)
       if (val !== null && typeof val === 'object' && !Array.isArray(val) && Array.isArray((val as Readonly<Record<string, JsonValue>>).rules)) {
         return val as { readonly rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] }
+      }
+    }
+    const queriedReaders = await this.query('$permissions', { list: 'readers' }).catch(() => null)
+    if (Array.isArray(queriedReaders) && queriedReaders.every(x => typeof x === 'string')) {
+      return {
+        rules: [{ topicPattern: '*', allowedAuthors: queriedReaders, maxTtlMs: 30_000, allowRelay: true }],
       }
     }
     const perms = this.#topics.$permissions as { readonly members?: readonly { readonly publicKey: string; readonly reader?: boolean }[] } | undefined
