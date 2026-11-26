@@ -33,6 +33,7 @@ export {
   decodeSignedOperation,
   encodeSignedOperation,
   decodeOperationCore,
+  signOperationCore,
   verifySignedOperation,
   decodeEncryptedEnvelope,
   encodeEncryptedEnvelope,

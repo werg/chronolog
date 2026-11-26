@@ -472,10 +472,49 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return this.#epochKeys.get(epoch)?.slice() ?? null
   }
 
+  hasEpochKey(epoch: number): boolean {
+    return this.#epochKeys.has(epoch)
+  }
+
+  exportEpochKeys(): ReadonlyMap<number, Uint8Array> {
+    const out = new Map<number, Uint8Array>()
+    for (const [ep, key] of this.#epochKeys) out.set(ep, key.slice())
+    return out
+  }
+
   async installEpochKey(epoch: number, key: Uint8Array): Promise<void> {
     check(Number.isSafeInteger(epoch) && epoch >= 0 && key instanceof Uint8Array && key.length === 32, 'EPOCH_KEY_INVALID')
     this.#epochKeys.set(epoch, key.slice())
     await this.#store.put(`${this.#prefix}/epoch-key/${epoch}`, key.slice())
+  }
+
+  async unlockEpochsFromKeysTopic(wrapPrivateKey: CryptoKey, wrapPublicKeyHex: string): Promise<number> {
+    return this.#serial(async () => {
+      if (!this.genesis.privateChain || this.#blindHostMode) return 0
+      const keys = this.keysState()
+      let unlocked = 0
+      for (const entry of Object.values(keys.epochs ?? {})) {
+        if (this.#epochKeys.has(entry.epoch)) continue
+        const box = entry.boxes?.[this.identity.publicKey]
+        if (box === undefined) continue
+        try {
+          const plainKey = await hpkeOpenEpochKey(
+            wrapPrivateKey,
+            wrapPublicKeyHex,
+            box,
+            this.chainId,
+            entry.epoch,
+          )
+          if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
+          await this.installEpochKey(entry.epoch, plainKey)
+          unlocked++
+        } catch {
+          // Wrong wrap key or corrupted lockbox — ignore
+        }
+      }
+      if (unlocked > 0) await this.#rematerialize()
+      return unlocked
+    })
   }
 
   topic(name: string): JsonValue | null {
@@ -1039,6 +1078,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const appTopics = Object.keys(topics).filter(t => !isControlTopic(t))
     if (appTopics.length === 1) {
       const topic = appTopics[0]!
+      const described = await this.describe().catch(() => null)
+      if (described && described.commands.length > 0 && !described.commands.some(c => c.name === name)) {
+        throw new Error(`APPLICATION_COMMAND_UNKNOWN:${name}`)
+      }
       const body = (input !== null && typeof input === 'object' && !Array.isArray(input))
         ? { action: name, ...(input as Record<string, JsonValue>) }
         : { action: name, input: normalizeJsonValue(input) }
@@ -1083,6 +1126,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const appTopics = Object.keys(topics).filter(t => !isControlTopic(t))
     if (appTopics.length === 1) {
       const topic = appTopics[0]!
+      const described = await this.describe().catch(() => null)
+      if (described && described.queries.length > 0 && !described.queries.some(q => q.name === name)) {
+        throw new Error(`APPLICATION_QUERY_UNKNOWN:${name}`)
+      }
       const body = (input !== null && typeof input === 'object' && !Array.isArray(input))
         ? { query: name, ...(input as Record<string, JsonValue>) }
         : { query: name, input: normalizeJsonValue(input) }

@@ -33,6 +33,8 @@ export {
   genesisChainId,
   encodeSignedOperation,
   decodeSignedOperation,
+  signOperationCore,
+  verifySignedOperation,
   encodeEncryptedEnvelope,
   decodeEncryptedEnvelope,
   encryptedEnvelopeDigest,
