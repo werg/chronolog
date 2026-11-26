@@ -6,29 +6,23 @@
   "exports": {
     ".": "./src/index.ts",
     "./native": "./src/native.ts",
-    "./celld": "./src/celld.ts",
     "./browser": "./src/browser.ts",
-    "./sql-native": "./src/sql-native.ts",
-    "./sql-celld": "./src/sql-celld.ts",
+    "./worker": "./src/worker.ts",
     "./webrtc": "./src/webrtc.ts",
     "./webrtc-native": "./src/webrtc-native.ts",
-    "./tendriller": "./src/tendriller.ts",
-    "./sql": "./src/sql.ts",
-    "./sql-browser": "./src/sql-browser.ts",
-    "./sql-wasm": "./src/sql-wasm.ts",
     "./websocket": "./src/websocket.ts",
-    "./worker": "./src/worker.ts"
+    "./tendriller": "./src/tendriller.ts"
   },
   "dependencies": {
     "@chronolog/authority": "workspace:*",
-    "@chronolog/protocol": "workspace:*",
+    "@chronolog/canonical": "workspace:*",
+    "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",
+    "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",
     "@chronolog/signals": "workspace:*",
-    "@chronolog/materializer-doltlite": "workspace:*",
+    "@chronolog/sqlite-cas": "workspace:*",
     "@chronolog/transport-webrtc": "workspace:*",
-    "@chronolog/crypto": "workspace:*",
-    "@chronolog/transport-websocket": "workspace:*",
-    "@chronolog/canonical": "workspace:*"
+    "@chronolog/transport-websocket": "workspace:*"
   }
 }

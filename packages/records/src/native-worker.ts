@@ -4,12 +4,10 @@
 // separate SQLite file addressed by its numeric handle.
 export const nativeWorkerSource = String.raw`
 (async () => {
-const { parentPort, workerData } = await import('node:worker_threads')
-const { createRequire } = await import('node:module')
-const require = createRequire(workerData.sqliteModule)
-const { mkdirSync } = require('node:fs')
-const { dirname } = require('node:path')
-const Database = require(workerData.sqliteModule)
+const { parentPort } = await import('node:worker_threads')
+const { mkdirSync } = await import('node:fs')
+const { dirname } = await import('node:path')
+const { DatabaseSync } = await import('node:sqlite')
 const stores = new Map()
 function error(message) { throw new Error(message) }
 function validate(store, key, value) {
@@ -24,8 +22,8 @@ function open(handle, { path, options }) {
   let db
   try {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    db = new Database(path, { timeout: 0 })
-    db.exec('PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS stored_bytes (key TEXT PRIMARY KEY, value BLOB NOT NULL); COMMIT')
+    db = new DatabaseSync(path)
+    db.exec('PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS stored_bytes (key TEXT PRIMARY KEY, value BLOB NOT NULL); COMMIT')
   } catch (cause) {
     try { db?.close() } catch {}
     if (/locked|busy/i.test(cause.message)) throw Object.assign(new Error('BYTES_STORE_IN_USE', { cause }), { code: 'BYTES_STORE_IN_USE' })
@@ -35,14 +33,14 @@ function open(handle, { path, options }) {
     db, restoring: false, restoredBytes: 0,
     quota: options.quotaBytes ?? 256 * 1024 * 1024,
     maxValue: options.maxValueBytes ?? 128 * 1024 * 1024,
-    used: db.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get().bytes,
+    used: Number(db.prepare('SELECT coalesce(sum(length(value)), 0) AS bytes FROM stored_bytes').get().bytes),
     get: db.prepare('SELECT value FROM stored_bytes WHERE key = ?'),
     size: db.prepare('SELECT length(value) AS bytes FROM stored_bytes WHERE key = ?'),
     put: db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'),
     insert: db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?)'),
     remove: db.prepare('DELETE FROM stored_bytes WHERE key = ?'),
     count: db.prepare('SELECT count(*) AS count FROM stored_bytes'),
-    page: db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key'),
+    page: db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key LIMIT 64'),
   }
   stores.set(handle, store)
   return store
@@ -56,7 +54,7 @@ function run(store, method, args) {
   if (method === 'get') { validate(store, args.key); return store.get.get(args.key)?.value ?? null }
   if (method === 'put') {
     validate(store, args.key, args.value)
-    const next = store.used - (store.size.get(args.key)?.bytes ?? 0) + args.value.length
+    const next = store.used - Number(store.size.get(args.key)?.bytes ?? 0) + args.value.length
     if (next > store.quota) error('BYTES_STORE_QUOTA_EXCEEDED')
     store.put.run(args.key, args.value); store.used = next
     return undefined
@@ -66,7 +64,7 @@ function run(store, method, args) {
     const staged = new Map()
     for (const entry of args.entries) { validate(store, entry.key, entry.value); staged.set(entry.key, entry.value) }
     let next = store.used
-    for (const [k, v] of staged) next = next - (store.size.get(k)?.bytes ?? 0) + v.length
+    for (const [k, v] of staged) next = next - Number(store.size.get(k)?.bytes ?? 0) + v.length
     if (next > store.quota) error('BYTES_STORE_QUOTA_EXCEEDED')
     db.exec('BEGIN IMMEDIATE')
     try {
@@ -78,14 +76,14 @@ function run(store, method, args) {
   }
   if (method === 'delete') {
     validate(store, args.key)
-    const prior = store.size.get(args.key)?.bytes ?? 0
+    const prior = Number(store.size.get(args.key)?.bytes ?? 0)
     store.remove.run(args.key); store.used -= prior
     return undefined
   }
   if (method === 'page') {
     const value = []; let bytes = 0
-    for (const row of store.page.iterate(args.after)) {
-      value.push(row); bytes += row.value.length
+    for (const row of store.page.all(args.after)) {
+      value.push({ key: row.key, value: row.value }); bytes += row.value.length
       if (value.length >= 64 || bytes >= 1024 * 1024) break
     }
     return value
@@ -93,7 +91,7 @@ function run(store, method, args) {
   if (method === 'restoreBegin') {
     if (store.restoring) error('BYTES_STORE_RESTORE_IN_PROGRESS')
     db.exec('BEGIN IMMEDIATE')
-    if (store.count.get().count !== 0) { db.exec('ROLLBACK'); return false }
+    if (Number(store.count.get().count) !== 0) { db.exec('ROLLBACK'); return false }
     store.restoring = true; store.restoredBytes = 0
     return true
   }
@@ -102,7 +100,7 @@ function run(store, method, args) {
     validate(store, args.key, args.value)
     if (store.restoredBytes + args.value.length > store.quota) error('BYTES_STORE_QUOTA_EXCEEDED')
     try { store.insert.run(args.key, args.value) } catch (cause) {
-      if (cause.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') error('BYTES_STORE_DUPLICATE_KEY')
+      if (cause.errcode === 1555 || cause.code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || /UNIQUE constraint failed|PRIMARY KEY/i.test(cause.message)) error('BYTES_STORE_DUPLICATE_KEY')
       throw cause
     }
     store.restoredBytes += args.value.length

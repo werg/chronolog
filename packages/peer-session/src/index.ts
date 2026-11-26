@@ -1,19 +1,63 @@
 import type { ApplicationDefinition } from './definition.js'
 import type { CreateApplicationSessionOptions } from './runtime.js'
 import type { ApplicationSession } from './session.js'
+
 /** Passive import; actual storage and execution modules load only on explicit local open. */
-export async function createApplicationSession<const D extends ApplicationDefinition>(options: CreateApplicationSessionOptions<D>): Promise<ApplicationSession<D>> { return (await import('./runtime.js')).createApplicationSession(options) }
+export async function createApplicationSession<const D extends ApplicationDefinition = ApplicationDefinition>(
+  options: CreateApplicationSessionOptions<D>,
+): Promise<ApplicationSession<D>> {
+  return (await import('./runtime.js')).createApplicationSession(options)
+}
+
 export type { CreateApplicationSessionOptions } from './runtime.js'
-export type { ApplicationSession, SessionFacts } from './session.js'
+export type {
+  ApplicationSession,
+  SessionFacts,
+  SessionCasNode,
+  MemberRecord,
+  PermissionsTopicState,
+  KeysTopicState,
+  CheckpointBootstrapSnapshot,
+} from './session.js'
 export type * from './session-types.js'
 export type * from './operation.js'
-export type * from './operation-codec.js'
+export * from './genesis.js'
 export * from './definition.js'
 export * from './device.js'
 export * from '@chronolog/authority'
-export { eventExecutionManifest } from '@chronolog/materializer/manifest'
-export { emit, program, sqlStatement, platformOp, executionManifestArtifacts, bytesToHex, hexToBytes, GROUP_COLLECTIVE_ID } from '@chronolog/protocol'
-export type { ChangeProgram, EventPayload } from '@chronolog/protocol'
+export {
+  bytesToHex,
+  hexToBytes,
+  encodeGenesisBlock,
+  decodeGenesisBlock,
+  genesisChainId,
+  encodeSignedOperation,
+  decodeSignedOperation,
+  encodeEncryptedEnvelope,
+  decodeEncryptedEnvelope,
+  encryptedEnvelopeDigest,
+  envelopeAad,
+  operationIdDigest,
+  compareOperationOrder,
+  isControlTopic,
+  normalizeJsonValue,
+  DEFAULT_RUNTIME_MANIFEST,
+  DEFAULT_GENESIS_LIMITS,
+} from '@chronolog/protocol'
+export type {
+  EventPayload,
+  GenesisBlock,
+  JsonValue,
+  OperationCore,
+  OperationVisibility,
+  ReducersConfig,
+  RuntimeManifest,
+  SignedOperation,
+  EncryptedOperationEnvelope,
+  TopicBinding,
+  TopicUpdate,
+} from '@chronolog/protocol'
+export { STANDARD_MODULE_SOURCES, STANDARD_MODULE_IMPORTS } from '@chronolog/materializer/std-modules'
 export type { ApplicationPeerLink, ApplicationPeerConnectOptions, ApplicationPeerDiagnostics, ApplicationPeerLinkStats, ApplicationPeerLiveDiagnostics } from './network.js'
 export type { FramedPeerConnection, PeerLiveLane } from '@chronolog/records'
 export * from './live-view.js'
@@ -28,6 +72,5 @@ export type * from './content.js'
 export { createApplicationBackend } from './tendriller.js'
 export { createApplicationOwner } from './session-owner.js'
 export type * from './owner-types.js'
-export type * from './provisioning.js'
 export { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
 export * from './multi-session.js'

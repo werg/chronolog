@@ -1,4 +1,5 @@
 import { concatBytes, utf8 } from './bytes.js'
+import { sha256Sync } from './sync-hash.js'
 
 export const HASH_DOMAINS = Object.freeze({
   transaction: 'chronolog/transaction',
@@ -9,6 +10,13 @@ export const HASH_DOMAINS = Object.freeze({
   module: 'chronolog/module',
   entropy: 'chronolog/entropy',
   platformObject: 'chronolog/platform-object',
+  genesis: 'chronolog/genesis/v1',
+  op: 'chronolog/op/v1',
+  envelope: 'chronolog/envelope/v1',
+  state: 'chronolog/state/v1',
+  cas: 'chronolog/cas/v1',
+  history: 'chronolog/history/v1',
+  revision: 'chronolog/revision/v1',
 } as const)
 
 export type HashDomainKey = keyof typeof HASH_DOMAINS
@@ -28,4 +36,8 @@ export async function sha256(payload: Uint8Array): Promise<Uint8Array> {
 
 export async function hashDomain(domain: HashDomainKey, payload: Uint8Array): Promise<Uint8Array> {
   return sha256(domainSeparatedBytes(domain, payload))
+}
+
+export function hashDomainSync(domain: HashDomainKey, payload: Uint8Array): Uint8Array {
+  return sha256Sync(domainSeparatedBytes(domain, payload))
 }

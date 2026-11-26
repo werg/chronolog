@@ -1,6 +1,6 @@
 import type { OperationInspection as InlineOperationInspection } from '@chronolog/peer-session'
 import { serveWorkerWebRtcConnections } from '@chronolog/peer-session/webrtc'
-import type { MaterializedOperation, ApplicationPeerLink, ContentReference, ContentRetention, SignedOperationEnvelope, RetentionEvidence } from '@chronolog/peer-session'
+import type { MaterializedOperation, ApplicationPeerLink, ContentReference, ContentRetention, RetentionEvidence } from '@chronolog/peer-session'
 import type { HttpWebRtcSignaling, WebRtcRoute } from '@chronolog/transport-webrtc'
 import type { Bootstrap, BrowserState } from './contract.js'
 
@@ -47,8 +47,8 @@ const api = {
   open: (bootstrap: Bootstrap) => command<BrowserState>('open', { bootstrap }),
   connect: (options: { url: string; token: string; peerIdentity: string }) => command<ConnectionObservation>('connect', { options }),
   disconnect: () => command('disconnect'),
-  save: (operationId: string, text: string) => command<{ state: InlineOperationInspection; intent: SignedOperationEnvelope }>('save', { operationId, text }),
-  publish: (operationId: string, text: string) => command<{ materialized: MaterializedOperation; intent: SignedOperationEnvelope }>('publish', { operationId, text }),
+  save: (operationId: string, text: string) => command<{ state: InlineOperationInspection; intent: { readonly proposalId: string; readonly bytesHex: string } }>('save', { operationId, text }),
+  publish: (operationId: string, text: string) => command<{ materialized: MaterializedOperation; intent: { readonly proposalId: string; readonly bytesHex: string } }>('publish', { operationId, text }),
   retained: (operationId: string) => command<readonly RetentionEvidence[]>('retained', { operationId }),
   signal: (text: string) => command('signal', { text }),
   content: (reference: ContentReference) => command<{ bytes: number; sha256: string; retained: ContentRetention }>('content', { reference }),

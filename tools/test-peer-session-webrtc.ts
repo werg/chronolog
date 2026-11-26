@@ -9,8 +9,7 @@ import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
 import {
-  createApplicationSession, bytesToHex, createSigningIdentity, eventExecutionManifest, executionManifestArtifacts,
-  signAppDescriptor, signMembership, epochKeyCommitment,
+  createApplicationSession, bytesToHex, createChainGenesis,
   type ApplicationDevice, type ApplicationPeerLink, type ApplicationSession, type ApplicationEventBatch,
 } from '@chronolog/peer-session'
 import { openNativeDevice } from '@chronolog/peer-session/native'
@@ -20,7 +19,7 @@ import type { EphemeralSignal } from '@chronolog/signals'
 import { chromium } from '@playwright/test'
 import { build } from 'esbuild'
 
-import { definition, type BrowserState } from '../test/peer-session-webrtc/contract.js'
+import { definition, RTC_MESSAGES_REDUCER, type BrowserState } from '../test/peer-session-webrtc/contract.js'
 import type { AuthoredRtcTestApi } from '../test/peer-session-webrtc/page.js'
 import { waitFor } from './lib/wait-for.js'
 
@@ -111,21 +110,23 @@ try {
   phase = 'explicit-fixture-enrollment'
   const identity = await page.evaluate(name => (globalThis as unknown as TestWindow).authoredRtcTest.prepare(name), `authored-rtc-${crypto.randomUUID()}`)
   nativeDevice = await openNativeDevice({ path: join(directory, 'native.sqlite'), create: true })
-  const owner = await createSigningIdentity(), key = crypto.getRandomValues(new Uint8Array(32)), applicationId = '98'.repeat(32)
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
-  const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: identity.publicKey,
-    authorityPublicKey: owner.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest), finalityPolicy: { kind: 'signed-frontier', signer: identity.publicKey, scopes: [{ id: '56'.repeat(32), authorTimeAfterMs: -1n }] } }, owner)
-  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true, administrator: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n, epoch: 0,
-    epochKeyDigest: await epochKeyCommitment(applicationId, 0, key), members: [nativeDevice.identity.publicKey, identity.publicKey].map(publicKey => ({ publicKey, wrapKey: null,
-      reader: true, writer: true, administrator: false, publisher: false, finalizer: publicKey === identity.publicKey })) }, owner)
-  const authority = { descriptor, memberships: [membership] }
-  native = await createApplicationSession({ device: nativeDevice, authority, definition, epochKeys: new Map([[0, key]]) })
+  const key = crypto.getRandomValues(new Uint8Array(32))
+  const created = await createChainGenesis({
+    creator: { publicKey: identity.publicKey, reader: true, writer: true, administrator: true, finalizer: true },
+    members: [{ publicKey: nativeDevice.identity.publicKey, wrapKey: nativeDevice.wrapKey.publicKey, reader: true, writer: true }],
+    privateChain: true,
+    imports: { 'app/messages': RTC_MESSAGES_REDUCER },
+    topics: { messages: { module: 'app/messages', initialState: [] } },
+    finalitySchedule: [{ effectiveAfterMs: -1n, policy: { kind: 'signed-frontier', signer: identity.publicKey } }],
+    epoch0Key: key,
+  })
+  native = await createApplicationSession({ device: nativeDevice, genesis: created.genesisBytes, casNodes: created.casNodes, definition, epochKeys: new Map([[0, key]]) })
   const owned = native
   void (async () => {
     try { for await (const value of owned.signals.subscribe({ signal: owned.signal })) nativeSignals.push(value) }
     catch (error) { if (!owned.signal.aborted) errors.push(String(error)) }
   })()
-  await page.evaluate(bootstrap => (globalThis as unknown as TestWindow).authoredRtcTest.open(bootstrap), { authority, epoch: 0, epochKey: bytesToHex(key) })
+  await page.evaluate(bootstrap => (globalThis as unknown as TestWindow).authoredRtcTest.open(bootstrap), { chainId: created.chainId, genesisBytes: created.genesisBytes, casNodes: created.casNodes, epoch: 0, epochKey: bytesToHex(key) })
   const upload = await native.content.stage({ bytes: content.length })
   for (let offset = 0; offset < content.length; offset += 65_536) await upload.write(offset / 65_536, content.slice(offset, offset + 65_536))
   const reference = await upload.commit()
@@ -193,7 +194,7 @@ try {
     return converged.events.length === 4 && JSON.stringify(converged.events) === JSON.stringify((current.value as ApplicationEventBatch).events) &&
       converged.revision.digest === current.revision.digest
   }, 'authored RTC applied histories converge', 20_000)
-  const beforeSignal = converged.revision, nativeRevision = native.revision
+  const beforeSignal = converged.revision, nativeRevision = native.revision()
   await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.signal('browser live'))
   await native.signals.send('typing', { text: 'native live' })
   await waitFor(async () => {
@@ -202,7 +203,7 @@ try {
       nativeSignals.some(value => value.authorId === identity.publicKey && value.topic === 'typing')
   }, 'signed live signals cross independent lanes', 10_000)
   const afterSignals = await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.state())
-  assert.deepEqual(afterSignals.revision, beforeSignal); assert.deepEqual(native.revision, nativeRevision)
+  assert.deepEqual(afterSignals.revision, beforeSignal); assert.deepEqual(native.revision(), nativeRevision)
   passed('signed-live-signals-leave-application-history-unchanged')
   const exactRetry = await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.publish('browser-offline', 'browser with host stopped'))
   assert.deepEqual(exactRetry.intent, browserOperation.intent); assert.equal(exactRetry.materialized.proposalId, browserOperation.materialized.proposalId)
@@ -242,7 +243,7 @@ try {
       epochProvisioning: 'explicit fixture enrollment through the local test harness; cached local reopening supplies no authority/key bootstrap', browserFinalizerWithoutNative: true,
       excludes: ['packaged Tendriller host', 'automatic key delivery', 'automatic reconnect policy', 'public NAT traversal', 'TURN interoperability', 'provider billing', 'fixed-validator quorum finality'] },
     metrics: { host: { before: hostBefore, after: host }, browserHttp: { before: requestsBefore, after: browserRequests },
-      reconnect: { elapsedMs: reconnectElapsedMs, routes: [first.route, second.route], originalProposalId: saved.intent.payload.proposalId, retriedProposalId: retried.intent.payload.proposalId },
+      reconnect: { elapsedMs: reconnectElapsedMs, routes: [first.route, second.route], originalProposalId: saved.intent.proposalId, retriedProposalId: retried.intent.proposalId },
       signaling: after.signaling, reliable: { before: before.stats, after: after.stats }, nativeChannels: { before: nativeBefore, after: nativeChannel!.stats },
       content: { bytes: content.length, expectedSha256: contentHash, receivedSha256: receivedContent.sha256, reopenedSha256: reopenedContent.sha256,
         referenceId: reference.id, retainedBy: receivedContent.retained.payload.peer },

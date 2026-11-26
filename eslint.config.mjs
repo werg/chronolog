@@ -11,6 +11,8 @@ export default tseslint.config(
       "artifacts/**",
       "dist/**",
       "node_modules/**",
+      "packages/sqlite-cas/wasm/**",
+      "packages/sqlite-cas/vendor/**",
     ],
   },
   eslint.configs.recommended,

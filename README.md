@@ -1,96 +1,138 @@
-# Chronolog
+# Chronolog-DB
 
-Chronolog is an owned, peer-to-peer application session for browser Workers and Node.js peers. The application is a CRDT of immutable, signed, encrypted proposals. Every peer independently verifies authorship, authority and the execution contract, unions the operation set, and materializes state locally in one deterministic order: `(signed authorTimestampMs, signing public key, stable proposal ID)`. No peer, server, agent, finalizer or transport assigns that order. See the [authored operation-set contract](docs/CRDT_CONTRACT.md) and the [architecture overview](docs/authored-operation-set.md).
+**A local-first Merkle-DAG CRDT database where your application logic, permissions, SQL tables, and UI live as hash-pinned ES Modules over a flat timestamp-ordered operation set — with zero native C/C++ builds.**
 
-## Core model
+Chronolog-DB lets browsers, Node.js agents, and blind edge hosts (such as Cloudflare Workers) collaborate offline-first and converge deterministically to the exact same state, without a central sequencing server or a blockchain consensus requirement.
 
-- **Local-first authoring**: `submit()` and `command()` sign the exact intent with one author timestamp and durably store it on this device before returning. Retry preserves the original bytes, identity and timestamp, and a changed request under the same operation ID is rejected. Success means stored locally, not delivered, executed, retained or final.
-- **Revisable outcomes**: The signed intent is immutable; its provisional SQL outcome is not. An operation that arrives later but carries an earlier author time can change later outcomes, rows, effective events and schema. Missing bodies, keys or authority stay visible pending dependencies rather than becoming fake rejections.
-- **Separate facts**: `stored`, `materialized` (a coherent local outcome at a revision), `retained` (signed peer availability evidence) and `finalized` (optional closed-time proof) are separate observations. `operation.inspect()` and `operation.materialized()`, `.retained()` and `.finalized()` expose them; `session.operations.get/subscribe/retry` find, watch and re-drive operations by ID.
-- **Coherent views**: `query()` returns `{ applicationId, revision, value }`; `readView()` captures one immutable snapshot of SQL, events and revision. A reactive consumer derives its UI from such snapshots plus separate local drafts and invalidates when `changes()` reports revised proposals.
-- **Optional finality**: The default policy is `none`, a complete mode with no finalizer. Explicit `signed-frontier` and `fixed-validator` policies add signed admission and closed-time evidence that browser, native or host finalizers can supply. A closed frontier can exclude a newly seen older proposal; the original intent stays inspectable and is never silently retimestamped.
-- **Ordinary schema and permissions**: DDL, DML, ownership and permission changes are normal authorized transactions. There is no frozen application schema digest. Per-namespace and per-object DDL rights are independent of cryptographic grants, administration, finalization and code publication.
-- **Authority and publication**: `@chronolog/authority` holds signed application metadata, time-windowed membership and epoch keys, finality proofs and signed code publication. These govern who can decrypt, author, finalize or publish. They never order operations or overwrite application permission state.
-- **Unified session**: Live ephemeral signals and encrypted chunked content share the same identity, authorization and lifetime.
-- **Transport independence**: Direct WebRTC and WebSocket relay share one framed, authenticated, encrypted channel. Transports carry and de-duplicate facts. Their receipts, arrival order and replay counters do not define application order.
+## The Big Idea
 
-## Quick start
+Most collaborative databases force an awkward choice: either centralize ordering on a server, freeze your schema and permissions in rigid database catalogs, or fight custom CRDT data structures for every feature.
 
-See the [session reference](packages/peer-session/README.md) for the complete API.
+Chronolog-DB takes a much simpler, composable approach built on four ideas:
+
+1. **A Flat Timestamp-Ordered Operation Set ("Block Soup", Not Hash-Linked Blocks)**
+   Every mutation is an immutable, Ed25519-signed operation carrying `(authorTimestampMs, author, opId)`. There are no `parents` pointers and no forks to merge. Every replica sorts the set of known operations by `(authorTimestampMs, author, opId)` and folds them deterministically. Late earlier operations trigger a clean suffix replay from the nearest cached Merkle snapshot.
+
+2. **One Pure Content-Addressed Merkle-DAG (`CAS`)**
+   All large state — ES Module source code, SQLite database pages, binary assets, and replay metadata — lives in one content-addressed DAG (`ContentAddressedStore`) with explicit links, public/private partition isolation, LRU caching, and exact mark-and-sweep garbage collection.
+
+3. **Hash-Pinned ES Module Reducers in QuickJS-NG (`$reducers` Import Map)**
+   Each topic in the chain is reduced by a plain, readable, Vitest-testable ES Module pinned by content hash (`cas:sha256-...`) in the `$reducers` topic:
+   - **Fresh `QuickJSContext` per invocation:** Zero module-state leaks across `reduce()`, `query()`, or suffix replay; `Date`, `Math.random`, and `Intl` are stripped.
+   - **Frozen or governed upgrades:** Omit a reducer for `$reducers` to permanently freeze rules, or bind `$reducers` to `chronolog/permissions` (`adminOnlyReducers`) for governed upgrades.
+   - **Strict blind-host partition:** On private chains, `$*` control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`) are mutated only by `visibility: 'public'` operations and can read only `$*` topics and public CAS. A blind Cloudflare Worker host with zero decryption keys derives the exact same control state as every full replica.
+
+4. **First-Class Deterministic `chronolog:sqlite` + Nimble Write RLS (`chronolog/rls`)**
+   Reducers can import `chronolog:sqlite` (`sqlite-cas.wasm`, 1.34 MB): stock SQLite + FTS5 + `sqlite-vec` running over a 4 KiB Merkle-paged `CAS` VFS:
+   - **O(1) rollback & time travel:** A database snapshot is a single 32-byte `dbRoot` hash stored as a topic value.
+   - **Deterministic across timezones and platforms:** `random()`/`randomblob()` are disabled, `datetime('now')` and `localtime` are pinned to the signed operation's UTC `op_time()`, and `actor()`, `op_id()`, `op_time()` are bound by the host kernel.
+   - **Nimble Postgres-style write RLS + dynamic tables:** No rigid static schemas or bureaucratic catalogs. Reducers use `mode: 'admin' | 'user' | 'readonly'` + `chronolog/rls` (`applyRls`) to install validated `BEFORE INSERT/UPDATE/DELETE` triggers using arbitrary read-only SQL predicates, and can safely grant non-admin users `CREATE TABLE` / `CREATE INDEX` on their own tables.
+
+```text
+Signed Operations (flat set sorted by authorTimestampMs, author, opId)
+        │
+        ▼
+  TopicKernel (TS) ──► QuickJS-NG WASM Sandbox (Import Map in $reducers)
+        │                     │
+        │                     ├── chronolog:sqlite  (sqlite-cas.wasm: SQLite + FTS5 + sqlite-vec on Merkle-paged CAS)
+        │                     ├── chronolog:crypto  (sha256, verifyEd25519, canonicalJson)
+        │                     ├── chronolog:cas     (explicit-link put/get)
+        │                     └── chronolog/{permissions,keys,finality,publications,rls}
+        ▼
+  ContentAddressedStore (CAS) ──► BytesStore (Memory | IndexedDB | Node 22+ built-in node:sqlite)
+```
+
+## Five Audited Standard Modules
+
+Chronolog ships five small, audited ES Modules pinned into public CAS at genesis:
+
+| Module | Topic / Role | What It Does |
+| --- | --- | --- |
+| `chronolog/permissions` | `$permissions`, `$reducers`, `$signal_policy` | Member roles (`reader`, `writer`, `administrator`, `publisher`, `finalizer`), optional Ed25519 host-attestation verification, admin-only `$reducers` upgrades, and ephemeral signal rules. |
+| `chronolog/keys` | `$keys` | HPKE (X25519 + AES-256-GCM) epoch key lockboxes, key rotation, and fresh-device historical epoch grants (`grantBoxes`). |
+| `chronolog/finality` | `$finality` | Time-scoped optional finality schedule (`none`, `signed-frontier`, `fixed-validator`, `blockchain-anchor`) with clean `none -> P1` bootstrap and `P1 -> P2` handoffs. Finality decides inclusion and closed author-time, never order. |
+| `chronolog/publications` | `$publications` | Signed static UI release manifests referencing public CAS hashes. |
+| `chronolog/rls` | Utility library | Postgres-style write RLS triggers validated through SQLite's `mode: 'readonly'` parser (`applyRls`) plus dynamic user-table ownership helpers. |
+
+## Quick Example
 
 ```ts
-import { createApplicationSession, openNativeDevice } from '@chronolog/peer-session/native'
+import { createChainGenesis, createApplicationSession } from '@chronolog/peer-session'
+import { openNativeDevice } from '@chronolog/peer-session/native'
 
-// `create: true` only during explicit first setup; later runs resume the retained signer.
-const device = await openNativeDevice({ path: './device.sqlite', create: true })
-const session = await createApplicationSession({ device, definition, authority })
-try {
-  const op = await session.command('say', { text: 'Hello' }, { operationId: crypto.randomUUID() })
-  console.log(op.inspect().stored)                 // true: signed and durable on this device
-  const outcome = await op.materialized()          // accepted | rejected at this revision; revisable
-  const view = await session.query('messages', null)
-  console.log(outcome.outcome, view.revision.digest, view.value)
-} finally {
-  await session.close()
-}
+const tasksReducer = `
+import { openDb } from 'chronolog:sqlite';
+import { applyRls } from 'chronolog/rls';
+
+export default {
+  reduce(state, tx) {
+    const db = openDb(state);
+    db.exec('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL)', [], { mode: 'admin' });
+    applyRls(db, {
+      tasks: {
+        insert: 'NEW.owner = actor()',
+        update: 'OLD.owner = actor() AND NEW.owner = actor()',
+        delete: 'OLD.owner = actor()',
+      },
+    });
+    if (tx.payload.action === 'addTask') {
+      db.exec('INSERT INTO tasks (id, owner, title) VALUES (?, actor(), ?)', [tx.payload.id, tx.payload.title], { mode: 'user' });
+      return { ok: true, state: db.commit(), events: [{ topic: 'task.added', payload: tx.payload }] };
+    }
+    return { ok: false, code: 'unknown_action' };
+  },
+  query(state) {
+    const db = openDb(state);
+    return db.query('SELECT id, owner, title FROM tasks ORDER BY id').rows;
+  },
+  describe() {
+    return {
+      commands: [{ name: 'addTask', description: 'Create a task', input: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' } }, required: ['id', 'title'] } }],
+      queries: [{ name: 'listTasks', description: 'List tasks', input: { type: 'object', properties: {} } }],
+    };
+  },
+};
+`
+
+const device = await openNativeDevice({ path: './app.sqlite', create: true })
+const created = await createChainGenesis({
+  creator: { publicKey: device.identity.publicKey, wrapKey: device.wrapKey.publicKey, reader: true, writer: true, administrator: true },
+  imports: { 'app/tasks': tasksReducer },
+  topics: { tasks: { module: 'app/tasks', initialState: null } },
+})
+
+const session = await createApplicationSession({
+  device,
+  genesis: created.genesisBytes,
+  casNodes: created.casNodes,
+  epochKeys: new Map([[0, created.epoch0Key!]]),
+})
+
+await (await session.command('addTask', { id: 't1', title: 'Try Chronolog v2' })).materialized()
+console.log((await session.query('listTasks')).value)
+await session.close()
 ```
 
-`authority` is a verified `AuthorityProvider` or `AuthorityBundle`, and `definition` is built with `defineApplication`. The session opens cached identity, authority and keys without host discovery, a peer, an agent or a finalizer. A fresh device still needs enrollment and explicit key provisioning before it can read or author.
+## Zero Native Builds
 
-Native peers store data in SQLite under an exclusive writer lock; browser peers run the same session inside an owning Worker using OPFS or IndexedDB under an exclusive Web Lock. That device-local lock fences a physical store. It is not application ordering.
+Chronolog-DB requires **Node.js >= 22.15** and has **zero `node-gyp` / C++ native dependencies**:
+- Node durable storage uses Node's built-in `node:sqlite` (`DatabaseSync`) on one pooled worker thread per process.
+- Browser storage uses IndexedDB / OPFS.
+- Reducer execution uses QuickJS-NG WASM (`quickjs-emscripten-core` + `@jitl/quickjs-ng-wasmfile-release-sync`).
+- Deterministic SQL uses stock SQLite + FTS5 + `sqlite-vec` compiled to static `sqlite-cas.wasm` (compatible with Node, browsers, and Cloudflare Workers via static `WebAssembly.Module` imports).
 
-## Packages
-
-| Package | Responsibility |
-| --- | --- |
-| `peer-session` | Public session lifecycle, authored operations, queries, content, keys, key wrapping, owner extensions, participation, finality driving and tools |
-| `authority` | Portable signed application metadata, membership windows, grants, publications and optional finality proofs |
-| `records` | Bounded byte stores (native SQLite, browser OPFS/IndexedDB), framing, and flow-controlled channels |
-| `materializer` | Execution contract and SQL-free event materializer |
-| `materializer-doltlite` | Deterministic SQL execution over native and WASM DoltLite engines |
-| `transport-webrtc` | Browser and native WebRTC negotiation, reliable/live channels, and HTTP introductions |
-| `transport-websocket` | Dual-socket reliable/live WebSocket transport |
-| `signals` | Bounded, signed ephemeral JSON signals |
-| `protocol`, `crypto`, `canonical` | Deterministic CBOR, domain hashing, Ed25519/HPKE/AES-GCM, programs, canonical transaction order, and SQL validation |
-| `conformance` | Cross-engine execution equivalence, crash/reopen, and soak characterization |
-
-## Build, test, and package
-
-Requires Node 22+ (Node 24 for native SQLite/packaging checks) and pnpm 10:
+## Workspace Commands
 
 ```sh
-corepack pnpm install --frozen-lockfile
-corepack pnpm lint
-corepack pnpm typecheck
-corepack pnpm test
-corepack pnpm build
-corepack pnpm docs:check
+pnpm install --frozen-lockfile
+pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm docs:check
+pnpm package:authority   # Portable @chronolog/authority tarball
+pnpm package:session     # Universal zero-native-build @chronolog/peer-session tarball
 ```
-
-Package clean standalone archives:
-
-```sh
-node tools/package-peer-session.mjs
-node tools/package-peer-session.mjs --sql-native --output artifacts/peer-session-sql
-node tools/package-peer-session.mjs --sql-browser --output artifacts/peer-session-sql-browser
-node tools/package-authority.mjs
-```
-
-## Package and browser CI
-
-The package and browser workflow builds the public session archives, installs
-them in a clean consumer, and exercises Worker RTC endpoints and Chromium/WebKit
-record stores. Chronolog CI tests Chronolog only; it does not check out or pin
-Tendriller or its cookbooks.
 
 ## Documentation
 
-- [Session API reference](packages/peer-session/README.md)
-- [Worker lifetime and conversation delivery](packages/peer-session/README.md#separate-the-session-owner-request-worker-and-conversation-host)
-- [Authored operation-set contract](docs/CRDT_CONTRACT.md)
-- [Architecture and authority](docs/authored-operation-set.md)
-- [Deterministic SQL](docs/implementation-specs/10-deterministic-sql-transactions.md)
-- [Row ownership](docs/design-owner-rows.md)
-- [Sealed values](docs/sealed-data.md)
-- [Browser storage](docs/browser-storage.md)
-- [Qualification](docs/release-hardening.md)
+- [Chronolog v2 CRDT Contract](docs/CRDT_CONTRACT.md) — core invariants, ordering, partitioning, encryption, finality, and deterministic SQLite profile.
+- [Authored Operation-Set Model](docs/authored-operation-set.md) — operation lifecycle, offline authoring, reconnect rewrapping, and checkpoint bootstrap.
+- [Browser Storage Architecture](docs/browser-storage.md) — OPFS, IndexedDB, and worker ownership.
+- [Documentation Index](docs/README.md) — package guides (`@chronolog/peer-session`, `@chronolog/materializer`, `@chronolog/sqlite-cas`, `@chronolog/authority`, `@chronolog/signals`, `@chronolog/transport-webrtc`).

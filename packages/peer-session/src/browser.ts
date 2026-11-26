@@ -1,7 +1,6 @@
 export { connectApplicationOwner, WorkerApplicationSession, WorkerApplicationOperation, type WorkerApplicationReadView } from './worker-application.js'
 export type * from './owner-types.js'
 export type * from './session-types.js'
-export type * from './provisioning.js'
 export * from './live-view.js'
 export * from './projection.js'
 export * from './view-store.js'

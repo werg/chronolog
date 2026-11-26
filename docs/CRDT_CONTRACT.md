@@ -1,62 +1,79 @@
-# Authored operation-set contract
+# Chronolog v2 CRDT Contract
 
-This contract replaces the removed selected-generation protocol. There is one format and no migration, compatibility reader, legacy export or alternate ordering path.
+## 1. Core Model: Flat Timestamp-Ordered Operation Set
 
-## Immutable facts and canonical application order
+A Chronolog chain is identified by `chainId = hashDomain('genesis', encodeGenesisBlock(genesis))`.
 
-An author prepares a canonical `TransactionCore`, chooses `authorTimestampMs` once, signs it, and durably retains it before success is returned. Preserve the existing nonnegative int64 bigint timestamp codec and the only comparator:
+All state is deterministically derived by folding a **flat set** of signed operations (no `parents` hash-links) sorted strictly by the canonical comparator:
 
-`(signed authorTimestampMs, signing public-key bytes, stable proposal-ID bytes)`.
-
-The proposal ID is the domain-separated canonical transaction-core digest, not an encryption envelope or transport attempt digest. Rewrapping, retransmission, lost acknowledgements and reconnect must not mint another proposal or timestamp. An author/operation idempotency handle cannot silently be reused with different contents.
-
-Replicas independently verify, retain and union immutable operations and evidence. They replay the same eligible operation set in canonical author-time order. Arrival, receipt/feed positions, host clocks and participant roles cannot supply operation order. Earlier late operations may revise later provisional SQL outcomes and effective events. Missing keys/bodies/authority predecessors remain missing dependencies; operational engine errors are not deterministic transaction rejections.
-
-## Public observations
-
-- `stored`: the exact signed intent is durable on this device.
-- `materialized`: a coherent local outcome at a particular operation-set/projection revision; revisable until finalized.
-- `retained`: authenticated availability evidence from named peers; independent of execution and finality.
-- `finalized`: inclusion/closed-time evidence verified under the explicitly configured finality policy, with required bodies/keys and replay complete for a final read.
-
-Do not preserve `applied`, `shared`, abandoned-generation reapplication, coordinator/follower status, generation selection, takeover, handover or coordinator-signed order receipts as aliases. Query revisions are digests of effective materialized inputs and execution/policy context, not globally allocated sequence numbers. Local read/publication counters and transport replay counters do not define application order.
-
-## Optional finality
-
-`none` is a complete local-first mode with no finalizer dependency. Restore the original fixed-validator and signed-inclusion/author-time-closure proof semantics as optional, authenticated policies. A provider may determine inclusion and close an author-time frontier; it has no comparator or operation-sequencing interface. Browser, native and host placement are policy choices.
-
-A blocker at time T limits safe closure to T−1. Preserve complete policy scopes and historical first-inclusion/closure evidence. Newly first-included proposals behind a sealed frontier are explicitly excluded, including genuinely delayed offline work; retain the original intent for inspection and never silently retimestamp it. Unavailable finality must not block ordinary local authoring or provisional reads. Finality alone is not a retention promise or exactly-once external-effect mechanism.
-
-## Ordinary schema and permission transactions
-
-DDL, DML, ownership and permission changes use the same signed program, author-time replay, authorization and atomic rollback. No immutable application-schema digest, native-only schema path, global ordering pause or code publication is required. Keep engine/platform execution manifests and protected internal catalogs. Do not restore the old typed IR.
-
-There are no peer-execution `protectedChanges` blanket fences or external latest-control membership overlays. Enrollment/crypto/publication authority must not overwrite application permission state. Application membership/grant changes replay as authenticated authored transactions/facts.
-
-Namespace/object DDL authorization is represented identically in the TypeScript/WASM and Celld native statement paths as the internal snapshot:
-
-```ts
-interface DdlPermissions {
-  readonly create: boolean;                 // create objects in the application's main namespace
-  readonly alter: readonly string[];        // object names
-  readonly drop: readonly string[];         // table/view/virtual object names
-  readonly index: readonly string[];        // target table names for index create/drop
-  readonly trigger: readonly string[];      // target object names for trigger create/drop
-}
+```text
+(authorTimestampMs ASC, authorPublicKeyBytes ASC, opIdBytes ASC)
 ```
 
-This snapshot is generated by trusted platform code from the permission catalog at each statement, not supplied by authored SQL or accepted as a public privilege claim. New object ownership and subsequent permission changes must be visible to the next step in the same transaction. Keep reserved-system protection, owner/PK/FK/sealed-data invariants, invoker restrictions and original-signer trigger writes. Creation of forbidden modules, temporary/attached databases, extension loading, transaction-control statements and writable pragmas remains unavailable.
+No peer, host, relay, finalizer, transport receipt, or selected branch may assign operation order. Late arrival of an earlier operation triggers a deterministic suffix replay from the nearest cached snapshot.
 
-The native program-step ABI uses `mode: "replicated"` and `ddlPermissions` instead of the old consensus/schemaAdmin boolean. Internal bootstrap/platform/local-read modes remain distinct, trusted and restricted. A missing application DDL snapshot denies DDL; there is no schemaAdmin compatibility fallback. The native authorizer must authorize target objects using the same action mapping as the WASM/JS authorizer. Engine artifact hashes must reflect the changed ABI.
+## 2. Two-Way Public/Encrypted Control Partition
 
-## Browser-first and reactive consumers
+On chains with `privateChain: true`:
+- Control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`) may ONLY be mutated by `visibility: 'public'` operations.
+- Public operations can ONLY read `$*` topics and `public` CAS nodes.
+- Application (non-`$`) topics may ONLY be mutated by `visibility: 'encrypted'` operations (wrapped in `EncryptedOperationEnvelope` under an epoch key).
+- Idempotency deduplication is scoped by `(visibility, author, operationId)` and authenticated in `seenOpsRoot` (stored in CAS).
 
-After creation or admission and key wrapping, local identity/authority/store reopening must not wait for remote discovery, host refresh, agent availability or finality. A fresh browser still needs its actual keys; no plaintext key material enters authored assets.
+**Guarantee:** A blind host (`blindHostMode: true`) that holds zero decryption keys and replays only public operations derives bit-for-bit identical `$*` control topic state to every full replica, even under adversarial cross-partition `(author, operationId)` collisions.
 
-Render domain UI from coherent materialized snapshots plus separate local view/draft state. Notifications invalidate/rederive; they are not an append-only source for a second UI database. Late state/schema changes update rows, counts, inspectors and outcomes, preserve stable-ID focus/drafts, and expose stale-query errors honestly. Local durable submission—not network readiness—gates the ordinary Save action.
+## 3. Hash-Pinned Import-Map Reducers (`$reducers`)
 
-## Retained foundations and removal boundary
+`$reducers` defines:
+- `runtime`: pinned JS engine (`quickjs-ng@0.32.0`) and builtins (`chronolog:crypto`, `chronolog:cas`, `chronolog:sqlite`).
+- `imports`: map of bare module specifiers to `cas:sha256-<64-hex>` hashes in CAS.
+- `topics`: map of topic names to `{ module, export?, config? }`.
 
-Reuse canonical CBOR, signing/encryption, byte-store atomicity, device-local ownership, bounded RTC/relay transports, deterministic SQL/event execution, suffix replay, checkpoints and pinned read leases. No SQL-state merge is used. With finality disabled, keep replayable history; safe pruning requires a verified finalized prefix/checkpoint.
+Execution invariants:
+- Fresh `QuickJSContext` per `reduce()`, `query()`, and `describe()` invocation (zero cross-call state leakage).
+- Non-deterministic globals (`Date`, `Math.random`, `Intl`) are removed.
+- Missing CAS chunks, modules, or SQLite pages trigger an **uncatchable host-level `MissingDependencyError`** that user JS `try/catch` cannot swallow; replay halts cleanly before that operation until the missing dependency arrives.
+- If `$reducers` has no topic binding for `"$reducers"`, rules are permanently frozen.
 
-`peer-generation-v1`, `eligible-members-v1` and generation-order authority are not supported profiles or APIs. Negative tests may name removed formats solely to reject them. Local physical-store fencing and transport anti-replay counters remain; they are device-local protections, not application order. Preserve signed code publication and explicit account/device/publisher permissions separately from application operation ordering.
+## 4. State Root, Rolling History Digest & Revision Identity
+
+After each operation:
+- `stateRoot = hashDomain('state', cbor({ seenOpsRoot, topics }))`
+- `historyDigest = hashDomain('history', cbor([prevHistoryDigest, opId, outcome, rejectionCode, canonicalEvents]))`
+- `revision.digest = hashDomain('revision', cbor([historyDigest, stateRoot, view, policyContextDigest]))`
+
+Committing to `seenOpsRoot` and `historyDigest` ensures that checkpoint bootstrap plus suffix replay produces the exact same `stateRoot` AND `revision.digest` as a cold replay from genesis.
+
+## 5. Keys, Rotation & Reconnect Rewrapping (`$keys`)
+
+- Each device holds a persistent Ed25519 signing identity and a persistent X25519 `wrapKey`.
+- `$keys` stores per-epoch `keyCommitment` and HPKE (`DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/AES-256-GCM`) lockboxes per authorized reader.
+- Admitting a fresh device on a chain with rotated epochs atomically updates `$permissions` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history.
+- Encrypted envelopes are reconciled by `encryptedEnvelopeDigest` (not `opId` alone). When an offline device reconnects after an epoch rotation, it re-encrypts its exact original signed operation bytes under the newest epoch while preserving `opId`, `authorTimestampMs`, and signature.
+- Under `finality: none`, membership and key grants are provisional until all earlier operations are known; post-revocation confidentiality applies to epochs rotated after revocation whose ciphertext is not distributed to revoked peers.
+
+## 6. Deterministic SQLite-CAS Profile & Write RLS (`chronolog:sqlite`, `chronolog/rls`)
+
+`chronolog:sqlite` runs stock SQLite + FTS5 + `sqlite-vec` on a 4 KiB Merkle-paged `CAS` VFS (64-way fanout):
+- `actor()`, `op_id()`, and `op_time()` are bound directly by the host kernel per operation.
+- `random()` and `randomblob()` are disabled; `datetime('now')` and `localtime` modifiers resolve deterministically to UTC `op_time()`; `changes()` and `last_insert_rowid()` reset at every `openDb()` boundary.
+- `PRAGMA recursive_triggers = ON` is always active.
+- Three execution modes enforced by SQLite's C authorizer:
+  - `mode: 'admin'` — DDL, DML, and trigger management (trusted reducer logic).
+  - `mode: 'user'` — DML (`INSERT`/`UPDATE`/`DELETE`/`SELECT`) plus optional `ddl` allowlist (`createTable`, `alterTable`, `dropTable`, `indexOn`, `createView`, `dropView`). Never allowed to touch `_*` internal tables or `_rls_*` triggers.
+  - `mode: 'readonly'` — pure `SELECT` queries and `validateExpr()`.
+- `chronolog/rls` (`applyRls`) validates every user write predicate through SQLite's `mode: 'readonly'` parser (forbidding semicolons, sub-writes, and injection) before wrapping it in `BEFORE INSERT/UPDATE/DELETE` triggers with `RAISE(ABORT, ...)`.
+
+## 7. Optional Time-Scoped Finality (`$finality`)
+
+`$finality` stores a strictly monotonic schedule `[{ effectiveAfterMs, policy }]`.
+- `policy.kind = 'none'` is a first-class supported mode (zero finality dependencies; finalized-only reads explicitly reject with `FINALITY_UNSUPPORTED`).
+- Supported finalizing policies: `signed-frontier`, `fixed-validator`, and `blockchain-anchor`.
+- Handoff rule at `effectiveAfterMs = T1`:
+  - Outgoing finalizing policy `P0` must seal through `>= T1` before `P1` checkpoints are accepted.
+  - When `P0` is `'none'`, `P1` attests its bootstrap frontier at `>= T1` directly.
+- Finality checkpoints commit to `closedThroughMs`, `includedSetDigest`, `historyDigest`, `stateRoot`, and `inclusions`. Operations with `authorTimestampMs <= closedThroughMs` absent from `includedOpIds` are deterministically excluded.
+
+## 8. Ephemeral Signals (`@chronolog/signals` & `$signal_policy`)
+
+Ephemeral live-lane messages (cursors, typing, streaming tokens) stay completely off the durable operation set. `SignalStream` carries optional `stateRoot` and `supersedesStream` anchoring, and `ApplicationSession` caches `$signal_policy` per `stateRoot` so membership revocations take effect immediately.

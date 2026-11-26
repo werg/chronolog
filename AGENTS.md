@@ -1,68 +1,41 @@
 # Working with Chronolog-DB
 
-Chronolog-DB is the central peer-session pipe for Tendriller and standalone local-first applications: signing identity, deterministic execution, storage (`BytesStore`), operation journals, reactive views (`createLiveView`), local view stores (`createViewStore`), encrypted device checkpoints (`exportDeviceCheckpoint` / `restoreDeviceCheckpoint`), durable event forwarding (`forwardSessionEvents`), scoped tools (`createScopedApplicationTools`), and direct/relayed replication.
+Chronolog-DB is the local-first Merkle-DAG CRDT runtime for Tendriller and standalone peer applications: Ed25519/X25519 identity, flat timestamp-ordered operation sets, pure Merkle-DAG `CAS` (`ContentAddressedStore`), QuickJS-NG Import-Map ES Module reducers (`TopicKernel`), deterministic Merkle-paged SQLite+FTS5+`sqlite-vec` (`@chronolog/sqlite-cas`), reactive views (`createLiveView`), local view stores (`createViewStore`), encrypted device checkpoints, durable event forwarding (`forwardSessionEvents`), scoped tools (`createScopedApplicationTools`), ephemeral signals (`@chronolog/signals`), and direct/relayed replication.
 
-## Architectural invariants
+## Architectural Invariants
 
-Read [the authored operation-set contract](docs/CRDT_CONTRACT.md). The application
-is a CRDT of immutable, signed proposals. Every replica derives the same order
-from `(authorTimestampMs, signing public key, stable proposal ID)`. No peer, agent,
-server, finalizer, transport receipt or selected history may assign operation order.
+Read [the Chronolog v2 CRDT contract](docs/CRDT_CONTRACT.md).
 
-Author locally and durably before network delivery; exact retry preserves original
-identity, timestamp and bytes. Separate local storage, revisable materialization,
-peer retention and optional finality. No finality is a complete supported mode,
-not a disabled coordinator. Browser/native/host finalizers verify the same optional
-admission and closed-time policy; they have no ordering/comparator interface.
-
-Schema, grants and collective membership change through ordinary permissioned
-transactions in the authored-time replay. Do not freeze application schema or
-rewrite the materialized permission catalog from a latest external control head.
-The engine/platform manifest pins deterministic execution, not database structure.
-Preserve protected catalogs and actual namespace/object authorization.
-
-Prefer reactive views derived from coherent snapshots. Late earlier operations
-can change SQL outcomes, effective events, rows and schema; invalidate/rederive
-rather than accumulating network events as UI truth. Keep local drafts separate.
-
-This is one clean protocol. There are no generation-order APIs, migrations,
-legacy readers, compatibility exports or rollback-to-another-branch execution.
-Device-local owner locks and transport replay counters are not application order.
+- **Flat timestamp-ordered operation set:** Every replica derives the exact same order from `(authorTimestampMs, author, opId)`. No peer, host, finalizer, transport receipt, or selected history assigns operation order.
+- **Pure Merkle-DAG CAS & strict two-way partition:** On `privateChain: true`, `$*` control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`) are mutated ONLY by `visibility: 'public'` ops (which can read only `$*` topics and public CAS). Private topics are mutated ONLY by `visibility: 'encrypted'` ops. Idempotency is scoped by `(visibility, author, operationId)` in an authenticated `seenOpsRoot` CAS node. Blind hosts (`blindHostMode: true`) derive identical control state to full replicas.
+- **Deterministic QuickJS-NG + SQLite-CAS:** Fresh `QuickJSContext` per `reduce()`/`query()`/`describe()` invocation, non-deterministic globals stripped, uncatchable host-level `MissingDependencyError` interrupts, and static `WebAssembly.Module` injection for Cloudflare Workers. SQLite-CAS binds `actor()`, `op_id()`, `op_time()` in the host kernel, disables `random()`/`randomblob()`, pins `datetime('now')` and `localtime` to UTC `op_time()`, and enforces `mode: 'admin' | 'user' | 'readonly'` + `chronolog/rls`.
+- **Offline authoring & reconnect rewrapping:** Author locally and durably before network delivery. Encrypted envelopes are reconciled by `encryptedEnvelopeDigest` so rewrapped offline operations sync cleanly past undecryptable older epochs while preserving original `opId`, `authorTimestampMs`, and signature.
+- **Optional finality:** `finality: none` is a complete supported mode. `$finality` holds a time-scoped schedule supporting `none -> P1` bootstrap, `P1 -> P2` handoffs, and checkpoint-plus-suffix bootstrap with identical `stateRoot` and `revision.digest`.
+- **Zero native C/C++ builds:** Node durable storage uses Node 22+ built-in `node:sqlite` (`DatabaseSync`). No `better-sqlite3`, no `@dolthub/doltlite`, no `node-gyp`.
 
 ## Quick Commands
 
-### JS-only contributor fast lane (zero native C/C++ builds)
-```sh
-pnpm install --frozen-lockfile --ignore-scripts
-pnpm test:fast          # Serial import-closure JS test suite (excludes tests transitively importing native SQL)
-pnpm lint && pnpm typecheck && pnpm docs:check
-```
-
-### Full suite (with patched native SQL engine)
 ```sh
 pnpm install --frozen-lockfile
 pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm docs:check
-```
-
-### Packaging public artifacts (requires clean git tree unless `--allow-dirty`)
-```sh
-pnpm package:authority                                         # Portable CRDT authority/publication/finality package
-pnpm package:session                                           # Default events + native WebRTC
-node tools/package-peer-session.mjs --no-native-rtc            # Lean events-relay-only (no werift)
-node tools/package-peer-session.mjs --no-native-rtc --sql-wasm # Portable WASM SQL relay-only
-node tools/package-peer-session.mjs --sql-native --sql-browser --sql-wasm # Full SQL package
+pnpm test:fast            # Serial full zero-native-build suite
+pnpm package:authority    # Portable @chronolog/authority tarball
+pnpm package:session      # Universal zero-native-build @chronolog/peer-session tarball
+node tools/package-peer-session.mjs --no-native-rtc # Relay-only tarball (no werift)
 ```
 
 ## Package Boundaries
 
-- `packages/canonical`, `packages/crypto`, `packages/protocol`: deterministic CBOR, Ed25519/X25519/AES-GCM, wire formats. Zero native bindings.
-- `packages/records`: `BytesStore` (`MemoryBytesStore`, `NativeBytesStore` via one pooled worker-backed `better-sqlite3` thread per process, `IndexedDbBytesStore`), framed peer channels.
-- `packages/authority`: portable application/membership/publication authority and optional finality proofs/providers. Keep it free of eager native/SQL dependencies; finality never supplies the operation comparator.
-- `packages/materializer` & `packages/materializer-doltlite`: event materializer (pure JS) and deterministic SQL materializer (native Node-API + browser/Node WASM adapters).
-- `packages/peer-session`: unified session runtime, reactive views, view stores, encrypted checkpoints, event outbox, ergonomic batch/lifecycle client, and scoped tools. Passive browser/worker entrypoints must never eagerly load durable storage or SQL modules (verified by `tools/package-peer-session.mjs`).
+- `packages/canonical`, `packages/crypto`, `packages/protocol`: deterministic CBOR, Ed25519/X25519/HPKE/AES-GCM, synchronous `@noble/ed25519`, v2 Genesis/Operation/Envelope wire formats.
+- `packages/records`: `BytesStore` (`MemoryBytesStore`, `NativeBytesStore` via built-in `node:sqlite`, `IndexedDbBytesStore`), `ContentAddressedStore` (Merkle-DAG CAS with public/private partitions and exact mark-and-sweep GC), framed peer channels.
+- `packages/authority`: portable signed records, canonical `ApplicationDescription` input schemas, time-scoped `$finality` verification (`verifyFinalityV2`), and `signHostAttestationV2`. Zero eager materializer/SQL/Node imports.
+- `packages/materializer`: `TopicKernel`, `QuickJsSandbox` (`quickjs-emscripten-core` + `@jitl/quickjs-ng-wasmfile-release-sync`), and the 5 audited `STANDARD_MODULE_SOURCES` (`chronolog/{permissions,keys,finality,publications,rls}`).
+- `packages/sqlite-cas`: stock SQLite + FTS5 + `sqlite-vec` compiled to static `sqlite-cas.wasm` over a 4 KiB Merkle-paged `CAS` VFS with 3-mode authorizer and deterministic UTC profile.
+- `packages/signals`: ephemeral signed live-lane messages with optional `stateRoot`/`supersedesStream` anchoring.
+- `packages/peer-session`: unified `ApplicationSession`, `createChainGenesis`, `ApplicationDevice` (persisted Ed25519 + X25519 `wrapKey`), `ApplicationSessionOwner` / `WorkerApplicationSession`, reactive views, encrypted checkpoints, event forwarder, and scoped tools. Passive browser/worker entrypoints never eagerly load durable storage, QuickJS, or SQLite-CAS (verified by `tools/package-peer-session.mjs`).
 
 ## Verification Rules
 
-- Always run `pnpm lint && pnpm typecheck && pnpm test:fast` (and `pnpm test` when touching SQL or packaging) before committing.
+- Always run `pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm docs:check` before committing.
 - Never commit dirty provenance archives into downstream repos (`tendriller` requires `dirty: false` in `provenance.json`).
 - Keep `pnpm docs:check` green when modifying any Markdown file.

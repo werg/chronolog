@@ -30,6 +30,10 @@ export interface SignalStream {
   readonly endpointIncarnation?: string
   /** An application-defined recipient scope; routing is not a confidentiality boundary. */
   readonly target?: string
+  /** Optional materialized stateRoot this ephemeral frame overlays. */
+  readonly stateRoot?: string
+  /** Optional streamId superseded when a durable commit lands. */
+  readonly supersedesStream?: string
 }
 export interface SignalStreamSelector {
   readonly authorId?: string
@@ -651,14 +655,21 @@ function interrupted<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> 
 
 function checkedStream(value: SignalStream): SignalStream {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
-      Object.keys(value).some(key => !['streamId', 'endpointId', 'endpointIncarnation', 'target'].includes(key)) ||
+      Object.keys(value).some(key => !['streamId', 'endpointId', 'endpointIncarnation', 'target', 'stateRoot', 'supersedesStream'].includes(key)) ||
       !boundedLabel(value.streamId) ||
       (value.endpointId === undefined) !== (value.endpointIncarnation === undefined) ||
       value.endpointId !== undefined && !boundedLabel(value.endpointId) ||
       value.endpointIncarnation !== undefined && !boundedLabel(value.endpointIncarnation) ||
-      value.target !== undefined && !boundedLabel(value.target)) throw new SignalError('SIGNAL_STREAM_INVALID')
-  return { streamId: value.streamId, ...(value.endpointId === undefined ? {} : { endpointId: value.endpointId, endpointIncarnation: value.endpointIncarnation! }),
-    ...(value.target === undefined ? {} : { target: value.target }) }
+      value.target !== undefined && !boundedLabel(value.target) ||
+      value.stateRoot !== undefined && !/^[0-9a-f]{64}$/u.test(value.stateRoot) ||
+      value.supersedesStream !== undefined && !boundedLabel(value.supersedesStream)) throw new SignalError('SIGNAL_STREAM_INVALID')
+  return {
+    streamId: value.streamId,
+    ...(value.endpointId === undefined ? {} : { endpointId: value.endpointId, endpointIncarnation: value.endpointIncarnation! }),
+    ...(value.target === undefined ? {} : { target: value.target }),
+    ...(value.stateRoot === undefined ? {} : { stateRoot: value.stateRoot }),
+    ...(value.supersedesStream === undefined ? {} : { supersedesStream: value.supersedesStream }),
+  }
 }
 function decodeStream(value: unknown): SignalStream {
   if (typeof value !== 'string' || value.length > 2048) throw new SignalError('SIGNAL_STREAM_INVALID')

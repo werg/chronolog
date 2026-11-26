@@ -1,11 +1,12 @@
 import { canonicalJson, type EventPayload } from '@chronolog/protocol'
 import { awaitOwnedTask } from './lifetime.js'
-import type { ApplicationChange, ApplicationEvent, ApplicationEventBatch, ApplicationEventOptions, ApplicationReadView, MaterializedRevision, SessionStatus } from './session-types.js'
+import type { ApplicationChange, ApplicationEvent, ApplicationEventBatch, ApplicationEventOptions, MaterializedRevision, SessionStatus } from './session-types.js'
 import type { OperationInspection } from './operation.js'
 export interface ForwarderReadView {
   readonly applicationId: string
   readonly revision: MaterializedRevision
-  query(sql: string, parameters?: Parameters<ApplicationReadView['query']>[1]): ReturnType<ApplicationReadView['query']> | Promise<ReturnType<ApplicationReadView['query']>>
+  topic?(name: string): unknown
+  query(topic: string, input?: unknown): unknown
   readEvents(options?: ApplicationEventOptions): ApplicationEventBatch | Promise<ApplicationEventBatch>
   release(): void | Promise<void>
 }
@@ -61,7 +62,7 @@ export async function forwardSessionEvents<Projected extends EventProjection>(op
     check(operation !== null, 'EVENT_FORWARDER_OPERATION_MISSING')
     const inspected = await operation.inspect()
     check(inspected.applicationId === session.applicationId && inspected.author === event.author, 'EVENT_FORWARDER_OPERATION_SCOPE_INVALID')
-    return { stored: inspected.stored, materialized: present ? { proposalId: event.proposalId, revision, outcome: 'accepted', rejectionCode: null, failingStatementIndex: null } : inspected.materialized, retained: structuredClone(inspected.retained), finalized: present && inspected.finalized, excluded: inspected.excluded }
+    return { stored: inspected.stored, materialized: present ? { proposalId: event.proposalId, revision, outcome: 'accepted', rejectionCode: null } : inspected.materialized, retained: structuredClone(inspected.retained), finalized: present && inspected.finalized, excluded: inspected.excluded }
   }
   try {
     const raw = await awaitOwnedTask(signal, () => checkpoint.load())

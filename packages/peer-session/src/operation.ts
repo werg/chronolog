@@ -1,14 +1,46 @@
-import type { ChangeProgram as InlineChangeProgram } from '@chronolog/protocol'
+import type { OperationVisibility, TopicUpdate } from '@chronolog/protocol'
 import type { Signed } from '@chronolog/authority'
 import type { MaterializedRevision, WaitOptions } from './session-types.js'
-export interface MaterializedOperation { readonly proposalId: string; readonly revision: MaterializedRevision; readonly outcome: 'accepted' | 'rejected'; readonly rejectionCode: string | null; readonly failingStatementIndex: number | null }
-export interface RetentionStatement { readonly applicationId: string; readonly proposalId: string; readonly author: string; readonly envelopeDigest: string; readonly peer: string; readonly storageId: string }
+
+export interface MaterializedOperation {
+  readonly proposalId: string
+  readonly revision: MaterializedRevision
+  readonly outcome: 'accepted' | 'rejected'
+  readonly rejectionCode: string | null
+  readonly rejectionDetail?: string
+}
+
+export interface RetentionStatement {
+  readonly applicationId: string
+  readonly proposalId: string
+  readonly author: string
+  readonly envelopeDigest: string
+  readonly peer: string
+  readonly storageId: string
+}
+
 export type RetentionEvidence = Signed<RetentionStatement>
-export interface OperationInspection { readonly applicationId: string; readonly author: string; readonly authorTimestampMs: string | null; readonly proposalId: string; readonly operationId: string; readonly stored: boolean; readonly pending: 'body' | 'key' | 'authority' | 'materializer' | null; readonly materialized: MaterializedOperation | null; readonly retained: readonly RetentionEvidence[]; readonly finalized: boolean; readonly excluded: boolean }
+
+export interface OperationInspection {
+  readonly applicationId: string
+  readonly author: string
+  readonly authorTimestampMs: string | null
+  readonly proposalId: string
+  readonly operationId: string
+  readonly visibility: OperationVisibility
+  readonly stored: boolean
+  readonly pending: 'dependency' | 'key' | null
+  readonly materialized: MaterializedOperation | null
+  readonly retained: readonly RetentionEvidence[]
+  readonly finalized: boolean
+  readonly excluded: boolean
+}
+
 export interface OperationOwner {
   inspectOperation(id: string): OperationInspection
   waitOperation(id: string, fact: 'materialized' | 'retained' | 'finalized', options?: WaitOptions): Promise<OperationInspection>
 }
+
 export class ApplicationOperation {
   readonly stored = true
   constructor(readonly id: string, readonly operationId: string, private readonly owner: OperationOwner) {}
@@ -17,4 +49,10 @@ export class ApplicationOperation {
   async retained(options?: WaitOptions): Promise<readonly RetentionEvidence[]> { return (await this.owner.waitOperation(this.id, 'retained', options)).retained }
   async finalized(options?: WaitOptions): Promise<MaterializedOperation> { return (await this.owner.waitOperation(this.id, 'finalized', options)).materialized! }
 }
-export interface ApplicationSubmission { readonly operationId?: string; readonly authorTimestampMs?: bigint; readonly program: InlineChangeProgram }
+
+export interface ApplicationSubmission {
+  readonly operationId?: string
+  readonly authorTimestampMs?: bigint
+  readonly visibility?: OperationVisibility
+  readonly updates: readonly TopicUpdate[]
+}

@@ -20,7 +20,13 @@ const observed: EphemeralSignal[] = []
 
 async function open(cached = false): Promise<void> {
   if (device === undefined || bootstrap === undefined) throw new Error('AUTHORED_RTC_BOOTSTRAP_REQUIRED')
-  session = await createApplicationSession({ device, definition, ...(cached ? { applicationId: bootstrap.authority.descriptor.payload.applicationId } : { authority: bootstrap.authority, epochKeys: new Map([[bootstrap.epoch, hexToBytes(bootstrap.epochKey)]]) }) })
+  session = await createApplicationSession({
+    device,
+    definition,
+    ...(cached
+      ? { chainId: bootstrap.chainId }
+      : { genesis: bootstrap.genesisBytes, casNodes: bootstrap.casNodes, epochKeys: new Map([[bootstrap.epoch, hexToBytes(bootstrap.epochKey)]]) }),
+  })
   const owned = session
   void (async () => {
     try {
@@ -69,13 +75,17 @@ endpoint.addEventListener('message', event => {
         return { stats: link!.stats, signaling: introductions.map(value => value.stats), route: await connection!.getRoute() }
       case 'save': {
         const operation = await session!.command('say', input.text!, { operationId: input.operationId! })
-        return { state: operation.inspect(), intent: session!.exportFacts().envelopes.find(envelope => envelope.payload.proposalId === operation.id)! }
+        const facts = await session!.exportFacts()
+        const raw = facts.encryptedEnvelopes.at(-1)!
+        return { state: operation.inspect(), intent: { proposalId: operation.id, bytesHex: bytesToHex(raw) } }
       }
       case 'publish': {
         const operation = await session!.command('say', input.text!, { operationId: input.operationId! })
         const materialized = await operation.materialized({ signal: AbortSignal.timeout(20_000) })
         await link?.synchronize()
-        return { materialized, intent: session!.exportFacts().envelopes.find(envelope => envelope.payload.proposalId === operation.id)! }
+        const facts = await session!.exportFacts()
+        const raw = facts.encryptedEnvelopes.at(-1)!
+        return { materialized, intent: { proposalId: operation.id, bytesHex: bytesToHex(raw) } }
       }
       case 'retained': { await link!.synchronize(); return session!.operations.get(input.operationId!)!.retained({ signal: AbortSignal.timeout(20_000) }) }
       case 'signal': return session!.signals.send('typing', { text: input.text! })
@@ -91,8 +101,8 @@ endpoint.addEventListener('message', event => {
       }
       case 'finalize': {
         const current = await state(), throughMs = current.events.reduce((time, event) => BigInt(event.authorTimestampMs) > time ? BigInt(event.authorTimestampMs) : time, 0n)
-        const proof = await session!.finality.closeAuthorTime({ throughMs }), final = await session!.readView({ view: 'final' })
-        try { return { closedThroughMs: proof.closedThroughMs?.toString() ?? null, events: final.readEvents().events, revision: final.revision, signer: session!.identity.publicKey } } finally { final.release() }
+        const cp = await session!.finality.createCheckpoint({ throughMs }), final = await session!.readView({ view: 'final' })
+        try { return { closedThroughMs: cp.checkpoint.payload.closedThroughMs.toString(), events: final.readEvents().events, revision: final.revision, signer: session!.identity.publicKey } } finally { final.release() }
       }
       case 'state': return state()
       case 'reopen':

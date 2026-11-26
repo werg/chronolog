@@ -1,23 +1,9 @@
 # `@chronolog/materializer`
 
-Defines the deterministic execution contract shared by all Chronolog sessions, plus the SQL-free event materializer.
+Deterministic Chronolog v2 topic kernel, QuickJS-NG WASM ESM sandbox, and audited standard modules.
 
-## Execution contract
+## Exports
 
-`ChronologMaterializationRuntime` separates replay/publication from immutable snapshot reads:
-
-- The replica passes authenticated, strictly authored-time-ordered `ReplayProposal` records to `runtime.replay.materialize(ordered)`; no external membership overlay or order receipt is accepted. `txId` and `candidateDigest` are the canonical transaction-core digest, and `canonicalCandidate` is its raw canonical encoding.
-- `runtime.replay.publishFinal(prefixLength)` accepts only an immutable prefix already verified by the owning finality policy; it cannot choose order. With finality disabled, provisional replay works independently.
-- Late predecessors can revise provisional outcomes and events. Input order is validated, never dependency-sorted.
-- Replaying produces a candidate revision; publishing exposes SQL state, events, outcomes, and revision atomically.
-- Captured read views pin an exact revision and must be released when done.
-- Deterministic time and entropy come exclusively from the signed transaction, never ambient clocks or RNG.
-
-## Event materializer
-
-`createEventMaterializationRuntime({ store, namespace })` executes event-only programs over any `BytesStore`:
-
-- Writes immutable indexed records before advancing an atomic head pointer.
-- Verifies linked history integrity on reopen and enforces bounded record count and byte limits.
-- Rejects SQL steps with `profile:sql-disabled` and identifies itself with `eventExecutionManifest()`.
-- On an uncertain storage write, closes mutation ports and requires reopen from the durable head while keeping existing read snapshots intact.
+- **`TopicKernel` (`kernel.ts`):** Flat timestamp-ordered suffix-replay engine enforcing the two-way public/encrypted control partition, scoped `(visibility, author, operationId)` idempotency (`seenOpsRoot`), rolling `historyDigest`, `stateRoot`, `revision.digest`, `query()`, `describe()`, `signalPolicy()`, and `bootstrapFromCheckpoint()`.
+- **`QuickJsSandbox` (`quickjs-sandbox.ts`):** Fresh `QuickJSContext` per invocation, Import-Map loader over `CAS`, uncatchable host-level `MissingDependencyError`, static `WebAssembly.Module` support for Cloudflare Workers, and `chronolog:crypto` / `chronolog:cas` / `chronolog:sqlite` builtins.
+- **Standard Modules (`@chronolog/materializer/std-modules`):** `STANDARD_MODULE_SOURCES`, `STANDARD_MODULE_IMPORTS`, and `seedStandardModules()` for `chronolog/permissions`, `chronolog/keys`, `chronolog/finality`, `chronolog/publications`, and `chronolog/rls`.

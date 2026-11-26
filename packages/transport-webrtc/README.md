@@ -42,4 +42,4 @@ A reachable native peer can accept SDP offers over HTTPS via `createWebRtcOfferH
 - **Live lane**: `live.trySend()` returns `false` on congestion rather than queuing retries.
 - **Route inspection**: `connection.getRoute()` reports `direct`, `relay`, or `unknown` without exposing IP addresses.
 
-Use the maintained `session.connectPeer()` and browser/native RTC adapters from `@chronolog/peer-session`. Product-owned discovery/residency code chooses reconnects and an explicit WebSocket relay fallback; those choices do not assign application operation order. See [attachment boundaries and lifetime](../peer-session/README.md#attachment-boundaries-and-lifetime).
+Use the maintained `session.connectPeer()` and browser/native RTC adapters from `@chronolog/peer-session`. Product-owned discovery/residency code chooses reconnects and an explicit WebSocket relay fallback; those choices do not assign application operation order. See [peer-session entrypoints](../peer-session/README.md#entrypoints).

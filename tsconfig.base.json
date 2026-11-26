@@ -19,120 +19,29 @@
     "forceConsistentCasingInFileNames": true,
     "baseUrl": ".",
     "paths": {
-      "@chronolog/canonical": [
-        "packages/canonical/src/index.ts"
-      ],
-      "@chronolog/protocol": [
-        "packages/protocol/src/index.ts"
-      ],
-      "@chronolog/crypto": [
-        "packages/crypto/src/index.ts"
-      ],
-      "@chronolog/materializer": [
-        "packages/materializer/src/index.ts"
-      ],
-      "@chronolog/materializer-doltlite": [
-        "packages/materializer-doltlite/src/index.ts"
-      ],
-      "@chronolog/records": [
-        "packages/records/src/index.ts"
-      ],
-      "@chronolog/materializer-doltlite/browser": [
-        "packages/materializer-doltlite/src/browser.ts"
-      ],
-      "@chronolog/materializer-doltlite/wasm-node": [
-        "packages/materializer-doltlite/src/wasm-node.ts"
-      ],
-      "@chronolog/materializer-doltlite/celld": [
-        "packages/materializer-doltlite/src/celld-engine.ts"
-      ],
-      "@chronolog/signals": [
-        "packages/signals/src/index.ts"
-      ],
-      "@chronolog/transport-webrtc": [
-        "packages/transport-webrtc/src/index.ts"
-      ],
-      "@chronolog/transport-webrtc/native": [
-        "packages/transport-webrtc/src/native.ts"
-      ],
-      "@chronolog/authority": [
-        "packages/authority/src/index.ts"
-      ],
-      "@chronolog/authority/control": [
-        "packages/authority/src/control.ts"
-      ],
-      "@chronolog/peer-session": [
-        "packages/peer-session/src/index.ts"
-      ],
-      "@chronolog/peer-session/native": [
-        "packages/peer-session/src/native.ts"
-      ],
-      "@chronolog/peer-session/celld": [
-        "packages/peer-session/src/celld.ts"
-      ],
-      "@chronolog/peer-session/browser": [
-        "packages/peer-session/src/browser.ts"
-      ],
-      "@chronolog/peer-session/webrtc": [
-        "packages/peer-session/src/webrtc.ts"
-      ],
-      "@chronolog/peer-session/webrtc-native": [
-        "packages/peer-session/src/webrtc-native.ts"
-      ],
-      "@chronolog/records/native": [
-        "packages/records/src/native.ts"
-      ],
-      "@chronolog/records/celld": [
-        "packages/records/src/celld.ts"
-      ],
-      "@chronolog/records/browser": [
-        "packages/records/src/browser.ts"
-      ],
-      "@chronolog/records/indexeddb-browser": [
-        "packages/records/src/indexeddb-bytes-store.ts"
-      ],
-      "@chronolog/peer-session/sql-native": [
-        "packages/peer-session/src/sql-native.ts"
-      ],
-      "@chronolog/peer-session/sql-celld": [
-        "packages/peer-session/src/sql-celld.ts"
-      ],
-      "@chronolog/peer-session/tendriller": [
-        "packages/peer-session/src/tendriller.ts"
-      ],
-      "@chronolog/peer-session/sql": [
-        "packages/peer-session/src/sql.ts"
-      ],
-      "@chronolog/peer-session/sql-browser": [
-        "packages/peer-session/src/sql-browser.ts"
-      ],
-      "@chronolog/peer-session/sql-wasm": [
-        "packages/peer-session/src/sql-wasm.ts"
-      ],
-      "@chronolog/transport-websocket": [
-        "packages/transport-websocket/src/index.ts"
-      ],
-      "@chronolog/peer-session/websocket": [
-        "packages/peer-session/src/websocket.ts"
-      ],
-      "@chronolog/materializer/manifest": [
-        "packages/materializer/src/manifest.ts"
-      ],
-      "@chronolog/peer-session/worker": [
-        "packages/peer-session/src/worker.ts"
-      ],
-      "@chronolog/authority/metadata": [
-        "packages/authority/src/metadata.ts"
-      ],
-      "@chronolog/authority/participant": [
-        "packages/authority/src/participant.ts"
-      ],
-      "@chronolog/authority/publication": [
-        "packages/authority/src/publication.ts"
-      ],
-      "@chronolog/authority/finality": [
-        "packages/authority/src/finality.ts"
-      ]
+      "@chronolog/canonical": ["packages/canonical/src/index.ts"],
+      "@chronolog/protocol": ["packages/protocol/src/index.ts"],
+      "@chronolog/crypto": ["packages/crypto/src/index.ts"],
+      "@chronolog/materializer": ["packages/materializer/src/index.ts"],
+      "@chronolog/materializer/std-modules": ["packages/materializer/src/std-modules.ts"],
+      "@chronolog/sqlite-cas": ["packages/sqlite-cas/src/index.ts"],
+      "@chronolog/records": ["packages/records/src/index.ts"],
+      "@chronolog/records/native": ["packages/records/src/native.ts"],
+      "@chronolog/records/browser": ["packages/records/src/browser.ts"],
+      "@chronolog/records/indexeddb-browser": ["packages/records/src/indexeddb-bytes-store.ts"],
+      "@chronolog/signals": ["packages/signals/src/index.ts"],
+      "@chronolog/transport-webrtc": ["packages/transport-webrtc/src/index.ts"],
+      "@chronolog/transport-webrtc/native": ["packages/transport-webrtc/src/native.ts"],
+      "@chronolog/transport-websocket": ["packages/transport-websocket/src/index.ts"],
+      "@chronolog/authority": ["packages/authority/src/index.ts"],
+      "@chronolog/peer-session": ["packages/peer-session/src/index.ts"],
+      "@chronolog/peer-session/native": ["packages/peer-session/src/native.ts"],
+      "@chronolog/peer-session/browser": ["packages/peer-session/src/browser.ts"],
+      "@chronolog/peer-session/worker": ["packages/peer-session/src/worker.ts"],
+      "@chronolog/peer-session/webrtc": ["packages/peer-session/src/webrtc.ts"],
+      "@chronolog/peer-session/webrtc-native": ["packages/peer-session/src/webrtc-native.ts"],
+      "@chronolog/peer-session/websocket": ["packages/peer-session/src/websocket.ts"],
+      "@chronolog/peer-session/tendriller": ["packages/peer-session/src/tendriller.ts"]
     }
   }
 }

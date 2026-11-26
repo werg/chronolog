@@ -1,11 +1,18 @@
 import type { BytesStore } from '@chronolog/records'
 import { encryptEpochPayload, decryptEpochPayload, type EncryptedEpochPayload } from '@chronolog/crypto'
 import { bytesToHex, sha256 } from '@chronolog/canonical'
-import { check, decodeRecord, encodeRecord, equalRecord, recordDigest, signRecord, verifyRecord, type AuthorityProvider, type Signed, type SigningIdentity } from '@chronolog/authority'
+import { check, decodeRecord, encodeRecord, equalRecord, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from '@chronolog/authority'
 import { CONTENT_CHUNK_BYTES, MAX_CONTENT_BYTES, putContentBytes, readContentBytes, type ContentPutBytesOptions, type ContentReadBytesOptions } from './content-bytes.js'
 import { awaitOwnedTask } from './lifetime.js'
 export { CONTENT_CHUNK_BYTES } from './content-bytes.js'
 export type { ContentPutBytesOptions, ContentReadBytesOptions } from './content-bytes.js'
+
+export interface ContentAuthority {
+  readonly applicationId: string
+  isReader(publicKey: string): boolean
+  currentEpoch(): number
+  epochKey(epoch: number): Uint8Array | null
+}
 
 export const MAX_CONTENT_CHUNKS = MAX_CONTENT_BYTES / CONTENT_CHUNK_BYTES
 /** Canonical encrypted-envelope bytes: 64 KiB plaintext, AES tag, hex encoding and bounded metadata. */
@@ -80,17 +87,17 @@ export class ApplicationContent {
   readonly #reads = new Map<string, Set<AbortController>>()
   readonly #lifetime = new AbortController()
   readonly #prefix: string
-  readonly #options: { readonly store: BytesStore; readonly authority: AuthorityProvider; readonly identity: SigningIdentity; readonly storageId: string }
+  readonly #options: { readonly store: BytesStore; readonly authority: ContentAuthority; readonly identity: SigningIdentity; readonly storageId: string }
   #tail: Promise<unknown> = Promise.resolve()
-  constructor(options: { readonly store: BytesStore; readonly authority: AuthorityProvider; readonly identity: SigningIdentity; readonly storageId: string }) {
+  constructor(options: { readonly store: BytesStore; readonly authority: ContentAuthority; readonly identity: SigningIdentity; readonly storageId: string }) {
     check(typeof options.storageId === 'string' && options.storageId.length > 0 && options.storageId.length <= 256, 'CONTENT_STORAGE_ID_INVALID')
     this.#options = options
-    this.#prefix = `content/${options.authority.descriptor.applicationId}`
+    this.#prefix = `content/${options.authority.applicationId}`
   }
-  #reader(): void { this.#lifetime.signal.throwIfAborted(); check(this.#options.authority.grant(this.#options.identity.publicKey)?.reader, 'CONTENT_READER_REQUIRED') }
+  #reader(): void { this.#lifetime.signal.throwIfAborted(); check(this.#options.authority.isReader(this.#options.identity.publicKey), 'CONTENT_READER_REQUIRED') }
   #reference(input: ContentReference): ContentReference {
     assertContentReference(input)
-    check(input.applicationId === this.#options.authority.descriptor.applicationId, 'CONTENT_SCOPE_INVALID')
+    check(input.applicationId === this.#options.authority.applicationId, 'CONTENT_SCOPE_INVALID')
     return { ...input }
   }
   #serial<T>(work: () => Promise<T>): Promise<T> {
@@ -117,8 +124,8 @@ export class ApplicationContent {
   }
   async stage(options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload> {
     this.#reader()
-    const id = crypto.randomUUID(), epoch = this.#options.authority.currentMembership.epoch
-    const reference = { profile: 'authored-content-v1' as const, applicationId: this.#options.authority.descriptor.applicationId, epoch, bytes: options.bytes, mediaType: options.mediaType ?? 'application/octet-stream' }
+    const id = crypto.randomUUID(), epoch = this.#options.authority.currentEpoch()
+    const reference = { profile: 'authored-content-v1' as const, applicationId: this.#options.authority.applicationId, epoch, bytes: options.bytes, mediaType: options.mediaType ?? 'application/octet-stream' }
     assertReferenceBody(reference)
     check(this.#options.authority.epochKey(epoch) !== null, 'CONTENT_KEY_MISSING')
     await this.#serial(() => this.#options.store.put(`${this.#prefix}/stage/${id}`, encodeRecord({ stageId: id, reference, committed: null, discarded: false } satisfies Stage)))
@@ -132,7 +139,7 @@ export class ApplicationContent {
       const raw = await this.#options.store.get(key); check(raw !== null, 'CONTENT_STAGE_MISSING')
       const stage = decodeRecord<Stage>(raw)
       object(stage, ['stageId', 'reference', 'committed', 'discarded']); assertReferenceBody(stage.reference)
-      check(stage.stageId === id && stage.reference.applicationId === this.#options.authority.descriptor.applicationId && typeof stage.discarded === 'boolean', 'CONTENT_STAGE_INVALID')
+      check(stage.stageId === id && stage.reference.applicationId === this.#options.authority.applicationId && typeof stage.discarded === 'boolean', 'CONTENT_STAGE_INVALID')
       if (stage.committed !== null) { assertContentReference(stage.committed); check(equalRecord(body(stage.committed), stage.reference), 'CONTENT_STAGE_INVALID') }
       check(!stage.discarded, 'CONTENT_STAGE_DISCARDED')
       return stage
@@ -277,7 +284,7 @@ export class ApplicationContent {
   async verifyRetention(input: ContentReference, receipt: ContentRetention, expectedPeer?: string): Promise<void> {
     const reference = this.#reference(input)
     assertContentRetention(receipt)
-    check(equalRecord(receipt.payload.reference, reference) && (expectedPeer === undefined || receipt.signer === expectedPeer) && this.#options.authority.grant(receipt.signer)?.reader, 'CONTENT_RETENTION_INVALID')
+    check(equalRecord(receipt.payload.reference, reference) && (expectedPeer === undefined || receipt.signer === expectedPeer) && this.#options.authority.isReader(receipt.signer), 'CONTENT_RETENTION_INVALID')
     await verifyRecord('content-retention', receipt, expectedPeer)
   }
   /** Ask attached sources to retain the object; these signed availability facts are not finality. */

@@ -1,4 +1,4 @@
-import type { EventPayload } from './program.js'
+import type { EventPayload } from './v2.js'
 import { base64UrlToBytes, bytesToBase64Url } from './bytes.js'
 
 /** Authenticated proposal facts, supplied by the replica rather than an emit payload. */

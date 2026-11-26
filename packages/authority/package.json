@@ -3,6 +3,15 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts", "./control": "./src/control.ts", "./metadata": "./src/metadata.ts", "./participant": "./src/participant.ts", "./publication": "./src/publication.ts", "./finality": "./src/finality.ts" },
-  "dependencies": { "@chronolog/canonical": "workspace:*", "@chronolog/protocol": "workspace:*", "@chronolog/records": "workspace:*" }
+  "exports": {
+    ".": "./src/index.ts",
+    "./codec": "./src/codec.ts",
+    "./definition": "./src/definition.ts",
+    "./finality": "./src/finality-v2.ts"
+  },
+  "dependencies": {
+    "@chronolog/canonical": "workspace:*",
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*"
+  }
 }

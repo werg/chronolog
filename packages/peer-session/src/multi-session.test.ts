@@ -4,51 +4,78 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import { NativeBytesStore } from '@chronolog/records/native'
-import { bytesToHex, emit, executionManifestArtifacts, program } from '@chronolog/protocol'
-import { eventExecutionManifest } from '@chronolog/materializer/manifest'
-import { createSigningIdentity, signAppDescriptor, signMembership, epochKeyCommitment, type SigningIdentity } from '@chronolog/authority'
+import { createSigningIdentity, type SigningIdentity } from '@chronolog/authority'
 import { defineApplication, defineCommand } from './definition.js'
 import type { ApplicationDevice } from './device.js'
 import { exitCleanupCount } from './exit-cleanup.js'
+import { createChainGenesis } from './genesis.js'
 import { forwardManySessionEvents, mergeSessionChanges, type MergeableSession, type MergedSessionChange } from './multi-session.js'
 import { openDisposableNativeDevice, openNativeDevice } from './native.js'
 import { createApplicationSession } from './runtime.js'
 import type { ApplicationChange } from './session-types.js'
 
+const NOTE_REDUCER = `
+export default {
+  reduce(state, tx) {
+    const notes = Array.isArray(state) ? state : [];
+    return {
+      ok: true,
+      state: notes.concat([tx.payload]),
+      events: [{ topic: 'note', payload: tx.payload }],
+    };
+  },
+};
+`.trimStart()
+
 const definition = defineApplication({
   id: 'multi-session-test',
-  version: '1',
+  version: '2',
   commands: {
     addNote: defineCommand({
       description: 'Add a note',
       input: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-      prepare: ({ text }) => program(emit('note', { text })),
+      prepare: ({ text }) => [{ topic: 'notes', input: { text } }],
     }),
   },
   queries: {},
 })
 
-async function openSession(device: ApplicationDevice, applicationId: string) {
-  const authoritySigner = await createSigningIdentity(), key = crypto.getRandomValues(new Uint8Array(32))
-  const manifest = await executionManifestArtifacts(await eventExecutionManifest())
-  const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: device.identity.publicKey,
-    authorityPublicKey: authoritySigner.publicKey, executionManifestDigest: bytesToHex(manifest.executionManifestDigest),
-    finalityPolicy: { kind: 'none' } }, authoritySigner)
-  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true, administrator: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n,
-    epoch: 0, epochKeyDigest: await epochKeyCommitment(applicationId, 0, key),
-    members: [{ publicKey: device.identity.publicKey, wrapKey: null, reader: true, writer: true, administrator: true, publisher: false, finalizer: false }] }, authoritySigner)
-  return createApplicationSession({ device, definition, authority: { descriptor, memberships: [membership] }, epochKeys: new Map([[0, key]]) })
+async function openSession(device: ApplicationDevice) {
+  const created = await createChainGenesis({
+    creator: {
+      publicKey: device.identity.publicKey,
+      wrapKey: device.wrapKey.publicKey,
+      reader: true,
+      writer: true,
+      administrator: true,
+    },
+    privateChain: true,
+    imports: { 'app/notes': NOTE_REDUCER },
+    topics: { notes: { module: 'app/notes', initialState: [] } },
+  })
+  return createApplicationSession({
+    device,
+    definition,
+    genesis: created.genesisBytes,
+    casNodes: created.casNodes,
+    epochKeys: new Map([[0, created.epoch0Key!]]),
+  })
 }
 
-const applicationIdFor = (index: number): string => index.toString(16).padStart(2, '0').repeat(32)
-
-/** Minimal scripted session: a push-driven change feed that ends on abort. */
 function scriptedSession(applicationId: string): MergeableSession & { push(change: Partial<ApplicationChange>): void; fail(error: Error): void } {
   const queue: ApplicationChange[] = []
   let wake: () => void = () => undefined, failure: Error | undefined
   return {
     applicationId,
-    push(change) { queue.push({ kind: 'materialized', revision: { digest: '00'.repeat(32), view: 'local', executionManifestDigest: '11'.repeat(32), policyDigest: '22'.repeat(32) }, revisedProposalIds: [], ...change }); wake() },
+    push(change) {
+      queue.push({
+        kind: 'materialized',
+        revision: { digest: '00'.repeat(32), stateRoot: '11'.repeat(32), historyDigest: '22'.repeat(32), view: 'local', orderLength: 1 },
+        revisedProposalIds: [],
+        ...change,
+      })
+      wake()
+    },
     fail(error) { failure = error; wake() },
     async *changes(options = {}) {
       const signal = options.signal
@@ -85,7 +112,7 @@ describe('many sessions in one process', () => {
       expect(exitCleanupCount()).toBe(12)
       expect(process.listenerCount('exit')).toBeLessThanOrEqual(exitListeners + 1)
 
-      for (const [index, device] of devices.entries()) sessions.push(await openSession(device, applicationIdFor(index + 1)))
+      for (const device of devices) sessions.push(await openSession(device))
       const merged = mergeSessionChanges(sessions.slice(0, 20))
       merged.add(sessions[20]!)
       expect(merged.size).toBe(21)

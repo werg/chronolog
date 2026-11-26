@@ -1,12 +1,14 @@
-# Chronolog documentation
+# Chronolog-DB Documentation
 
-- [Session API reference](../packages/peer-session/README.md): definitions, devices, commands, queries, operation observations, participation, browser Workers, content, and tools.
-- [Worker lifetime and conversation delivery](../packages/peer-session/README.md#separate-the-session-owner-request-worker-and-conversation-host): distinguish connectivity, request handling, retained progress and host delivery.
-- [Authored operation-set contract](CRDT_CONTRACT.md): immutable signed proposals, canonical author-time order, observations, optional finality, ordinary schema and permission transactions.
-- [Architecture and authority](authored-operation-set.md): execution model, observations, authority separation, finality, transports, and storage bounds.
-- [Deterministic SQL](implementation-specs/10-deterministic-sql-transactions.md): change programs, limits, execution identity, and atomic outcomes.
-- [Row ownership](design-owner-rows.md): SQL data ownership and collective membership.
-- [Sealed values](sealed-data.md): explicit recipient encryption for private fields.
-- [Browser storage](browser-storage.md): OPFS/IndexedDB selection, locking, and capability probing.
-- [Qualification](release-hardening.md): test suites, packaging, and verification gates.
-- [Materializer](../packages/materializer/README.md) | [Signals](../packages/signals/README.md) | [WebRTC transport](../packages/transport-webrtc/README.md)
+- [Chronolog v2 CRDT Contract](CRDT_CONTRACT.md) — formal invariants for ordering, public/encrypted partitioning, QuickJS-NG Import-Map reducers, deterministic SQLite-CAS, write RLS, keys, finality, and signals.
+- [Authored Operation-Set Guide](authored-operation-set.md) — practical guide to authoring, replication, reconnect rewrapping, checkpoints, and reactive views.
+- [Browser Storage Architecture](browser-storage.md) — OPFS, IndexedDB, and single-owner worker isolation in browsers.
+
+## Package Guides
+
+- [`@chronolog/peer-session`](../packages/peer-session/README.md) — full session API, `createChainGenesis`, `ApplicationDevice`, `ApplicationSessionOwner`, `createLiveView`, `forwardSessionEvents`, and `createScopedApplicationTools`.
+- [`@chronolog/materializer`](../packages/materializer/README.md) — `TopicKernel`, `QuickJsSandbox`, and the 5 audited standard ES Modules.
+- [`@chronolog/sqlite-cas`](../packages/sqlite-cas/README.md) — Merkle-paged SQLite + FTS5 + `sqlite-vec` WASM driver and deterministic profile.
+- [`@chronolog/authority`](../packages/authority/README.md) — portable signed records, `ApplicationDescription`, and time-scoped `$finality` verification.
+- [`@chronolog/signals`](../packages/signals/README.md) — signed ephemeral live-lane messages.
+- [`@chronolog/transport-webrtc`](../packages/transport-webrtc/README.md) — direct WebRTC data-channel and media/stream transport.

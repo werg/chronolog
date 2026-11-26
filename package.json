@@ -9,42 +9,35 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "build:sqlite-cas": "node tools/build-sqlite-cas.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint . --cache --cache-strategy content --cache-location node_modules/.cache/eslint/.eslintcache --max-warnings 0",
     "lint:fix": "pnpm lint --fix",
     "check:commit": "pnpm lint && pnpm typecheck",
     "test": "vitest run",
-    "test:fast": "node tools/run-fast-tests.mjs",
+    "test:fast": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:fuzz": "vitest run packages/canonical/src/cbor.fuzz.test.ts packages/protocol/src/sql.fuzz.test.ts",
-    "test:publication-crash": "vitest run test/materializer-publication-crash.integration.test.ts",
-    "test:native-sanitizers": "bash tools/run-native-sanitizers.sh",
-    "bench:materialize": "tsx tools/bench-materialize.ts",
-    "test:soak": "tsx packages/conformance/src/release-characterization.ts --iterations 500 --reopen-every 25 --late-every 10 --late-depth 7 --output artifacts/release/soak.json",
-    "characterize": "tsx packages/conformance/src/release-characterization.ts --iterations 100 --reopen-every 20 --late-every 10 --late-depth 5 --output artifacts/release/characterization.json",
-    "release:metadata": "pnpm build && tsx tools/generate-release-metadata.ts --output artifacts/release",
-    "conformance": "tsx packages/conformance/src/conformance-report.ts --output artifacts/conformance/report.json",
-    "conformance:compare": "tsx packages/conformance/src/compare-reports.ts",
+    "test:fuzz": "vitest run packages/canonical/src/cbor.fuzz.test.ts",
     "docs:check": "node tools/check-doc-links.mjs",
     "prepare": "husky",
     "package:signals": "node tools/package-signals.mjs",
     "test:signals-package": "node tools/test-signals-package.mjs",
     "package:session": "node tools/package-peer-session.mjs",
-    "test:session-sql": "node tools/test-peer-session-sql.mjs",
     "test:session-webrtc": "tsx tools/test-peer-session-webrtc.ts",
     "package:authority": "node tools/package-authority.mjs"
   },
   "devDependencies": {
+    "@chronolog/authority": "workspace:*",
     "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",
-    "@chronolog/materializer-doltlite": "workspace:*",
-    "@chronolog/authority": "workspace:*",
     "@chronolog/peer-session": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",
     "@chronolog/signals": "workspace:*",
+    "@chronolog/sqlite-cas": "workspace:*",
     "@chronolog/transport-webrtc": "workspace:*",
+    "@chronolog/transport-websocket": "workspace:*",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.65.0",
     "@types/node": "^24.0.0",
@@ -52,20 +45,14 @@
     "esbuild": "0.28.2",
     "eslint": "^10.7.0",
     "husky": "^9.1.7",
-    "node-gyp": "11.5.0",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.64.0",
-    "vitest": "^3.2.4",
-    "@chronolog/transport-websocket": "workspace:*"
+    "vitest": "^3.2.4"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "@dolthub/doltlite",
       "esbuild"
-    ],
-    "patchedDependencies": {
-      "@dolthub/doltlite@0.11.29": "patches/@dolthub__doltlite@0.11.29.patch"
-    }
+    ]
   }
 }

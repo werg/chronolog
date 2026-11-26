@@ -1,20 +1,113 @@
-import { createSigningIdentity, signAppDescriptor, signMembership, epochKeyCommitment, recordDigest, type AuthorityBundle, type FinalityPolicy, type SigningIdentity } from '@chronolog/authority'
-import { executionManifestArtifacts, bytesToHex, emit, program } from '@chronolog/protocol'
-import { eventExecutionManifest } from '@chronolog/materializer/manifest'
+import { createSigningIdentity, type FinalityPolicyV2, type SigningIdentity } from '@chronolog/authority'
 import { MemoryBytesStore } from '@chronolog/records'
-import { openApplicationDevice } from './device.js'
-import { createWrapKeyPair } from './wrap-keys.js'
-import { createApplicationSession } from './runtime.js'
 import { defineApplication, defineCommand, defineQuery } from './definition.js'
+import { openApplicationDevice } from './device.js'
+import { createChainGenesis } from './genesis.js'
+import { createApplicationSession } from './runtime.js'
 import type { ApplicationReadView } from './session-types.js'
-export const eventDefinition = defineApplication({ id: 'authored-test', version: '1', commands: { say: defineCommand({ description: 'Say', input: { type: 'string' }, prepare: text => program(emit('message', text)) }) }, queries: { messages: defineQuery({ description: 'Messages', input: { type: 'null' }, read: (view: ApplicationReadView) => view.readEvents() }) } })
-export async function sessionFixture(options: { readonly count?: number; readonly finalityPolicy?: FinalityPolicy; readonly identities?: readonly SigningIdentity[]; readonly manifestDigest?: string } = {}) {
-  const identities = options.identities ?? await Promise.all(Array.from({ length: options.count ?? 2 }, () => createSigningIdentity())), authorityIdentity = await createSigningIdentity(), applicationId = 'ab'.repeat(32), epochKey = crypto.getRandomValues(new Uint8Array(32))
-  const wrapPairs = await Promise.all(identities.map(() => createWrapKeyPair()))
-  const digest = options.manifestDigest ?? bytesToHex((await executionManifestArtifacts(await eventExecutionManifest())).executionManifestDigest)
-  const descriptor = await signAppDescriptor({ applicationId, rootPrincipal: identities[0]!.publicKey, authorityPublicKey: authorityIdentity.publicKey, executionManifestDigest: digest, finalityPolicy: options.finalityPolicy ?? { kind: 'none' } }, authorityIdentity)
-  const membership = await signMembership({ admission: { mode: 'attested', hostKey: 'ee'.repeat(32), accounts: [], grant: { reader: true, writer: true, administrator: true } }, admitted: [], invites: [], applicationId, revision: 0, previous: null, authorTimeAfterMs: -1n, epoch: 0, epochKeyDigest: await epochKeyCommitment(applicationId, 0, epochKey), members: identities.map((identity, i) => ({ publicKey: identity.publicKey, wrapKey: wrapPairs[i]!.publicKey, reader: true, writer: true, administrator: i === 0, publisher: i === 0, finalizer: options.finalityPolicy?.kind === 'signed-frontier' ? options.finalityPolicy.signer === identity.publicKey : options.finalityPolicy?.kind === 'fixed-validator' ? options.finalityPolicy.validators.includes(identity.publicKey) : false })) }, authorityIdentity)
-  const bundle: AuthorityBundle = { descriptor, memberships: [membership] }, stores = identities.map(() => new MemoryBytesStore())
-  const open = async (index: number, keys = true) => createApplicationSession({ device: await openApplicationDevice({ store: stores[index]!, create: true, managedSigner: identities[index]! }), definition: eventDefinition, authority: bundle, ...(keys ? { epochKeys: new Map([[0, epochKey]]) } : {}) })
-  return { identities, wrapPairs, authorityIdentity, applicationId, descriptor, membership, membershipId: await recordDigest(membership), epochKey, bundle, stores, open }
+import { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
+
+const MESSAGES_REDUCER_SOURCE = `
+export default {
+  reduce(state, tx) {
+    const items = Array.isArray(state) ? state : [];
+    const text = typeof tx.payload === 'string' ? tx.payload : (tx.payload && tx.payload.text);
+    return {
+      ok: true,
+      state: items.concat([{ opId: tx.opId, author: tx.author, text }]),
+      events: [{ topic: 'message', payload: text }],
+    };
+  },
+  query(state) {
+    return Array.isArray(state) ? state : [];
+  },
+  describe() {
+    return {
+      commands: [{ name: 'say', description: 'Emit a message', input: { type: 'string' } }],
+      queries: [{ name: 'messages', description: 'Read emitted messages', input: { type: 'null' } }],
+    };
+  },
+};
+`.trimStart()
+
+export const fixtureDefinition = defineApplication({
+  id: 'chronolog-fixture',
+  version: '2',
+  commands: {
+    say: defineCommand({
+      description: 'Emit a message',
+      input: { type: 'string' },
+      prepare: text => [{ topic: 'messages', input: text }],
+    }),
+  },
+  queries: {
+    messages: defineQuery({
+      description: 'Read emitted messages',
+      input: { type: 'null' },
+      read: (view: ApplicationReadView) => view.readEvents({ topics: ['message'] }),
+    }),
+  },
+})
+
+export async function sessionFixture(options: {
+  readonly count?: number
+  readonly identities?: readonly SigningIdentity[]
+  readonly finalityPolicy?: FinalityPolicyV2
+  readonly privateChain?: boolean
+} = {}) {
+  const identities = options.identities ?? await Promise.all(Array.from({ length: options.count ?? 2 }, () => createSigningIdentity()))
+  const wrapPairs = await Promise.all(identities.map(async () => {
+    const pair = await createWrapKeyPair()
+    return { publicKey: pair.publicKey, privateKey: await importWrapPrivateKey(pair.privateKey) }
+  }))
+  const epochKey = crypto.getRandomValues(new Uint8Array(32))
+  const members = identities.map((id, i) => ({
+    publicKey: id.publicKey,
+    wrapKey: wrapPairs[i]!.publicKey,
+    reader: true,
+    writer: true,
+    administrator: i === 0,
+    publisher: i === 0,
+    finalizer: i === 0,
+  }))
+  const created = await createChainGenesis({
+    creator: members[0]!,
+    members: members.slice(1),
+    privateChain: options.privateChain ?? true,
+    imports: { 'app/messages': MESSAGES_REDUCER_SOURCE },
+    topics: { messages: { module: 'app/messages', initialState: [] } },
+    epoch0Key: epochKey,
+    ...(options.finalityPolicy === undefined ? {} : {
+      finalitySchedule: [{ effectiveAfterMs: -1n, policy: options.finalityPolicy }],
+    }),
+  })
+  const stores = identities.map(() => new MemoryBytesStore())
+
+  return {
+    applicationId: created.chainId,
+    chainId: created.chainId,
+    genesis: created.genesis,
+    genesisBytes: created.genesisBytes,
+    casNodes: created.casNodes,
+    identities,
+    wrapPairs,
+    epochKey,
+    stores,
+    async open(index: number) {
+      const store = stores[index]!
+      const device = await openApplicationDevice({
+        store,
+        create: true,
+        managedSigner: identities[index]!,
+        managedWrapKey: wrapPairs[index]!,
+      })
+      return createApplicationSession({
+        device,
+        genesis: created.genesisBytes,
+        casNodes: created.casNodes,
+        epochKeys: new Map([[0, epochKey]]),
+        definition: fixtureDefinition,
+      })
+    },
+  }
 }

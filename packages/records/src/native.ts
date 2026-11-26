@@ -1,4 +1,3 @@
-import { createRequire } from 'node:module'
 import { Worker } from 'node:worker_threads'
 import type { BytesStore, BytesStoreEntry } from './bytes-store.js'
 import { nativeWorkerSource } from './native-worker.js'
@@ -32,8 +31,7 @@ class NativeStorePool {
   failure: Error | undefined
 
   constructor() {
-    this.worker = new Worker(nativeWorkerSource, { eval: true,
-      workerData: { sqliteModule: createRequire(import.meta.url).resolve('better-sqlite3') } })
+    this.worker = new Worker(nativeWorkerSource, { eval: true })
     this.#ready = new Promise((resolve, reject) => { this.#requests.set(0, { resolve: () => resolve(), reject }) })
     void this.#ready.catch(() => undefined)
     this.worker.on('message', (response: Response) => {

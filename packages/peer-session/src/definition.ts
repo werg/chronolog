@@ -1,11 +1,20 @@
-import { encodeChangeProgram, type ChangeProgram } from '@chronolog/protocol'
-import { applicationDescriptionDigest, checkedApplicationInputSchema, parseApplicationInput, validateApplicationDescription, type ApplicationDescription, type ApplicationInput, type ApplicationInputSchema } from '@chronolog/authority'
+import { normalizeJsonValue, type TopicUpdate } from '@chronolog/protocol'
+import {
+  applicationDescriptionDigest,
+  checkedApplicationInputSchema,
+  parseApplicationInput,
+  validateApplicationDescription,
+  type ApplicationDescription,
+  type ApplicationInput,
+  type ApplicationInputSchema,
+} from '@chronolog/authority'
+
 export { parseApplicationInput, type ApplicationDescription, type ApplicationInput, type ApplicationInputSchema } from '@chronolog/authority'
 
 export interface ApplicationCommand<Input = never> {
   readonly description: string
   readonly input: ApplicationInputSchema
-  prepare(input: Input): ChangeProgram
+  prepare(input: Input): readonly TopicUpdate[]
 }
 
 export interface ApplicationQuery<Input = never, Result = unknown, View = unknown> {
@@ -19,7 +28,6 @@ export interface ApplicationDefinition<
   Queries extends Readonly<Record<string, ApplicationQuery<never, unknown, never>>> = Readonly<Record<string, ApplicationQuery<never, unknown, never>>>,
 > {
   readonly id: string
-  /** Changes to command preparation or query semantics require a new version. */
   readonly version: string
   readonly commands: Commands
   readonly queries: Queries
@@ -28,19 +36,23 @@ export interface ApplicationDefinition<
 export function defineCommand<const S extends ApplicationInputSchema>(options: {
   readonly description: string
   readonly input: S
-  readonly prepare: (input: ApplicationInput<S>) => ChangeProgram
+  readonly prepare: (input: ApplicationInput<S>) => readonly TopicUpdate[] | TopicUpdate
 }): ApplicationCommand<ApplicationInput<S>> {
   const input = checkedApplicationInputSchema(options.input)
   if (typeof options.description !== 'string' || options.description.length > 4096 || typeof options.prepare !== 'function') {
     throw new Error('APPLICATION_COMMAND_INVALID')
   }
-  return Object.freeze({ description: options.description, input,
+  return Object.freeze({
+    description: options.description,
+    input,
     prepare(value: ApplicationInput<S>) {
       const validated = parseApplicationInput(input, value) as ApplicationInput<S>
-      const program = options.prepare(validated)
-      // Reject malformed or oversized programs before saving/signing an attempt.
-      encodeChangeProgram(program)
-      return program
+      const prepared = options.prepare(validated)
+      const list: readonly TopicUpdate[] = Array.isArray(prepared) ? prepared as readonly TopicUpdate[] : [prepared as TopicUpdate]
+      return list.map(update => ({
+        topic: update.topic,
+        input: normalizeJsonValue(update.input),
+      }))
     },
   })
 }
@@ -54,8 +66,12 @@ export function defineQuery<const S extends ApplicationInputSchema, Result, View
   if (typeof options.description !== 'string' || options.description.length > 4096 || typeof options.read !== 'function') {
     throw new Error('APPLICATION_QUERY_INVALID')
   }
-  return Object.freeze({ description: options.description, input,
-    read(view: View, value: ApplicationInput<S>) { return options.read(view, parseApplicationInput(input, value) as ApplicationInput<S>) },
+  return Object.freeze({
+    description: options.description,
+    input,
+    read(view: View, value: ApplicationInput<S>) {
+      return options.read(view, parseApplicationInput(input, value) as ApplicationInput<S>)
+    },
   })
 }
 
@@ -79,14 +95,12 @@ export function defineApplication<
   return Object.freeze({ ...definition, commands: Object.freeze({ ...definition.commands }), queries: Object.freeze({ ...definition.queries }) })
 }
 
-/** Descriptions and tool schemas come from the same definition that executes commands. */
 export function describeApplication(definition: ApplicationDefinition): ApplicationDescription {
   const describe = (entries: Readonly<Record<string, { readonly description: string; readonly input: ApplicationInputSchema }>>) =>
     Object.keys(entries).sort().map(name => ({ name, description: entries[name]!.description, input: entries[name]!.input }))
   return validateApplicationDescription({ id: definition.id, version: definition.version, commands: describe(definition.commands), queries: describe(definition.queries) })
 }
 
-/** Authenticates the same public description used by bootstrap and local tools. */
 export async function applicationDefinitionDigest(definition: ApplicationDefinition): Promise<string> {
   return applicationDescriptionDigest(describeApplication(definition))
 }

@@ -1,1 +1,1 @@
-{"name":"@chronolog/crypto","version":"0.0.0","private":true,"type":"module","exports":"./src/index.ts","dependencies":{"@chronolog/protocol":"workspace:*"}}
+{"name":"@chronolog/crypto","version":"0.0.0","private":true,"type":"module","exports":"./src/index.ts","dependencies":{"@chronolog/protocol":"workspace:*","@noble/ed25519":"^3.2.0","@noble/hashes":"1.8.0"}}
