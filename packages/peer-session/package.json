@@ -11,7 +11,8 @@
     "./webrtc": "./src/webrtc.ts",
     "./webrtc-native": "./src/webrtc-native.ts",
     "./websocket": "./src/websocket.ts",
-    "./tendriller": "./src/tendriller.ts"
+    "./tendriller": "./src/tendriller.ts",
+    "./kernel": "./src/kernel.ts"
   },
   "dependencies": {
     "@chronolog/authority": "workspace:*",

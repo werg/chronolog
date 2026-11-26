@@ -23,7 +23,7 @@ const nativeRtc = !values['no-native-rtc'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 
 const entries = Object.fromEntries([
-  'index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller',
+  'index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'kernel',
   ...(nativeRtc ? ['webrtc-native'] : []),
 ].map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 
@@ -66,7 +66,7 @@ assert(
 );
 
 // Verify browser/worker entrypoints never statically pull Node APIs or werift.
-for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller']) {
+for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'kernel']) {
   const entryOut = Object.entries(bundled.metafile.outputs).find(([, value]) =>
     value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(entryOut, `Missing bundled entry: ${entry}`);
