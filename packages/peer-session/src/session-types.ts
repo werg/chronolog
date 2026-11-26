@@ -40,7 +40,7 @@ export interface ApplicationReadView {
   readonly applicationId: string
   readonly revision: MaterializedRevision
   topic(name: string): JsonValue | null
-  query(topic: string, input?: JsonValue): JsonValue
+  query(topic: string, input?: JsonValue): Promise<JsonValue>
   readEvents(options?: ApplicationEventOptions): ApplicationEventBatch
   release(): void
 }

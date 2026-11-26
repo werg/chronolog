@@ -598,15 +598,16 @@ export class TopicKernel {
   }
 
   /** Execute a pure read-only query against a topic's query() export (or return raw topic state if no query export). */
-  async query(topic: string, input: JsonValue = null): Promise<JsonValue> {
-    const reducersConfig = assertValidReducersConfig(this.#topics.$reducers)
+  async query(topic: string, input: JsonValue = null, topicsOverride?: Readonly<Record<string, JsonValue>>): Promise<JsonValue> {
+    const sourceTopics = topicsOverride ?? this.#topics
+    const reducersConfig = assertValidReducersConfig(sourceTopics.$reducers)
     const binding = reducersConfig.topics[topic]
-    const state = Object.hasOwn(this.#topics, topic) ? this.#topics[topic]! : null
+    const state = Object.hasOwn(sourceTopics, topic) ? sourceTopics[topic]! : null
     if (binding === undefined) return structuredClone(state)
     const casPartition: CasPartition = (this.genesis.privateChain && isControlTopic(topic)) ? 'public' : 'private'
     const visibleTopics = (this.genesis.privateChain && isControlTopic(topic))
-      ? filterPublicTopics(this.#topics)
-      : this.#topics
+      ? filterPublicTopics(sourceTopics)
+      : sourceTopics
     const res = await this.sandbox.invoke({
       imports: reducersConfig.imports,
       builtins: reducersConfig.runtime.builtins,

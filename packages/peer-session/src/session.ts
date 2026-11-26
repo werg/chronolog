@@ -1216,9 +1216,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         checkLive()
         return Object.hasOwn(topicsSnap, name) ? structuredClone(topicsSnap[name]!) : null
       },
-      query(topic: string, _input?: JsonValue): JsonValue {
+      async query(topic: string, input?: JsonValue): Promise<JsonValue> {
         checkLive()
-        return Object.hasOwn(topicsSnap, topic) ? structuredClone(topicsSnap[topic]!) : null
+        if (kernel === null) return Object.hasOwn(topicsSnap, topic) ? structuredClone(topicsSnap[topic]!) : null
+        return kernel.query(topic, input ?? null, topicsSnap)
       },
       readEvents(eventOptions: ApplicationEventOptions = {}): ApplicationEventBatch {
         checkLive()
