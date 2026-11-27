@@ -43,12 +43,21 @@ export type BlockchainAnchorVerifier = (
   checkpoint: FinalityCheckpoint,
 ) => boolean | Promise<boolean>
 
+export interface EquivocationProof {
+  readonly signer: string
+  readonly policyScopeId: string
+  readonly reason: 'conflicting_checkpoint_at_frontier' | 'dropped_prior_inclusion'
+  readonly first: FinalityCheckpoint
+  readonly second: FinalityCheckpoint
+}
+
 export interface VerifiedFinalityV2 {
   readonly closedThroughMs: bigint | null
   readonly includedOpIds: ReadonlySet<string>
   readonly excludedOpIds: ReadonlySet<string>
   readonly latestCheckpoint: FinalityCheckpoint | null
   readonly verifiedCheckpoints: readonly FinalityCheckpoint[]
+  readonly equivocationProofs: readonly EquivocationProof[]
 }
 
 export async function policyScopeId(logId: string, entry: ScheduledFinalityEntry): Promise<string> {
@@ -195,12 +204,72 @@ export async function verifyFinalityV2(options: {
     }
   }
 
+  // Detect cryptographic notary/validator equivocation across verified checkpoints
+  const equivocationProofs: EquivocationProof[] = []
+  const bySignerScope = new Map<string, FinalityCheckpoint[]>()
+  for (const cp of verifiedCheckpoints) {
+    if (cp.attestation.kind !== 'signatures') continue
+    for (const sig of cp.attestation.signatures) {
+      const key = `${sig.signer}:${cp.payload.policyScopeId}`
+      let list = bySignerScope.get(key)
+      if (list === undefined) { list = []; bySignerScope.set(key, list) }
+      list.push(cp)
+    }
+  }
+  for (const [key, list] of bySignerScope) {
+    const sep = key.indexOf(':')
+    const signer = key.slice(0, sep)
+    const scopeId = key.slice(sep + 1)
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i]!
+      const aOps = new Set(a.payload.inclusions.map(x => x.opId))
+      for (let j = i + 1; j < list.length; j++) {
+        const b = list[j]!
+        if (a.payload.closedThroughMs === b.payload.closedThroughMs) {
+          if (
+            a.payload.includedSetDigest !== b.payload.includedSetDigest ||
+            a.payload.stateRoot !== b.payload.stateRoot ||
+            a.payload.historyDigest !== b.payload.historyDigest
+          ) {
+            equivocationProofs.push({
+              signer,
+              policyScopeId: scopeId,
+              reason: 'conflicting_checkpoint_at_frontier',
+              first: a,
+              second: b,
+            })
+          }
+        } else if (b.payload.closedThroughMs > a.payload.closedThroughMs && aOps.size > 0 && b.payload.inclusions.length > 0) {
+          const bOps = new Set(b.payload.inclusions.map(x => x.opId))
+          const bMinTs = b.payload.inclusions.reduce((min, x) => (x.authorTimestampMs < min ? x.authorTimestampMs : min), b.payload.inclusions[0]!.authorTimestampMs)
+          // Only flag dropped inclusion when b overlaps a's timestamp range (full cumulative checkpoint)
+          if (bMinTs <= a.payload.closedThroughMs) {
+            let dropped = false
+            for (const opId of aOps) {
+              if (!bOps.has(opId)) { dropped = true; break }
+            }
+            if (dropped) {
+              equivocationProofs.push({
+                signer,
+                policyScopeId: scopeId,
+                reason: 'dropped_prior_inclusion',
+                first: a,
+                second: b,
+              })
+            }
+          }
+        }
+      }
+    }
+  }
+
   return {
     closedThroughMs: highestClosed,
     includedOpIds,
     excludedOpIds,
     latestCheckpoint: verifiedCheckpoints.at(-1) ?? null,
     verifiedCheckpoints,
+    equivocationProofs,
   }
 }
 

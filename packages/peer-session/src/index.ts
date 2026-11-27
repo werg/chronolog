@@ -15,6 +15,10 @@ export type {
   SessionFacts,
   SessionCasNode,
   MemberRecord,
+  GuardianMember,
+  GuardiansConfig,
+  RecoveryRequestRecord,
+  KeyRingState,
   PermissionsMultisigInfo,
   PermissionsTopicState,
   KeysTopicState,
@@ -51,6 +55,8 @@ export type {
   EventPayload,
   LogGenesis,
   JsonValue,
+  OperationAssumption,
+  OperationAssumptionsConfig,
   OperationCore,
   OperationVisibility,
   ReducersConfig,
@@ -77,3 +83,6 @@ export { createApplicationOwner } from './session-owner.js'
 export type * from './owner-types.js'
 export { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
 export * from './multi-session.js'
+export * from './sql-extensions.js'
+export { diffMerkleDbRoots, createOverlayCas, type MerkleDbDiff } from 'chronolog-db'
+export { splitSecret, combineShares, type ShamirShare } from '@chronolog/crypto'

@@ -1,5 +1,12 @@
 import { utf8 } from '@chronolog/canonical'
 import { computeCasHash, type ContentAddressedStore } from '@chronolog/records'
+import { STD_CRDT_SOURCE } from './std/crdt.js'
+import { STD_TEXT_SOURCE } from './std/text.js'
+import { STD_LEDGER_SOURCE } from './std/ledger.js'
+import { STD_WORKFLOW_SOURCE } from './std/workflow.js'
+import { STD_FS_SOURCE } from './std/fs.js'
+
+export { STD_CRDT_SOURCE, STD_TEXT_SOURCE, STD_LEDGER_SOURCE, STD_WORKFLOW_SOURCE, STD_FS_SOURCE }
 
 export const STD_PERMISSIONS_SOURCE = `
 import { verifyEd25519, canonicalJson } from 'chronolog:crypto';
@@ -34,17 +41,31 @@ function normalizeMember(m) {
   if (!m || typeof m !== 'object' || !HEX32.test(m.publicKey || '') || (m.wrapKey !== undefined && m.wrapKey !== null && !HEX32.test(m.wrapKey))) {
     throw new Error('INVALID_MEMBER');
   }
+  const scopes = Array.isArray(m.scopes)
+    ? sortedKeys(m.scopes.filter(s => typeof s === 'string' && s.length > 0 && s.length <= 128))
+    : undefined;
+  const expiresAtMs = m.expiresAtMs !== undefined && m.expiresAtMs !== null && Number.isSafeInteger(m.expiresAtMs)
+    ? m.expiresAtMs
+    : undefined;
   return {
     publicKey: m.publicKey,
     ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
     ...(typeof m.label === 'string' && m.label.length > 0 ? { label: m.label } : {}),
     ...(typeof m.subject === 'string' && m.subject.length > 0 ? { subject: m.subject } : {}),
+    ...(scopes && scopes.length > 0 ? { scopes } : {}),
+    ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     reader: Boolean(m.reader),
     writer: Boolean(m.writer),
     administrator: Boolean(m.administrator),
     publisher: Boolean(m.publisher),
     finalizer: Boolean(m.finalizer),
   };
+}
+
+function isMemberExpired(member, atMs) {
+  if (!member || member.expiresAtMs === undefined || member.expiresAtMs === null) return false;
+  if (!Number.isSafeInteger(atMs) || atMs <= 0) return false;
+  return atMs > member.expiresAtMs;
 }
 
 function queryMembersList(members, role) {
@@ -57,9 +78,18 @@ function queryMembersList(members, role) {
   return [];
 }
 
-function checkMembersCapability(members, capability, actor) {
+function checkMembersCapability(members, capability, actor, options) {
   const m = members.find(x => x.publicKey === actor);
   if (!m) return false;
+  const atMs = options && Number.isSafeInteger(options.atMs) ? options.atMs : 0;
+  if (isMemberExpired(m, atMs)) return false;
+  if (capability === 'scope') {
+    if (m.administrator === true) return true;
+    const scope = options && typeof options.scope === 'string' ? options.scope : '';
+    if (!scope) return false;
+    if (!Array.isArray(m.scopes)) return false;
+    return m.scopes.includes('*') || m.scopes.includes(scope);
+  }
   if (capability === 'reader') return m.reader === true;
   if (capability === 'writer') return m.writer === true || m.administrator === true;
   if (capability === 'administrator') return m.administrator === true;
@@ -146,7 +176,103 @@ export const attestedMembers = {
       return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
     }
 
+    if (input.action === 'requestRecovery') {
+      const guardians = cur.guardians;
+      if (!guardians || !Array.isArray(guardians.members) || guardians.members.length === 0) {
+        return { ok: false, code: 'guardians_not_configured' };
+      }
+      if (!HEX32.test(input.newPublicKey || '') || !HEX32.test(input.newWrapKey || '')) {
+        return { ok: false, code: 'invalid_recovery_key' };
+      }
+      if (tx.author !== input.newPublicKey && !authorIsAdmin) {
+        return { ok: false, code: 'recovery_author_mismatch' };
+      }
+      const requestId = typeof input.requestId === 'string' && input.requestId.length > 0 ? input.requestId : tx.opId;
+      const requests = { ...(cur.recoveryRequests || {}) };
+      requests[requestId] = {
+        requestId,
+        newPublicKey: input.newPublicKey,
+        newWrapKey: input.newWrapKey,
+        label: typeof input.label === 'string' ? input.label.slice(0, 80) : 'Recovered device',
+        verificationCode: typeof input.verificationCode === 'string' ? input.verificationCode.slice(0, 32) : '',
+        approvals: [],
+        status: 'pending',
+        createdAtMs: Number(tx.authorTimestampMs || 0),
+      };
+      return {
+        ok: true,
+        state: { ...cur, recoveryRequests: requests },
+        events: [{ topic: '$permissions.recovery_requested', payload: { requestId, newPublicKey: input.newPublicKey } }],
+      };
+    }
+
+    if (input.action === 'approveRecovery') {
+      const guardians = cur.guardians;
+      if (!guardians || !Array.isArray(guardians.members) || !guardians.members.some(g => g.publicKey === tx.author)) {
+        return { ok: false, code: 'guardian_required' };
+      }
+      const requests = { ...(cur.recoveryRequests || {}) };
+      const req = requests[input.requestId];
+      if (!req || req.status !== 'pending') return { ok: false, code: 'recovery_request_not_found' };
+      const approvals = sortedKeys((req.approvals || []).concat([tx.author]));
+      const completed = approvals.length >= guardians.threshold;
+      requests[input.requestId] = { ...req, approvals, status: completed ? 'completed' : 'pending' };
+      let members = cur.members;
+      if (completed) {
+        const promoted = normalizeMember({
+          publicKey: req.newPublicKey,
+          wrapKey: req.newWrapKey,
+          label: req.label,
+          reader: true,
+          writer: true,
+          administrator: true,
+          publisher: true,
+          finalizer: false,
+        });
+        members = cur.members.filter(m => m.publicKey !== promoted.publicKey).concat([promoted]);
+        members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+      }
+      return {
+        ok: true,
+        state: { ...cur, members, recoveryRequests: requests },
+        events: [{ topic: completed ? '$permissions.recovery_completed' : '$permissions.recovery_approved', payload: { requestId: input.requestId, guardian: tx.author, approvals: approvals.length, threshold: guardians.threshold } }],
+      };
+    }
+
     if (!authorIsAdmin) return { ok: false, code: 'admin_required' };
+
+    if (input.action === 'setGuardians') {
+      if (input.guardians === null) {
+        return { ok: true, state: { ...cur, guardians: null }, events: [{ topic: '$permissions.guardians_cleared', payload: {} }] };
+      }
+      const g = input.guardians;
+      if (!g || typeof g !== 'object' || !Array.isArray(g.members) || g.members.length === 0) {
+        return { ok: false, code: 'invalid_guardians' };
+      }
+      const cleaned = [];
+      const seen = new Set();
+      for (const item of g.members) {
+        if (!item || !HEX32.test(item.publicKey || '') || !HEX32.test(item.wrapKey || '') || seen.has(item.publicKey)) {
+          return { ok: false, code: 'invalid_guardian' };
+        }
+        seen.add(item.publicKey);
+        cleaned.push({
+          publicKey: item.publicKey,
+          wrapKey: item.wrapKey,
+          ...(typeof item.label === 'string' && item.label.length > 0 ? { label: item.label.slice(0, 80) } : {}),
+        });
+      }
+      cleaned.sort((a, b) => (a.publicKey < b.publicKey ? -1 : 1));
+      const threshold = Number(g.threshold);
+      if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > cleaned.length) {
+        return { ok: false, code: 'invalid_guardian_threshold' };
+      }
+      return {
+        ok: true,
+        state: { ...cur, guardians: { threshold, members: cleaned } },
+        events: [{ topic: '$permissions.guardians_updated', payload: { threshold, count: cleaned.length } }],
+      };
+    }
 
     if (input.action === 'removeMember') {
       if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
@@ -196,10 +322,17 @@ export const attestedMembers = {
     const members = Array.isArray(cur.members) ? cur.members : [];
     if (input && typeof input === 'object') {
       if (typeof input.check === 'string' && typeof input.actor === 'string') {
-        return checkMembersCapability(members, input.check, input.actor);
+        if (input.check === 'guardian') {
+          return Boolean(cur.guardians && Array.isArray(cur.guardians.members) && cur.guardians.members.some(g => g.publicKey === input.actor));
+        }
+        return checkMembersCapability(members, input.check, input.actor, input);
       }
       if (typeof input.list === 'string') {
+        if (input.list === 'guardians') return cur.guardians && Array.isArray(cur.guardians.members) ? cur.guardians.members.map(g => g.publicKey) : [];
         return queryMembersList(members, input.list);
+      }
+      if (input.guardians === true) {
+        return { guardians: cur.guardians ?? null, recoveryRequests: cur.recoveryRequests ?? {} };
       }
       if (input.admission === true) {
         return cur.admission ?? null;
@@ -216,6 +349,8 @@ export const attestedMembers = {
           openWriters: false,
           blockedAuthors: [],
           admission: cur.admission ?? null,
+          guardians: cur.guardians ?? null,
+          recoveryRequests: cur.recoveryRequests ?? {},
           multisig: null,
         };
       }
@@ -241,12 +376,38 @@ export const openMembers = {
           openRead: state.openRead !== false,
           openWrite: state.openWrite !== false,
           blockedAuthors: Array.isArray(state.blockedAuthors) ? state.blockedAuthors : [],
+          vouchedAuthors: Array.isArray(state.vouchedAuthors) ? state.vouchedAuthors : [],
+          antiSpam: state.antiSpam && typeof state.antiSpam === 'object' ? state.antiSpam : null,
           admission: state.admission ?? null,
         }
-      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], admission: null };
+      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], vouchedAuthors: [], antiSpam: null, admission: null };
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
+
+    if (input.action === 'vouchAuthor') {
+      const canVouch = cur.admins.includes(tx.author) || cur.vouchedAuthors.includes(tx.author);
+      if (!canVouch) return { ok: false, code: 'vouch_permission_required' };
+      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
+      if (cur.blockedAuthors.includes(input.publicKey)) return { ok: false, code: 'author_blocked' };
+      const vouchedAuthors = sortedKeys(cur.vouchedAuthors.concat([input.publicKey])).slice(-4096);
+      return { ok: true, state: { ...cur, vouchedAuthors }, events: [{ topic: '$permissions.author_vouched', payload: { publicKey: input.publicKey, by: tx.author } }] };
+    }
+
     if (!cur.admins.includes(tx.author)) return { ok: false, code: 'admin_required' };
+
+    if (input.action === 'setAntiSpam') {
+      if (input.antiSpam === null) {
+        return { ok: true, state: { ...cur, antiSpam: null } };
+      }
+      const cfg = input.antiSpam;
+      if (!cfg || typeof cfg !== 'object') return { ok: false, code: 'invalid_antispam' };
+      const next = {
+        requireVouch: Boolean(cfg.requireVouch),
+        ...(Number.isSafeInteger(cfg.maxOpsPerWindow) && cfg.maxOpsPerWindow > 0 ? { maxOpsPerWindow: cfg.maxOpsPerWindow } : {}),
+        ...(Number.isSafeInteger(cfg.windowMs) && cfg.windowMs > 0 ? { windowMs: cfg.windowMs } : {}),
+      };
+      return { ok: true, state: { ...cur, antiSpam: next }, events: [{ topic: '$permissions.antispam_updated', payload: next }] };
+    }
 
     if (input.action === 'setAdmin') {
       if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
@@ -311,12 +472,15 @@ export const openMembers = {
           openRead: state.openRead !== false,
           openWrite: state.openWrite !== false,
           blockedAuthors: Array.isArray(state.blockedAuthors) ? sortedKeys(state.blockedAuthors.filter(k => HEX32.test(k || ''))) : [],
+          vouchedAuthors: Array.isArray(state.vouchedAuthors) ? sortedKeys(state.vouchedAuthors.filter(k => HEX32.test(k || ''))) : [],
+          antiSpam: state.antiSpam && typeof state.antiSpam === 'object' ? state.antiSpam : null,
           admission: state.admission ?? null,
         }
-      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], admission: null };
+      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], vouchedAuthors: [], antiSpam: null, admission: null };
 
     const adminSet = new Set(cur.admins);
     const blockedSet = new Set(cur.blockedAuthors);
+    const vouchedSet = new Set(cur.vouchedAuthors);
     const synthesizedMap = new Map();
     for (const m of cur.members) synthesizedMap.set(m.publicKey, m);
     for (const a of cur.admins) {
@@ -341,11 +505,17 @@ export const openMembers = {
         if (input.check === 'publisher') return adminSet.has(input.actor) || checkMembersCapability(members, 'publisher', input.actor);
         if (input.check === 'writer') {
           if (blockedSet.has(input.actor)) return false;
-          return cur.openWrite || adminSet.has(input.actor) || checkMembersCapability(members, 'writer', input.actor);
+          if (adminSet.has(input.actor)) return true;
+          if (checkMembersCapability(members, 'writer', input.actor, input)) return true;
+          if (!cur.openWrite) return false;
+          if (cur.antiSpam && cur.antiSpam.requireVouch === true) {
+            return vouchedSet.has(input.actor);
+          }
+          return true;
         }
-        if (input.check === 'reader') return cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'reader', input.actor);
-        if (input.check === 'member') return cur.openWrite || cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'member', input.actor);
-        return checkMembersCapability(members, input.check, input.actor);
+        if (input.check === 'reader') return cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'reader', input.actor, input);
+        if (input.check === 'member') return cur.openWrite || cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'member', input.actor, input);
+        return checkMembersCapability(members, input.check, input.actor, input);
       }
       if (typeof input.list === 'string') {
         if (input.list === 'blockedAuthors') return cur.blockedAuthors;
@@ -625,11 +795,128 @@ function isReader(ctx, author) {
   return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.reader === true));
 }
 
+function isGuardian(ctx, author) {
+  const checked = ctx.query('$permissions', { check: 'guardian', actor: author });
+  return checked === true;
+}
+
+const RING_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
 export const hpkeEpochs = {
   reduce(state, tx, ctx) {
     const cur = state && typeof state === 'object' ? state : { currentEpoch: -1, epochs: {} };
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
+
+    if (input.action === 'setRecoveryVault') {
+      if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
+      const vault = input.vault;
+      if (!vault || typeof vault.nonce !== 'string' || typeof vault.ciphertext !== 'string') {
+        return { ok: false, code: 'recovery_vault_invalid' };
+      }
+      if (!input.guardianShares || typeof input.guardianShares !== 'object') {
+        return { ok: false, code: 'guardian_shares_invalid' };
+      }
+      const guardianShares = {};
+      for (const [pk, item] of Object.entries(input.guardianShares)) {
+        if (!HEX32.test(pk) || !item || !Number.isSafeInteger(item.index) || item.index < 1 || item.index > 255 || !item.box || typeof item.box.encapsulatedKey !== 'string' || typeof item.box.ciphertext !== 'string') {
+          return { ok: false, code: 'guardian_share_invalid' };
+        }
+        guardianShares[pk] = { index: item.index, box: { encapsulatedKey: item.box.encapsulatedKey, ciphertext: item.box.ciphertext } };
+      }
+      return {
+        ok: true,
+        state: {
+          ...cur,
+          recovery: {
+            vault: { nonce: vault.nonce, ciphertext: vault.ciphertext },
+            guardianShares,
+          },
+        },
+        events: [{ topic: '$keys.recovery_vault_updated', payload: { guardians: Object.keys(guardianShares).length } }],
+      };
+    }
+
+    if (input.action === 'submitRecoveryShare') {
+      if (!isGuardian(ctx, tx.author)) return { ok: false, code: 'guardian_required' };
+      if (!HEX32.test(input.member || '') || !Number.isSafeInteger(input.index) || input.index < 1 || input.index > 255 || !input.box || typeof input.box.encapsulatedKey !== 'string' || typeof input.box.ciphertext !== 'string') {
+        return { ok: false, code: 'recovery_share_invalid' };
+      }
+      const recoveryGrants = { ...(cur.recoveryGrants || {}) };
+      const forMember = { ...(recoveryGrants[input.member] || {}) };
+      forMember[tx.author] = {
+        index: input.index,
+        box: { encapsulatedKey: input.box.encapsulatedKey, ciphertext: input.box.ciphertext },
+      };
+      recoveryGrants[input.member] = forMember;
+      return {
+        ok: true,
+        state: { ...cur, recoveryGrants },
+        events: [{ topic: '$keys.recovery_share_submitted', payload: { member: input.member, guardian: tx.author } }],
+      };
+    }
+
+    if (input.action === 'rotateRingEpoch') {
+      if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
+      const ringName = typeof input.ring === 'string' && RING_RE.test(input.ring) ? input.ring : null;
+      if (!ringName || ringName === 'default') return { ok: false, code: 'ring_name_invalid' };
+      const rings = { ...(cur.rings || {}) };
+      const prevRing = rings[ringName] || { currentEpoch: -1, epochs: {} };
+      const epoch = input.epoch;
+      if (!Number.isSafeInteger(epoch) || epoch !== prevRing.currentEpoch + 1) return { ok: false, code: 'epoch_sequence_invalid' };
+      if (!HEX32.test(input.keyCommitment || '')) return { ok: false, code: 'key_commitment_invalid' };
+      if (!input.boxes || typeof input.boxes !== 'object') return { ok: false, code: 'boxes_invalid' };
+      const boxes = {};
+      for (const [pk, box] of Object.entries(input.boxes)) {
+        if (!HEX32.test(pk) || !box || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') {
+          return { ok: false, code: 'box_invalid' };
+        }
+        boxes[pk] = { encapsulatedKey: box.encapsulatedKey, ciphertext: box.ciphertext };
+      }
+      rings[ringName] = {
+        currentEpoch: epoch,
+        epochs: { ...prevRing.epochs, [String(epoch)]: { epoch, keyCommitment: input.keyCommitment, boxes } },
+      };
+      const topicRings = { ...(cur.topicRings || {}) };
+      if (Array.isArray(input.topics)) {
+        for (const t of input.topics) {
+          if (typeof t === 'string' && t.length > 0 && !t.startsWith('$')) topicRings[t] = ringName;
+        }
+      }
+      return {
+        ok: true,
+        state: { ...cur, rings, topicRings },
+        events: [{ topic: '$keys.ring_rotated', payload: { ring: ringName, epoch } }],
+      };
+    }
+
+    if (input.action === 'grantRingBoxes') {
+      if (!isAdmin(ctx, tx.author) && !isReader(ctx, tx.author)) return { ok: false, code: 'reader_required' };
+      const ringName = typeof input.ring === 'string' && RING_RE.test(input.ring) ? input.ring : null;
+      const rings = { ...(cur.rings || {}) };
+      if (!ringName || !rings[ringName]) return { ok: false, code: 'ring_not_found' };
+      if (!HEX32.test(input.member || '') || !input.epochBoxes || typeof input.epochBoxes !== 'object') {
+        return { ok: false, code: 'grant_boxes_invalid' };
+      }
+      const nextEpochs = { ...rings[ringName].epochs };
+      for (const [epKey, box] of Object.entries(input.epochBoxes)) {
+        const existing = nextEpochs[epKey];
+        if (!existing) return { ok: false, code: 'epoch_missing' };
+        if (!box || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') {
+          return { ok: false, code: 'box_invalid' };
+        }
+        nextEpochs[epKey] = {
+          ...existing,
+          boxes: { ...existing.boxes, [input.member]: { encapsulatedKey: box.encapsulatedKey, ciphertext: box.ciphertext } },
+        };
+      }
+      rings[ringName] = { ...rings[ringName], epochs: nextEpochs };
+      return {
+        ok: true,
+        state: { ...cur, rings },
+        events: [{ topic: '$keys.ring_granted', payload: { ring: ringName, member: input.member } }],
+      };
+    }
 
     if (input.action === 'rotateEpoch') {
       if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
@@ -647,7 +934,7 @@ export const hpkeEpochs = {
       const nextEpochs = { ...cur.epochs, [String(epoch)]: { epoch, keyCommitment: input.keyCommitment, boxes } };
       return {
         ok: true,
-        state: { currentEpoch: epoch, epochs: nextEpochs },
+        state: { ...cur, currentEpoch: epoch, epochs: nextEpochs },
         events: [{ topic: '$keys.rotated', payload: { epoch } }],
       };
     }
@@ -676,7 +963,7 @@ export const hpkeEpochs = {
       }
       return {
         ok: true,
-        state: { currentEpoch: cur.currentEpoch, epochs: nextEpochs },
+        state: { ...cur, currentEpoch: cur.currentEpoch, epochs: nextEpochs },
         events: [{ topic: '$keys.granted', payload: { member: input.member } }],
       };
     }
@@ -685,14 +972,40 @@ export const hpkeEpochs = {
   },
   query(state, input) {
     const cur = state || { currentEpoch: -1, epochs: {} };
-    if (input && input.member) {
-      const out = {};
-      for (const [ep, entry] of Object.entries(cur.epochs || {})) {
-        if (entry.boxes && entry.boxes[input.member]) {
-          out[ep] = { epoch: entry.epoch, keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
-        }
+    if (input && typeof input === 'object') {
+      if (typeof input.recoveryFor === 'string') {
+        const vault = cur.recovery ? cur.recovery.vault : null;
+        const shares = cur.recoveryGrants && cur.recoveryGrants[input.recoveryFor] ? cur.recoveryGrants[input.recoveryFor] : {};
+        return { vault, shares };
       }
-      return { currentEpoch: cur.currentEpoch, memberEpochs: out };
+      if (typeof input.guardianShareFor === 'string') {
+        return cur.recovery && cur.recovery.guardianShares ? (cur.recovery.guardianShares[input.guardianShareFor] || null) : null;
+      }
+      if (typeof input.topicRing === 'string') {
+        return cur.topicRings && cur.topicRings[input.topicRing] ? cur.topicRings[input.topicRing] : 'default';
+      }
+      if (typeof input.ring === 'string' && input.ring !== 'default') {
+        const ring = cur.rings && cur.rings[input.ring] ? cur.rings[input.ring] : { currentEpoch: -1, epochs: {} };
+        if (input.member) {
+          const out = {};
+          for (const [ep, entry] of Object.entries(ring.epochs || {})) {
+            if (entry.boxes && entry.boxes[input.member]) {
+              out[ep] = { epoch: entry.epoch, keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
+            }
+          }
+          return { ring: input.ring, currentEpoch: ring.currentEpoch, memberEpochs: out };
+        }
+        return ring;
+      }
+      if (input.member) {
+        const out = {};
+        for (const [ep, entry] of Object.entries(cur.epochs || {})) {
+          if (entry.boxes && entry.boxes[input.member]) {
+            out[ep] = { epoch: entry.epoch, keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
+          }
+        }
+        return { currentEpoch: cur.currentEpoch, memberEpochs: out };
+      }
     }
     return cur;
   },
@@ -907,14 +1220,195 @@ export function recordTableOwners(db, createdTables, droppedTables, owner) {
     db.exec('DELETE FROM _rls_table_owners WHERE name = ?', [name], { mode: 'admin' });
   }
 }
+
+/**
+ * Install automatic row-version stamping triggers on tables that have '_last_op_id TEXT'
+ * (and optional '_updated_at INTEGER') columns. Powers 1-line 'based_on_row' optimistic concurrency.
+ */
+export function stampRowOp(db, tables, options = {}) {
+  const list = Array.isArray(tables) ? tables : [tables];
+  const withUpdatedAt = options && options.updatedAt === true;
+  for (const table of list) {
+    const qTable = quoteIdent(table);
+    const insName = '_rls_stamp_' + table + '_ins';
+    const updName = '_rls_stamp_' + table + '_upd';
+    db.exec('DROP TRIGGER IF EXISTS "' + insName + '"', [], { mode: 'admin' });
+    db.exec('DROP TRIGGER IF EXISTS "' + updName + '"', [], { mode: 'admin' });
+    const setClause = withUpdatedAt
+      ? '_last_op_id = op_id(), _updated_at = op_time()'
+      : '_last_op_id = op_id()';
+    db.exec(
+      'CREATE TRIGGER "' + insName + '" AFTER INSERT ON ' + qTable +
+      ' WHEN NEW._last_op_id IS NOT op_id() BEGIN UPDATE ' + qTable +
+      ' SET ' + setClause + ' WHERE rowid = NEW.rowid; END',
+      [],
+      { mode: 'admin' },
+    );
+    db.exec(
+      'CREATE TRIGGER "' + updName + '" AFTER UPDATE ON ' + qTable +
+      ' WHEN NEW._last_op_id IS NOT op_id() BEGIN UPDATE ' + qTable +
+      ' SET ' + setClause + ' WHERE rowid = NEW.rowid; END',
+      [],
+      { mode: 'admin' },
+    );
+  }
+}
+
+export function ensureConflictsTable(db) {
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS _chronolog_conflicts (' +
+    'op_id TEXT PRIMARY KEY NOT NULL, ' +
+    'author TEXT NOT NULL, ' +
+    'author_time INTEGER NOT NULL, ' +
+    'code TEXT NOT NULL, ' +
+    'detail TEXT, ' +
+    'payload_json TEXT NOT NULL, ' +
+    'resolved INTEGER NOT NULL DEFAULT 0, ' +
+    'resolution TEXT' +
+    ')',
+    [],
+    { mode: 'admin' },
+  );
+}
+
+export function recordConflict(db, tx, failure) {
+  ensureConflictsTable(db);
+  db.exec(
+    'INSERT OR REPLACE INTO _chronolog_conflicts (op_id, author, author_time, code, detail, payload_json, resolved, resolution) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)',
+    [
+      String(tx.opId),
+      String(tx.author),
+      Number(tx.authorTimestampMs || 0),
+      String((failure && failure.code) || 'assumption:failed'),
+      failure && failure.detail ? String(failure.detail) : null,
+      JSON.stringify(tx.payload === undefined ? null : tx.payload),
+    ],
+    { mode: 'admin' },
+  );
+}
+
+export function ensureAuditTable(db) {
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS _chronolog_audit (' +
+    'seq INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+    'table_name TEXT NOT NULL, ' +
+    'row_rowid INTEGER NOT NULL, ' +
+    'action TEXT NOT NULL, ' +
+    'actor TEXT NOT NULL, ' +
+    'op_id TEXT NOT NULL, ' +
+    'op_time INTEGER NOT NULL, ' +
+    'before_json TEXT, ' +
+    'after_json TEXT' +
+    ')',
+    [],
+    { mode: 'admin' },
+  );
+}
+
+/**
+ * Install deterministic AFTER INSERT/UPDATE/DELETE audit triggers on tables, recording
+ * actor(), op_id(), op_time(), and JSON row snapshots into _chronolog_audit.
+ */
+export function enableAuditLog(db, tables) {
+  ensureAuditTable(db);
+  const list = Array.isArray(tables) ? tables : [tables];
+  for (const table of list) {
+    const qTable = quoteIdent(table);
+    const info = db.query('SELECT * FROM ' + qTable + ' LIMIT 0', []);
+    const cols = Array.isArray(info.columns) ? info.columns : [];
+    const quoteCol = c => {
+      if (typeof c !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c)) {
+        throw new Error('RLS_INVALID_COLUMN:' + String(c));
+      }
+      return '"' + c + '"';
+    };
+    const buildJsonObj = prefix => {
+      if (cols.length === 0) return "'{}'";
+      const pairs = cols.map(c => "'" + String(c).replace(/'/g, "''") + "', " + prefix + '.' + quoteCol(c));
+      return 'json_object(' + pairs.join(', ') + ')';
+    };
+    const insTrig = '_rls_audit_' + table + '_ins';
+    const updTrig = '_rls_audit_' + table + '_upd';
+    const delTrig = '_rls_audit_' + table + '_del';
+    db.exec('DROP TRIGGER IF EXISTS "' + insTrig + '"', [], { mode: 'admin' });
+    db.exec('DROP TRIGGER IF EXISTS "' + updTrig + '"', [], { mode: 'admin' });
+    db.exec('DROP TRIGGER IF EXISTS "' + delTrig + '"', [], { mode: 'admin' });
+    db.exec(
+      'CREATE TRIGGER "' + insTrig + '" AFTER INSERT ON ' + qTable +
+      " BEGIN INSERT INTO _chronolog_audit (table_name, row_rowid, action, actor, op_id, op_time, before_json, after_json) VALUES ('" +
+      table + "', NEW.rowid, 'insert', actor(), op_id(), op_time(), NULL, " + buildJsonObj('NEW') + '); END',
+      [],
+      { mode: 'admin' },
+    );
+    db.exec(
+      'CREATE TRIGGER "' + updTrig + '" AFTER UPDATE ON ' + qTable +
+      " BEGIN INSERT INTO _chronolog_audit (table_name, row_rowid, action, actor, op_id, op_time, before_json, after_json) VALUES ('" +
+      table + "', NEW.rowid, 'update', actor(), op_id(), op_time(), " + buildJsonObj('OLD') + ', ' + buildJsonObj('NEW') + '); END',
+      [],
+      { mode: 'admin' },
+    );
+    db.exec(
+      'CREATE TRIGGER "' + delTrig + '" AFTER DELETE ON ' + qTable +
+      " BEGIN INSERT INTO _chronolog_audit (table_name, row_rowid, action, actor, op_id, op_time, before_json, after_json) VALUES ('" +
+      table + "', OLD.rowid, 'delete', actor(), op_id(), op_time(), " + buildJsonObj('OLD') + ', NULL); END',
+      [],
+      { mode: 'admin' },
+    );
+  }
+}
+
+export function queryAuditHistory(db, options = {}) {
+  const hasTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_chronolog_audit'", []);
+  if (hasTable.rows.length === 0) return [];
+  const limit = Number.isSafeInteger(options.limit) && options.limit > 0 ? Math.min(options.limit, 500) : 100;
+  const where = [];
+  const params = [];
+  if (typeof options.table === 'string' && options.table.length > 0) {
+    where.push('table_name = ?');
+    params.push(options.table);
+  }
+  if (typeof options.opId === 'string' && options.opId.length > 0) {
+    where.push('op_id = ?');
+    params.push(options.opId);
+  }
+  const whereSql = where.length > 0 ? ' WHERE ' + where.join(' AND ') : '';
+  params.push(limit);
+  const res = db.query(
+    'SELECT seq, table_name, row_rowid, action, actor, op_id, op_time, before_json, after_json FROM _chronolog_audit' +
+    whereSql + ' ORDER BY seq DESC LIMIT ?',
+    params,
+  );
+  return res.rows.map(r => ({
+    seq: r[0],
+    table: r[1],
+    rowid: r[2],
+    action: r[3],
+    actor: r[4],
+    opId: r[5],
+    opTimeMs: r[6],
+    before: r[7] ? JSON.parse(String(r[7])) : null,
+    after: r[8] ? JSON.parse(String(r[8])) : null,
+  }));
+}
 `.trimStart()
 
 export const STD_SQL_SOURCE = `
 import { openDb } from 'chronolog:sqlite';
-import { applyRls, getOwnedTables, recordTableOwners } from 'chronolog/rls';
+import { applyRls, enableAuditLog, ensureConflictsTable, getOwnedTables, queryAuditHistory, recordConflict, recordTableOwners, stampRowOp } from 'chronolog/rls';
 
-function hasCapability(ctx, capability, actor) {
-  const checked = ctx.query('$permissions', { check: capability, actor });
+function extractTouchedTables(sql) {
+  const out = [];
+  const re = /(?:INSERT\\s+(?:OR\\s+\\w+\\s+)?INTO|UPDATE\\s+(?:OR\\s+\\w+\\s+)?|DELETE\\s+FROM|CREATE\\s+(?:VIRTUAL\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE|DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?)\\s+["']?([A-Za-z_][A-Za-z0-9_]*)["']?/gi;
+  let m;
+  while ((m = re.exec(String(sql))) !== null) {
+    if (m[1] && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+function hasCapability(ctx, capability, actor, extra) {
+  const queryInput = extra ? { check: capability, actor, ...extra } : { check: capability, actor };
+  const checked = ctx.query('$permissions', queryInput);
   if (typeof checked === 'boolean') return checked;
   const perms = ctx.topic('$permissions');
   if (!perms || !Array.isArray(perms.members)) return false;
@@ -945,14 +1439,94 @@ function normalizeStatement(stmt) {
   return null;
 }
 
+function quoteSqlIdent(name) {
+  if (typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error('SQL_INVALID_IDENTIFIER:' + String(name));
+  }
+  return '"' + name + '"';
+}
+
+function buildWhereClause(whereObj) {
+  if (!whereObj || typeof whereObj !== 'object' || Array.isArray(whereObj)) {
+    throw new Error('PRECONDITION_WHERE_INVALID');
+  }
+  const keys = Object.keys(whereObj).sort();
+  if (keys.length === 0) throw new Error('PRECONDITION_WHERE_EMPTY');
+  const clauses = [];
+  const params = [];
+  for (const k of keys) {
+    const val = whereObj[k];
+    if (val === null) {
+      clauses.push(quoteSqlIdent(k) + ' IS NULL');
+    } else {
+      clauses.push(quoteSqlIdent(k) + ' = ?');
+      params.push(val);
+    }
+  }
+  return { clause: clauses.join(' AND '), params };
+}
+
 function checkPreconditions(db, preconditions) {
   if (!Array.isArray(preconditions)) return { ok: true };
   for (let i = 0; i < preconditions.length; i++) {
     const pre = preconditions[i];
-    if (!pre || typeof pre !== 'object' || typeof pre.sql !== 'string') {
-      return { ok: false, code: 'sql:invalid_precondition', detail: 'Precondition ' + i + ' missing sql' };
+    if (!pre || typeof pre !== 'object') {
+      return { ok: false, code: 'sql:invalid_precondition', detail: 'Precondition ' + i + ' invalid' };
     }
     const failCode = typeof pre.code === 'string' && pre.code.length > 0 ? pre.code : 'sql:precondition_failed';
+
+    if (pre.kind === 'based_on_row') {
+      try {
+        const qTable = quoteSqlIdent(pre.table);
+        const { clause, params } = buildWhereClause(pre.where);
+        const res = db.query('SELECT _last_op_id FROM ' + qTable + ' WHERE ' + clause, params);
+        if (pre.lastOpId === null) {
+          if (res.rows.length > 0) {
+            return { ok: false, code: failCode === 'sql:precondition_failed' ? 'sql:row_already_exists' : failCode, detail: 'Expected row to not exist in ' + pre.table };
+          }
+          continue;
+        }
+        if (res.rows.length !== 1) {
+          return { ok: false, code: failCode === 'sql:precondition_failed' ? 'sql:row_missing' : failCode, detail: 'Expected 1 row in ' + pre.table + ', got ' + res.rows.length };
+        }
+        if (res.rows[0][0] !== pre.lastOpId) {
+          return { ok: false, code: failCode === 'sql:precondition_failed' ? 'sql:row_modified' : failCode, detail: 'Row in ' + pre.table + ' modified (expected op ' + pre.lastOpId + ', got ' + String(res.rows[0][0]) + ')' };
+        }
+        continue;
+      } catch (err) {
+        return { ok: false, code: failCode, detail: String(err && err.message ? err.message : err) };
+      }
+    }
+
+    if (pre.kind === 'row_matches') {
+      try {
+        const qTable = quoteSqlIdent(pre.table);
+        const { clause, params } = buildWhereClause(pre.where);
+        const expectObj = pre.expect && typeof pre.expect === 'object' && !Array.isArray(pre.expect) ? pre.expect : null;
+        if (!expectObj) return { ok: false, code: 'sql:invalid_precondition', detail: 'row_matches requires expect object' };
+        const cols = Object.keys(expectObj).sort();
+        if (cols.length === 0) return { ok: false, code: 'sql:invalid_precondition', detail: 'row_matches expect empty' };
+        const sel = cols.map(quoteSqlIdent).join(', ');
+        const res = db.query('SELECT ' + sel + ' FROM ' + qTable + ' WHERE ' + clause, params);
+        if (res.rows.length !== 1) {
+          return { ok: false, code: failCode, detail: 'Expected 1 matching row in ' + pre.table + ', got ' + res.rows.length };
+        }
+        for (let c = 0; c < cols.length; c++) {
+          const actual = res.rows[0][c];
+          const expected = expectObj[cols[c]];
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+            return { ok: false, code: failCode, detail: 'Column ' + cols[c] + ' expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual) };
+          }
+        }
+        continue;
+      } catch (err) {
+        return { ok: false, code: failCode, detail: String(err && err.message ? err.message : err) };
+      }
+    }
+
+    if (typeof pre.sql !== 'string') {
+      return { ok: false, code: 'sql:invalid_precondition', detail: 'Precondition ' + i + ' missing sql' };
+    }
     let res;
     try {
       res = db.query(pre.sql, Array.isArray(pre.params) ? pre.params : []);
@@ -1074,8 +1648,9 @@ export const sqlDatabase = {
 
     const cfg = ctx.config && typeof ctx.config === 'object' ? ctx.config : {};
     const allowPublicWrite = cfg.allowPublicWrite === true;
-    const isAdmin = hasCapability(ctx, 'administrator', tx.author);
-    const isWriter = allowPublicWrite || isAdmin || hasCapability(ctx, 'writer', tx.author);
+    const atMs = Number(tx.authorTimestampMs || 0);
+    const isAdmin = hasCapability(ctx, 'administrator', tx.author, { atMs });
+    const isWriter = allowPublicWrite || isAdmin || hasCapability(ctx, 'writer', tx.author, { atMs });
     const action = typeof input.action === 'string' ? input.action : 'exec';
 
     if (action === 'setConfig') {
@@ -1115,7 +1690,18 @@ export const sqlDatabase = {
       const db = openDb(cur.dbRoot);
       try {
         const preCheck = checkPreconditions(db, input.preconditions);
-        if (!preCheck.ok) return preCheck;
+        if (!preCheck.ok) {
+          if (input.onPreconditionFailed === 'record_conflict') {
+            recordConflict(db, tx, preCheck);
+            const dbRoot = db.commit();
+            return {
+              ok: true,
+              state: { ...cur, dbRoot },
+              events: [{ topic: 'sql.conflict_recorded', payload: { opId: tx.opId, code: preCheck.code, detail: preCheck.detail || null } }],
+            };
+          }
+          return preCheck;
+        }
         for (const rawStmt of statements) {
           const stmt = normalizeStatement(rawStmt);
           if (!stmt) return { ok: false, code: 'sql:invalid_statement' };
@@ -1126,6 +1712,12 @@ export const sqlDatabase = {
           const merged = mergeRlsPolicies(cur.policies, input.policies);
           applyRls(db, merged.toApply);
           nextPolicies = merged.nextPolicies;
+        }
+        if (Array.isArray(input.stampTables) && input.stampTables.length > 0) {
+          stampRowOp(db, input.stampTables, { updatedAt: input.stampUpdatedAt === true });
+        }
+        if (Array.isArray(input.auditTables) && input.auditTables.length > 0) {
+          enableAuditLog(db, input.auditTables);
         }
         const postCheck = checkPreconditions(db, input.postconditions);
         if (!postCheck.ok) return postCheck;
@@ -1146,6 +1738,11 @@ export const sqlDatabase = {
 
     if (action === 'exec') {
       if (!isWriter) return { ok: false, code: 'writer_required' };
+      if (!isAdmin && typeof input.requiredScope === 'string' && input.requiredScope.length > 0) {
+        if (!hasCapability(ctx, 'scope', tx.author, { scope: input.requiredScope, atMs })) {
+          return { ok: false, code: 'scope_required', detail: input.requiredScope };
+        }
+      }
       const mode = input.mode === 'admin' ? 'admin' : 'user';
       if (mode === 'admin' && !isAdmin) return { ok: false, code: 'admin_required' };
       const statements = Array.isArray(input.statements)
@@ -1160,12 +1757,25 @@ export const sqlDatabase = {
       const db = openDb(cur.dbRoot);
       try {
         const preCheck = checkPreconditions(db, input.preconditions);
-        if (!preCheck.ok) return preCheck;
+        if (!preCheck.ok) {
+          if (input.onPreconditionFailed === 'record_conflict') {
+            recordConflict(db, tx, preCheck);
+            const dbRoot = db.commit();
+            return {
+              ok: true,
+              state: { ...cur, dbRoot },
+              events: [{ topic: 'sql.conflict_recorded', payload: { opId: tx.opId, code: preCheck.code, detail: preCheck.detail || null } }],
+            };
+          }
+          return preCheck;
+        }
 
         let owned = mode === 'user' && cur.allowUserDdl ? getOwnedTables(db, tx.author) : null;
+        const touchedSet = new Set();
         for (const rawStmt of statements) {
           const stmt = normalizeStatement(rawStmt);
           if (!stmt) return { ok: false, code: 'sql:invalid_statement' };
+          for (const tbl of extractTouchedTables(stmt.sql)) touchedSet.add(tbl);
           const execOpts = mode === 'admin'
             ? { mode: 'admin' }
             : cur.allowUserDdl
@@ -1184,6 +1794,8 @@ export const sqlDatabase = {
           const res = db.exec(stmt.sql, stmt.params, execOpts);
           const created = (res.createdTables || []).concat(res.createdViews || []);
           const dropped = (res.droppedTables || []).concat(res.droppedViews || []);
+          for (const tbl of created) touchedSet.add(tbl);
+          for (const tbl of dropped) touchedSet.add(tbl);
           if (mode === 'user' && cur.allowUserDdl && (created.length > 0 || dropped.length > 0)) {
             recordTableOwners(db, created, dropped, tx.author);
             owned = getOwnedTables(db, tx.author);
@@ -1194,10 +1806,42 @@ export const sqlDatabase = {
         if (!postCheck.ok) return postCheck;
 
         const dbRoot = db.commit();
+        const touchedTables = Array.from(touchedSet).sort();
+        const baseEvents = normalizeEvents(input.events);
+        const events = touchedTables.length > 0
+          ? baseEvents.concat([{ topic: 'sql.tables_changed', payload: { tables: touchedTables, dbRoot } }])
+          : baseEvents;
         return {
           ok: true,
           state: { ...cur, dbRoot },
-          events: normalizeEvents(input.events),
+          events,
+        };
+      } catch (err) {
+        return { ok: false, code: extractSqlErrorCode(err), detail: String(err && err.message ? err.message : err) };
+      } finally {
+        db.close();
+      }
+    }
+
+    if (action === 'resolveConflict') {
+      if (!isWriter) return { ok: false, code: 'writer_required' };
+      if (typeof input.opId !== 'string' || input.opId.length === 0) return { ok: false, code: 'sql:invalid_conflict_id' };
+      const db = openDb(cur.dbRoot);
+      try {
+        ensureConflictsTable(db);
+        const existing = db.query('SELECT author FROM _chronolog_conflicts WHERE op_id = ?', [input.opId]);
+        if (existing.rows.length === 0) return { ok: false, code: 'sql:conflict_not_found' };
+        if (!isAdmin && existing.rows[0][0] !== tx.author) return { ok: false, code: 'conflict_owner_or_admin_required' };
+        db.exec(
+          'UPDATE _chronolog_conflicts SET resolved = 1, resolution = ? WHERE op_id = ?',
+          [typeof input.resolution === 'string' ? input.resolution : 'resolved', input.opId],
+          { mode: 'admin' },
+        );
+        const dbRoot = db.commit();
+        return {
+          ok: true,
+          state: { ...cur, dbRoot },
+          events: normalizeEvents(input.events).concat([{ topic: 'sql.conflict_resolved', payload: { opId: input.opId } }]),
         };
       } catch (err) {
         return { ok: false, code: extractSqlErrorCode(err), detail: String(err && err.message ? err.message : err) };
@@ -1207,6 +1851,29 @@ export const sqlDatabase = {
     }
 
     return { ok: false, code: 'unknown_action' };
+  },
+
+  onConflict(state, tx, ctx, failure) {
+    const cur = normalizeSqlState(state, ctx.config);
+    const cfg = ctx.config && typeof ctx.config === 'object' ? ctx.config : {};
+    const allowPublicWrite = cfg.allowPublicWrite === true;
+    const isAdmin = hasCapability(ctx, 'administrator', tx.author);
+    const isWriter = allowPublicWrite || isAdmin || hasCapability(ctx, 'writer', tx.author);
+    if (!isWriter) return { ok: false, code: 'writer_required' };
+    const db = openDb(cur.dbRoot);
+    try {
+      recordConflict(db, tx, failure);
+      const dbRoot = db.commit();
+      return {
+        ok: true,
+        state: { ...cur, dbRoot },
+        events: [{ topic: 'sql.conflict_recorded', payload: { opId: tx.opId, code: (failure && failure.code) || 'assumption:failed', detail: (failure && failure.detail) || null } }],
+      };
+    } catch (err) {
+      return { ok: false, code: extractSqlErrorCode(err), detail: String(err && err.message ? err.message : err) };
+    } finally {
+      db.close();
+    }
   },
 
   query(state, input, ctx) {
@@ -1227,6 +1894,41 @@ export const sqlDatabase = {
         return input.format === 'objects'
           ? { columns: res.columns, rows: rowsToObjects(res) }
           : res;
+      } finally {
+        db.close();
+      }
+    }
+    if (kind === 'audit') {
+      const db = openDb(cur.dbRoot);
+      try {
+        return { dbRoot: cur.dbRoot, audit: queryAuditHistory(db, input || {}) };
+      } finally {
+        db.close();
+      }
+    }
+    if (kind === 'conflicts') {
+      const db = openDb(cur.dbRoot);
+      try {
+        const hasTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_chronolog_conflicts'", []);
+        if (hasTable.rows.length === 0) return { dbRoot: cur.dbRoot, conflicts: [] };
+        const unresolvedOnly = input && input.unresolvedOnly !== false;
+        const sql = unresolvedOnly
+          ? 'SELECT op_id, author, author_time, code, detail, payload_json, resolved, resolution FROM _chronolog_conflicts WHERE resolved = 0 ORDER BY author_time DESC'
+          : 'SELECT op_id, author, author_time, code, detail, payload_json, resolved, resolution FROM _chronolog_conflicts ORDER BY author_time DESC';
+        const res = db.query(sql, []);
+        return {
+          dbRoot: cur.dbRoot,
+          conflicts: res.rows.map(r => ({
+            opId: r[0],
+            author: r[1],
+            authorTimeMs: r[2],
+            code: r[3],
+            detail: r[4],
+            payload: JSON.parse(String(r[5] || 'null')),
+            resolved: Boolean(r[6]),
+            resolution: r[7],
+          })),
+        };
       } finally {
         db.close();
       }
@@ -1578,6 +2280,11 @@ export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.
   'chronolog/rls': STD_RLS_SOURCE,
   'chronolog/sql': STD_SQL_SOURCE,
   'chronolog/sqlite-helpers': STD_SQLITE_HELPERS_SOURCE,
+  'chronolog/crdt': STD_CRDT_SOURCE,
+  'chronolog/text': STD_TEXT_SOURCE,
+  'chronolog/ledger': STD_LEDGER_SOURCE,
+  'chronolog/workflow': STD_WORKFLOW_SOURCE,
+  'chronolog/fs': STD_FS_SOURCE,
 })
 
 export const STANDARD_MODULE_IMPORTS: Readonly<Record<string, string>> = Object.freeze(

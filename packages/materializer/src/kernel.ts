@@ -6,6 +6,7 @@ import {
 } from '@chronolog/canonical'
 import {
   assertValidReducersConfig,
+  canonicalJson,
   compareOperationOrder,
   decodeLogGenesis,
   encodeCanonicalJsonCbor,
@@ -17,6 +18,7 @@ import {
   operationIdDigest,
   type LogGenesis,
   type JsonValue,
+  type OperationAssumption,
   type OperationCore,
   type OperationVisibility,
   type ReducersConfig,
@@ -52,6 +54,7 @@ export interface KernelOperationOutcome {
   readonly outcome: 'accepted' | 'rejected'
   readonly rejectionCode: string | null
   readonly rejectionDetail?: string
+  readonly conflictRecorded?: boolean
   readonly events: readonly EmittedKernelEvent[]
 }
 
@@ -63,9 +66,16 @@ export interface KernelRevision {
   readonly orderLength: number
 }
 
+interface RecordedOpOutcome {
+  readonly outcome: 'accepted' | 'rejected'
+  readonly visibility: OperationVisibility
+}
+
 export interface KernelSnapshot {
   readonly topics: Readonly<Record<string, JsonValue>>
   readonly seenOps: ReadonlySet<string>
+  readonly opOutcomes: ReadonlyMap<string, RecordedOpOutcome>
+  readonly topicLastOpIds: ReadonlyMap<string, string>
   readonly seenOpsRoot: string
   readonly historyDigest: string
   readonly stateRoot: string
@@ -87,6 +97,8 @@ export interface KernelMaterializedCache {
 interface KernelMutableState {
   topics: Record<string, JsonValue>
   seenOps: Set<string>
+  opOutcomes: Map<string, RecordedOpOutcome>
+  topicLastOpIds: Map<string, string>
   seenOpsRoot: string
   historyDigest: string
   stateRoot: string
@@ -213,6 +225,8 @@ export class TopicKernel {
   #outcomes: KernelOperationOutcome[] = []
   #topics: Record<string, JsonValue>
   #seenOps = new Set<string>()
+  #opOutcomes = new Map<string, RecordedOpOutcome>()
+  #topicLastOpIds = new Map<string, string>()
   #seenOpsRoot: string
   #historyDigest: string = ZERO_HASH
   #stateRoot: string
@@ -251,6 +265,8 @@ export class TopicKernel {
     return {
       topics: structuredClone(state.topics),
       seenOps: new Set(state.seenOps),
+      opOutcomes: new Map(state.opOutcomes),
+      topicLastOpIds: new Map(state.topicLastOpIds),
       seenOpsRoot: state.seenOpsRoot,
       historyDigest: state.historyDigest,
       stateRoot: state.stateRoot,
@@ -262,6 +278,8 @@ export class TopicKernel {
     return {
       topics: structuredClone(this.#topics),
       seenOps: new Set(this.#seenOps),
+      opOutcomes: new Map(this.#opOutcomes),
+      topicLastOpIds: new Map(this.#topicLastOpIds),
       seenOpsRoot: this.#seenOpsRoot,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
@@ -293,6 +311,14 @@ export class TopicKernel {
 
   topic(name: string): JsonValue | null {
     return Object.hasOwn(this.#topics, name) ? structuredClone(this.#topics[name]!) : null
+  }
+
+  opOutcome(opId: string): 'accepted' | 'rejected' | null {
+    return this.#opOutcomes.get(opId)?.outcome ?? null
+  }
+
+  topicLastOpId(topic: string): string | null {
+    return this.#topicLastOpIds.get(topic) ?? null
   }
 
   get outcomes(): readonly KernelOperationOutcome[] {
@@ -450,6 +476,18 @@ export class TopicKernel {
     }))
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
     this.#seenOps = new Set(decodedSeen)
+    this.#opOutcomes = new Map()
+    this.#topicLastOpIds = new Map()
+    for (let i = 0; i < this.#outcomes.length; i++) {
+      const o = this.#outcomes[i]!
+      const entry = this.#order[i]!
+      this.#opOutcomes.set(o.opId, { outcome: o.outcome, visibility: o.visibility })
+      if (o.outcome === 'accepted') {
+        for (const u of entry.core.updates) {
+          this.#topicLastOpIds.set(u.topic, o.opId)
+        }
+      }
+    }
     this.#seenOpsRoot = cache.seenOpsRoot
     this.#historyDigest = cache.historyDigest
     this.#stateRoot = cache.stateRoot
@@ -487,6 +525,8 @@ export class TopicKernel {
     }
     this.#order = []
     this.#outcomes = []
+    this.#opOutcomes.clear()
+    this.#topicLastOpIds.clear()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(checkpoint.topics)) : structuredClone(checkpoint.topics)
     this.#seenOps = new Set(decodedSeen)
     this.#seenOpsRoot = checkpoint.seenOpsRoot
@@ -545,6 +585,8 @@ export class TopicKernel {
     const work: KernelMutableState = {
       topics: structuredClone(snap.topics),
       seenOps: new Set(snap.seenOps),
+      opOutcomes: new Map(snap.opOutcomes),
+      topicLastOpIds: new Map(snap.topicLastOpIds),
       seenOpsRoot: snap.seenOpsRoot,
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
@@ -584,6 +626,8 @@ export class TopicKernel {
       // readers never observe a rewound or partially materialized kernel.
       this.#topics = work.topics
       this.#seenOps = work.seenOps
+      this.#opOutcomes = work.opOutcomes
+      this.#topicLastOpIds = work.topicLastOpIds
       this.#seenOpsRoot = work.seenOpsRoot
       this.#historyDigest = work.historyDigest
       this.#stateRoot = work.stateRoot
@@ -612,7 +656,12 @@ export class TopicKernel {
     authorHex: string,
   ): Promise<{ readonly kind: 'done'; readonly outcome: KernelOperationOutcome } | { readonly kind: 'missing'; readonly dependency: string }> {
     const core = entry.core
-    const makeRejected = (code: string, detail?: string): { readonly kind: 'done'; readonly outcome: KernelOperationOutcome } => {
+    const makeRejected = (
+      code: string,
+      detail?: string,
+      extra?: { readonly conflictRecorded?: boolean; readonly events?: readonly EmittedKernelEvent[] },
+    ): { readonly kind: 'done'; readonly outcome: KernelOperationOutcome } => {
+      const evs = extra?.events ?? []
       const outcome: KernelOperationOutcome = {
         opId: opIdHex,
         author: authorHex,
@@ -622,9 +671,11 @@ export class TopicKernel {
         outcome: 'rejected',
         rejectionCode: code,
         ...(detail === undefined ? {} : { rejectionDetail: detail }),
-        events: [],
+        ...(extra?.conflictRecorded === true ? { conflictRecorded: true } : {}),
+        events: evs,
       }
-      work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'rejected', code, [])
+      work.opOutcomes.set(opIdHex, { outcome: 'rejected', visibility: core.visibility })
+      work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'rejected', code, evs)
       return { kind: 'done', outcome }
     }
 
@@ -653,11 +704,210 @@ export class TopicKernel {
 
     // Consume idempotency handle (even if reducer rejects, matching Chronolog's contract)
     const casPartition: CasPartition = (this.genesis.privateLog && core.visibility === 'public') ? 'public' : 'private'
+    const isPublicOnPrivate = this.genesis.privateLog && core.visibility === 'public'
+
+    const buildVisibleOutcomes = (): Record<string, 'accepted' | 'rejected'> => {
+      const out: Record<string, 'accepted' | 'rejected'> = {}
+      for (const [k, rec] of work.opOutcomes) {
+        if (isPublicOnPrivate && rec.visibility !== 'public') continue
+        out[k] = rec.outcome
+      }
+      return out
+    }
+    const buildVisibleTopicLastOpIds = (): Record<string, string> => {
+      const out: Record<string, string> = {}
+      for (const [topicName, lastId] of work.topicLastOpIds) {
+        if (isPublicOnPrivate && !isControlTopic(topicName)) continue
+        out[topicName] = lastId
+      }
+      return out
+    }
+
+    // Evaluate signed operation-level assumptions before applying topic updates
+    if (core.assumptions !== undefined && core.assumptions.checks.length > 0) {
+      const visibleTopicsForAssumptions = isPublicOnPrivate ? filterPublicTopics(work.topics) : work.topics
+      const visibleOutcomes = buildVisibleOutcomes()
+      const visibleTopicLastOps = buildVisibleTopicLastOpIds()
+      let failure: { readonly code: string; readonly detail?: string; readonly checkIndex: number } | null = null
+
+      for (let i = 0; i < core.assumptions.checks.length; i++) {
+        const chk: OperationAssumption = core.assumptions.checks[i]!
+        if (chk.kind === 'op_accepted') {
+          const st = Object.hasOwn(visibleOutcomes, chk.opId) ? visibleOutcomes[chk.opId] : undefined
+          if (st === undefined) {
+            failure = { code: 'assumption:missing_op', detail: `Required op ${chk.opId} not present`, checkIndex: i }
+            break
+          }
+          if (st !== 'accepted') {
+            failure = { code: 'assumption:dependency_rejected', detail: `Required op ${chk.opId} was rejected`, checkIndex: i }
+            break
+          }
+        } else if (chk.kind === 'op_rejected') {
+          const st = Object.hasOwn(visibleOutcomes, chk.opId) ? visibleOutcomes[chk.opId] : undefined
+          if (st === undefined) {
+            failure = { code: 'assumption:missing_op', detail: `Referenced op ${chk.opId} not present`, checkIndex: i }
+            break
+          }
+          if (st !== 'rejected') {
+            failure = { code: 'assumption:expected_rejected', detail: `Expected op ${chk.opId} to be rejected`, checkIndex: i }
+            break
+          }
+        } else if (chk.kind === 'topic_revision') {
+          if (isPublicOnPrivate && !isControlTopic(chk.topic)) {
+            failure = { code: 'partition:public_op_private_assumption', detail: `Public op cannot assume private topic ${chk.topic}`, checkIndex: i }
+            break
+          }
+          const actual = Object.hasOwn(visibleTopicLastOps, chk.topic) ? visibleTopicLastOps[chk.topic]! : null
+          if (actual !== chk.lastOpId) {
+            failure = { code: 'assumption:topic_modified', detail: `Topic ${chk.topic} lastOpId expected ${String(chk.lastOpId)}, got ${String(actual)}`, checkIndex: i }
+            break
+          }
+        } else if (chk.kind === 'query_match') {
+          if (isPublicOnPrivate && !isControlTopic(chk.topic)) {
+            failure = { code: 'partition:public_op_private_assumption', detail: `Public op cannot query private topic ${chk.topic}`, checkIndex: i }
+            break
+          }
+          let reducersConfig: ReducersConfig
+          try {
+            reducersConfig = assertValidReducersConfig(work.topics.$reducers)
+          } catch (err) {
+            failure = { code: 'reducers_config_invalid', detail: err instanceof Error ? err.message : String(err), checkIndex: i }
+            break
+          }
+          const binding = reducersConfig.topics[chk.topic]
+          const topicState: JsonValue = Object.hasOwn(visibleTopicsForAssumptions, chk.topic) ? visibleTopicsForAssumptions[chk.topic]! : null
+          let actualValue: JsonValue = topicState
+          if (binding !== undefined) {
+            let qRes
+            try {
+              qRes = await this.sandbox.invoke({
+                imports: reducersConfig.imports,
+                builtins: reducersConfig.runtime.builtins,
+                topicBindings: reducersConfig.topics,
+                moduleSpecifier: binding.module,
+                exportName: binding.export ?? 'default',
+                method: 'query',
+                state: topicState,
+                payload: chk.query,
+                opOutcomes: visibleOutcomes,
+                topicLastOpIds: visibleTopicLastOps,
+                topics: visibleTopicsForAssumptions,
+                ...(binding.config === undefined ? {} : { config: binding.config }),
+                cas: this.cas,
+                casPartition: (isPublicOnPrivate || isControlTopic(chk.topic)) ? 'public' : 'private',
+                readOnly: true,
+                maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
+              })
+            } catch (err) {
+              if (err instanceof MissingDependencyError) {
+                return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
+              }
+              throw err
+            }
+            if (!qRes.ok) {
+              if (qRes.code !== 'vm:missing_method:query') {
+                failure = { code: 'assumption:query_failed', detail: qRes.detail ?? qRes.code, checkIndex: i }
+                break
+              }
+            } else {
+              actualValue = qRes.value
+            }
+          }
+          if (canonicalJson(actualValue) !== canonicalJson(chk.expect)) {
+            failure = { code: 'assumption:query_mismatch', detail: `Query assumption ${i} on ${chk.topic} did not match`, checkIndex: i }
+            break
+          }
+        }
+      }
+
+      if (failure !== null) {
+        work.seenOps.add(dedupKey)
+        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        if (core.assumptions.onFailed === 'record_conflict' && failure.code !== 'partition:public_op_private_assumption') {
+          const primaryUpdate = core.updates[0]!
+          let reducersConfig: ReducersConfig | null = null
+          try { reducersConfig = assertValidReducersConfig(work.topics.$reducers) } catch { /* leave null */ }
+          const binding = reducersConfig?.topics[primaryUpdate.topic]
+          if (reducersConfig !== null && binding !== undefined) {
+            const curTopicState: JsonValue = Object.hasOwn(work.topics, primaryUpdate.topic) ? work.topics[primaryUpdate.topic]! : null
+            let conflictRes
+            try {
+              conflictRes = await this.sandbox.invoke({
+                imports: reducersConfig.imports,
+                builtins: reducersConfig.runtime.builtins,
+                topicBindings: reducersConfig.topics,
+                moduleSpecifier: binding.module,
+                exportName: binding.export ?? 'default',
+                method: 'onConflict',
+                state: curTopicState,
+                payload: primaryUpdate.input,
+                tx: {
+                  opId: opIdHex,
+                  author: authorHex,
+                  authorTimestampMs: Number(core.authorTimestampMs),
+                  operationId: core.operationId,
+                },
+                conflict: failure,
+                opOutcomes: visibleOutcomes,
+                topicLastOpIds: visibleTopicLastOps,
+                topics: visibleTopicsForAssumptions,
+                ...(binding.config === undefined ? {} : { config: binding.config }),
+                cas: this.cas,
+                casPartition,
+                readOnly: false,
+                maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
+              })
+            } catch (err) {
+              if (err instanceof MissingDependencyError) {
+                return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
+              }
+              throw err
+            }
+            if (conflictRes.ok && conflictRes.value !== null && typeof conflictRes.value === 'object' && !Array.isArray(conflictRes.value)) {
+              const outRec = conflictRes.value as Readonly<Record<string, JsonValue>>
+              if (outRec.ok === true) {
+                const nextTopicState: JsonValue = outRec.state === undefined ? null : outRec.state
+                const encodedTopic = encodeCanonicalJsonCbor(nextTopicState)
+                if (encodedTopic.length <= this.genesis.limits.maxTopicStateBytes) {
+                  const conflictEvents: EmittedKernelEvent[] = []
+                  let ord = 0
+                  if (Array.isArray(outRec.events)) {
+                    for (const rawEv of outRec.events as readonly JsonValue[]) {
+                      if (rawEv !== null && typeof rawEv === 'object' && !Array.isArray(rawEv)) {
+                        const ev = rawEv as Readonly<Record<string, JsonValue>>
+                        if (typeof ev.topic === 'string') {
+                          conflictEvents.push({
+                            opId: opIdHex,
+                            eventOrdinal: ord++,
+                            topic: ev.topic,
+                            payload: ev.payload ?? null,
+                            author: authorHex,
+                            operationId: core.operationId,
+                            authorTimestampMs: core.authorTimestampMs,
+                          })
+                        }
+                      }
+                    }
+                  }
+                  work.topics = { ...work.topics, [primaryUpdate.topic]: nextTopicState }
+                  work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+                  return makeRejected(failure.code, failure.detail, { conflictRecorded: true, events: conflictEvents })
+                }
+              }
+            }
+          }
+        }
+        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+        return makeRejected(failure.code, failure.detail)
+      }
+    }
 
     // Copy-on-write working topics map
     const workingTopics: Record<string, JsonValue> = structuredClone(work.topics)
     const emitted: EmittedKernelEvent[] = []
     let ordinal = 0
+    const visibleOutcomesForReduce = buildVisibleOutcomes()
+    const visibleTopicLastOpsForReduce = buildVisibleTopicLastOpIds()
 
     for (const update of core.updates) {
       let reducersConfig: ReducersConfig
@@ -697,6 +947,8 @@ export class TopicKernel {
             authorTimestampMs: Number(core.authorTimestampMs),
             operationId: core.operationId,
           },
+          opOutcomes: visibleOutcomesForReduce,
+          topicLastOpIds: visibleTopicLastOpsForReduce,
           topics: visibleTopics,
           ...(binding.config === undefined ? {} : { config: binding.config }),
           cas: this.cas,
@@ -788,6 +1040,10 @@ export class TopicKernel {
     work.seenOps.add(dedupKey)
     work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
     work.topics = workingTopics
+    work.opOutcomes.set(opIdHex, { outcome: 'accepted', visibility: core.visibility })
+    for (const u of core.updates) {
+      work.topicLastOpIds.set(u.topic, opIdHex)
+    }
     work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
     work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'accepted', null, emitted)
 
@@ -861,6 +1117,96 @@ export class TopicKernel {
       }
     }
     return res.value
+  }
+
+  /**
+   * Time-travel materialization: reconstructs the exact coherent state at a specific opId
+   * or at/before a timestamp without mutating live kernel state.
+   */
+  async materializeAt(
+    target: { readonly opId: string } | { readonly atTimestampMs: bigint },
+  ): Promise<{
+    readonly revision: KernelRevision
+    readonly topics: Readonly<Record<string, JsonValue>>
+    readonly orderLength: number
+    readonly targetOpId: string | null
+  }> {
+    let targetLen = 0
+    if ('opId' in target) {
+      const idx = this.#order.findIndex(item => bytesToHex(item.opId) === target.opId)
+      if (idx < 0) throw new Error(`TIME_TRAVEL_OP_NOT_FOUND:${target.opId}`)
+      targetLen = idx + 1
+    } else {
+      for (let i = 0; i < this.#order.length; i++) {
+        if (this.#order[i]!.core.authorTimestampMs <= target.atTimestampMs) {
+          targetLen = i + 1
+        } else {
+          break
+        }
+      }
+    }
+
+    let snapIndex = 0
+    for (const idx of this.#snapshots.keys()) {
+      if (idx <= targetLen && idx > snapIndex) snapIndex = idx
+    }
+    const snap = this.#snapshots.get(snapIndex)!
+    const work: KernelMutableState = {
+      topics: structuredClone(snap.topics),
+      seenOps: new Set(snap.seenOps),
+      opOutcomes: new Map(snap.opOutcomes),
+      topicLastOpIds: new Map(snap.topicLastOpIds),
+      seenOpsRoot: snap.seenOpsRoot,
+      historyDigest: snap.historyDigest,
+      stateRoot: snap.stateRoot,
+    }
+
+    this.cas.beginBatch()
+    try {
+      for (let i = snapIndex; i < targetLen; i++) {
+        const entry = this.#order[i]!
+        const opIdHex = bytesToHex(entry.opId)
+        const authorHex = bytesToHex(entry.core.author)
+        const step = await this.#applyOne(work, entry, opIdHex, authorHex)
+        if (step.kind === 'missing') {
+          throw new MissingDependencyError(step.dependency.split('/')[1] ?? step.dependency, 'cas')
+        }
+      }
+      // Keep ephemeral replay writes out of persisted CAS (rollbackBatch discards uncommitted staging)
+      this.cas.rollbackBatch()
+    } catch (err) {
+      this.cas.rollbackBatch()
+      throw err
+    }
+
+    const revision: KernelRevision = {
+      stateRoot: work.stateRoot,
+      historyDigest: work.historyDigest,
+      digest: computeRevisionDigest(work.historyDigest, work.stateRoot, 'local', this.#policyContextDigest),
+      view: 'local',
+      orderLength: targetLen,
+    }
+    return {
+      revision,
+      topics: structuredClone(work.topics),
+      orderLength: targetLen,
+      targetOpId: targetLen > 0 ? bytesToHex(this.#order[targetLen - 1]!.opId) : null,
+    }
+  }
+
+  /** Execute a read-only query against a historical revision (by opId or timestamp). */
+  async queryAt(
+    topic: string,
+    input: JsonValue,
+    target: { readonly opId: string } | { readonly atTimestampMs: bigint },
+  ): Promise<{
+    readonly revision: KernelRevision
+    readonly targetOpId: string | null
+    readonly value: JsonValue
+  }> {
+    const snap = await this.materializeAt(target)
+    const value = await this.query(topic, input, snap.topics)
+    return { revision: snap.revision, targetOpId: snap.targetOpId, value }
   }
 
   /** Collect exported command/query descriptions across all bound topics (for MCP & scoped tools). */

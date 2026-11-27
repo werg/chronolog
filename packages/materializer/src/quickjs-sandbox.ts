@@ -89,13 +89,19 @@ export interface QuickJsSandboxOptions {
   readonly watchdogMs?: number
 }
 
+export interface AssumptionFailureInfo {
+  readonly code: string
+  readonly detail?: string
+  readonly checkIndex?: number
+}
+
 export interface ReducerInvocationInput {
   readonly imports: Readonly<Record<string, string>>
   readonly builtins: Readonly<Record<string, string>>
   readonly topicBindings?: Readonly<Record<string, { readonly module: string; readonly export?: string; readonly config?: JsonValue }>>
   readonly moduleSpecifier: string
   readonly exportName: string
-  readonly method: 'reduce' | 'query' | 'describe'
+  readonly method: 'reduce' | 'query' | 'describe' | 'onConflict'
   readonly state: JsonValue
   readonly payload: JsonValue
   readonly tx?: {
@@ -104,6 +110,9 @@ export interface ReducerInvocationInput {
     readonly authorTimestampMs: number
     readonly operationId: string
   }
+  readonly conflict?: AssumptionFailureInfo
+  readonly opOutcomes?: Readonly<Record<string, 'accepted' | 'rejected'>>
+  readonly topicLastOpIds?: Readonly<Record<string, string>>
   readonly topics: Readonly<Record<string, JsonValue>>
   readonly config?: JsonValue
   readonly cas: ContentAddressedStore
@@ -246,7 +255,14 @@ export class QuickJsSandbox {
           const exp = input.exportName === 'default'
             ? `import __target from ${JSON.stringify(input.moduleSpecifier)};`
             : `import { ${input.exportName} as __target } from ${JSON.stringify(input.moduleSpecifier)};`
-          return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const ctx = Object.freeze({ topic(name) { return Object.prototype.hasOwnProperty.call(env.topics, name) ? env.topics[name] : null; }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${input.method === 'reduce' ? 'fn(env.state, env.tx, ctx)' : input.method === 'query' ? 'fn(env.state, env.payload, ctx)' : 'fn(env.state, ctx)'}; return JSON.stringify({ __ok: true, value: out }); };`
+          const callExpr = input.method === 'reduce'
+            ? 'fn(env.state, env.tx, ctx)'
+            : input.method === 'onConflict'
+              ? 'fn(env.state, env.tx, ctx, env.conflict)'
+              : input.method === 'query'
+                ? 'fn(env.state, env.payload, ctx)'
+                : 'fn(env.state, ctx)'
+          return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const ctx = Object.freeze({ topic(name) { return Object.prototype.hasOwnProperty.call(env.topics, name) ? env.topics[name] : null; }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, opOutcome(opId) { const key = String(opId); return env.opOutcomes && Object.prototype.hasOwnProperty.call(env.opOutcomes, key) ? env.opOutcomes[key] : null; }, topicLastOpId(name) { const key = String(name); return env.topicLastOpIds && Object.prototype.hasOwnProperty.call(env.topicLastOpIds, key) ? env.topicLastOpIds[key] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${callExpr}; return JSON.stringify({ __ok: true, value: out }); };`
         }
         const ref = input.imports[moduleName]
         if (ref === undefined) return { error: new Error(`MODULE_NOT_FOUND:${moduleName}`) }
@@ -426,6 +442,9 @@ export class QuickJsSandbox {
           state: input.state,
           payload: input.payload,
           tx: input.tx === undefined ? null : { ...input.tx, payload: input.payload },
+          conflict: input.conflict ?? null,
+          opOutcomes: input.opOutcomes ?? {},
+          topicLastOpIds: input.topicLastOpIds ?? {},
           topics: input.topics,
           config: input.config ?? null,
         })

@@ -1,4 +1,4 @@
-import type { OperationVisibility, TopicUpdate } from '@chronolog/protocol'
+import type { OperationAssumptionsConfig, OperationVisibility, TopicUpdate } from '@chronolog/protocol'
 import type { Signed } from '@chronolog/authority'
 import type { MaterializedRevision, WaitOptions } from './session-types.js'
 
@@ -55,4 +55,8 @@ export interface ApplicationSubmission {
   readonly authorTimestampMs?: bigint
   readonly visibility?: OperationVisibility
   readonly updates: readonly TopicUpdate[]
+  readonly assumptions?: OperationAssumptionsConfig
+  readonly afterOps?: readonly string[]
+  readonly requiresRejected?: readonly string[]
+  readonly onAssumptionFailed?: 'reject' | 'record_conflict'
 }

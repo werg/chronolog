@@ -5,7 +5,19 @@ export interface LiveView<Value> { readonly snapshot: LiveViewSnapshot<Value> | 
 export interface ReactiveReadView { readonly revision: MaterializedRevision; release(): void | Promise<void> }
 export interface ReactiveSession<View extends ReactiveReadView = ApplicationReadView> { readView(): Promise<View>; onChange(listener: (change: InlineApplicationChange) => void): () => void; onStatus(listener: (value: SessionStatus) => void): () => void }
 /** Invalidation rederives a coherent captured snapshot. It never incrementally mirrors arrival events. */
-export function createLiveView<Value, View extends ReactiveReadView = ApplicationReadView>(session: ReactiveSession<View>, derive: (view: View) => Value | Promise<Value>, options: { readonly signal?: AbortSignal; readonly onError?: (error: unknown) => void; readonly onStatus?: (status: SessionStatus) => void } = {}): LiveView<Value> {
+export function createLiveView<Value, View extends ReactiveReadView = ApplicationReadView>(
+  session: ReactiveSession<View>,
+  derive: (view: View) => Value | Promise<Value>,
+  options: {
+    readonly signal?: AbortSignal
+    readonly onError?: (error: unknown) => void
+    readonly onStatus?: (status: SessionStatus) => void
+    /** Optional topic filter: skip re-derivation when a forward materialization only touched unrelated topics. */
+    readonly watchTopics?: readonly string[]
+    /** Optional SQL table filter: skip re-derivation when a forward SQL update only touched unrelated tables. */
+    readonly watchTables?: readonly string[]
+  } = {},
+): LiveView<Value> {
   let snapshot: LiveViewSnapshot<Value> | null = null, status: SessionStatus | null = null, error: unknown = null, closed = false, dirty = false, running = false
   const listeners = new Set<(snapshot: LiveViewSnapshot<Value>) => void>(), waiters = new Set<{ resolve(value: LiveViewSnapshot<Value>): void; reject(error: unknown): void }>()
   let stopChange: () => void = () => {}, stopStatus: () => void = () => {}
@@ -41,8 +53,20 @@ export function createLiveView<Value, View extends ReactiveReadView = Applicatio
       const timer = setTimeout(() => { done(); reject(new Error('LIVE_VIEW_TIMEOUT')) }, timeoutMs); waiters.add(waiter); input.signal?.addEventListener('abort', abort, { once: true }); invalidate()
     })
   }
-  stopChange = session.onChange(invalidate)
-  stopStatus = session.onStatus(value => { status = value; notify(() => options.onStatus?.(value)); if (value.phase === 'closed') close(); else if (value.database === 'ready') invalidate() })
+  const watchTopics = options.watchTopics !== undefined && options.watchTopics.length > 0 ? new Set(options.watchTopics) : null
+  const watchTables = options.watchTables !== undefined && options.watchTables.length > 0 ? new Set(options.watchTables) : null
+  stopChange = session.onChange((change) => {
+    if (snapshot !== null && change.kind === 'materialized') {
+      if (watchTopics !== null && change.changedTopics !== undefined && change.changedTopics.length > 0) {
+        if (!change.changedTopics.some(t => watchTopics.has(t))) return
+      }
+      if (watchTables !== null && change.changedTables !== undefined && change.changedTables.length > 0) {
+        if (!change.changedTables.some(t => watchTables.has(t))) return
+      }
+    }
+    invalidate()
+  })
+  stopStatus = session.onStatus(value => { const prevDb = status?.database; status = value; notify(() => options.onStatus?.(value)); if (value.phase === 'closed') close(); else if (value.database === 'ready' && prevDb !== 'ready') invalidate() })
   options.signal?.addEventListener('abort', close, { once: true }); if (options.signal?.aborted) close(); else invalidate()
   return { get snapshot() { return snapshot }, get status() { return status }, get error() { return error }, ready, refresh() { snapshot = null; return ready() }, subscribe(listener) { if (closed) throw new Error('LIVE_VIEW_CLOSED'); listeners.add(listener); if (snapshot !== null) notify(() => listener(snapshot!)); return () => { listeners.delete(listener) } }, close }
 }

@@ -119,6 +119,17 @@ export interface TopicUpdate {
   readonly input: JsonValue
 }
 
+export type OperationAssumption =
+  | { readonly kind: 'op_accepted'; readonly opId: string }
+  | { readonly kind: 'op_rejected'; readonly opId: string }
+  | { readonly kind: 'topic_revision'; readonly topic: string; readonly lastOpId: string | null }
+  | { readonly kind: 'query_match'; readonly topic: string; readonly query: JsonValue; readonly expect: JsonValue }
+
+export interface OperationAssumptionsConfig {
+  readonly checks: readonly OperationAssumption[]
+  readonly onFailed?: 'reject' | 'record_conflict'
+}
+
 export interface OperationCore {
   readonly version: 1
   readonly logId: Uint8Array
@@ -128,6 +139,7 @@ export interface OperationCore {
   readonly nonce: Uint8Array
   readonly visibility: OperationVisibility
   readonly updates: readonly TopicUpdate[]
+  readonly assumptions?: OperationAssumptionsConfig
 }
 
 export interface SignedOperation {
@@ -143,6 +155,8 @@ export interface EncryptedOperationEnvelope {
   readonly epoch: number
   readonly nonce: Uint8Array
   readonly ciphertext: Uint8Array
+  /** Optional compartment key ring name; omitted when using the default log ring. */
+  readonly ring?: string
 }
 
 export interface OperationOrderKey {
@@ -373,6 +387,46 @@ export function genesisLogId(genesis: LogGenesis | Uint8Array): Uint8Array {
   return hashDomainSync('genesis', bytes)
 }
 
+const MAX_ASSUMPTIONS_PER_OP = 32
+
+export function normalizeAssumptionsConfig(raw: unknown): OperationAssumptionsConfig {
+  protocolInvariant(raw !== null && typeof raw === 'object' && !Array.isArray(raw), 'SCHEMA_INVALID', 'assumptions must be an object')
+  const obj = raw as { readonly checks?: unknown; readonly onFailed?: unknown }
+  protocolInvariant(Array.isArray(obj.checks) && obj.checks.length > 0 && obj.checks.length <= MAX_ASSUMPTIONS_PER_OP, 'SCHEMA_INVALID', 'assumptions.checks must be non-empty bounded array')
+  if (obj.onFailed !== undefined) {
+    protocolInvariant(obj.onFailed === 'reject' || obj.onFailed === 'record_conflict', 'SCHEMA_INVALID', 'Invalid assumptions.onFailed')
+  }
+  const checks: OperationAssumption[] = obj.checks.map((item): OperationAssumption => {
+    protocolInvariant(item !== null && typeof item === 'object' && !Array.isArray(item), 'SCHEMA_INVALID', 'Invalid assumption check')
+    const rec = item as Record<string, unknown>
+    if (rec.kind === 'op_accepted' || rec.kind === 'op_rejected') {
+      protocolInvariant(typeof rec.opId === 'string' && HEX32.test(rec.opId), 'SCHEMA_INVALID', 'Invalid assumption opId')
+      return { kind: rec.kind, opId: rec.opId }
+    }
+    if (rec.kind === 'topic_revision') {
+      protocolInvariant(typeof rec.topic === 'string', 'SCHEMA_INVALID', 'Invalid assumption topic')
+      assertValidTopicName(rec.topic)
+      protocolInvariant(rec.lastOpId === null || (typeof rec.lastOpId === 'string' && HEX32.test(rec.lastOpId)), 'SCHEMA_INVALID', 'Invalid assumption lastOpId')
+      return { kind: 'topic_revision', topic: rec.topic, lastOpId: rec.lastOpId }
+    }
+    if (rec.kind === 'query_match') {
+      protocolInvariant(typeof rec.topic === 'string', 'SCHEMA_INVALID', 'Invalid assumption topic')
+      assertValidTopicName(rec.topic)
+      return {
+        kind: 'query_match',
+        topic: rec.topic,
+        query: normalizeJsonValue(rec.query ?? null),
+        expect: normalizeJsonValue(rec.expect ?? null),
+      }
+    }
+    throw new ProtocolError('SCHEMA_INVALID', `Unknown assumption kind: ${String(rec.kind)}`)
+  })
+  return {
+    checks,
+    ...(obj.onFailed === undefined || obj.onFailed === 'reject' ? {} : { onFailed: obj.onFailed }),
+  }
+}
+
 export function encodeOperationCore(core: OperationCore): Uint8Array {
   protocolInvariant(core.version === 1, 'UNSUPPORTED_VERSION', 'Operation version must be 1')
   protocolInvariant(core.logId instanceof Uint8Array && core.logId.length === 32, 'SCHEMA_INVALID', 'logId must be 32 bytes')
@@ -402,12 +456,20 @@ export function encodeOperationCore(core: OperationCore): Uint8Array {
     [6n, core.visibility === 'public' ? 0n : 1n],
     [7n, encodedUpdates],
   ])
+  if (core.assumptions !== undefined) {
+    const norm = normalizeAssumptionsConfig(core.assumptions)
+    const encodedAssumptions: JsonValue = {
+      checks: norm.checks.map(c => ({ ...c })),
+      ...(norm.onFailed === undefined ? {} : { onFailed: norm.onFailed }),
+    }
+    map.set(8n, jsonToCbor(encodedAssumptions))
+  }
   return encodeCanonicalCbor(map)
 }
 
 export function decodeOperationCore(bytes: Uint8Array): OperationCore {
   const raw = assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
-  protocolInvariant(raw instanceof Map && raw.size === 8, 'SCHEMA_INVALID', 'OperationCore must be an 8-entry map')
+  protocolInvariant(raw instanceof Map && (raw.size === 8 || (raw.size === 9 && raw.has(8n))), 'SCHEMA_INVALID', 'OperationCore must be an 8- or 9-entry map')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'UNSUPPORTED_VERSION', 'Unsupported op version')
   const logId = map.get(1n)
@@ -429,6 +491,8 @@ export function decodeOperationCore(bytes: Uint8Array): OperationCore {
     assertValidTopicName(item[0])
     return { topic: item[0], input: cborToJson(item[1] as CborValue) }
   })
+  const rawAssumptions = map.get(8n)
+  const assumptions = rawAssumptions === undefined ? undefined : normalizeAssumptionsConfig(cborToJson(rawAssumptions))
   const core: OperationCore = {
     version: 1,
     logId: logId.slice(),
@@ -438,6 +502,7 @@ export function decodeOperationCore(bytes: Uint8Array): OperationCore {
     nonce: nonce.slice(),
     visibility: vis === 0n ? 'public' : 'encrypted',
     updates,
+    ...(assumptions === undefined ? {} : { assumptions }),
   }
   protocolInvariant(equalBytes(encodeOperationCore(core), bytes), 'CBOR_NON_CANONICAL', 'OperationCore bytes not canonical')
   return core
@@ -478,12 +543,14 @@ export function decodeSignedOperation(bytes: Uint8Array): SignedOperation {
   return { coreBytes: coreBytes.slice(), signature: signature.slice() }
 }
 
+const RING_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/u
+
 export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8Array {
   protocolInvariant(env.version === 1, 'UNSUPPORTED_VERSION', 'Envelope version must be 1')
   protocolInvariant(env.logId.length === 32 && env.opId.length === 32 && env.author.length === 32, 'SCHEMA_INVALID', 'Invalid envelope 32-byte field')
   protocolInvariant(Number.isSafeInteger(env.epoch) && env.epoch >= 0, 'SCHEMA_INVALID', 'Invalid epoch')
   protocolInvariant(env.nonce.length === 12 && env.ciphertext.length > 0, 'SCHEMA_INVALID', 'Invalid ciphertext/nonce')
-  return encodeCanonicalCbor(new Map<CborMapKey, CborValue>([
+  const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
     [1n, env.logId],
     [2n, env.opId],
@@ -491,12 +558,17 @@ export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8A
     [4n, BigInt(env.epoch)],
     [5n, env.nonce],
     [6n, env.ciphertext],
-  ]))
+  ])
+  if (env.ring !== undefined && env.ring !== 'default') {
+    protocolInvariant(typeof env.ring === 'string' && RING_NAME_RE.test(env.ring), 'SCHEMA_INVALID', 'Invalid envelope ring name')
+    map.set(7n, env.ring)
+  }
+  return encodeCanonicalCbor(map)
 }
 
 export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEnvelope {
   const raw = assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
-  protocolInvariant(raw instanceof Map && raw.size === 7, 'SCHEMA_INVALID', 'Invalid envelope')
+  protocolInvariant(raw instanceof Map && (raw.size === 7 || (raw.size === 8 && raw.has(7n))), 'SCHEMA_INVALID', 'Invalid envelope')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'SCHEMA_INVALID', 'Invalid envelope')
   const logId = map.get(1n), opId = map.get(2n), author = map.get(3n), epoch = map.get(4n), nonce = map.get(5n), ciphertext = map.get(6n)
@@ -510,6 +582,10 @@ export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEn
     'SCHEMA_INVALID',
     'Invalid envelope fields',
   )
+  const rawRing = map.get(7n)
+  if (rawRing !== undefined) {
+    protocolInvariant(typeof rawRing === 'string' && rawRing !== 'default' && RING_NAME_RE.test(rawRing), 'SCHEMA_INVALID', 'Invalid envelope ring')
+  }
   return {
     version: 1,
     logId: logId.slice(),
@@ -518,6 +594,7 @@ export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEn
     epoch: Number(epoch),
     nonce: nonce.slice(),
     ciphertext: ciphertext.slice(),
+    ...(rawRing === undefined ? {} : { ring: rawRing }),
   }
 }
 

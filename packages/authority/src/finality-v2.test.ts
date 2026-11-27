@@ -111,4 +111,44 @@ describe('authority v2 finality schedule & host attestations', () => {
     expect(await verifyHostAttestationV2(att, host.publicKey)).toBe(true)
     expect(await verifyHostAttestationV2(att, '0'.repeat(64))).toBe(false)
   })
+
+  it('detects notary equivocation and produces self-evidencing fraud proofs', async () => {
+    const logId = 'b'.repeat(64)
+    const notary = await createSigningIdentity()
+    const schedule: ScheduledFinalityEntry[] = [
+      { effectiveAfterMs: -1n, policy: { kind: 'none' } },
+      { effectiveAfterMs: 100n, policy: { kind: 'signed-frontier', signer: notary.publicKey } },
+    ]
+    const scope = await policyScopeId(logId, schedule[1]!)
+    const opA = '1'.repeat(64)
+    const opB = '2'.repeat(64)
+
+    const p1 = {
+      logId,
+      policyScopeId: scope,
+      closedThroughMs: 500n,
+      includedSetDigest: computeIncludedSetDigest([opA]),
+      historyDigest: 'c'.repeat(64),
+      stateRoot: 'd'.repeat(64),
+      inclusions: [{ opId: opA, authorTimestampMs: 200n, author: notary.publicKey }],
+    }
+    const pConflicting = {
+      ...p1,
+      includedSetDigest: computeIncludedSetDigest([opB]),
+      inclusions: [{ opId: opB, authorTimestampMs: 200n, author: notary.publicKey }],
+    }
+    const cp1: FinalityCheckpoint = {
+      payload: p1,
+      attestation: { kind: 'signatures', signatures: [await signFinalityCheckpoint(p1, notary)] },
+    }
+    const cpConflicting: FinalityCheckpoint = {
+      payload: pConflicting,
+      attestation: { kind: 'signatures', signatures: [await signFinalityCheckpoint(pConflicting, notary)] },
+    }
+
+    const res = await verifyFinalityV2({ logId, schedule, checkpoints: [cp1, cpConflicting] })
+    expect(res.equivocationProofs).toHaveLength(1)
+    expect(res.equivocationProofs[0]?.signer).toBe(notary.publicKey)
+    expect(res.equivocationProofs[0]?.reason).toBe('conflicting_checkpoint_at_frontier')
+  })
 })

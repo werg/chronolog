@@ -1,5 +1,6 @@
 import { bytesToHex, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
-import { decryptEpochPayload, encryptEpochPayload } from '@chronolog/crypto'
+import { openSqlBranch, type SqlBranch } from './sql-extensions.js'
+import { combineShares, decryptEpochPayload, encryptEpochPayload, splitSecret } from '@chronolog/crypto'
 import {
   computeCasHash,
   ContentAddressedStore,
@@ -21,6 +22,7 @@ import {
   envelopeAad,
   genesisLogId,
   isControlTopic,
+  normalizeAssumptionsConfig,
   normalizeJsonValue,
   operationIdDigest,
   signOperationCore,
@@ -28,6 +30,8 @@ import {
   type EncryptedOperationEnvelope,
   type LogGenesis,
   type JsonValue,
+  type OperationAssumption,
+  type OperationAssumptionsConfig,
   type OperationCore,
   type OperationVisibility,
   type SignedOperation,
@@ -121,11 +125,36 @@ export interface SessionFacts {
 export interface MemberRecord {
   readonly publicKey: string
   readonly wrapKey?: string
+  readonly label?: string
+  readonly scopes?: readonly string[]
+  readonly expiresAtMs?: number
   readonly reader: boolean
   readonly writer: boolean
   readonly administrator: boolean
   readonly publisher: boolean
   readonly finalizer: boolean
+}
+
+export interface GuardianMember {
+  readonly publicKey: string
+  readonly wrapKey: string
+  readonly label?: string
+}
+
+export interface GuardiansConfig {
+  readonly threshold: number
+  readonly members: readonly GuardianMember[]
+}
+
+export interface RecoveryRequestRecord {
+  readonly requestId: string
+  readonly newPublicKey: string
+  readonly newWrapKey: string
+  readonly label: string
+  readonly verificationCode: string
+  readonly approvals: readonly string[]
+  readonly status: 'pending' | 'completed'
+  readonly createdAtMs: number
 }
 
 export interface PermissionsMultisigInfo {
@@ -145,7 +174,18 @@ export interface PermissionsTopicState {
   readonly openWriters?: boolean
   readonly blockedAuthors?: readonly string[]
   readonly admission: { readonly hostKey?: string } | null
+  readonly guardians?: GuardiansConfig | null
+  readonly recoveryRequests?: Readonly<Record<string, RecoveryRequestRecord>>
   readonly multisig?: PermissionsMultisigInfo | null
+}
+
+export interface KeyRingState {
+  readonly currentEpoch: number
+  readonly epochs: Readonly<Record<string, {
+    readonly epoch: number
+    readonly keyCommitment: string
+    readonly boxes: Readonly<Record<string, EpochKeyBox>>
+  }>>
 }
 
 export interface KeysTopicState {
@@ -155,6 +195,13 @@ export interface KeysTopicState {
     readonly keyCommitment: string
     readonly boxes: Readonly<Record<string, EpochKeyBox>>
   }>>
+  readonly rings?: Readonly<Record<string, KeyRingState>>
+  readonly topicRings?: Readonly<Record<string, string>>
+  readonly recovery?: {
+    readonly vault: { readonly nonce: string; readonly ciphertext: string }
+    readonly guardianShares: Readonly<Record<string, { readonly index: number; readonly box: EpochKeyBox }>>
+  }
+  readonly recoveryGrants?: Readonly<Record<string, Readonly<Record<string, { readonly index: number; readonly box: EpochKeyBox }>>>>
 }
 
 export interface CheckpointBootstrapSnapshot {
@@ -297,6 +344,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #retentions = new Map<string, Map<string, RetentionEvidence>>()
   readonly #checkpoints = new Map<string, FinalityCheckpoint>()
   readonly #epochKeys = new Map<number, Uint8Array>()
+  readonly #ringKeys = new Map<string, Map<number, Uint8Array>>()
 
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
   readonly #changeListeners = new Set<(change: ApplicationChange) => void>()
@@ -313,6 +361,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     excludedOpIds: new Set(),
     latestCheckpoint: null,
     verifiedCheckpoints: [],
+    equivocationProofs: [],
   }
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
   #cachedDescription: { stateRoot: string; value: ApplicationDescription } | null = null
@@ -594,6 +643,23 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     check(Number.isSafeInteger(epoch) && epoch >= 0 && key instanceof Uint8Array && key.length === 32, 'EPOCH_KEY_INVALID')
     this.#epochKeys.set(epoch, key.slice())
     await this.#store.put(`${this.#prefix}/epoch-key/${epoch}`, key.slice())
+  }
+
+  async installRingKey(ring: string, epoch: number, key: Uint8Array): Promise<void> {
+    check(typeof ring === 'string' && ring.length > 0 && ring !== 'default', 'RING_NAME_INVALID')
+    check(Number.isSafeInteger(epoch) && epoch >= 0 && key instanceof Uint8Array && key.length === 32, 'EPOCH_KEY_INVALID')
+    let map = this.#ringKeys.get(ring)
+    if (map === undefined) {
+      map = new Map()
+      this.#ringKeys.set(ring, map)
+    }
+    map.set(epoch, key.slice())
+    await this.#store.put(`${this.#prefix}/ring-key/${ring}/${epoch}`, key.slice())
+  }
+
+  ringKey(ring: string, epoch: number): Uint8Array | null {
+    if (ring === 'default') return this.epochKey(epoch)
+    return this.#ringKeys.get(ring)?.get(epoch)?.slice() ?? null
   }
 
   async unlockEpochsFromKeysTopic(wrapPrivateKey: CryptoKey, wrapPublicKeyHex: string): Promise<number> {
@@ -924,6 +990,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32 && !this.#epochKeys.has(ep)) {
           this.#epochKeys.set(ep, entry.value.slice())
         }
+      } else if (rest.startsWith('ring-key/')) {
+        const parts = rest.slice('ring-key/'.length).split('/')
+        const ring = parts[0]
+        const ep = Number(parts[1])
+        if (ring && ring !== 'default' && Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32) {
+          let map = this.#ringKeys.get(ring)
+          if (map === undefined) { map = new Map(); this.#ringKeys.set(ring, map) }
+          if (!map.has(ep)) map.set(ep, entry.value.slice())
+        }
       } else if (rest.startsWith('public-op/')) {
         try {
           const signed = decodeSignedOperation(entry.value)
@@ -1051,6 +1126,28 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         // Wrong wrap key or corrupted lockbox — ignore
       }
     }
+    for (const [ringName, ringState] of Object.entries(keys.rings ?? {})) {
+      const existingMap = this.#ringKeys.get(ringName)
+      for (const entry of Object.values(ringState.epochs ?? {})) {
+        if (existingMap?.has(entry.epoch)) continue
+        const box = entry.boxes?.[this.identity.publicKey]
+        if (box === undefined) continue
+        try {
+          const plainKey = await hpkeOpenEpochKey(
+            this.device.wrapKey.privateKey,
+            this.device.wrapKey.publicKey,
+            box,
+            `${this.logId}:${ringName}`,
+            entry.epoch,
+          )
+          if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
+          await this.installRingKey(ringName, entry.epoch, plainKey)
+          unlockedAny = true
+        } catch {
+          // Not a member of this compartment ring — ignore
+        }
+      }
+    }
     return unlockedAny
   }
 
@@ -1058,7 +1155,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (!this.genesis.privateLog || this.#blindHostMode) return
     for (const entry of this.#encryptedEnvelopes.values()) {
       if (entry.decrypted !== undefined) continue
-      const epochKey = this.#epochKeys.get(entry.envelope.epoch)
+      const ring = entry.envelope.ring ?? 'default'
+      const epochKey = ring === 'default'
+        ? this.#epochKeys.get(entry.envelope.epoch)
+        : this.#ringKeys.get(ring)?.get(entry.envelope.epoch)
       if (epochKey === undefined) continue
       try {
         const aad = envelopeAad(entry.envelope.logId, entry.envelope.opId, entry.envelope.author)
@@ -1320,15 +1420,53 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       this.#materializationError = null
 
       const revised: string[] = []
+      const changedTopicsSet = new Set<string>()
+      const changedTablesSet = new Set<string>()
+      let hasHistoryRevision = false
+      let allNewSqlWithTables = true
+      let sawNewSql = false
       for (const o of localResult.outcomes) {
         const key = `${o.outcome}:${o.rejectionCode ?? ''}`
-        if (prevOutcomes.get(o.opId) !== key) revised.push(o.opId)
+        const prevKey = prevOutcomes.get(o.opId)
+        if (prevKey !== key) {
+          revised.push(o.opId)
+          if (prevKey !== undefined) {
+            hasHistoryRevision = true
+          } else if (o.outcome === 'accepted') {
+            const input = allByOpId.get(o.opId)
+            if (input !== undefined) {
+              for (const u of input.core.updates) changedTopicsSet.add(u.topic)
+            }
+            let opHadTableEvent = false
+            for (const ev of o.events) {
+              if (ev.topic === 'sql.tables_changed' && ev.payload && typeof ev.payload === 'object' && !Array.isArray(ev.payload)) {
+                const tbls = (ev.payload as { readonly tables?: unknown }).tables
+                if (Array.isArray(tbls)) {
+                  opHadTableEvent = true
+                  sawNewSql = true
+                  for (const t of tbls) {
+                    if (typeof t === 'string') changedTablesSet.add(t)
+                  }
+                }
+              }
+            }
+            if (!opHadTableEvent && o.events.some(ev => ev.topic === 'sql.migrated' || ev.topic === 'sql.rls_updated')) {
+              allNewSqlWithTables = false
+            }
+          }
+        }
       }
+      const changedTopics = !hasHistoryRevision && changedTopicsSet.size > 0 ? [...changedTopicsSet].sort() : undefined
+      const changedTables = !hasHistoryRevision && sawNewSql && allNewSqlWithTables && changedTablesSet.size > 0
+        ? [...changedTablesSet].sort()
+        : undefined
       if (this.#lastLocalRevision.digest !== prevDigest) {
         this.#emitChange({
           kind: localResult.pendingDependencies.length > 0 ? 'dependency' : 'materialized',
           revision: this.#lastLocalRevision,
           revisedProposalIds: revised,
+          ...(changedTopics === undefined ? {} : { changedTopics }),
+          ...(changedTables === undefined ? {} : { changedTables }),
         })
       }
       if (this.#lastFinalRevision !== null && this.#lastFinalRevision.digest !== prevFinalDigest) {
@@ -1393,7 +1531,42 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
       }
 
-      const authorTimestampMs = input.authorTimestampMs ?? BigInt(Date.now())
+      const combinedChecks: OperationAssumption[] = [
+        ...(input.assumptions?.checks ?? []),
+        ...(input.afterOps ?? []).map(opId => ({ kind: 'op_accepted' as const, opId })),
+        ...(input.requiresRejected ?? []).map(opId => ({ kind: 'op_rejected' as const, opId })),
+      ]
+      const onFailed = input.assumptions?.onFailed ?? input.onAssumptionFailed
+      const assumptions: OperationAssumptionsConfig | undefined = combinedChecks.length > 0
+        ? normalizeAssumptionsConfig({
+            checks: combinedChecks,
+            ...(onFailed === undefined ? {} : { onFailed }),
+          })
+        : undefined
+
+      let causalFloorMs = 0n
+      if (assumptions !== undefined) {
+        const referencedOpIds = new Set<string>()
+        for (const chk of assumptions.checks) {
+          if (chk.kind === 'op_accepted' || chk.kind === 'op_rejected') referencedOpIds.add(chk.opId)
+          else if (chk.kind === 'topic_revision' && chk.lastOpId !== null) referencedOpIds.add(chk.lastOpId)
+        }
+        for (const refId of referencedOpIds) {
+          const pub = this.#publicOps.get(refId)
+          if (pub !== undefined && pub.core.authorTimestampMs + 1n > causalFloorMs) {
+            causalFloorMs = pub.core.authorTimestampMs + 1n
+          }
+          for (const enc of this.#encryptedEnvelopes.values()) {
+            const dec = enc.decrypted
+            if (dec !== null && dec !== undefined && dec.opId === refId && dec.core.authorTimestampMs + 1n > causalFloorMs) {
+              causalFloorMs = dec.core.authorTimestampMs + 1n
+            }
+          }
+        }
+      }
+
+      const nowMs = BigInt(Date.now())
+      const authorTimestampMs = input.authorTimestampMs ?? (nowMs >= causalFloorMs ? nowMs : causalFloorMs)
       const logIdBytes = hexToBytes(this.logId)
       const authorBytes = hexToBytes(this.identity.publicKey)
       const core: OperationCore = {
@@ -1405,6 +1578,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         nonce: crypto.getRandomValues(new Uint8Array(16)),
         visibility,
         updates: updatesList.map(u => ({ topic: u.topic, input: normalizeJsonValue(u.input) })),
+        ...(assumptions === undefined ? {} : { assumptions }),
       }
 
       const signed = await signOperationCore(core, this.device.identity.privateKey)
@@ -1416,9 +1590,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         await this.#store.put(`${this.#prefix}/public-op/${opIdHex}`, opBytes)
         this.#publicOps.set(opIdHex, { raw: opBytes, signed, core })
       } else {
-        const epoch = this.currentEpoch()
+        const keysState = this.keysState()
+        const ringNames = new Set(updatesList.map(u => keysState.topicRings?.[u.topic] ?? 'default'))
+        check(ringNames.size === 1, 'OPERATION_CROSS_RING_FORBIDDEN')
+        const ring = [...ringNames][0]!
+        const epoch = ring === 'default'
+          ? this.currentEpoch()
+          : (keysState.rings?.[ring]?.currentEpoch ?? -1)
         check(epoch >= 0, 'EPOCH_KEY_REQUIRED')
-        const epochKey = this.#epochKeys.get(epoch)
+        const epochKey = ring === 'default'
+          ? this.#epochKeys.get(epoch)
+          : this.#ringKeys.get(ring)?.get(epoch)
         check(epochKey !== undefined, 'EPOCH_KEY_MISSING')
         const aad = envelopeAad(logIdBytes, opIdBytes, authorBytes)
         const enc = await encryptEpochPayload(epochKey, BigInt(epoch), opBytes, aad)
@@ -1430,6 +1612,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           epoch,
           nonce: enc.nonce,
           ciphertext: enc.ciphertext,
+          ...(ring === 'default' ? {} : { ring }),
         }
         const envBytes = encodeEncryptedEnvelope(env)
         const envDigest = bytesToHex(encryptedEnvelopeDigest(envBytes))
@@ -1609,6 +1792,84 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return schedule.some(entry => entry.policy.kind !== 'none')
   }
 
+  opOutcome(opId: string): 'accepted' | 'rejected' | null {
+    return this.#kernel.opOutcome(opId)
+  }
+
+  topicLastOpId(topic: string): string | null {
+    return this.#kernel.topicLastOpId(topic)
+  }
+
+  /**
+   * Plain-language finality lifecycle status for UI badges (Pending -> Confirmed -> Needs attention):
+   * - 'equivocated': notary/witness equivocation detected (fraud proof available via equivocationProofs())
+   * - 'finalized': op is included in a verified $finality checkpoint
+   * - 'excluded': closed-time frontier passed op's timestamp without including it
+   * - 'synced': op has retention evidence from at least one peer/host
+   * - 'local': authored/stored locally, awaiting sync or finality
+   */
+  finalityStatus(opId: string): 'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local' {
+    if (this.#verifiedFinality.equivocationProofs.length > 0) return 'equivocated'
+    if (this.#verifiedFinality.includedOpIds.has(opId)) return 'finalized'
+    if (this.#verifiedFinality.excludedOpIds.has(opId)) return 'excluded'
+    const ret = this.#retentions.get(opId)
+    if (ret !== undefined && ret.size > 0) return 'synced'
+    return 'local'
+  }
+
+  equivocationProofs() {
+    return this.#verifiedFinality.equivocationProofs
+  }
+
+  /**
+   * Time-travel query: run any topic query against a historical opId or timestamp
+   * without mutating live session state.
+   */
+  async queryAsOf(
+    topic: string,
+    input: JsonValue = null,
+    target: { readonly opId: string } | { readonly atTimestampMs: bigint },
+  ): Promise<{
+    readonly applicationId: string
+    readonly revision: MaterializedRevision
+    readonly targetOpId: string | null
+    readonly value: JsonValue
+  }> {
+    const res = await this.#kernel.queryAt(topic, input, target)
+    return {
+      applicationId: this.applicationId,
+      revision: toMaterializedRevision(res.revision),
+      targetOpId: res.targetOpId,
+      value: res.value,
+    }
+  }
+
+  /**
+   * Open a zero-copy O(1) SQLite branch over the current dbRoot of a chronolog/sql topic.
+   * Run speculative queries/mutations, compute exact row-level diffs, and optionally export a guarded proposal.
+   */
+  async forkSql(topic: string): Promise<SqlBranch> {
+    const topicState = this.#kernel.topic(topic) as { readonly dbRoot?: unknown } | null
+    const baseRoot = topicState !== null && typeof topicState === 'object' && typeof topicState.dbRoot === 'string'
+      ? topicState.dbRoot
+      : null
+    let driver = this.#sqliteDriver
+    if (driver === undefined) {
+      const { createSqliteCasDriver } = await import('chronolog-db')
+      driver = await createSqliteCasDriver()
+      this.#sqliteDriver = driver
+    }
+    const partition: CasPartition = (this.genesis.privateLog && isControlTopic(topic)) ? 'public' : 'private'
+    return openSqlBranch({
+      topic,
+      baseRoot,
+      cas: this.cas,
+      partition,
+      driver,
+      actor: this.identity.publicKey,
+    })
+  }
+
   /** Capture a coherent read snapshot for reactive views, queries, and event pagination. */
   async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<ApplicationReadView> {
     const viewKind = options.view ?? 'local'
@@ -1619,6 +1880,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const revision = kernel === null ? this.revision(viewKind) : toMaterializedRevision(kernel.revision(viewKind))
     const topicsSnap = kernel === null ? {} : kernel.topics
     const outcomesSnap = kernel === null ? [] : kernel.outcomes
+    const opOutcomeSnap = new Map<string, 'accepted' | 'rejected'>()
+    for (const o of outcomesSnap) opOutcomeSnap.set(o.opId, o.outcome)
     const events: ApplicationEvent[] = []
     for (const outcome of outcomesSnap) {
       if (outcome.outcome !== 'accepted') continue
@@ -1638,6 +1901,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         checkLive()
         if (kernel === null) return Object.hasOwn(topicsSnap, topic) ? structuredClone(topicsSnap[topic]!) : null
         return kernel.query(topic, input ?? null, topicsSnap)
+      },
+      opOutcome(opId: string): 'accepted' | 'rejected' | null {
+        checkLive()
+        return opOutcomeSnap.get(opId) ?? null
+      },
+      topicLastOpId(topic: string): string | null {
+        checkLive()
+        return kernel === null ? null : kernel.topicLastOpId(topic)
       },
       readEvents(eventOptions: ApplicationEventOptions = {}): ApplicationEventBatch {
         checkLive()
@@ -1671,6 +1942,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly wrapKey?: string
     readonly label?: string
     readonly subject?: string
+    readonly scopes?: readonly string[]
+    readonly expiresAtMs?: number
     readonly reader?: boolean
     readonly writer?: boolean
     readonly administrator?: boolean
@@ -1686,6 +1959,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       ...(options.wrapKey ? { wrapKey: options.wrapKey } : {}),
       ...(options.label ? { label: options.label } : {}),
       ...(options.subject ? { subject: options.subject } : {}),
+      ...(options.scopes && options.scopes.length > 0 ? { scopes: [...options.scopes] } : {}),
+      ...(options.expiresAtMs !== undefined ? { expiresAtMs: options.expiresAtMs } : {}),
       reader: options.reader ?? true,
       writer: options.writer ?? true,
       administrator: options.administrator ?? false,
@@ -1789,6 +2064,273 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }],
     })
     return { epoch: nextEpoch, operation }
+  }
+
+  /**
+   * Create or rotate a named compartment key ring in $keys (e.g. 'admins' or 'personal:<pk>'),
+   * sealing its epoch key strictly to the chosen members and binding the specified topics to it.
+   */
+  async createCompartment(
+    ringName: string,
+    options: {
+      readonly topics: readonly string[]
+      readonly members: readonly { readonly publicKey: string; readonly wrapKey: string }[]
+      readonly operationId?: string
+      readonly authorTimestampMs?: bigint
+    },
+  ): Promise<{ readonly ring: string; readonly epoch: number; readonly operation: ApplicationOperation }> {
+    check(this.genesis.privateLog, 'COMPARTMENT_PRIVATE_LOG_ONLY')
+    check(typeof ringName === 'string' && ringName.length > 0 && ringName !== 'default', 'RING_NAME_INVALID')
+    const keysState = this.keysState()
+    const prevRing = keysState.rings?.[ringName]
+    const nextEpoch = (prevRing?.currentEpoch ?? -1) + 1
+    const key = crypto.getRandomValues(new Uint8Array(32))
+    await this.installRingKey(ringName, nextEpoch, key)
+
+    const boxes: Record<string, EpochKeyBox> = {}
+    for (const m of options.members) {
+      boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, `${this.logId}:${ringName}`, nextEpoch)
+    }
+
+    const operation = await this.submit({
+      visibility: 'public',
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$keys',
+        input: {
+          action: 'rotateRingEpoch',
+          ring: ringName,
+          epoch: nextEpoch,
+          keyCommitment: epochKeyCommitmentV2(key),
+          boxes: boxes as unknown as JsonValue,
+          topics: [...options.topics],
+        },
+      }],
+    })
+    return { ring: ringName, epoch: nextEpoch, operation }
+  }
+
+  /**
+   * Configure threshold Social Recovery ("Trusted Backup Contacts"):
+   * - Splits a fresh 32-byte recoveryKey into N Shamir shares (threshold M).
+   * - Encrypts all retained epoch + compartment keys inside a recovery vault under recoveryKey.
+   * - HPKE-seals each Shamir share strictly to its guardian's wrapKey (guardians cannot read app data).
+   * - Atomically updates $permissions.guardians and $keys.recovery.
+   */
+  async setupSocialRecovery(options: {
+    readonly guardians: readonly GuardianMember[]
+    readonly threshold: number
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  }): Promise<ApplicationOperation> {
+    check(options.guardians.length > 0, 'GUARDIANS_REQUIRED')
+    check(Number.isSafeInteger(options.threshold) && options.threshold >= 1 && options.threshold <= options.guardians.length, 'INVALID_GUARDIAN_THRESHOLD')
+    const updates: TopicUpdate[] = [{
+      topic: '$permissions',
+      input: {
+        action: 'setGuardians',
+        guardians: {
+          threshold: options.threshold,
+          members: options.guardians.map(g => ({
+            publicKey: g.publicKey,
+            wrapKey: g.wrapKey,
+            ...(g.label ? { label: g.label } : {}),
+          })),
+        },
+      },
+    }]
+
+    if (this.genesis.privateLog) {
+      const recoveryKey = crypto.getRandomValues(new Uint8Array(32))
+      const vaultPayload: {
+        readonly epochs: Record<string, string>
+        readonly rings: Record<string, Record<string, string>>
+      } = { epochs: {}, rings: {} }
+      for (const [ep, key] of this.#epochKeys) {
+        vaultPayload.epochs[String(ep)] = bytesToHex(key)
+      }
+      for (const [ring, map] of this.#ringKeys) {
+        const ringObj: Record<string, string> = {}
+        for (const [ep, key] of map) ringObj[String(ep)] = bytesToHex(key)
+        vaultPayload.rings[ring] = ringObj
+      }
+      const aad = utf8(`chronolog-recovery-vault:${this.logId}`)
+      const encVault = await encryptEpochPayload(recoveryKey, 0n, utf8(JSON.stringify(vaultPayload)), aad)
+
+      const shares = splitSecret(recoveryKey, options.threshold, options.guardians.length)
+      const guardianShares: Record<string, { readonly index: number; readonly box: EpochKeyBox }> = {}
+      for (let i = 0; i < options.guardians.length; i++) {
+        const g = options.guardians[i]!
+        const share = shares[i]!
+        const box = await hpkeSealEpochKey(g.wrapKey, share.bytes, `${this.logId}:recovery-share`, share.index)
+        guardianShares[g.publicKey] = { index: share.index, box }
+      }
+      updates.push({
+        topic: '$keys',
+        input: {
+          action: 'setRecoveryVault',
+          vault: {
+            nonce: bytesToHex(encVault.nonce),
+            ciphertext: bytesToHex(encVault.ciphertext),
+          },
+          guardianShares: guardianShares as unknown as JsonValue,
+        },
+      })
+    }
+
+    return this.submit({
+      visibility: 'public',
+      updates,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+    })
+  }
+
+  /** Fresh device requests recovery from configured guardians with a short human-readable match code. */
+  async requestSocialRecovery(options: {
+    readonly requestId?: string
+    readonly label?: string
+    readonly verificationCode?: string
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  } = {}): Promise<{ readonly requestId: string; readonly verificationCode: string; readonly operation: ApplicationOperation }> {
+    const requestId = options.requestId ?? crypto.randomUUID()
+    const codeBytes = crypto.getRandomValues(new Uint8Array(3))
+    const codeNum = ((codeBytes[0]! << 16) | (codeBytes[1]! << 8) | codeBytes[2]!) % 1_000_000
+    const verificationCode = options.verificationCode ?? String(codeNum).padStart(6, '0')
+    const operation = await this.submit({
+      visibility: 'public',
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$permissions',
+        input: {
+          action: 'requestRecovery',
+          requestId,
+          newPublicKey: this.identity.publicKey,
+          newWrapKey: this.device.wrapKey.publicKey,
+          label: options.label ?? 'Recovered device',
+          verificationCode,
+        },
+      }],
+    })
+    return { requestId, verificationCode, operation }
+  }
+
+  /** Guardian approves a pending recovery request and re-seals their Shamir share to the recovering device. */
+  async approveSocialRecovery(
+    requestId: string,
+    options: { readonly operationId?: string; readonly authorTimestampMs?: bigint } = {},
+  ): Promise<ApplicationOperation> {
+    const permInfo = (await this.#kernel.query('$permissions', { guardians: true })) as {
+      readonly recoveryRequests?: Readonly<Record<string, RecoveryRequestRecord>>
+    }
+    const req = permInfo?.recoveryRequests?.[requestId]
+    check(req !== undefined && req.status === 'pending', 'RECOVERY_REQUEST_NOT_FOUND')
+
+    const updates: TopicUpdate[] = [{
+      topic: '$permissions',
+      input: { action: 'approveRecovery', requestId },
+    }]
+
+    if (this.genesis.privateLog) {
+      const myShare = (await this.#kernel.query('$keys', { guardianShareFor: this.identity.publicKey })) as {
+        readonly index: number
+        readonly box: EpochKeyBox
+      } | null
+      check(myShare !== null, 'GUARDIAN_SHARE_MISSING')
+      const shareBytes = await hpkeOpenEpochKey(
+        this.device.wrapKey.privateKey,
+        this.device.wrapKey.publicKey,
+        myShare.box,
+        `${this.logId}:recovery-share`,
+        myShare.index,
+      )
+      const resealedBox = await hpkeSealEpochKey(
+        req.newWrapKey,
+        shareBytes,
+        `${this.logId}:recovery-grant`,
+        myShare.index,
+      )
+      updates.push({
+        topic: '$keys',
+        input: {
+          action: 'submitRecoveryShare',
+          member: req.newPublicKey,
+          index: myShare.index,
+          box: resealedBox as unknown as JsonValue,
+        },
+      })
+    }
+
+    return this.submit({
+      visibility: 'public',
+      updates,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+    })
+  }
+
+  /**
+   * Called by the recovering device once threshold guardians have approved:
+   * unseals guardian shares, reconstructs recoveryKey via Shamir interpolation,
+   * decrypts the recovery vault, installs all epoch + compartment keys, and rematerializes.
+   */
+  async completeSocialRecovery(): Promise<{ readonly restoredEpochs: number; readonly restoredRings: number }> {
+    return this.#serial(async () => {
+      if (!this.genesis.privateLog) return { restoredEpochs: 0, restoredRings: 0 }
+      const permInfo = (await this.#kernel.query('$permissions', { guardians: true })) as {
+        readonly guardians?: GuardiansConfig | null
+      }
+      const threshold = permInfo?.guardians?.threshold ?? 1
+      const rec = (await this.#kernel.query('$keys', { recoveryFor: this.identity.publicKey })) as unknown as {
+        readonly vault: { readonly nonce: string; readonly ciphertext: string } | null
+        readonly shares: Readonly<Record<string, { readonly index: number; readonly box: EpochKeyBox }>>
+      }
+      check(rec?.vault !== null && rec?.vault !== undefined, 'RECOVERY_VAULT_MISSING')
+      const shareEntries = Object.values(rec.shares ?? {})
+      check(shareEntries.length >= threshold, 'INSUFFICIENT_RECOVERY_SHARES')
+
+      const decodedShares: { index: number; bytes: Uint8Array }[] = []
+      for (const entry of shareEntries.slice(0, threshold)) {
+        const bytes = await hpkeOpenEpochKey(
+          this.device.wrapKey.privateKey,
+          this.device.wrapKey.publicKey,
+          entry.box,
+          `${this.logId}:recovery-grant`,
+          entry.index,
+        )
+        decodedShares.push({ index: entry.index, bytes })
+      }
+      const recoveryKey = combineShares(decodedShares)
+      const aad = utf8(`chronolog-recovery-vault:${this.logId}`)
+      const plainBytes = await decryptEpochPayload(recoveryKey, {
+        epoch: 0n,
+        nonce: hexToBytes(rec.vault.nonce),
+        ciphertext: hexToBytes(rec.vault.ciphertext),
+      }, aad)
+      const parsed = JSON.parse(new TextDecoder().decode(plainBytes)) as {
+        readonly epochs: Record<string, string>
+        readonly rings: Record<string, Record<string, string>>
+      }
+
+      let restoredEpochs = 0
+      for (const [epStr, hexKey] of Object.entries(parsed.epochs ?? {})) {
+        await this.installEpochKey(Number(epStr), hexToBytes(hexKey))
+        restoredEpochs++
+      }
+      let restoredRings = 0
+      for (const [ring, eps] of Object.entries(parsed.rings ?? {})) {
+        for (const [epStr, hexKey] of Object.entries(eps)) {
+          await this.installRingKey(ring, Number(epStr), hexToBytes(hexKey))
+        }
+        restoredRings++
+      }
+
+      await this.#rematerialize()
+      return { restoredEpochs, restoredRings }
+    })
   }
 
   async removeMember(publicKey: string, options: {

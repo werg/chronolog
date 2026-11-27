@@ -1,5 +1,5 @@
 import { bytesToHex, decodeUtf8, hexToBytes, utf8 } from '@chronolog/canonical'
-import type { CasPartition, ContentAddressedStore } from '@chronolog/records'
+import { computeCasHash, type CasNode, type CasPartition, type ContentAddressedStore } from '@chronolog/records'
 
 export const MERKLE_PAGE_SIZE = 4096
 export const MERKLE_FANOUT = 64
@@ -276,4 +276,163 @@ export class MerklePageFile {
     this.#mutated = false
     return nextRoot
   }
+}
+
+export interface MerkleDbDiff {
+  readonly baseRoot: string | null
+  readonly nextRoot: string | null
+  readonly baseByteLength: number
+  readonly nextByteLength: number
+  readonly addedPages: readonly number[]
+  readonly removedPages: readonly number[]
+  readonly modifiedPages: readonly number[]
+  readonly totalChangedPages: number
+}
+
+/**
+ * Walk two 64-way Merkle page trees in lockstep, skipping identical subtree hashes in O(1),
+ * and return the exact list of added, removed, and modified 4 KiB SQLite page indices.
+ */
+export function diffMerkleDbRoots(
+  cas: Pick<ContentAddressedStore, 'getSync'>,
+  baseRoot: string | null,
+  nextRoot: string | null,
+  partition: CasPartition | 'any' = 'any',
+): MerkleDbDiff {
+  if (baseRoot === nextRoot) {
+    let byteLength = 0
+    if (baseRoot !== null) {
+      const node = cas.getSync(baseRoot, partition)
+      if (node !== null) byteLength = (JSON.parse(decodeUtf8(node.bytes)) as RootManifest).byteLength
+    }
+    return {
+      baseRoot,
+      nextRoot,
+      baseByteLength: byteLength,
+      nextByteLength: byteLength,
+      addedPages: [],
+      removedPages: [],
+      modifiedPages: [],
+      totalChangedPages: 0,
+    }
+  }
+
+  const readManifest = (root: string | null): RootManifest => {
+    if (root === null) return { v: 1, pageSize: MERKLE_PAGE_SIZE, byteLength: 0, depth: 0, treeRoot: null }
+    const node = cas.getSync(root, partition)
+    if (node === null) throw new Error(`SQLITE_CAS_MISSING_ROOT:${root}`)
+    const parsed = JSON.parse(decodeUtf8(node.bytes)) as RootManifest
+    if (parsed.v !== 1 || parsed.pageSize !== MERKLE_PAGE_SIZE) throw new Error('SQLITE_CAS_MANIFEST_INVALID')
+    return parsed
+  }
+
+  const baseMan = readManifest(baseRoot)
+  const nextMan = readManifest(nextRoot)
+  const basePages = Math.ceil(baseMan.byteLength / MERKLE_PAGE_SIZE)
+  const nextPages = Math.ceil(nextMan.byteLength / MERKLE_PAGE_SIZE)
+
+  // Fast subtree walk when depths match; lift virtual tree if depths differ
+  const maxDepth = Math.max(baseMan.depth, nextMan.depth)
+  const addedPages: number[] = []
+  const removedPages: number[] = []
+  const modifiedPages: number[] = []
+
+  const getChildHash = (nodeHash: string | null, depth: number, actualDepth: number, slot: number): string | null => {
+    if (nodeHash === null) return null
+    if (depth > actualDepth) {
+      return slot === 0 ? nodeHash : null
+    }
+    const node = cas.getSync(nodeHash, partition)
+    if (node === null) throw new Error(`SQLITE_CAS_MISSING_NODE:${nodeHash}`)
+    const hex = bytesToHex(node.bytes.subarray(slot * HASH_BYTES, (slot + 1) * HASH_BYTES))
+    return hex === ZERO_HASH ? null : hex
+  }
+
+  const walk = (
+    hashA: string | null,
+    depthA: number,
+    hashB: string | null,
+    depthB: number,
+    depth: number,
+    baseIdx: number,
+  ): void => {
+    if (hashA === hashB && depthA === depthB) return
+    if (hashA === null && hashB === null) return
+    if (depth === 0) {
+      const inA = baseIdx < basePages && hashA !== null
+      const inB = baseIdx < nextPages && hashB !== null
+      if (!inA && inB) addedPages.push(baseIdx)
+      else if (inA && !inB) removedPages.push(baseIdx)
+      else if (inA && inB && hashA !== hashB) modifiedPages.push(baseIdx)
+      return
+    }
+    const stride = MERKLE_FANOUT ** (depth - 1)
+    const maxPages = Math.max(basePages, nextPages)
+    for (let slot = 0; slot < MERKLE_FANOUT; slot++) {
+      const childBase = baseIdx + slot * stride
+      if (childBase >= maxPages) break
+      const childA = getChildHash(hashA, depth, depthA, slot)
+      const childB = getChildHash(hashB, depth, depthB, slot)
+      const nextDepthA = depth > depthA ? depthA : depth - 1
+      const nextDepthB = depth > depthB ? depthB : depth - 1
+      walk(childA, nextDepthA, childB, nextDepthB, depth - 1, childBase)
+    }
+  }
+
+  walk(baseMan.treeRoot, baseMan.depth, nextMan.treeRoot, nextMan.depth, maxDepth, 0)
+  return {
+    baseRoot,
+    nextRoot,
+    baseByteLength: baseMan.byteLength,
+    nextByteLength: nextMan.byteLength,
+    addedPages,
+    removedPages,
+    modifiedPages,
+    totalChangedPages: addedPages.length + removedPages.length + modifiedPages.length,
+  }
+}
+
+/**
+ * Create a zero-copy in-memory overlay over an existing ContentAddressedStore.
+ * Reads fall through to baseCas; writes stay strictly inside the ephemeral overlay Map
+ * so speculative SQL branches never mutate persisted CAS storage.
+ */
+export function createOverlayCas(baseCas: ContentAddressedStore): ContentAddressedStore {
+  const overlay = new Map<string, { readonly node: CasNode; readonly partitions: Set<CasPartition> }>()
+  const putSync = (bytes: Uint8Array, links: readonly string[] = [], partition: CasPartition = 'private'): string => {
+    const unique = [...new Set(links)].sort()
+    const hash = computeCasHash(bytes, unique)
+    const existing = overlay.get(hash)
+    if (existing !== undefined) {
+      existing.partitions.add(partition)
+    } else {
+      overlay.set(hash, { node: { bytes: bytes.slice(), links: unique }, partitions: new Set([partition]) })
+    }
+    return hash
+  }
+  return {
+    getSync(hash: string, partition: CasPartition | 'any' = 'any'): CasNode | null {
+      const local = overlay.get(hash)
+      if (local !== undefined && (partition === 'any' || local.partitions.has(partition))) {
+        return local.node
+      }
+      return baseCas.getSync(hash, partition)
+    },
+    async get(hash: string, partition: CasPartition | 'any' = 'any'): Promise<CasNode | null> {
+      const local = overlay.get(hash)
+      if (local !== undefined && (partition === 'any' || local.partitions.has(partition))) {
+        return local.node
+      }
+      return baseCas.get(hash, partition)
+    },
+    hasSync(hash: string, partition: CasPartition | 'any' = 'any'): boolean {
+      const local = overlay.get(hash)
+      if (local !== undefined && (partition === 'any' || local.partitions.has(partition))) return true
+      return baseCas.hasSync(hash, partition)
+    },
+    putSync,
+    async put(bytes: Uint8Array, links: readonly string[] = [], partition: CasPartition = 'private'): Promise<string> {
+      return putSync(bytes, links, partition)
+    },
+  } as unknown as ContentAddressedStore
 }

@@ -1,4 +1,4 @@
-import type { EventPayload, JsonValue } from '@chronolog/protocol'
+import type { EventPayload, JsonValue, OperationAssumptionsConfig } from '@chronolog/protocol'
 import type { SqliteQueryResult } from '@chronolog/materializer'
 
 export interface MaterializedRevision {
@@ -41,6 +41,8 @@ export interface ApplicationReadView {
   readonly revision: MaterializedRevision
   topic(name: string): JsonValue | null
   query(topic: string, input?: JsonValue): Promise<JsonValue>
+  opOutcome?(opId: string): 'accepted' | 'rejected' | null
+  topicLastOpId?(topic: string): string | null
   readEvents(options?: ApplicationEventOptions): ApplicationEventBatch
   release(): void
 }
@@ -49,12 +51,22 @@ export interface CommandOptions {
   readonly operationId?: string
   readonly authorTimestampMs?: bigint
   readonly visibility?: 'public' | 'encrypted'
+  /** Explicit signed causal and/or state assumptions evaluated deterministically before applying updates. */
+  readonly assumptions?: OperationAssumptionsConfig
+  /** Shorthand for op_accepted assumptions (automatically clamps authorTimestampMs past referenced ops). */
+  readonly afterOps?: readonly string[]
+  /** Shorthand for op_rejected assumptions (deterministic fallback / compensating action). */
+  readonly requiresRejected?: readonly string[]
+  /** Behavior when an assumption fails: 'reject' (default) or 'record_conflict'. */
+  readonly onAssumptionFailed?: 'reject' | 'record_conflict'
 }
 
 export interface ApplicationChange {
   readonly kind: 'materialized' | 'finalized' | 'dependency'
   readonly revision: MaterializedRevision
   readonly revisedProposalIds: readonly string[]
+  readonly changedTopics?: readonly string[]
+  readonly changedTables?: readonly string[]
 }
 
 export interface SessionStatus {
