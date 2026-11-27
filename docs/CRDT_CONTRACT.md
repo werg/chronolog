@@ -1,4 +1,4 @@
-# Chronolog v2 CRDT Contract
+# Chronolog CRDT Contract
 
 ## 1. Core Model: Flat Timestamp-Ordered Operation Set
 

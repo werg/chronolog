@@ -1,6 +1,6 @@
 # Browser record storage
 
-Browser events-only sessions keep protocol metadata separate from durable application records and support OPFS or IndexedDB behind one immutable per-device backend pin. SQL sessions use a separate DoltLite WASM + OPFS SAH-pool VFS.
+Browser sessions keep protocol metadata separate from durable application records and support OPFS or IndexedDB behind one immutable per-device backend pin. Both event topics and `chronolog-db` (SQLite-CAS) topics persist their Merkle-paged CAS chunks inside that same pinned store.
 
 ## Lazy activation and backend pinning
 

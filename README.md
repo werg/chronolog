@@ -228,7 +228,7 @@ await (await session.submit({
         { sql: 'SELECT COUNT(*) = 0 FROM tasks WHERE id = ?', params: ['t1'], code: 'already_exists' },
       ],
       statements: [
-        { sql: 'INSERT INTO tasks (id, owner, title) VALUES (?, actor(), ?)', params: ['t1', 'Ship Chronolog v2'] },
+        { sql: 'INSERT INTO tasks (id, owner, title) VALUES (?, actor(), ?)', params: ['t1', 'Ship Chronolog'] },
       ],
     },
   }],
@@ -262,7 +262,7 @@ pnpm package:session     # Universal zero-native-build @chronolog/peer-session t
 
 ## Documentation
 
-- [Chronolog v2 CRDT Contract](docs/CRDT_CONTRACT.md) — core invariants, ordering, partitioning, encryption, finality, and deterministic SQLite profile.
+- [Chronolog CRDT Contract](docs/CRDT_CONTRACT.md) — core invariants, ordering, partitioning, encryption, finality, and deterministic SQLite profile.
 - [Authored Operation-Set Model](docs/authored-operation-set.md) — operation lifecycle, offline authoring, reconnect rewrapping, and checkpoint bootstrap.
 - [Browser Storage Architecture](docs/browser-storage.md) — OPFS, IndexedDB, and worker ownership.
 - [Documentation Index](docs/README.md) — package guides (`@chronolog/peer-session`, `@chronolog/materializer`, `chronolog-db`, `@chronolog/authority`, `@chronolog/signals`, `@chronolog/transport-webrtc`).
