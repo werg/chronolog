@@ -227,7 +227,7 @@ function declarations(entryPoints) {
   const result = compiler.emit(undefined, (path, content, _bom, _error, sourceFiles) => {
     if (!path.endsWith('.d.ts')) return;
     for (const file of sourceFiles ?? []) inputs.add(relative(root, file.fileName).replaceAll('\\', '/'));
-    const rewritten = content.replace(/(['"])(@chronolog\/[^'"]+)\1/gu, (_match, quote, name) => {
+    const rewritten = content.replace(/(['"])(@chronolog\/[^'"]+|chronolog-db)\1/gu, (_match, quote, name) => {
       const sourcePath = parsed.options.paths?.[name]?.[0];
       assert(sourcePath, `Missing declaration alias: ${name}`);
       const destination = join(out, sourcePath.replace(/\.ts$/u, '.js'));
