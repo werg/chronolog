@@ -7,13 +7,16 @@ import {
   isPublicBlobReference, isPrivateContentReference,
   putContentBytes, readContentBytes,
   type BlobGetOptions, type BlobInfo, type BlobPutOptions, type BlobReference,
-  type ContentGetOptions, type ContentPutBytesOptions, type ContentPutOptions, type ContentReadBytesOptions,
+  type ContentCacheStats, type ContentGetOptions, type ContentPruneResult,
+  type ContentPutBytesOptions, type ContentPutOptions, type ContentReadBytesOptions,
+  type ContentStreamPutOptions,
 } from './content-bytes.js'
 import { awaitOwnedTask } from './lifetime.js'
 export { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_BLOB_CHUNKS, isPublicBlobReference, isPrivateContentReference } from './content-bytes.js'
 export type {
   BlobGetOptions, BlobInfo, BlobPutOptions, BlobReference,
-  ContentGetOptions, ContentPutBytesOptions, ContentPutOptions, ContentReadBytesOptions,
+  ContentCacheStats, ContentGetOptions, ContentPruneResult,
+  ContentPutBytesOptions, ContentPutOptions, ContentReadBytesOptions, ContentStreamPutOptions,
   PublicBlobReference,
 } from './content-bytes.js'
 
@@ -97,18 +100,85 @@ function envelope(bytes: Uint8Array, epoch: number, plaintextBytes: number): Enc
   return value
 }
 
+interface CacheEntry {
+  readonly kind: 'public' | 'private'
+  readonly key: string
+  readonly bytes: number
+  lastAccessMs: number
+  pinned: boolean
+  readonly reference?: ContentReference
+}
+
 /** Durable encrypted content is independent of operation execution, peer delivery and finality. */
 export class ApplicationContent {
   readonly #sources = new Map<string, ContentSource>()
   readonly #reads = new Map<string, Set<AbortController>>()
   readonly #lifetime = new AbortController()
   readonly #prefix: string
-  readonly #options: { readonly store: BytesStore; readonly authority: ContentAuthority; readonly identity: SigningIdentity; readonly storageId: string }
+  readonly #options: { readonly store: BytesStore; readonly authority: ContentAuthority; readonly identity: SigningIdentity; readonly storageId: string; readonly maxCacheBytes?: number }
+  #cacheIndex: Map<string, CacheEntry> | null = null
   #tail: Promise<unknown> = Promise.resolve()
-  constructor(options: { readonly store: BytesStore; readonly authority: ContentAuthority; readonly identity: SigningIdentity; readonly storageId: string }) {
+  constructor(options: { readonly store: BytesStore; readonly authority: ContentAuthority; readonly identity: SigningIdentity; readonly storageId: string; readonly maxCacheBytes?: number }) {
     check(typeof options.storageId === 'string' && options.storageId.length > 0 && options.storageId.length <= 256, 'CONTENT_STORAGE_ID_INVALID')
     this.#options = options
     this.#prefix = `content/${options.authority.applicationId}`
+  }
+  async #loadCacheIndex(): Promise<Map<string, CacheEntry>> {
+    if (this.#cacheIndex !== null) return this.#cacheIndex
+    const map = new Map<string, CacheEntry>()
+    const raw = await this.#options.store.get(`${this.#prefix}/cache-index`)
+    if (raw !== null && raw.length > 0) {
+      try {
+        const list = decodeRecord<CacheEntry[]>(raw)
+        if (Array.isArray(list)) {
+          for (const item of list) {
+            if (item && typeof item.key === 'string' && (item.kind === 'public' || item.kind === 'private') && typeof item.bytes === 'number') {
+              map.set(`${item.kind}:${item.key}`, { ...item, pinned: Boolean(item.pinned) })
+            }
+          }
+        }
+      } catch { /* ignore corrupt cache index */ }
+    }
+    this.#cacheIndex = map
+    return map
+  }
+  async #saveCacheIndex(map: Map<string, CacheEntry>): Promise<void> {
+    await this.#options.store.put(`${this.#prefix}/cache-index`, encodeRecord([...map.values()]))
+  }
+  async #touchCacheEntry(kind: 'public' | 'private', key: string, bytes: number, reference?: ContentReference): Promise<void> {
+    const map = await this.#loadCacheIndex()
+    const id = `${kind}:${key}`
+    const prev = map.get(id)
+    map.set(id, {
+      kind,
+      key,
+      bytes,
+      lastAccessMs: Date.now(),
+      pinned: prev?.pinned ?? false,
+      ...(reference !== undefined ? { reference } : prev?.reference !== undefined ? { reference: prev.reference } : {}),
+    })
+    await this.#saveCacheIndex(map)
+  }
+  async #dropCacheEntry(kind: 'public' | 'private', key: string): Promise<void> {
+    const map = await this.#loadCacheIndex()
+    if (map.delete(`${kind}:${key}`)) {
+      await this.#saveCacheIndex(map)
+    }
+  }
+  #cacheIdOf(target: BlobReference | string): { readonly kind: 'public' | 'private'; readonly key: string } {
+    if (typeof target === 'string') {
+      check(digest(target), 'CONTENT_BLOB_INVALID')
+      return { kind: 'public', key: target }
+    }
+    if (isPublicBlobReference(target)) {
+      check(digest(target.hash), 'CONTENT_BLOB_INVALID')
+      return { kind: 'public', key: target.hash }
+    }
+    if (isPrivateContentReference(target)) {
+      const ref = this.#reference(target)
+      return { kind: 'private', key: ref.id }
+    }
+    throw new Error('CONTENT_REFERENCE_INVALID')
   }
   #reader(): void { this.#lifetime.signal.throwIfAborted(); check(this.#options.authority.isReader(this.#options.identity.publicKey), 'CONTENT_READER_REQUIRED') }
   #reference(input: ContentReference): ContentReference {
@@ -210,6 +280,7 @@ export class ApplicationContent {
         const reference: ContentReference = { ...stage.reference, id: await recordDigest(manifest) }
         await this.#options.store.put(`${this.#prefix}/manifest/${reference.id}`, encodeRecord(manifest))
         await this.#options.store.put(key, encodeRecord({ ...stage, committed: reference }))
+        await this.#touchCacheEntry('private', reference.id, reference.bytes, reference)
         return reference
       }),
       discard: () => this.#serial(async () => {
@@ -351,6 +422,7 @@ export class ApplicationContent {
       await this.#remove(`${this.#prefix}/manifest/${reference.id}`)
       await this.#remove(`${this.#prefix}/retentions/${reference.id}`)
       for (const chunk of manifest?.chunks ?? []) await this.#remove(`${this.#prefix}/chunk/${chunk.hash}`)
+      await this.#dropCacheEntry('private', reference.id)
     })
   }
   async #localBlobInfo(hash: string, signal: AbortSignal): Promise<BlobInfo | null> {
@@ -387,6 +459,7 @@ export class ApplicationContent {
       }
       // Write metadata last so an interrupted write is never mistaken for a complete blob.
       await this.#options.store.put(`${this.#prefix}/blob/${hash}/meta`, encodeRecord(info))
+      await this.#touchCacheEntry('public', hash, info.bytes)
     })
     return info
   }
@@ -476,6 +549,7 @@ export class ApplicationContent {
       await this.#remove(`${this.#prefix}/blob/${hash}/meta`)
       const count = info === null ? 0 : Math.ceil(info.bytes / CONTENT_CHUNK_BYTES)
       for (let index = 0; index < count; index++) await this.#remove(`${this.#prefix}/blob/${hash}/chunk/${index}`)
+      await this.#dropCacheEntry('public', hash)
     })
   }
   /** Serve only verified local bytes. Serving never recursively consults remote sources. */
@@ -575,8 +649,179 @@ export class ApplicationContent {
         await this.#options.store.put(`${this.#prefix}/chunk/${chunk.hash}`, chunk.bytes)
       }
       await this.#options.store.put(`${this.#prefix}/manifest/${reference.id}`, encodeRecord(manifest))
+      await this.#touchCacheEntry('private', reference.id, reference.bytes, reference)
     })
     return reference
+  }
+  /** Stream an async iterable of Uint8Array chunks into private or public lazy-pull content without holding the entire file in memory. */
+  async putStream(
+    chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    options: ContentStreamPutOptions = {},
+  ): Promise<BlobReference> {
+    const visibility = options.visibility ?? 'private'
+    const mediaType = options.mediaType ?? 'application/octet-stream'
+    const signal = options.signal === undefined ? this.#lifetime.signal : AbortSignal.any([this.#lifetime.signal, options.signal])
+    signal.throwIfAborted()
+    if (visibility === 'private' && options.totalBytes !== undefined) {
+      this.#reader()
+      const total = options.totalBytes
+      check(Number.isSafeInteger(total) && total >= 0 && total <= MAX_CONTENT_BYTES, 'CONTENT_RANGE_INVALID')
+      const upload = await this.stage({ bytes: total, mediaType })
+      let written = 0
+      let chunkIndex = 0
+      let buffer: Uint8Array = new Uint8Array(0)
+      try {
+        for await (const part of chunks) {
+          signal.throwIfAborted()
+          check(part instanceof Uint8Array, 'CONTENT_CHUNK_SIZE_INVALID')
+          if (part.byteLength === 0) continue
+          buffer = buffer.byteLength === 0 ? part.slice() : concatBytes(buffer, part)
+          while (buffer.byteLength >= CONTENT_CHUNK_BYTES) {
+            const slice = buffer.subarray(0, CONTENT_CHUNK_BYTES)
+            await upload.write(chunkIndex++, slice)
+            written += slice.byteLength
+            buffer = buffer.subarray(CONTENT_CHUNK_BYTES)
+          }
+        }
+        if (buffer.byteLength > 0) {
+          await upload.write(chunkIndex++, buffer)
+          written += buffer.byteLength
+        }
+        check(written === total, 'CONTENT_INCOMPLETE')
+        return await upload.commit()
+      } catch (error) {
+        await upload.discard().catch(() => undefined)
+        throw error
+      }
+    }
+    const maxAllowed = visibility === 'public' ? MAX_BLOB_BYTES : MAX_CONTENT_BYTES
+    const parts: Uint8Array[] = []
+    let total = 0
+    for await (const part of chunks) {
+      signal.throwIfAborted()
+      check(part instanceof Uint8Array, 'CONTENT_CHUNK_SIZE_INVALID')
+      total += part.byteLength
+      check(total <= maxAllowed, 'CONTENT_RANGE_INVALID')
+      if (part.byteLength > 0) parts.push(part.slice())
+    }
+    const assembled = parts.length === 0 ? new Uint8Array(0) : concatBytes(...parts)
+    return this.put(assembled, { visibility, mediaType, ...(options.signal === undefined ? {} : { signal: options.signal }) })
+  }
+  /** Stream verified chunks for either a private ContentReference or a public PublicBlobReference / SHA-256 hash. */
+  async *readStream(target: BlobReference | string, options: ContentGetOptions = {}): AsyncIterable<Uint8Array> {
+    if (isPrivateContentReference(target)) {
+      const ref = this.#reference(target)
+      if (options.maxBytes !== undefined) check(ref.bytes <= options.maxBytes, 'CONTENT_READ_LIMIT_EXCEEDED')
+      for await (const chunk of this.read(ref, options.signal === undefined ? {} : { signal: options.signal })) {
+        yield chunk
+      }
+      return
+    }
+    const hash = typeof target === 'string' ? target : isPublicBlobReference(target) ? target.hash : ''
+    check(digest(hash), 'CONTENT_REFERENCE_INVALID')
+    const expectedBytes = options.expectedBytes ?? (isPublicBlobReference(target) ? target.bytes : undefined)
+    const bytes = await this.getBlob(hash, { ...options, ...(expectedBytes === undefined ? {} : { expectedBytes }) })
+    if (bytes === null) throw new Error('CONTENT_BLOB_MISSING')
+    for (let offset = 0; offset < bytes.byteLength; offset += CONTENT_CHUNK_BYTES) {
+      yield bytes.subarray(offset, Math.min(bytes.byteLength, offset + CONTENT_CHUNK_BYTES))
+    }
+  }
+  /** Pin a cached blob or private content item so `pruneCache()` will never evict it. */
+  async pin(target: BlobReference | string): Promise<void> {
+    this.#reader()
+    const { kind, key } = this.#cacheIdOf(target)
+    await this.#serial(async () => {
+      const map = await this.#loadCacheIndex()
+      const id = `${kind}:${key}`
+      const existing = map.get(id)
+      if (existing !== undefined) {
+        existing.pinned = true
+        existing.lastAccessMs = Date.now()
+      } else {
+        map.set(id, {
+          kind,
+          key,
+          bytes: typeof target === 'string' ? 0 : target.bytes,
+          lastAccessMs: Date.now(),
+          pinned: true,
+          ...(isPrivateContentReference(target) ? { reference: this.#reference(target) } : {}),
+        })
+      }
+      await this.#saveCacheIndex(map)
+    })
+  }
+  async unpin(target: BlobReference | string): Promise<void> {
+    this.#reader()
+    const { kind, key } = this.#cacheIdOf(target)
+    await this.#serial(async () => {
+      const map = await this.#loadCacheIndex()
+      const existing = map.get(`${kind}:${key}`)
+      if (existing !== undefined) {
+        existing.pinned = false
+        await this.#saveCacheIndex(map)
+      }
+    })
+  }
+  async isPinned(target: BlobReference | string): Promise<boolean> {
+    this.#reader()
+    const { kind, key } = this.#cacheIdOf(target)
+    const map = await this.#loadCacheIndex()
+    return map.get(`${kind}:${key}`)?.pinned === true
+  }
+  async stats(): Promise<ContentCacheStats> {
+    this.#reader()
+    const map = await this.#loadCacheIndex()
+    let publicBlobs = 0
+    let privateItems = 0
+    let totalBytes = 0
+    let pinnedCount = 0
+    for (const entry of map.values()) {
+      if (entry.kind === 'public') publicBlobs++
+      else privateItems++
+      totalBytes += entry.bytes
+      if (entry.pinned) pinnedCount++
+    }
+    return {
+      publicBlobs,
+      privateItems,
+      totalBytes,
+      pinnedCount,
+      maxCacheBytes: this.#options.maxCacheBytes ?? null,
+    }
+  }
+  /** Evict oldest unpinned locally cached blobs/items down to `maxBytes` (LRU). */
+  async pruneCache(options: { readonly maxBytes?: number } = {}): Promise<ContentPruneResult> {
+    this.#reader()
+    const limit = options.maxBytes ?? this.#options.maxCacheBytes
+    check(limit !== undefined && Number.isSafeInteger(limit) && limit >= 0, 'CONTENT_CACHE_LIMIT_INVALID')
+    const map = await this.#loadCacheIndex()
+    let totalBytes = 0
+    for (const entry of map.values()) totalBytes += entry.bytes
+    if (totalBytes <= limit) {
+      return { evictedCount: 0, evictedBytes: 0, remainingBytes: totalBytes }
+    }
+    const candidates = [...map.values()]
+      .filter(e => !e.pinned)
+      .sort((a, b) => a.lastAccessMs - b.lastAccessMs || a.key.localeCompare(b.key))
+    let evictedCount = 0
+    let evictedBytes = 0
+    for (const entry of candidates) {
+      if (totalBytes - evictedBytes <= limit) break
+      if (entry.kind === 'public') {
+        await this.deleteBlob(entry.key)
+      } else if (entry.reference !== undefined) {
+        await this.discard(entry.reference)
+      } else {
+        await this.#serial(() => this.#dropCacheEntry(entry.kind, entry.key))
+      }
+      evictedCount++
+      evictedBytes += entry.bytes
+    }
+    return {
+      evictedCount,
+      evictedBytes,
+      remainingBytes: Math.max(0, totalBytes - evictedBytes),
+    }
   }
   /** Unified lazy-pull blob write: supports both public raw-SHA-256 blobs and private epoch-encrypted blobs. */
   async put(bytes: Uint8Array, options: ContentPutOptions = {}): Promise<BlobReference> {

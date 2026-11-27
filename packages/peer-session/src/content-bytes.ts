@@ -37,6 +37,24 @@ export interface ContentGetOptions {
   readonly cache?: boolean
   readonly signal?: AbortSignal
 }
+export interface ContentStreamPutOptions {
+  readonly visibility?: 'public' | 'private'
+  readonly mediaType?: string
+  readonly totalBytes?: number
+  readonly signal?: AbortSignal
+}
+export interface ContentCacheStats {
+  readonly publicBlobs: number
+  readonly privateItems: number
+  readonly totalBytes: number
+  readonly pinnedCount: number
+  readonly maxCacheBytes: number | null
+}
+export interface ContentPruneResult {
+  readonly evictedCount: number
+  readonly evictedBytes: number
+  readonly remainingBytes: number
+}
 export function isPublicBlobReference(value: unknown): value is PublicBlobReference {
   return value !== null && typeof value === 'object' && (value as { profile?: unknown }).profile === 'chronolog-blob-v2' &&
     (value as { visibility?: unknown }).visibility === 'public'

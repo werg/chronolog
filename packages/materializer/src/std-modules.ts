@@ -206,6 +206,7 @@ export const attestedMembers = {
       }
       if (input.summary === true) {
         return {
+          mode: 'attested',
           members,
           readers: queryMembersList(members, 'readers'),
           writers: queryMembersList(members, 'writers'),
@@ -213,7 +214,9 @@ export const attestedMembers = {
           publishers: queryMembersList(members, 'publishers'),
           openReaders: false,
           openWriters: false,
+          blockedAuthors: [],
           admission: cur.admission ?? null,
+          multisig: null,
         };
       }
       if (input.publicKey) {
@@ -237,9 +240,10 @@ export const openMembers = {
           members: Array.isArray(state.members) ? state.members : [],
           openRead: state.openRead !== false,
           openWrite: state.openWrite !== false,
+          blockedAuthors: Array.isArray(state.blockedAuthors) ? state.blockedAuthors : [],
           admission: state.admission ?? null,
         }
-      : { admins: [], members: [], openRead: true, openWrite: true, admission: null };
+      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], admission: null };
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
     if (!cur.admins.includes(tx.author)) return { ok: false, code: 'admin_required' };
@@ -250,7 +254,10 @@ export const openMembers = {
         ? cur.admins.filter(k => k !== input.publicKey)
         : sortedKeys(cur.admins.concat([input.publicKey]));
       if (admins.length === 0) return { ok: false, code: 'last_admin_required' };
-      return { ok: true, state: { ...cur, admins }, events: [{ topic: '$permissions.admin', payload: { publicKey: input.publicKey, enabled: input.enabled !== false } }] };
+      const blockedAuthors = input.enabled === false
+        ? cur.blockedAuthors
+        : cur.blockedAuthors.filter(k => k !== input.publicKey);
+      return { ok: true, state: { ...cur, admins, blockedAuthors }, events: [{ topic: '$permissions.admin', payload: { publicKey: input.publicKey, enabled: input.enabled !== false } }] };
     }
 
     if (input.action === 'setOpen') {
@@ -264,12 +271,34 @@ export const openMembers = {
       };
     }
 
+    if (input.action === 'blockAuthor') {
+      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
+      if (cur.admins.includes(input.publicKey)) return { ok: false, code: 'cannot_block_admin' };
+      const blockedAuthors = sortedKeys(cur.blockedAuthors.concat([input.publicKey])).slice(-2048);
+      return {
+        ok: true,
+        state: { ...cur, blockedAuthors },
+        events: [{ topic: '$permissions.author_blocked', payload: { publicKey: input.publicKey, ...(typeof input.reason === 'string' && input.reason ? { reason: input.reason.slice(0, 160) } : {}) } }],
+      };
+    }
+
+    if (input.action === 'unblockAuthor') {
+      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
+      const blockedAuthors = cur.blockedAuthors.filter(k => k !== input.publicKey);
+      return {
+        ok: true,
+        state: { ...cur, blockedAuthors },
+        events: [{ topic: '$permissions.author_unblocked', payload: { publicKey: input.publicKey } }],
+      };
+    }
+
     if (input.action === 'setMember') {
       const next = normalizeMember(input.member);
       const members = cur.members.filter(m => m.publicKey !== next.publicKey).concat([next]);
       members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
       const admins = next.administrator ? sortedKeys(cur.admins.concat([next.publicKey])) : cur.admins;
-      return { ok: true, state: { ...cur, admins, members }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
+      const blockedAuthors = next.administrator ? cur.blockedAuthors.filter(k => k !== next.publicKey) : cur.blockedAuthors;
+      return { ok: true, state: { ...cur, admins, members, blockedAuthors }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
     }
 
     return { ok: false, code: 'unknown_action' };
@@ -281,11 +310,13 @@ export const openMembers = {
           members: Array.isArray(state.members) ? state.members : [],
           openRead: state.openRead !== false,
           openWrite: state.openWrite !== false,
+          blockedAuthors: Array.isArray(state.blockedAuthors) ? sortedKeys(state.blockedAuthors.filter(k => HEX32.test(k || ''))) : [],
           admission: state.admission ?? null,
         }
-      : { admins: [], members: [], openRead: true, openWrite: true, admission: null };
+      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], admission: null };
 
     const adminSet = new Set(cur.admins);
+    const blockedSet = new Set(cur.blockedAuthors);
     const synthesizedMap = new Map();
     for (const m of cur.members) synthesizedMap.set(m.publicKey, m);
     for (const a of cur.admins) {
@@ -305,14 +336,19 @@ export const openMembers = {
     if (input && typeof input === 'object') {
       if (typeof input.check === 'string' && typeof input.actor === 'string') {
         if (!HEX32.test(input.actor)) return false;
+        if (input.check === 'blocked') return blockedSet.has(input.actor);
         if (input.check === 'administrator') return adminSet.has(input.actor);
         if (input.check === 'publisher') return adminSet.has(input.actor) || checkMembersCapability(members, 'publisher', input.actor);
-        if (input.check === 'writer') return cur.openWrite || adminSet.has(input.actor) || checkMembersCapability(members, 'writer', input.actor);
+        if (input.check === 'writer') {
+          if (blockedSet.has(input.actor)) return false;
+          return cur.openWrite || adminSet.has(input.actor) || checkMembersCapability(members, 'writer', input.actor);
+        }
         if (input.check === 'reader') return cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'reader', input.actor);
         if (input.check === 'member') return cur.openWrite || cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'member', input.actor);
         return checkMembersCapability(members, input.check, input.actor);
       }
       if (typeof input.list === 'string') {
+        if (input.list === 'blockedAuthors') return cur.blockedAuthors;
         if (input.list === 'readers' && cur.openRead) return ['*'];
         if (input.list === 'writers' && cur.openWrite) return ['*'];
         return queryMembersList(members, input.list);
@@ -320,6 +356,7 @@ export const openMembers = {
       if (input.admission === true) return cur.admission;
       if (input.summary === true) {
         return {
+          mode: 'open',
           members,
           readers: cur.openRead ? ['*'] : queryMembersList(members, 'readers'),
           writers: cur.openWrite ? ['*'] : queryMembersList(members, 'writers'),
@@ -327,7 +364,9 @@ export const openMembers = {
           publishers: queryMembersList(members, 'publishers'),
           openReaders: cur.openRead,
           openWriters: cur.openWrite,
+          blockedAuthors: cur.blockedAuthors,
           admission: cur.admission,
+          multisig: null,
         };
       }
       if (input.publicKey) {
@@ -495,6 +534,7 @@ export const multisigMembers = {
       if (input.admission === true) return null;
       if (input.summary === true) {
         return {
+          mode: 'multisig',
           members,
           readers: queryMembersList(members, 'readers'),
           writers: queryMembersList(members, 'writers'),
@@ -502,7 +542,13 @@ export const multisigMembers = {
           publishers: queryMembersList(members, 'publishers'),
           openReaders: false,
           openWriters: false,
+          blockedAuthors: [],
           admission: null,
+          multisig: {
+            threshold: cur.threshold,
+            signers: cur.signers,
+            proposals: cur.proposals,
+          },
         };
       }
       if (input.publicKey) {
@@ -1371,6 +1417,159 @@ export const sqlDatabase = {
 export default sqlDatabase;
 `.trimStart()
 
+export const STD_SQLITE_HELPERS_SOURCE = `
+import { openDb } from 'chronolog:sqlite';
+import { applyRls } from 'chronolog/rls';
+
+export function rowsToObjects(res) {
+  return (res.rows || []).map(row => {
+    const obj = {};
+    for (let i = 0; i < res.columns.length; i++) obj[res.columns[i]] = row[i];
+    return obj;
+  });
+}
+
+/**
+ * Open a deterministic chronolog:sqlite database, invoke fn(db), auto-close in finally,
+ * and optionally commit when mutate === true.
+ */
+export function withDb(dbRoot, fn, options) {
+  const db = openDb(dbRoot ?? null);
+  try {
+    const value = fn(db);
+    if (options && options.commit === true) {
+      return { value, dbRoot: db.commit() };
+    }
+    return value;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Build a concise, self-describing chronolog:sqlite ES Module reducer with automatic
+ * schema/tables/read-only SQL query introspection, permission checks, and write RLS.
+ */
+export function defineSqlReducer(spec) {
+  const commands = (spec && spec.commands) || {};
+  const queries = (spec && spec.queries) || {};
+  const setup = typeof (spec && spec.setup) === 'function' ? spec.setup : null;
+  const policies = (spec && spec.policies) || null;
+  const allowPublicWrite = Boolean(spec && spec.allowPublicWrite);
+
+  function checkCap(ctx, cap, actor) {
+    const checked = ctx.query('$permissions', { check: cap, actor });
+    if (typeof checked === 'boolean') return checked;
+    const perms = ctx.topic('$permissions');
+    if (!perms || !Array.isArray(perms.members)) return false;
+    const m = perms.members.find(x => x.publicKey === actor);
+    if (!m) return false;
+    if (cap === 'administrator') return m.administrator === true;
+    if (cap === 'writer') return m.writer === true || m.administrator === true;
+    return m.reader === true;
+  }
+
+  return {
+    reduce(state, tx, ctx) {
+      const cur = state && typeof state === 'object' ? state : { dbRoot: null, initialized: false };
+      const input = tx.payload;
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return { ok: false, code: 'invalid_input' };
+      }
+      const action = typeof input.action === 'string' ? input.action : null;
+      const handler = action && Object.prototype.hasOwnProperty.call(commands, action) ? commands[action] : null;
+      if (!handler) return { ok: false, code: 'unknown_action' };
+      const reqAdmin = Boolean(handler.adminOnly);
+      if (reqAdmin) {
+        if (!checkCap(ctx, 'administrator', tx.author)) return { ok: false, code: 'admin_required' };
+      } else if (!allowPublicWrite && !checkCap(ctx, 'writer', tx.author)) {
+        return { ok: false, code: 'writer_required' };
+      }
+      const db = openDb(cur.dbRoot ?? null);
+      try {
+        if (!cur.initialized) {
+          if (setup) setup(db);
+          if (policies) applyRls(db, policies);
+        }
+        const run = typeof handler === 'function' ? handler : handler.run;
+        const out = run(db, input, tx, ctx);
+        if (out && out.ok === false) return out;
+        const dbRoot = db.commit();
+        return {
+          ok: true,
+          state: { ...cur, dbRoot, initialized: true },
+          ...(out && Array.isArray(out.events) ? { events: out.events } : {}),
+        };
+      } catch (err) {
+        const msg = String(err && err.message ? err.message : err);
+        const rls = /rls_denied:[A-Za-z0-9_]+:(?:insert|update|delete)/.exec(msg);
+        return { ok: false, code: rls ? rls[0] : 'sql:error', detail: msg };
+      } finally {
+        db.close();
+      }
+    },
+    query(state, input, ctx) {
+      const cur = state && typeof state === 'object' ? state : { dbRoot: null, initialized: false };
+      const qObj = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+      const qName = typeof qObj.query === 'string' ? qObj.query : (typeof qObj.kind === 'string' ? qObj.kind : null);
+      if (qName && Object.prototype.hasOwnProperty.call(queries, qName)) {
+        const qHandler = queries[qName];
+        const run = typeof qHandler === 'function' ? qHandler : qHandler.run;
+        return withDb(cur.dbRoot, db => run(db, qObj, ctx));
+      }
+      if (typeof qObj.sql === 'string') {
+        return withDb(cur.dbRoot, db => {
+          const res = db.query(qObj.sql, Array.isArray(qObj.params) ? qObj.params : []);
+          return qObj.format === 'objects' ? { columns: res.columns, rows: rowsToObjects(res) } : res;
+        });
+      }
+      if (qName === 'tables') {
+        return withDb(cur.dbRoot, db => {
+          const res = db.query("SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_rls_%' ORDER BY name", []);
+          return { dbRoot: cur.dbRoot, tables: res.rows.map(r => ({ name: r[0], type: r[1] })) };
+        });
+      }
+      if (qName === 'schema') {
+        return withDb(cur.dbRoot, db => {
+          const res = db.query("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name", []);
+          const objects = res.rows.map(r => ({ type: r[0], name: r[1], table: r[2], sql: r[3] }));
+          const tables = [];
+          for (const obj of objects) {
+            if ((obj.type !== 'table' && obj.type !== 'view') || String(obj.name).startsWith('_rls_')) continue;
+            let columns = [];
+            try {
+              const info = db.query('SELECT * FROM "' + String(obj.name).replace(/"/g, '""') + '" LIMIT 0', []);
+              columns = Array.isArray(info.columns) ? info.columns.slice() : [];
+            } catch {}
+            tables.push({ name: obj.name, type: obj.type, owner: null, columns, rls: policies && policies[obj.name] ? policies[obj.name] : null });
+          }
+          return { dbRoot: cur.dbRoot, schemaVersion: 1, policies: policies || {}, allowUserDdl: false, userOwnedObjects: {}, tables, objects };
+        });
+      }
+      return { dbRoot: cur.dbRoot, initialized: Boolean(cur.initialized) };
+    },
+    describe() {
+      return {
+        commands: Object.entries(commands).map(([name, entry]) => ({
+          name,
+          description: (entry && entry.description) || '',
+          input: (entry && entry.input) || { type: 'object', properties: {} },
+        })),
+        queries: [
+          ...Object.entries(queries).map(([name, entry]) => ({
+            name,
+            description: (entry && entry.description) || '',
+            input: (entry && entry.input) || { type: 'object', properties: {} },
+          })),
+          { name: 'schema', description: 'Inspect SQLite-CAS schema tables and RLS policies.', input: { type: 'object', properties: {} } },
+          { name: 'tables', description: 'List user tables and views.', input: { type: 'object', properties: {} } },
+        ],
+      };
+    },
+  };
+}
+`.trimStart()
+
 export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.freeze({
   'chronolog/permissions': STD_PERMISSIONS_SOURCE,
   'chronolog/keys': STD_KEYS_SOURCE,
@@ -1378,6 +1577,7 @@ export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.
   'chronolog/publications': STD_PUBLICATIONS_SOURCE,
   'chronolog/rls': STD_RLS_SOURCE,
   'chronolog/sql': STD_SQL_SOURCE,
+  'chronolog/sqlite-helpers': STD_SQLITE_HELPERS_SOURCE,
 })
 
 export const STANDARD_MODULE_IMPORTS: Readonly<Record<string, string>> = Object.freeze(

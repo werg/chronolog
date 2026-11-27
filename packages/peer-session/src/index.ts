@@ -15,6 +15,7 @@ export type {
   SessionFacts,
   SessionCasNode,
   MemberRecord,
+  PermissionsMultisigInfo,
   PermissionsTopicState,
   KeysTopicState,
   CheckpointBootstrapSnapshot,

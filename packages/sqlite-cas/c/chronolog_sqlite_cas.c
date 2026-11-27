@@ -261,7 +261,15 @@ static int chronologAuthorizer(
     }
     return SQLITE_OK;
   }
-  if (action == SQLITE_CREATE_TRIGGER || action == SQLITE_DROP_TRIGGER || action == SQLITE_PRAGMA ||
+  if (action == SQLITE_PRAGMA) {
+    /* Allow read-only page_size and data_version pragmas required internally by FTS5 and sqlite-vec (vec0) during DML. */
+    if (arg1 && arg2 == NULL &&
+        (strcasecmp(arg1, "page_size") == 0 || strcasecmp(arg1, "data_version") == 0)) {
+      return SQLITE_OK;
+    }
+    return SQLITE_DENY;
+  }
+  if (action == SQLITE_CREATE_TRIGGER || action == SQLITE_DROP_TRIGGER ||
       action == SQLITE_ANALYZE || action == SQLITE_TRANSACTION || action == SQLITE_SAVEPOINT) {
     return SQLITE_DENY;
   }

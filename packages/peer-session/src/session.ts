@@ -127,9 +127,24 @@ export interface MemberRecord {
   readonly finalizer: boolean
 }
 
+export interface PermissionsMultisigInfo {
+  readonly threshold: number
+  readonly signers: readonly string[]
+  readonly proposals: Readonly<Record<string, JsonValue>>
+}
+
 export interface PermissionsTopicState {
+  readonly mode?: 'attested' | 'open' | 'multisig' | 'custom'
   readonly members: readonly MemberRecord[]
+  readonly readers?: readonly string[]
+  readonly writers?: readonly string[]
+  readonly administrators?: readonly string[]
+  readonly publishers?: readonly string[]
+  readonly openReaders?: boolean
+  readonly openWriters?: boolean
+  readonly blockedAuthors?: readonly string[]
   readonly admission: { readonly hostKey?: string } | null
+  readonly multisig?: PermissionsMultisigInfo | null
 }
 
 export interface KeysTopicState {
@@ -187,6 +202,7 @@ interface LocalPendingOp {
 }
 
 interface EvaluatedPermissionsSummary {
+  readonly mode: 'attested' | 'open' | 'multisig' | 'custom'
   readonly members: readonly MemberRecord[]
   readonly readers: ReadonlySet<string>
   readonly writers: ReadonlySet<string>
@@ -194,7 +210,9 @@ interface EvaluatedPermissionsSummary {
   readonly publishers: ReadonlySet<string>
   readonly openReaders: boolean
   readonly openWriters: boolean
+  readonly blockedAuthors: ReadonlySet<string>
   readonly admission: { readonly hostKey?: string } | null
+  readonly multisig: PermissionsMultisigInfo | null
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -456,20 +474,34 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   permissions(): PermissionsTopicState {
     if (this.#evaluatedPermissions !== null) {
+      const p = this.#evaluatedPermissions
       return {
-        members: this.#evaluatedPermissions.members,
-        admission: this.#evaluatedPermissions.admission,
+        mode: p.mode,
+        members: p.members,
+        readers: p.openReaders ? ['*'] : [...p.readers].sort(),
+        writers: p.openWriters ? ['*'] : [...p.writers].sort(),
+        administrators: [...p.administrators].sort(),
+        publishers: [...p.publishers].sort(),
+        openReaders: p.openReaders,
+        openWriters: p.openWriters,
+        blockedAuthors: [...p.blockedAuthors].sort(),
+        admission: p.admission,
+        multisig: p.multisig,
       }
     }
     const raw = this.#kernel.topic('$permissions') as PermissionsTopicState | null
     if (raw === null || typeof raw !== 'object' || !Array.isArray(raw.members)) {
-      return { members: [], admission: null }
+      return { members: [], openReaders: false, openWriters: false, blockedAuthors: [], admission: null, multisig: null }
     }
     return raw
   }
 
   member(publicKey: string): MemberRecord | null {
     return this.permissions().members.find(m => m.publicKey === publicKey) ?? null
+  }
+
+  isBlockedAuthor(publicKey: string): boolean {
+    return this.#evaluatedPermissions !== null && this.#evaluatedPermissions.blockedAuthors.has(publicKey)
   }
 
   isMember(publicKey: string): boolean {
@@ -494,6 +526,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   isWriter(publicKey: string): boolean {
     if (this.#evaluatedPermissions !== null) {
+      if (this.#evaluatedPermissions.blockedAuthors.has(publicKey)) return false
       if (this.#evaluatedPermissions.openWriters) return /^[0-9a-f]{64}$/u.test(publicKey)
       return this.#evaluatedPermissions.writers.has(publicKey) || this.#evaluatedPermissions.administrators.has(publicKey)
     }
@@ -709,7 +742,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const modSpec = queue.shift()!
         if (visited.has(modSpec)) continue
         visited.add(modSpec)
-        if (modSpec === 'chronolog:sqlite' || modSpec === 'chronolog/sql') {
+        if (modSpec === 'chronolog:sqlite' || modSpec === 'chronolog/sql' || modSpec === 'chronolog/sqlite-helpers') {
           needsSqlite = true
           break
         }
@@ -719,7 +752,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const node = await this.cas.get(hash, 'any')
         if (node === null) continue
         const text = new TextDecoder().decode(node.bytes)
-        if (text.includes('chronolog:sqlite') || text.includes('chronolog/sql')) {
+        if (text.includes('chronolog:sqlite') || text.includes('chronolog/sql') || text.includes('chronolog/sqlite-helpers')) {
           needsSqlite = true
           break
         }
@@ -778,39 +811,63 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const writers = parseStringList(s.writers)
         const admins = parseStringList(s.administrators)
         const pubs = parseStringList(s.publishers)
+        const blocked = parseStringList(s.blockedAuthors)
         const admission = (s.admission !== null && typeof s.admission === 'object' && !Array.isArray(s.admission))
           ? s.admission as { readonly hostKey?: string }
           : null
+        const msRaw = s.multisig
+        const multisig: PermissionsMultisigInfo | null =
+          msRaw !== null && typeof msRaw === 'object' && !Array.isArray(msRaw) &&
+          typeof (msRaw as { threshold?: unknown }).threshold === 'number' &&
+          Array.isArray((msRaw as { signers?: unknown }).signers)
+            ? {
+                threshold: (msRaw as { threshold: number }).threshold,
+                signers: (msRaw as { signers: string[] }).signers.filter(k => typeof k === 'string'),
+                proposals: ((msRaw as { proposals?: Record<string, JsonValue> }).proposals ?? {}),
+              }
+            : null
+        const openReaders = s.openReaders === true || readers.open
+        const openWriters = s.openWriters === true || writers.open
+        const mode: EvaluatedPermissionsSummary['mode'] =
+          s.mode === 'attested' || s.mode === 'open' || s.mode === 'multisig'
+            ? s.mode
+            : multisig !== null ? 'multisig' : (openReaders || openWriters) ? 'open' : admission !== null ? 'attested' : 'custom'
         this.#evaluatedPermissions = {
+          mode,
           members: parseMembers(s.members),
           readers: readers.keys,
           writers: writers.keys,
           administrators: admins.keys,
           publishers: pubs.keys,
-          openReaders: s.openReaders === true || readers.open,
-          openWriters: s.openWriters === true || writers.open,
+          openReaders,
+          openWriters,
+          blockedAuthors: blocked.keys,
           admission,
+          multisig,
         }
         return
       }
 
-      const [rRaw, wRaw, aRaw, pRaw, mRaw, admRaw] = await Promise.all([
+      const [rRaw, wRaw, aRaw, pRaw, mRaw, admRaw, blkRaw] = await Promise.all([
         kernel.query('$permissions', { list: 'readers' }).catch(() => null),
         kernel.query('$permissions', { list: 'writers' }).catch(() => null),
         kernel.query('$permissions', { list: 'administrators' }).catch(() => null),
         kernel.query('$permissions', { list: 'publishers' }).catch(() => null),
         kernel.query('$permissions', { list: 'members' }).catch(() => null),
         kernel.query('$permissions', { admission: true }).catch(() => null),
+        kernel.query('$permissions', { list: 'blockedAuthors' }).catch(() => null),
       ])
       if (Array.isArray(rRaw) || Array.isArray(wRaw) || Array.isArray(aRaw)) {
         const readers = parseStringList(rRaw)
         const writers = parseStringList(wRaw)
         const admins = parseStringList(aRaw)
         const pubs = parseStringList(pRaw)
+        const blocked = parseStringList(blkRaw)
         const admission = (admRaw !== null && typeof admRaw === 'object' && !Array.isArray(admRaw))
           ? admRaw as { readonly hostKey?: string }
           : null
         this.#evaluatedPermissions = {
+          mode: (readers.open || writers.open) ? 'open' : admission !== null ? 'attested' : 'custom',
           members: parseMembers(mRaw),
           readers: readers.keys,
           writers: writers.keys,
@@ -818,7 +875,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           publishers: pubs.keys,
           openReaders: readers.open,
           openWriters: writers.open,
+          blockedAuthors: blocked.keys,
           admission,
+          multisig: null,
         }
         return
       }
@@ -830,6 +889,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (raw !== null && typeof raw === 'object' && Array.isArray(raw.members)) {
       const members = parseMembers(raw.members)
       this.#evaluatedPermissions = {
+        mode: raw.admission ? 'attested' : 'custom',
         members,
         readers: new Set(members.filter(m => m.reader).map(m => m.publicKey)),
         writers: new Set(members.filter(m => m.writer || m.administrator).map(m => m.publicKey)),
@@ -837,7 +897,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         publishers: new Set(members.filter(m => m.publisher || m.administrator).map(m => m.publicKey)),
         openReaders: false,
         openWriters: false,
+        blockedAuthors: new Set(),
         admission: raw.admission ?? null,
+        multisig: null,
       }
     } else {
       this.#evaluatedPermissions = null
@@ -1333,7 +1395,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (appTopics.length === 1) {
       const topic = appTopics[0]!
       const described = await this.describe().catch(() => null)
-      if (described && described.commands.length > 0 && !described.commands.some(c => c.name === name)) {
+      const matchesDescribed = (cName: string): boolean =>
+        cName === name || cName === `${topic}.${name}` || cName === `${topic}:${name}`
+      if (described && described.commands.length > 0 && !described.commands.some(c => matchesDescribed(c.name))) {
         throw new Error(`APPLICATION_COMMAND_UNKNOWN:${name}`)
       }
       const body = (input !== null && typeof input === 'object' && !Array.isArray(input))
@@ -1381,7 +1445,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (appTopics.length === 1) {
       const topic = appTopics[0]!
       const described = await this.describe().catch(() => null)
-      if (described && described.queries.length > 0 && !described.queries.some(q => q.name === name)) {
+      const matchesDescribed = (qName: string): boolean =>
+        qName === name || qName === `${topic}.${name}` || qName === `${topic}:${name}`
+      if (described && described.queries.length > 0 && !described.queries.some(q => matchesDescribed(q.name))) {
         throw new Error(`APPLICATION_QUERY_UNKNOWN:${name}`)
       }
       const body = (input !== null && typeof input === 'object' && !Array.isArray(input))
@@ -2040,6 +2106,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   // ---- Facts export & merge (P2P + blind host sync) ----
+
+  /** Read a decoded CAS node payload & links cleanly without touching internal wire envelopes. */
+  async readCasPayload(hash: string, partition: CasPartition | 'any' = 'any'): Promise<{
+    readonly hash: string
+    readonly payload: Uint8Array
+    readonly links: readonly string[]
+  } | null> {
+    const node = await this.cas.get(hash, partition)
+    if (node === null) return null
+    return { hash, payload: node.bytes.slice(), links: [...node.links] }
+  }
 
   async exportFacts(options: { readonly includePrivateCas?: boolean; readonly includeGenesis?: boolean } = {}): Promise<SessionFacts> {
     const includePrivate = options.includePrivateCas ?? (!this.#blindHostMode && this.isReader(this.identity.publicKey))

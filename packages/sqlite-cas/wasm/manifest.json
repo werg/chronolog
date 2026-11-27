@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "builtinId": "sqlite-cas@1#sha256-bbc4674a5dd1d11962a8227ce5f1118e2e6ed7d00163ea92f1f35781caf46936",
-  "wasmSha256": "bbc4674a5dd1d11962a8227ce5f1118e2e6ed7d00163ea92f1f35781caf46936",
-  "wasmBytes": 1344911
+  "builtinId": "sqlite-cas@1#sha256-d894d07f096d9907a0538e2603c3ff7c485cb6d8b86a39321dba7c42e22cf2d7",
+  "wasmSha256": "d894d07f096d9907a0538e2603c3ff7c485cb6d8b86a39321dba7c42e22cf2d7",
+  "wasmBytes": 1344992
 }
