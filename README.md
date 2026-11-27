@@ -24,10 +24,10 @@ Chronolog-DB collapses all three into a single, radical abstraction:
 
 Inspired by Martin Kleppmann's work on timestamp-ordered operation logs with rollback-and-replay, Chronolog pushes the idea all the way to the bottom:
 
-- **A flat set of operations ("block soup", not hash-linked blocks):** Every mutation is an immutable, Ed25519-signed operation stamped with `(authorTimestampMs, author, opId)`. There are no `parents` pointers and no forks to merge.
+- **A flat set of independent operations — expressly *not* a Merkle chain:** Every mutation is an immutable, standalone Ed25519-signed operation stamped with `(authorTimestampMs, author, opId)`. Input operations **never** reference preceding operations, blocks, or state roots by hash; there are no `parents` pointers and no forks to merge. (Individual operations may reference content-addressed CAS hashes for blobs or module code, and carry a genesis domain-separation ID named `chainId` in the wire struct, but they are never hash-chained together.)
 - **One total order, zero sequencers:** Every replica sorts the set of operations it has seen by `(authorTimestampMs, author, opId)` and folds them forward deterministically. No peer, relay, host, or validator ever assigns operation order.
-- **Offline first, O(1) rewind on late arrivals:** Author locally and durably without waiting for a network or quorum. When an earlier-timestamped operation arrives later from a reconnecting peer, Chronolog doesn't need inverse functions or custom merge logic — it jumps back in **O(1)** to the nearest content-addressed Merkle snapshot before that timestamp and deterministically replays the suffix.
-- **One pure Merkle-DAG CAS:** Every large artifact — reducer ES Module source code, SQLite database pages, binary blobs, and replay checkpoints — lives in one content-addressed DAG (`ContentAddressedStore`) with explicit links, strict public/private partitions, and exact mark-and-sweep garbage collection. Because snapshots are immutable hashes, "undo" is just holding a 32-byte pointer.
+- **Offline first, O(1) rewind on late arrivals:** Author locally and durably without waiting for a network or quorum. When an earlier-timestamped operation arrives later from a reconnecting peer, Chronolog doesn't need inverse functions or custom merge logic — it jumps back in **O(1)** to the nearest content-addressed snapshot before that timestamp and deterministically replays the suffix.
+- **One pure Merkle-DAG CAS for artifacts & derived snapshots:** Large immutable values — reducer ES Module source code, SQLite database pages, binary blobs, and *derived* replay snapshots — live in one content-addressed DAG (`ContentAddressedStore`) with explicit links, strict public/private partitions, and exact mark-and-sweep garbage collection. Input operations remain an unlinked flat set; the Merkle DAG exists solely for content deduplication and O(1) snapshot rewind.
 
 ---
 
@@ -48,13 +48,13 @@ Specifically, `$reducers` holds an **Import Map** of hash-pinned ES Modules (`sp
 
 Look at what falls out of reducing *state that contains the reducers over other topics of its own state*:
 
-- **Self-evolving or permanently frozen:** Bind `$reducers` itself to a governance reducer (such as `adminOnlyReducers`, or an M-of-N multisig governance module) and your database's own rules, migrations, and permissions evolve deterministically at exact points in authored history — and rewind cleanly during suffix replay! Or omit a reducer for `$reducers` at genesis to freeze the laws of physics for the lifetime of the chain.
+- **Self-evolving or permanently frozen:** Bind `$reducers` itself to a governance reducer (such as `adminOnlyReducers`, or an M-of-N multisig governance module) and your database's own rules, migrations, and permissions evolve deterministically at exact points in authored history — and rewind cleanly during suffix replay! Or omit a reducer for `$reducers` at genesis to freeze the laws of physics for the lifetime of the log.
 - **Permissions, keys, finality, and UI are just topics:**
   - `$permissions` isn't hardcoded into the engine — it's a topic reducer answering a minimal capability query interface (`ctx.query('$permissions', { check: 'writer', actor })`). Ship with host-attested `attestedMembers`, zero-host M-of-N `multisigMembers`, public `openMembers`, or write your own capability system in 40 lines of JS.
   - `$keys` manages HPKE (X25519 + AES-256-GCM) epoch key lockboxes and key rotation.
-  - `$finality` holds the chain's time-scoped finality schedule.
+  - `$finality` holds the log's time-scoped finality schedule.
   - `$publications` holds signed static web app release manifests referencing public CAS hashes.
-- **Strict blind-host partition:** On private chains (`privateChain: true`), `$*` control topics are mutated *only* by `visibility: 'public'` operations and can read *only* `$*` topics and public CAS. Private application topics are mutated *only* by `visibility: 'encrypted'` operations. A completely blind host (like a Cloudflare Worker with zero decryption keys) runs the exact same `TopicKernel` in `blindHostMode: true` and derives bit-for-bit identical control state (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`) as every full replica.
+- **Strict blind-host partition:** On private logs (`privateChain: true`), `$*` control topics are mutated *only* by `visibility: 'public'` operations and can read *only* `$*` topics and public CAS. Private application topics are mutated *only* by `visibility: 'encrypted'` operations. A completely blind host (like a Cloudflare Worker with zero decryption keys) runs the exact same `TopicKernel` in `blindHostMode: true` and derives bit-for-bit identical control state (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`) as every full replica.
 
 ---
 
@@ -65,7 +65,7 @@ Because undo-do-redo applies to *any* pure reducer over Merkle-DAG CAS, **a comp
 Under the hood, `@chronolog/sqlite-cas` compiles **stock SQLite + FTS5 full-text search + `sqlite-vec` vector search** to a single static 1.34 MB `sqlite-cas.wasm` binary backed by a 4 KiB Merkle-paged `CAS` VFS:
 
 - **A whole SQL database is one 32-byte hash:** The topic state stores `{ dbRoot, schemaVersion, policies, allowUserDdl }`. Every `db.commit()` writes only dirty 4 KiB pages into CAS and returns the new 32-byte `dbRoot`. Rolling back a failed transaction or rewinding to replay an earlier offline operation across a `CREATE TABLE`, `ALTER TABLE`, `UNIQUE` constraint, foreign key, FTS5 index, or `sqlite-vec` table is **O(1)** — simply open the previous `dbRoot`.
-- **Multiple independent SQL databases per chain:** Bind `inventory`, `analytics`, and `scratch` to `chronolog/sql` in the same chain to get three isolated, hash-addressed relational databases sharing one identity, encryption, and permission boundary.
+- **Multiple independent SQL databases in one log:** Bind `inventory`, `analytics`, and `scratch` to `chronolog/sql` in the same chronolog to get three isolated, hash-addressed relational databases sharing one identity, encryption, and permission boundary.
 - **Bit-for-bit deterministic everywhere:** Works identically in Chromium, WebKit, Node.js, and Cloudflare Workers. `random()` and `randomblob()` are disabled; `datetime('now')` and `localtime` are pinned to the signed operation's UTC `op_time()`; and `actor()`, `op_id()`, and `op_time()` are bound directly in the host kernel so reducers and SQL queries can never forge the caller.
 
 ---
@@ -112,7 +112,7 @@ If **any** precondition, postcondition, SQL constraint, or RLS trigger fails, th
 Instead of static, bureaucratic permission catalogs, `chronolog/sql` pairs SQLite's C-level authorizer (`mode: 'admin' | 'user' | 'readonly'`) with `chronolog/rls` (`applyRls`):
 
 - **Arbitrary read-only SQL write policies:** Administrators declare per-table `insert`, `update`, and `delete` predicates using `NEW.*`, `OLD.*`, `actor()`, `op_id()`, `op_time()`, and arbitrary subqueries against any table in the database (for example, checking a `grants` or `memberships` table!). Each predicate is validated through SQLite's `mode: 'readonly'` authorizer before `chronolog/rls` compiles it into tamper-proof `BEFORE INSERT/UPDATE/DELETE` triggers that `mode: 'user'` cannot alter or drop.
-- **Policies evolve on-chain:** Install or rewrite RLS policies at any time through ordinary signed `action: 'migrate'` or `action: 'setRls'` operations.
+- **Policies evolve in the log:** Install or rewrite RLS policies at any time through ordinary signed `action: 'migrate'` or `action: 'setRls'` operations.
 - **Dynamic tables for non-admin users:** With `allowUserDdl: true`, regular writers in `mode: 'user'` can `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE INDEX`, and `CREATE VIEW` on tables they created (tracked in `_rls_table_owners`), while remaining strictly fenced out of admin tables and other users' DDL.
 - **Live schema introspection:** Query `{ query: 'schema' }` on any `chronolog/sql` topic to inspect every table, view, column list, table owner, and active RLS policy from the current deterministic snapshot.
 
