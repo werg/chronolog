@@ -18,6 +18,7 @@ export interface CreateApplicationSessionOptions<D extends ApplicationDefinition
   readonly blockchainVerifier?: BlockchainAnchorVerifier
   readonly sqliteWasmModule?: WebAssembly.Module
   readonly sqliteWasmBytes?: Uint8Array
+  readonly materializedSnapshot?: Uint8Array
   readonly maxOperations?: number
 }
 

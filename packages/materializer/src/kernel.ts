@@ -72,6 +72,18 @@ export interface KernelSnapshot {
   readonly orderLength: number
 }
 
+export interface KernelMaterializedCache {
+  readonly v: 1
+  readonly logId: string
+  readonly blindHostMode: boolean
+  readonly topics: Readonly<Record<string, JsonValue>>
+  readonly seenOpsRoot: string
+  readonly historyDigest: string
+  readonly stateRoot: string
+  readonly orderOpIds: readonly string[]
+  readonly outcomes: readonly KernelOperationOutcome[]
+}
+
 interface KernelMutableState {
   topics: Record<string, JsonValue>
   seenOps: Set<string>
@@ -163,6 +175,21 @@ function extractCasHashes(value: JsonValue, out: Set<string>): void {
   }
 }
 
+function extractRequiredCasHashes(value: JsonValue, out: Set<string>, key?: string): void {
+  if (typeof value === 'string') {
+    if (value.startsWith('cas:sha256-') && value.length === 75) out.add(value.slice(11))
+    else if (key === 'dbRoot' && /^[0-9a-f]{64}$/u.test(value)) out.add(value)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value as readonly JsonValue[]) extractRequiredCasHashes(item, out)
+    return
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) extractRequiredCasHashes(v, out, k)
+  }
+}
+
 /**
  * Chronolog v2 Topic Kernel & Suffix-Replay Engine.
  * - Flat timestamp-ordered operation set: (authorTimestampMs, author, opId)
@@ -192,6 +219,8 @@ export class TopicKernel {
   #pendingDependencies = new Set<string>()
   #skippedOpIds = new Set<string>()
   #snapshots = new Map<number, KernelSnapshot>()
+  readonly #genesisSnapshot: KernelSnapshot
+  #cacheRestores = 0
   #cachedDescribe: { stateRoot: string; value: Readonly<Record<string, JsonValue>> } | null = null
   #queryCacheStateRoot = ''
   #queryCache = new Map<string, JsonValue>()
@@ -214,7 +243,8 @@ export class TopicKernel {
       : structuredClone(this.genesis.initialTopics)
     this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, 'public')
     this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
-    this.#snapshots.set(0, this.#captureSnapshot(0))
+    this.#genesisSnapshot = this.#captureSnapshot(0)
+    this.#snapshots.set(0, this.#genesisSnapshot)
   }
 
   #captureSnapshotFrom(state: KernelMutableState, orderLength: number): KernelSnapshot {
@@ -293,6 +323,143 @@ export class TopicKernel {
       extractCasHashes(snap.topics, roots)
     }
     return roots
+  }
+
+  get cacheRestores(): number {
+    return this.#cacheRestores
+  }
+
+  /** Export a self-verifying materialized cache snapshot for instant cold-open or suffix catch-up. */
+  exportMaterializedCache(): KernelMaterializedCache {
+    return {
+      v: 1,
+      logId: this.logIdHex,
+      blindHostMode: this.blindHostMode,
+      topics: structuredClone(this.#topics),
+      seenOpsRoot: this.#seenOpsRoot,
+      historyDigest: this.#historyDigest,
+      stateRoot: this.#stateRoot,
+      orderOpIds: this.#order.map(item => bytesToHex(item.opId)),
+      outcomes: this.#outcomes.map(o => ({
+        opId: o.opId,
+        author: o.author,
+        operationId: o.operationId,
+        authorTimestampMs: o.authorTimestampMs,
+        visibility: o.visibility,
+        outcome: o.outcome,
+        rejectionCode: o.rejectionCode,
+        ...(o.rejectionDetail === undefined ? {} : { rejectionDetail: o.rejectionDetail }),
+        events: o.events.map((e: EmittedKernelEvent) => ({
+          opId: e.opId,
+          eventOrdinal: e.eventOrdinal,
+          topic: e.topic,
+          payload: structuredClone(e.payload),
+          author: e.author,
+          operationId: e.operationId,
+          authorTimestampMs: e.authorTimestampMs,
+        })),
+      })),
+    }
+  }
+
+  /**
+   * Restore materialized state directly from a previously exported cache if:
+   * - logId, blindHostMode, and recomputed stateRoot match exactly,
+   * - seenOpsRoot and every CAS node hash referenced by topics exist locally, and
+   * - cache.orderOpIds is an exact prefix of canonically sorted `inputs`.
+   * Returns true on cache hit (exact or suffix-catchup prefix), false on miss.
+   */
+  async restoreMaterializedCache(
+    cache: KernelMaterializedCache,
+    inputs: readonly KernelOperationInput[],
+  ): Promise<boolean> {
+    if (
+      cache.v !== 1 ||
+      cache.logId !== this.logIdHex ||
+      cache.blindHostMode !== this.blindHostMode ||
+      !Array.isArray(cache.orderOpIds) ||
+      !Array.isArray(cache.outcomes) ||
+      cache.orderOpIds.length === 0 ||
+      cache.orderOpIds.length !== cache.outcomes.length
+    ) {
+      return false
+    }
+    if (computeStateRoot(cache.topics, cache.seenOpsRoot) !== cache.stateRoot) {
+      return false
+    }
+    const seenNode = await this.cas.get(cache.seenOpsRoot, 'any')
+    if (seenNode === null) return false
+    const neededCas = new Set<string>()
+    extractRequiredCasHashes(cache.topics, neededCas)
+    for (const hash of neededCas) {
+      if (!this.cas.hasSync(hash, 'any') && await this.cas.get(hash, 'any') === null) {
+        return false
+      }
+    }
+    let decodedSeen: string[]
+    try {
+      const { assertCanonicalCbor, DEFAULT_DECODE_LIMITS } = await import('@chronolog/canonical')
+      const raw = normalizeJsonValue(JSON.parse(JSON.stringify(assertCanonicalCbor(seenNode.bytes, DEFAULT_DECODE_LIMITS))))
+      if (!Array.isArray(raw)) return false
+      decodedSeen = raw.filter((v): v is string => typeof v === 'string')
+    } catch {
+      return false
+    }
+
+    const eligible: KernelOperationInput[] = []
+    const seenIds = new Set<string>()
+    for (const item of inputs) {
+      if (bytesToHex(item.core.logId) !== this.logIdHex) continue
+      if (this.blindHostMode && this.genesis.privateLog && item.core.visibility !== 'public') continue
+      const opIdHex = bytesToHex(item.opId)
+      if (seenIds.has(opIdHex)) continue
+      seenIds.add(opIdHex)
+      eligible.push(item)
+    }
+    eligible.sort((a, b) => compareOperationOrder(
+      { authorTimestampMs: a.core.authorTimestampMs, author: a.core.author, opId: a.opId },
+      { authorTimestampMs: b.core.authorTimestampMs, author: b.core.author, opId: b.opId },
+    ))
+
+    const prefixLen = cache.orderOpIds.length
+    if (prefixLen > eligible.length) return false
+    for (let i = 0; i < prefixLen; i++) {
+      if (bytesToHex(eligible[i]!.opId) !== cache.orderOpIds[i]) return false
+    }
+
+    this.#order = eligible.slice(0, prefixLen)
+    const cachedOutcomes: readonly KernelOperationOutcome[] = cache.outcomes
+    this.#outcomes = cachedOutcomes.map((o: KernelOperationOutcome) => ({
+      opId: o.opId,
+      author: o.author,
+      operationId: o.operationId,
+      authorTimestampMs: BigInt(o.authorTimestampMs),
+      visibility: o.visibility,
+      outcome: o.outcome,
+      rejectionCode: o.rejectionCode,
+      ...(o.rejectionDetail === undefined ? {} : { rejectionDetail: o.rejectionDetail }),
+      events: o.events.map((e: EmittedKernelEvent) => ({
+        opId: e.opId,
+        eventOrdinal: e.eventOrdinal,
+        topic: e.topic,
+        payload: structuredClone(e.payload),
+        author: e.author,
+        operationId: e.operationId,
+        authorTimestampMs: BigInt(e.authorTimestampMs),
+      })),
+    }))
+    this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
+    this.#seenOps = new Set(decodedSeen)
+    this.#seenOpsRoot = cache.seenOpsRoot
+    this.#historyDigest = cache.historyDigest
+    this.#stateRoot = cache.stateRoot
+    this.#pendingDependencies.clear()
+    this.#skippedOpIds.clear()
+    this.#snapshots.clear()
+    this.#snapshots.set(0, this.#genesisSnapshot)
+    this.#snapshots.set(prefixLen, this.#captureSnapshot(prefixLen))
+    this.#cacheRestores++
+    return true
   }
 
   /**

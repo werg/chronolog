@@ -281,4 +281,97 @@ describe('Chronolog v2 ergonomics & platform upgrades', () => {
       await session.close()
     }
   })
+
+  it('restores cold-opened and ephemeral sessions from local & epoch-encrypted materialized snapshots with zero plaintext', async () => {
+    const store = new MemoryBytesStore()
+    const dev1 = await openApplicationDevice({ store, create: true })
+    const created = await createLogGenesis({
+      creator: {
+        publicKey: dev1.identity.publicKey,
+        reader: true,
+        writer: true,
+        administrator: true,
+        publisher: true,
+        finalizer: true,
+      },
+      privateLog: true,
+      topics: { db: { module: 'chronolog/sql' } },
+    })
+
+    let expectedStateRoot: string
+    let exportedSnapshot: Uint8Array | null
+    let exportedFacts: Awaited<ReturnType<Awaited<ReturnType<typeof createApplicationSession>>['exportFacts']>>
+
+    const s1 = await createApplicationSession({
+      device: dev1,
+      genesis: created.genesisBytes,
+      casNodes: created.casNodes,
+      epochKeys: new Map([[0, created.epoch0Key!]]),
+    })
+    try {
+      await (await s1.command('migrate', {
+        statements: [
+          'CREATE TABLE items (id TEXT PRIMARY KEY, secret TEXT NOT NULL)',
+          { sql: 'INSERT INTO items(id, secret) VALUES (?, ?)', params: ['a', 'classified-alpha'] },
+          { sql: 'INSERT INTO items(id, secret) VALUES (?, ?)', params: ['b', 'classified-beta'] },
+        ],
+      }, { operationId: 'snap-1', authorTimestampMs: 1_000_000n })).materialized()
+      expectedStateRoot = s1.revision().stateRoot
+      exportedSnapshot = await s1.exportMaterializedSnapshot()
+      exportedFacts = await s1.exportFacts()
+    } finally {
+      await s1.close()
+    }
+
+    // Encrypted snapshot must contain ZERO plaintext!
+    expect(exportedSnapshot).not.toBeNull()
+    const dump = new TextDecoder().decode(exportedSnapshot!)
+    expect(dump).not.toContain('classified-alpha')
+    expect(dump).not.toContain('classified-beta')
+
+    // 1. Cold reopen on the same local store restores directly from local materialized-cache!
+    const dev2 = await openApplicationDevice({ store })
+    const s2 = await createApplicationSession({
+      device: dev2,
+      genesis: created.genesisBytes,
+      casNodes: created.casNodes,
+      epochKeys: new Map([[0, created.epoch0Key!]]),
+    })
+    try {
+      expect(s2.materializedCacheHits).toBe(1)
+      expect(s2.revision().stateRoot).toBe(expectedStateRoot)
+      const rows = await s2.query('sql', { sql: 'SELECT id, secret FROM items ORDER BY id', format: 'objects' })
+      expect((rows.value as { rows: unknown[] }).rows).toEqual([
+        { id: 'a', secret: 'classified-alpha' },
+        { id: 'b', secret: 'classified-beta' },
+      ])
+    } finally {
+      await s2.close()
+    }
+
+    // 2. Ephemeral peer (Hosted MCP pattern) boots from encrypted snapshot + facts with cache hit,
+    //    AND handles suffix catch-up + out-of-order historical rewind accurately!
+    const ephemeralDev = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const s3 = await createApplicationSession({
+      device: ephemeralDev,
+      genesis: created.genesisBytes,
+      casNodes: exportedFacts.casNodes,
+      epochKeys: new Map([[0, created.epoch0Key!]]),
+      materializedSnapshot: exportedSnapshot!,
+    })
+    try {
+      await s3.mergeFacts(exportedFacts)
+      expect(s3.materializedCacheHits).toBe(1)
+      expect(s3.revision().stateRoot).toBe(expectedStateRoot)
+      const rows = await s3.query('sql', { sql: 'SELECT id, secret FROM items ORDER BY id', format: 'objects' })
+      expect((rows.value as { rows: unknown[] }).rows).toHaveLength(2)
+
+      // Wrong-key / tampered snapshot is rejected cleanly
+      const badBytes = exportedSnapshot!.slice()
+      badBytes[badBytes.length - 1] = (badBytes[badBytes.length - 1] ?? 0) ^ 0xff
+      expect(await s3.importMaterializedSnapshot(badBytes)).toBe(false)
+    } finally {
+      await s3.close()
+    }
+  })
 })

@@ -59,6 +59,7 @@ import {
   STANDARD_MODULE_SOURCES,
   TopicKernel,
   type EmittedKernelEvent,
+  type KernelMaterializedCache,
   type KernelOperationInput,
   type QuickJsSandboxOptions,
   type SqliteBuiltinDriver,
@@ -176,6 +177,7 @@ export interface OpenApplicationSessionOptions<D extends ApplicationDefinition =
   readonly blindHostMode?: boolean
   readonly blockchainVerifier?: BlockchainAnchorVerifier
   readonly sqliteWasmModule?: WebAssembly.Module
+  readonly materializedSnapshot?: Uint8Array
   readonly maxOperations?: number
   readonly release: () => void | Promise<void>
 }
@@ -315,6 +317,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
   #cachedDescription: { stateRoot: string; value: ApplicationDescription } | null = null
   #evaluatedPermissions: EvaluatedPermissionsSummary | null = null
+  #pendingMaterializedCache: KernelMaterializedCache | null = null
+  #pendingEncryptedSnapshot: Uint8Array | null = null
+  #lastPersistedCacheDigest = ''
+  #materializedCacheHits = 0
   #closed = false
   #closing?: Promise<void>
   #tail: Promise<unknown> = Promise.resolve()
@@ -338,6 +344,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#blindHostMode = options.blindHostMode ?? false
     if (options.blockchainVerifier !== undefined) this.#blockchainVerifier = options.blockchainVerifier
     if (options.sqliteWasmModule !== undefined) this.#sqliteWasmModule = options.sqliteWasmModule
+    if (options.materializedSnapshot !== undefined) this.#pendingEncryptedSnapshot = options.materializedSnapshot.slice()
     this.#maxOperations = options.maxOperations ?? 50_000
     this.#sandboxOptions = {
       ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
@@ -960,7 +967,51 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           const key = await recordDigest(cp.payload)
           this.#checkpoints.set(key, cp)
         } catch { /* ignore */ }
+      } else if (rest === 'materialized-cache') {
+        try {
+          const cached = decodeRecord<KernelMaterializedCache>(entry.value)
+          if (cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode) {
+            this.#pendingMaterializedCache = cached
+          }
+        } catch { /* ignore corrupt cache */ }
       }
+    }
+  }
+
+  async #decodeMaterializedSnapshot(bytes: Uint8Array): Promise<KernelMaterializedCache | null> {
+    try {
+      const env = decodeRecord<{
+        readonly v?: unknown
+        readonly private?: unknown
+        readonly logId?: unknown
+        readonly epoch?: unknown
+        readonly nonce?: unknown
+        readonly ciphertext?: unknown
+        readonly cache?: unknown
+      }>(bytes)
+      if (env.v !== 1 || env.logId !== this.logId) return null
+      if (env.private === true) {
+        if (!this.genesis.privateLog || this.#blindHostMode) return null
+        if (typeof env.epoch !== 'number' || !Number.isSafeInteger(env.epoch) || env.epoch < 0) return null
+        if (!(env.nonce instanceof Uint8Array) || !(env.ciphertext instanceof Uint8Array)) return null
+        const epochKey = this.#epochKeys.get(env.epoch)
+        if (epochKey === undefined) return null
+        const aad = utf8(`chronolog-v2-snapshot:${this.logId}:${env.epoch}`)
+        const plain = await decryptEpochPayload(epochKey, {
+          epoch: BigInt(env.epoch),
+          nonce: env.nonce,
+          ciphertext: env.ciphertext,
+        }, aad)
+        const cached = decodeRecord<KernelMaterializedCache>(plain)
+        return cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode ? cached : null
+      }
+      if (env.private === false && env.cache !== undefined && env.cache !== null && typeof env.cache === 'object') {
+        const cached = env.cache as KernelMaterializedCache
+        return cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode ? cached : null
+      }
+      return null
+    } catch {
+      return null
     }
   }
 
@@ -1169,7 +1220,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'))
-      let localResult
       if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
         const nextKernel = new TopicKernel({
           genesis: this.genesisBytes,
@@ -1178,13 +1228,43 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ...this.#sandboxOptions,
           sqliteDriver: this.#sqliteDriver,
         })
-        localResult = await nextKernel.materialize(eligibleLocal)
         this.#kernel = nextKernel
         this.#kernelHasSqlite = true
         this.#finalKernel = null
-      } else {
-        localResult = await this.#kernel.materialize(eligibleLocal)
       }
+
+      // Attempt O(1) or suffix-only restore from local or imported materialized cache before full replay.
+      if (this.#pendingEncryptedSnapshot !== null && eligibleLocal.length > 0) {
+        const decoded = await this.#decodeMaterializedSnapshot(this.#pendingEncryptedSnapshot)
+        if (decoded !== null) {
+          this.#pendingMaterializedCache = decoded
+          this.#pendingEncryptedSnapshot = null
+        } else if (this.#epochKeys.size > 0 || !this.genesis.privateLog) {
+          // Discard invalid/unusable snapshot once keys are available
+          this.#pendingEncryptedSnapshot = null
+        }
+      }
+      if (this.#pendingMaterializedCache !== null && eligibleLocal.length > 0) {
+        const cached = this.#pendingMaterializedCache
+        this.#pendingMaterializedCache = null
+        if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(cached.topics.$reducers) && this.#sqliteDriver !== undefined) {
+          this.#kernel = new TopicKernel({
+            genesis: this.genesisBytes,
+            cas: this.cas,
+            blindHostMode: this.#blindHostMode,
+            ...this.#sandboxOptions,
+            sqliteDriver: this.#sqliteDriver,
+          })
+          this.#kernelHasSqlite = true
+          this.#finalKernel = null
+        }
+        const restored = await this.#kernel.restoreMaterializedCache(cached, eligibleLocal)
+        if (restored) {
+          this.#materializedCacheHits++
+        }
+      }
+
+      let localResult = await this.#kernel.materialize(eligibleLocal)
       // On public logs or when $reducers was just loaded into #kernel, check if SQLite is newly
       // required by a freshly applied $reducers op and upgrade atomically if so.
       if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(this.#kernel.topic('$reducers')) && this.#sqliteDriver !== undefined) {
@@ -1202,6 +1282,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
       await this.#refreshPermissionsCache(this.#kernel)
       this.#lastLocalRevision = toMaterializedRevision(localResult.revision)
+
+      // Persist clean local materialized cache for instant next reopen / suffix catch-up.
+      if (
+        localResult.pendingDependencies.length === 0 &&
+        eligibleLocal.length > 0 &&
+        localResult.revision.digest !== this.#lastPersistedCacheDigest
+      ) {
+        try {
+          await this.#store.put(`${this.#prefix}/materialized-cache`, encodeRecord(this.#kernel.exportMaterializedCache()))
+          this.#lastPersistedCacheDigest = localResult.revision.digest
+        } catch { /* best-effort cache persistence */ }
+      }
 
       if (this.#verifiedFinality.closedThroughMs !== null) {
         this.#finalKernel ??= new TopicKernel({
@@ -2108,6 +2200,59 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   // ---- Facts export & merge (P2P + blind host sync) ----
 
   /** Read a decoded CAS node payload & links cleanly without touching internal wire envelopes. */
+  /** Number of times this session skipped full replay by restoring a verified materialized cache/snapshot. */
+  get materializedCacheHits(): number {
+    return this.#materializedCacheHits
+  }
+
+  /**
+   * Export a compact, self-verifying materialized snapshot.
+   * On private logs, encrypts the snapshot under the current epoch key (AEAD) so blind hosts
+   * and ephemeral participants (e.g. Hosted MCP) can cache it with ZERO plaintext at rest.
+   */
+  async exportMaterializedSnapshot(): Promise<Uint8Array | null> {
+    if (this.#kernel.outcomes.length === 0 || this.#kernel.pendingDependencies.length > 0) return null
+    const cache = this.#kernel.exportMaterializedCache()
+    if (this.genesis.privateLog && !this.#blindHostMode) {
+      const epoch = this.#currentEpochFrom(this.#kernel)
+      const epochKey = epoch >= 0 ? this.#epochKeys.get(epoch) : undefined
+      if (epochKey === undefined) return null
+      const plain = encodeRecord(cache)
+      const aad = utf8(`chronolog-v2-snapshot:${this.logId}:${epoch}`)
+      const enc = await encryptEpochPayload(epochKey, BigInt(epoch), plain, aad)
+      return encodeRecord({
+        v: 1,
+        private: true,
+        logId: this.logId,
+        epoch,
+        nonce: enc.nonce,
+        ciphertext: enc.ciphertext,
+      })
+    }
+    return encodeRecord({
+      v: 1,
+      private: false,
+      logId: this.logId,
+      cache,
+    })
+  }
+
+  /**
+   * Stage or immediately apply an exported materialized snapshot (AEAD-decrypted on private logs).
+   * Returns true if validated and accepted (either applied now or staged for the next mergeFacts).
+   */
+  importMaterializedSnapshot(bytes: Uint8Array): Promise<boolean> {
+    return this.#serial(async () => {
+      const decoded = await this.#decodeMaterializedSnapshot(bytes)
+      if (decoded === null) return false
+      this.#pendingMaterializedCache = decoded
+      if (this.#publicOps.size > 0 || this.#encryptedEnvelopes.size > 0) {
+        await this.#rematerialize()
+      }
+      return true
+    })
+  }
+
   async readCasPayload(hash: string, partition: CasPartition | 'any' = 'any'): Promise<{
     readonly hash: string
     readonly payload: Uint8Array
