@@ -1,6 +1,7 @@
 import type { ApplicationDefinition } from './definition.js'
 import type { CreateApplicationSessionOptions } from './runtime.js'
 import type { ApplicationSession } from './session.js'
+import type { queryFederatedSql as QueryFederatedSqlFn } from './sql-extensions.js'
 
 /** Passive import; actual storage and execution modules load only on explicit local open. */
 export async function createApplicationSession<const D extends ApplicationDefinition = ApplicationDefinition>(
@@ -83,6 +84,19 @@ export { createApplicationOwner } from './session-owner.js'
 export type * from './owner-types.js'
 export { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
 export * from './multi-session.js'
-export * from './sql-extensions.js'
-export { diffMerkleDbRoots, createOverlayCas, type MerkleDbDiff } from 'chronolog-db'
+export type {
+  FederatedSqlSource,
+  SqlBranch,
+  SqlBranchDiff,
+  SqlBranchProposal,
+  TableRowDiff,
+} from './sql-extensions.js'
+export type { MerkleDbDiff } from 'chronolog-db'
 export { splitSecret, combineShares, type ShamirShare } from '@chronolog/crypto'
+
+/** Lazy passive wrapper so importing @chronolog/peer-session never eagerly pulls sqlite-cas WASM. */
+export async function queryFederatedSql(
+  ...args: Parameters<typeof QueryFederatedSqlFn>
+): ReturnType<typeof QueryFederatedSqlFn> {
+  return (await import('./sql-extensions.js')).queryFederatedSql(...args)
+}
