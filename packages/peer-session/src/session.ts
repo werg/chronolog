@@ -2142,7 +2142,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
   }
 
-  async exportPublicControlFacts(): Promise<{ readonly publicOps: readonly Uint8Array[]; readonly casNodes: readonly SessionCasNode[] }> {
+  async exportPublicControlFacts(): Promise<{
+    readonly publicOps: readonly Uint8Array[]
+    readonly casNodes: readonly SessionCasNode[]
+    readonly checkpoints: readonly FinalityCheckpoint[]
+  }> {
     const casNodes: SessionCasNode[] = []
     for (const hash of this.cas.listKnownHashes('public')) {
       const raw = await this.cas.getRaw(hash, 'public')
@@ -2151,6 +2155,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return {
       publicOps: [...this.#publicOps.values()].map(v => v.raw.slice()),
       casNodes,
+      checkpoints: [...this.#checkpoints.values()],
     }
   }
 
