@@ -1,6 +1,5 @@
 export { createApplicationSession, type CreateApplicationSessionOptions } from './index.js'
 export { openBrowserDevice } from './browser-device.js'
-export { acquireApplicationOwnerLock } from './owner-lock.js'
 export { createApplicationOwner } from './session-owner.js'
 export type * from './owner-types.js'
 export { openWorkerWebRtcConnection } from './worker-transport.js'

@@ -54,6 +54,8 @@ export interface ApplicationSubmission {
   readonly operationId?: string
   readonly authorTimestampMs?: bigint
   readonly visibility?: OperationVisibility
+  /** Wait for background materialization before resolving submit (defaults to false for instant local append). */
+  readonly awaitMaterialized?: boolean
   readonly updates: readonly TopicUpdate[]
   readonly assumptions?: OperationAssumptionsConfig
   readonly afterOps?: readonly string[]

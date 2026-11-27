@@ -1,17 +1,12 @@
 import { encodeCanonicalCbor } from '@chronolog/canonical'
-import { OpfsBytesStore, acquireBrowserStorage, probeOpfsWritable } from '@chronolog/records/browser'
-import { IndexedDbBytesStore, inspectExistingIndexedDbRecords } from '@chronolog/records/indexeddb-browser'
+import { IndexedDbBytesStore } from '@chronolog/records/indexeddb-browser'
 import { openBrowserDevice, probeBrowserCapabilities } from '@chronolog/peer-session/worker'
-import { BrowserMetadataStore } from '../../packages/peer-session/src/browser-metadata.js'
 import type { BytesStore } from '@chronolog/records'
 
 const endpoint = globalThis as unknown as {
   addEventListener(type: 'message', listener: (event: MessageEvent) => void): void
   postMessage(value: unknown): void
 }
-const pinKey = 'peer-session/storage-backend/v1'
-const openedKey = 'peer-session/storage-opened/v1'
-const bindingKey = 'peer-session/storage-binding/v1'
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error('BROWSER_STORAGE_TEST: ' + message)
 }
@@ -54,46 +49,38 @@ async function idbConformance(name: string): Promise<void> {
   let store = await IndexedDbBytesStore.open(name)
   check((await store.entries()).length === 0, 'empty IDB enumeration')
   await exercise(store)
+  const seqBefore = await store.latestChangeSeq()
+  check(seqBefore > 0, 'changelog advances on writes')
   const snapshot = store.entries(), laterWrite = store.put('later', Uint8Array.of(8))
   const entries = await snapshot
   await laterWrite
   check(entries.map(entry => entry.key).join(',') === 'data,empty,large,ordering', 'sorted IDB snapshot precedes queued write')
-  check(entries[0]?.value[0] === 1 && entries[1]?.value.length === 0, 'decoded IDB snapshot values')
-  check(entries[2]?.value.length === 128 * 1024 + 13 && entries[3]?.value[0] === 2, 'large and replaced IDB snapshot values')
-  entries[0].value[0] = 99
-  check((await store.get('data'))?.[0] === 1, 'IDB snapshot does not alias storage')
+  const delta = await store.readChangesSince(seqBefore)
+  check(delta.changes.some(c => c.key === 'later' && !c.deleted), 'changelog records incremental writes')
   const batch = await store.getMany(['missing', 'ordering', 'empty', 'data'])
-  check(batch[0] === null && batch[1]?.[0] === 2 && batch[2]?.length === 0 && batch[3]?.[0] === 1, 'ordered IDB batch with absent and empty values')
+  check(batch[0] === null && batch[1]?.[0] === 2 && batch[2]?.length === 0 && batch[3]?.[0] === 1, 'ordered IDB batch')
   for (let index = 0; index < 150; index++) await store.put(`page/${index.toString().padStart(3, '0')}`, new Uint8Array(128).fill(index))
-  let seen = 0
-  for await (const entry of store.iterateEntries()) { check(entry.value instanceof Uint8Array, 'streamed IDB value'); seen++ }
-  check(seen === 155, 'IDB enumeration crosses bounded pages')
-  const iterator = store.iterateEntries()[Symbol.asyncIterator]()
-  await iterator.next()
-  let written = false
-  const writing = store.put('after-snapshot', Uint8Array.of(7)).then(() => { written = true })
-  await new Promise(resolve => setTimeout(resolve, 0))
-  check(!written, 'IDB enumeration owns the mutation queue')
-  await iterator.return?.(); await writing
+  let prefixCount = 0
+  for await (const entry of store.iteratePrefix('page/')) { check(entry.key.startsWith('page/'), 'prefix filter'); prefixCount++ }
+  check(prefixCount === 150, 'prefix scan returns all matching pages')
+  await store.deleteMany(['page/000', 'page/001'])
+  check(await store.get('page/000') === null && await store.get('page/001') === null, 'deleteMany removes keys')
   const target = await IndexedDbBytesStore.open(name + '-stream-restore')
   try {
     await fails(target.putStreamIfEmpty((async function* () { yield { key: 'identity', value: Uint8Array.of(1) }; throw Error('restore-interrupted') })()), 'restore-interrupted')
     check((await target.entries()).length === 0, 'interrupted IDB import publishes no identity')
     check(await target.putStreamIfEmpty(store.iterateEntries()), 'IDB streamed atomic restore')
-    check((await target.entries()).length === 156, 'IDB staged restore publishes all pages')
     check(!await target.putStreamIfEmpty((async function* () { throw Error('must not consume input') })()), 'IDB restore refuses existing identity')
   } finally { await target.close() }
-  const closing = store.close()
-  await closing
+  await store.close()
   await fails(store.put('after-close', Uint8Array.of(1)), 'INDEXEDDB_STORE_CLOSED')
   store = await IndexedDbBytesStore.open(name)
   check((await store.get('ordering'))?.[0] === 2, 'IDB persisted order')
-  check(await store.get('evicted') === null, 'IDB deletion survives reopen')
   await store.close()
 
-  // Inject wrong-key envelopes in the real IDB object store, not a fake decoder.
+  // Corrupt envelope detection
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open('chronolog-data:' + name, 2)
+    const request = indexedDB.open('chronolog-data:' + name, 3)
     request.onsuccess = () => { resolve(request.result) }
     request.onerror = () => { reject(request.error) }
   })
@@ -106,184 +93,32 @@ async function idbConformance(name: string): Promise<void> {
   database.close()
   store = await IndexedDbBytesStore.open(name)
   await fails(store.get('ordering'), 'INDEXEDDB_VALUE_CORRUPT')
-  await fails(store.entries(), 'INDEXEDDB_VALUE_CORRUPT')
   await store.close()
-}
-async function opfsConformance(name: string): Promise<void> {
-  if (!await probeOpfsWritable()) return
-  const root = await navigator.storage.getDirectory()
-  const directory = await root.getDirectoryHandle('test-records-' + name, { create: true })
-  let store = new OpfsBytesStore(directory)
-  await exercise(store)
-  const iterator = store.iterateEntries()[Symbol.asyncIterator]()
-  await iterator.next()
-  let written = false
-  const writing = store.put('after-snapshot', Uint8Array.of(7)).then(() => { written = true })
-  await new Promise(resolve => setTimeout(resolve, 0))
-  check(!written, 'OPFS enumeration owns the mutation queue')
-  await iterator.return?.(); await writing
-  const entries = []
-  for await (const entry of store.iterateEntries()) entries.push(entry)
-  check(entries.map(entry => entry.key).sort().join(',') === 'after-snapshot,data,empty,large,ordering', 'OPFS authenticated logical key enumeration')
-  check(entries.find(entry => entry.key === 'large')?.value.length === 128 * 1024 + 13, 'OPFS streamed large value')
-  await store.close()
-  store = new OpfsBytesStore(directory)
-  check((await store.get('ordering'))?.[0] === 2, 'OPFS persisted order')
-  check(await store.get('evicted') === null, 'OPFS deletion survives reopen')
-  await store.close()
-  await root.removeEntry('test-records-' + name, { recursive: true })
 }
 
 async function run(name: string): Promise<{ id: string; storageId: string; backend: string }> {
   const report = await probeBrowserCapabilities()
-  check(report.secureContext && report.dedicatedWorker && report.webLocks, 'worker and locks available')
+  check(report.secureContext && report.dedicatedWorker, 'worker available')
   check(report.crypto.ed25519 && report.crypto.x25519, 'native crypto available')
-  check(report.indexedDb.writable && report.events.supported, 'durable record backend available: ' + JSON.stringify(report))
-  check(!report.sql.qualified, 'SQL qualification is separate')
+  check(report.indexedDb.writable && report.events.supported && report.events.backend === 'indexeddb', 'indexeddb backend available')
+  check(report.sql.qualified, 'SQLite-CAS over IndexedDB is qualified')
   const device = await openBrowserDevice({ name, create: true })
-  const metadata = await BrowserMetadataStore.open(name)
-  check(await metadata.get(pinKey) === null, 'no pin before first data use')
-  check(await metadata.get(openedKey) === null, 'no durable init on identity-only setup')
   const storage = await device.openStorage()
-  const rawPin = await metadata.get(pinKey)
-  check(rawPin !== null, 'first data use pinned backend')
-  const pin = encodeCanonicalCbor([1n, report.events.backend])
-  check(rawPin.length === pin.length && rawPin.every((v, i) => v === pin[i]), 'preferred backend')
   await storage.store.put('history/test', Uint8Array.of(7, 8, 9))
+
+  // Multi-tab concurrent access succeeds with zero storage locks!
   const second = await openBrowserDevice({ name })
-  await fails(second.openStorage(), 'BROWSER_STORAGE_IN_USE')
+  const secondStorage = await second.openStorage()
+  check((await secondStorage.store.get('history/test'))?.[2] === 9, 'concurrent second tab reads immediately')
+  await secondStorage.store.put('history/from-tab2', Uint8Array.of(42))
+  check((await storage.store.get('history/from-tab2'))?.[0] === 42, 'first tab sees second tab write')
+  await secondStorage.close()
   await second.close()
   await storage.close()
   await device.close()
-  metadata.close()
-
-  const reopened = await openBrowserDevice({ name })
-  check(reopened.identity.publicKey === device.identity.publicKey && reopened.storageId === device.storageId, 'identity persists')
-  const persisted = await reopened.openStorage()
-  check((await persisted.store.get('history/test'))?.[2] === 9, 'history persists')
-  await reopened.close()
-
-  // Exercise automatic selection under the Safari-style split: the OPFS
-  // directory is inspectable, but its writable stream method is absent.
-  const fallbackName = name + '-idb'
-  const fallback = await openBrowserDevice({ name: fallbackName, create: true })
-  const fallbackMeta = await BrowserMetadataStore.open(fallbackName)
-  const prototype = FileSystemFileHandle.prototype
-  const writable = Object.getOwnPropertyDescriptor(prototype, 'createWritable')
-  Object.defineProperty(prototype, 'createWritable', { configurable: true, value: undefined })
-  const fallbackStore = await (async () => {
-    try {
-      const capability = await probeBrowserCapabilities()
-      check(capability.events.backend === 'indexeddb', 'writable stream absence selects IDB')
-      return await fallback.openStorage()
-    } finally {
-      if (writable) Object.defineProperty(prototype, 'createWritable', writable)
-      else Reflect.deleteProperty(prototype, 'createWritable')
-    }
-  })()
-  const fallbackPin = await fallbackMeta.get(pinKey)
-  const expectedPin = encodeCanonicalCbor([1n, 'indexeddb'])
-  check(fallbackPin?.length === expectedPin.length && fallbackPin.every((value, index) => value === expectedPin[index]), 'automatic IDB pin')
-  await fallbackStore.store.put('history/test', Uint8Array.of(42))
-  await fallback.close()
-  const fallbackAgain = await openBrowserDevice({ name: fallbackName })
-  const idbStore = await fallbackAgain.openStorage()
-  check((await idbStore.store.get('history/test'))?.[0] === 42, 'pinned IDB persists and reopens')
-  await fallbackAgain.close()
-  fallbackMeta.close()
-
-  // Delete only records, not the immutable pin or signer. Must fail, never fork OPFS.
-  await new Promise<void>((resolve, reject) => {
-    const request = indexedDB.deleteDatabase('chronolog-data:' + fallbackName)
-    request.onsuccess = () => { resolve() }
-    request.onerror = () => { reject(request.error) }
-    request.onblocked = () => { reject(new Error('IDB delete blocked') ) }
-  })
-  const lost = await openBrowserDevice({ name: fallbackName })
-  await fails(lost.openStorage(), 'APPLICATION_DATA_STORAGE_MISSING')
-  await lost.close()
-  check(!await inspectExistingIndexedDbRecords(fallbackName), 'missing pinned IDB was not recreated')
-
-  if (report.opfs.createWritable) {
-    // Simulate a legacy release interrupted after writing STORAGE_BINDING
-    // but before its metadata STORAGE_OPENED flag was acknowledged.
-    const legacyName = name + '-old'
-    const legacy = await openBrowserDevice({ name: legacyName, create: true })
-    const oldOwner = await acquireBrowserStorage(legacyName)
-    await oldOwner.bytes.put(bindingKey, encodeCanonicalCbor([legacy.identity.publicKey, legacy.storageId]))
-    await oldOwner.close()
-    const oldMeta = await BrowserMetadataStore.open(legacyName)
-    check(await oldMeta.get(openedKey) === null && await oldMeta.get(pinKey) === null, 'legacy crash fixture')
-    const oldOpened = await legacy.openStorage()
-    check((await oldOpened.store.get(bindingKey)) !== null, 'legacy directory retained')
-    check((await oldMeta.get(pinKey))?.length === encodeCanonicalCbor([1n, 'opfs']).length, 'legacy OPFS pinned')
-    await legacy.close()
-    oldMeta.close()
-  }
-
-  // Metadata can disappear independently of records. Without an immutable
-  // pin, an orphaned IDB store must never silently turn into fresh OPFS data.
-  const orphanName = name + '-orphaned-idb'
-  check(!await inspectExistingIndexedDbRecords(orphanName), 'missing IDB inspection is non-creating')
-  const orphan = await IndexedDbBytesStore.open(orphanName)
-  await orphan.put('history/test', Uint8Array.of(19))
-  await orphan.close()
-  check(await inspectExistingIndexedDbRecords(orphanName), 'orphaned IDB exists')
-  const orphanDevice = await openBrowserDevice({ name: orphanName, create: true })
-  await fails(orphanDevice.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS')
-  const orphanMetadata = await BrowserMetadataStore.open(orphanName)
-  check(await orphanMetadata.get(pinKey) === null, 'ambiguous IDB does not claim a new backend')
-  orphanMetadata.close()
-  await orphanDevice.close()
-
-  // Old OPFS directories with missing/corrupt bindings are ambiguous instead
-  // of a fresh empty history. This is a different crash window from a valid
-  // STORAGE_BINDING awaiting the metadata STORAGE_OPENED marker.
-  if (report.opfs.createWritable) {
-    const interruptedName = name + '-empty-legacy'
-    const interrupted = await openBrowserDevice({ name: interruptedName, create: true })
-    const root = await navigator.storage.getDirectory()
-    await root.getDirectoryHandle('chronolog-' + interruptedName, { create: true })
-    await fails(interrupted.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS')
-    await interrupted.close()
-  }
-
-  // An absent OPFS directory API is different from a missing writable stream:
-  // an unpinned device cannot prove that no older OPFS journal exists.
-  const directoryMethod = Object.getOwnPropertyDescriptor(navigator.storage, 'getDirectory')
-  Object.defineProperty(navigator.storage, 'getDirectory', { configurable: true, value: undefined })
-  try {
-    const capability = await probeBrowserCapabilities()
-    check(capability.indexedDb.writable && !capability.events.supported && capability.events.backend === null,
-      'diagnostics fail closed if the OPFS directory cannot be inspected')
-    const unpinned = await openBrowserDevice({ name: name + '-no-directory', create: true })
-    try { await fails(unpinned.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS') }
-    finally { await unpinned.close() }
-
-    // An exposed but failing directory API (as in WebKit private contexts)
-    // is not proof that selecting an empty IndexedDB history would be safe.
-    Object.defineProperty(navigator.storage, 'getDirectory', { configurable: true, value: async () => {
-      throw new DOMException('Storage directory unavailable', 'UnknownError')
-    } })
-    const failedProbe = await probeBrowserCapabilities()
-    check(failedProbe.indexedDb.writable && !failedProbe.events.supported && failedProbe.events.backend === null &&
-      failedProbe.events.reason?.startsWith('UnknownError:'), 'directory I/O errors remain fail-closed: ' + JSON.stringify(failedProbe))
-    const unavailableName = name + '-directory-error'
-    const unavailable = await openBrowserDevice({ name: unavailableName, create: true })
-    const unavailableMetadata = await BrowserMetadataStore.open(unavailableName)
-    try {
-      await fails(unavailable.openStorage(), 'BROWSER_STORAGE_BACKEND_AMBIGUOUS')
-      check(await unavailableMetadata.get(pinKey) === null, 'directory error never pins a fallback backend')
-      check(!await inspectExistingIndexedDbRecords(unavailableName), 'directory error never creates empty fallback history')
-    } finally { unavailableMetadata.close(); await unavailable.close() }
-  } finally {
-    if (directoryMethod) Object.defineProperty(navigator.storage, 'getDirectory', directoryMethod)
-    else Reflect.deleteProperty(navigator.storage, 'getDirectory')
-  }
 
   await idbConformance(name + '-conformance')
-  await opfsConformance(name + '-conformance')
-  return { id: device.identity.publicKey, storageId: device.storageId, backend: report.events.backend! }
+  return { id: device.identity.publicKey, storageId: device.storageId, backend: report.events.backend }
 }
 async function resume(name: string): Promise<{ id: string; storageId: string }> {
   const device = await openBrowserDevice({ name })

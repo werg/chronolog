@@ -2,6 +2,7 @@ import {
   newQuickJSWASMModuleFromVariant,
   newVariant,
   type QuickJSHandle,
+  type QuickJSRuntime,
   type QuickJSSyncVariant,
   type QuickJSWASMModule,
 } from 'quickjs-emscripten-core'
@@ -188,6 +189,8 @@ export class QuickJsSandbox {
   readonly #wasmPromise: Promise<QuickJSWASMModule>
   readonly #sqliteDriver: SqliteBuiltinDriver | undefined
   readonly #watchdogMs: number
+  readonly #runtimePool: (QuickJSRuntime | undefined)[] = []
+  readonly #nestedQueryCache = new Map<string, string>()
 
   constructor(options: QuickJsSandboxOptions = {}) {
     this.#wasmPromise = loadQuickJsModule(options.wasmModule)
@@ -199,21 +202,58 @@ export class QuickJsSandbox {
     return this.#sqliteDriver?.builtinId ?? null
   }
 
+  dispose(): void {
+    for (let i = 0; i < this.#runtimePool.length; i++) {
+      try { this.#runtimePool[i]?.dispose() } catch { /* ignore */ }
+      this.#runtimePool[i] = undefined
+    }
+    this.#nestedQueryCache.clear()
+  }
+
   /**
-   * Execute one deterministic reduce/query/describe call in a brand-new isolated QuickJSRuntime + Context.
-   * Zero live module state is ever shared across invocations.
+   * Execute one deterministic reduce/query/describe call in a fresh isolated QuickJSContext.
+   * Demand-pages locally stored CAS nodes that were evicted from the RAM LRU cache.
    */
   async invoke(input: ReducerInvocationInput): Promise<ReducerInvocationResult> {
     const qjs = await this.#wasmPromise
+    const readPartition: CasPartition | 'any' = input.casPartition === 'public' ? 'public' : 'any'
+    for (let faults = 0; faults < 256; faults++) {
+      try {
+        return this.#invokeSync(qjs, input, 0)
+      } catch (err) {
+        if (err instanceof MissingDependencyError && await input.cas.ensureLoaded(err.hash, readPartition)) {
+          continue
+        }
+        throw err
+      }
+    }
     return this.#invokeSync(qjs, input, 0)
   }
 
+  #acquireRuntime(qjs: QuickJSWASMModule, depth: number): QuickJSRuntime {
+    const existing = this.#runtimePool[depth]
+    if (existing !== undefined) {
+      this.#runtimePool[depth] = undefined
+      return existing
+    }
+    return qjs.newRuntime()
+  }
+
+  #releaseRuntime(runtime: QuickJSRuntime, depth: number, healthy: boolean): void {
+    if (healthy && this.#runtimePool[depth] === undefined) {
+      this.#runtimePool[depth] = runtime
+      return
+    }
+    try { runtime.dispose() } catch { /* ignore */ }
+  }
+
   #invokeSync(qjs: QuickJSWASMModule, input: ReducerInvocationInput, depth: number): ReducerInvocationResult {
-    const runtime = qjs.newRuntime()
+    const runtime = this.#acquireRuntime(qjs, depth)
     const openDbs = new Map<number, SqliteDbHandle>()
     let nextDbId = 1
     let missingDep: MissingDependencyError | null = null
     let timedOut = false
+    let healthy = true
     const deadline = Date.now() + this.#watchdogMs
 
     const readPartition: CasPartition | 'any' = input.casPartition === 'public' ? 'public' : 'any'
@@ -307,6 +347,22 @@ export class QuickJsSandbox {
             return ctx.newString(JSON.stringify(topicState))
           }
           const nestedPartition: CasPartition = (readPartition === 'public' || isControlTopic(topicName)) ? 'public' : input.casPartition
+          const modRef = input.imports[binding.module] ?? ''
+          // Pure deterministic query memoization for control topics (e.g. $permissions) when module & topic state are unchanged.
+          const canMemoize = isControlTopic(topicName) && modRef.startsWith('cas:sha256-') && Object.keys(input.imports).length <= 32
+          let memoKey: string | null = null
+          if (canMemoize) {
+            const stateKey = bytesToHex(sha256Sync(utf8(JSON.stringify(topicState))))
+            const inputKey = JSON.stringify(rawQueryInput)
+            const configKey = binding.config === undefined ? '' : JSON.stringify(binding.config)
+            memoKey = `${nestedPartition}\0${modRef}\0${binding.export ?? 'default'}\0${stateKey}\0${configKey}\0${inputKey}`
+            const hit = this.#nestedQueryCache.get(memoKey)
+            if (hit !== undefined) {
+              this.#nestedQueryCache.delete(memoKey)
+              this.#nestedQueryCache.set(memoKey, hit)
+              return ctx.newString(hit)
+            }
+          }
           let nestedRes: ReducerInvocationResult
           try {
             nestedRes = this.#invokeSync(qjs, {
@@ -338,7 +394,15 @@ export class QuickJsSandbox {
             }
             throw new Error(`TOPIC_QUERY_FAILED:${nestedRes.code}:${nestedRes.detail ?? ''}`)
           }
-          return ctx.newString(JSON.stringify(nestedRes.value))
+          const serialized = JSON.stringify(nestedRes.value)
+          if (memoKey !== null) {
+            this.#nestedQueryCache.set(memoKey, serialized)
+            if (this.#nestedQueryCache.size > 512) {
+              const oldest = this.#nestedQueryCache.keys().next().value
+              if (oldest !== undefined) this.#nestedQueryCache.delete(oldest)
+            }
+          }
+          return ctx.newString(serialized)
         })
 
         bindFn('sha256', (dataHandle) => {
@@ -497,10 +561,14 @@ export class QuickJsSandbox {
       } finally {
         for (const db of openDbs.values()) { try { db.close() } catch { /* ignore */ } }
         openDbs.clear()
-        ctx.dispose()
+        try { ctx.dispose() } catch { healthy = false }
       }
+    } catch (err) {
+      healthy = false
+      throw err
     } finally {
-      runtime.dispose()
+      if (timedOut || missingDep !== null) healthy = false
+      this.#releaseRuntime(runtime, depth, healthy)
     }
   }
 }

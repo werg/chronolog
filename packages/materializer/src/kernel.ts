@@ -33,6 +33,8 @@ import {
 export interface KernelOperationInput {
   readonly opId: Uint8Array
   readonly core: OperationCore
+  /** Caller already verified opId === operationIdDigest(core); skips O(N) CBOR+SHA-256 re-verification on every materialize(). */
+  readonly verified?: boolean
 }
 
 export interface EmittedKernelEvent {
@@ -233,6 +235,9 @@ export class TopicKernel {
   #pendingDependencies = new Set<string>()
   #skippedOpIds = new Set<string>()
   #snapshots = new Map<number, KernelSnapshot>()
+  #frontierOpIds = new Set<string>()
+  #frontierOrderLength = 0
+  #frontierMaxTimestampMs = 0n
   readonly #genesisSnapshot: KernelSnapshot
   #cacheRestores = 0
   #cachedDescribe: { stateRoot: string; value: Readonly<Record<string, JsonValue>> } | null = null
@@ -335,8 +340,20 @@ export class TopicKernel {
       historyDigest: this.#historyDigest,
       digest: computeRevisionDigest(this.#historyDigest, this.#stateRoot, view, policyContextDigest),
       view,
-      orderLength: this.#order.length,
+      orderLength: this.#frontierOrderLength + this.#order.length,
     }
+  }
+
+  get frontierOrderLength(): number {
+    return this.#frontierOrderLength
+  }
+
+  get frontierMaxTimestampMs(): bigint {
+    return this.#frontierMaxTimestampMs
+  }
+
+  hasFrontierOp(opId: string): boolean {
+    return this.#frontierOpIds.has(opId)
   }
 
   /** Collect all CAS root hashes reachable from current state + retained suffix snapshots (for local GC). */
@@ -537,6 +554,60 @@ export class TopicKernel {
   }
 
   /**
+   * Bootstrap kernel state directly from a host-cached encrypted Snapshot Bundle WITHOUT requiring
+   * all historical operations to be downloaded first. Subsequent materialize(suffixInputs) skips
+   * any op already covered by `frontierOpIds` and applies only new tail operations.
+   */
+  async restoreSnapshotFrontier(snapshot: {
+    readonly topics: Readonly<Record<string, JsonValue>>
+    readonly seenOpsRoot: string
+    readonly historyDigest: string
+    readonly stateRoot: string
+    readonly orderOpIds: readonly string[]
+    readonly maxAuthorTimestampMs?: bigint | string | number
+  }): Promise<boolean> {
+    if (computeStateRoot(snapshot.topics, snapshot.seenOpsRoot) !== snapshot.stateRoot) {
+      return false
+    }
+    const seenNode = await this.cas.get(snapshot.seenOpsRoot, 'any')
+    if (seenNode === null) return false
+    const neededCas = new Set<string>()
+    extractRequiredCasHashes(snapshot.topics, neededCas)
+    for (const hash of neededCas) {
+      if (!this.cas.hasSync(hash, 'any') && await this.cas.get(hash, 'any') === null) {
+        return false
+      }
+    }
+    let decodedSeen: string[]
+    try {
+      const { assertCanonicalCbor, DEFAULT_DECODE_LIMITS } = await import('@chronolog/canonical')
+      const raw = normalizeJsonValue(JSON.parse(JSON.stringify(assertCanonicalCbor(seenNode.bytes, DEFAULT_DECODE_LIMITS))))
+      if (!Array.isArray(raw)) return false
+      decodedSeen = raw.filter((v): v is string => typeof v === 'string')
+    } catch {
+      return false
+    }
+    this.#order = []
+    this.#outcomes = []
+    this.#opOutcomes.clear()
+    this.#topicLastOpIds.clear()
+    this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(snapshot.topics)) : structuredClone(snapshot.topics)
+    this.#seenOps = new Set(decodedSeen)
+    this.#seenOpsRoot = snapshot.seenOpsRoot
+    this.#historyDigest = snapshot.historyDigest
+    this.#stateRoot = snapshot.stateRoot
+    this.#frontierOpIds = new Set(snapshot.orderOpIds)
+    this.#frontierOrderLength = snapshot.orderOpIds.length
+    this.#frontierMaxTimestampMs = snapshot.maxAuthorTimestampMs !== undefined ? BigInt(snapshot.maxAuthorTimestampMs) : 0n
+    this.#pendingDependencies.clear()
+    this.#skippedOpIds.clear()
+    this.#snapshots.clear()
+    this.#snapshots.set(0, this.#captureSnapshot(0))
+    this.#cacheRestores++
+    return true
+  }
+
+  /**
    * Deterministically materialize an eligible operation set (arbitrary input order; sorted internally).
    * Rewinds only to the earliest snapshot before the first changed position (suffix replay).
    */
@@ -548,7 +619,10 @@ export class TopicKernel {
       if (bytesToHex(item.core.logId) !== this.logIdHex) continue
       if (this.blindHostMode && this.genesis.privateLog && item.core.visibility !== 'public') continue
       const opIdHex = bytesToHex(item.opId)
-      if (bytesToHex(operationIdDigest(item.core)) !== opIdHex) throw new Error('KERNEL_OP_ID_MISMATCH')
+      if (this.#frontierOpIds.has(opIdHex)) continue
+      if (item.verified !== true && bytesToHex(operationIdDigest(item.core)) !== opIdHex) {
+        throw new Error('KERNEL_OP_ID_MISMATCH')
+      }
       if (seenIds.has(opIdHex)) continue
       seenIds.add(opIdHex)
       eligible.push(item)
@@ -576,7 +650,7 @@ export class TopicKernel {
     // If previous run had missing dependencies, re-evaluate from earliest missing point (0 if uncertain)
     if (this.#pendingDependencies.size > 0) diff = 0
 
-    // Find nearest cached snapshot <= diff
+    // Find nearest cached snapshot <= diff (includes the rolling tip snapshot at this.#order.length!)
     let snapIndex = 0
     for (const idx of this.#snapshots.keys()) {
       if (idx <= diff && idx > snapIndex) snapIndex = idx
@@ -593,7 +667,9 @@ export class TopicKernel {
     }
     const nextSnapshots = new Map<number, KernelSnapshot>()
     for (const [idx, s] of this.#snapshots) {
-      if (idx <= snapIndex) nextSnapshots.set(idx, s)
+      if (idx <= snapIndex && (idx === 0 || idx % this.#snapshotInterval === 0 || idx === snapIndex)) {
+        nextSnapshots.set(idx, s)
+      }
     }
 
     const nextOutcomes = this.#outcomes.slice(0, snapIndex)
@@ -620,6 +696,14 @@ export class TopicKernel {
         if (nextOrder.length % this.#snapshotInterval === 0) {
           nextSnapshots.set(nextOrder.length, this.#captureSnapshotFrom(work, nextOrder.length))
         }
+      }
+      // Always capture a rolling tip snapshot so the next monotonic append replays strictly 1 op (never 2..16).
+      if (nextOrder.length > 0 && !nextSnapshots.has(nextOrder.length)) {
+        // Evict the previous non-interval tip snapshot so memory stays bounded.
+        for (const idx of [...nextSnapshots.keys()]) {
+          if (idx > 0 && idx % this.#snapshotInterval !== 0) nextSnapshots.delete(idx)
+        }
+        nextSnapshots.set(nextOrder.length, this.#captureSnapshotFrom(work, nextOrder.length))
       }
       await this.cas.flushBatch()
       // Atomically commit all derived state once replay and CAS flush succeed so concurrent

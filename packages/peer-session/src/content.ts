@@ -123,46 +123,54 @@ export class ApplicationContent {
     this.#options = options
     this.#prefix = `content/${options.authority.applicationId}`
   }
+  #cacheEntryKey(kind: 'public' | 'private', key: string): string {
+    return `${this.#prefix}/cache-entry/${kind}/${key}`
+  }
   async #loadCacheIndex(): Promise<Map<string, CacheEntry>> {
     if (this.#cacheIndex !== null) return this.#cacheIndex
     const map = new Map<string, CacheEntry>()
-    const raw = await this.#options.store.get(`${this.#prefix}/cache-index`)
-    if (raw !== null && raw.length > 0) {
+    const entryPrefix = `${this.#prefix}/cache-entry/`
+    const ingest = (entry: { readonly key: string; readonly value: Uint8Array }): void => {
+      if (!entry.key.startsWith(entryPrefix) || entry.value.length === 0) return
       try {
-        const list = decodeRecord<CacheEntry[]>(raw)
-        if (Array.isArray(list)) {
-          for (const item of list) {
-            if (item && typeof item.key === 'string' && (item.kind === 'public' || item.kind === 'private') && typeof item.bytes === 'number') {
-              map.set(`${item.kind}:${item.key}`, { ...item, pinned: Boolean(item.pinned) })
-            }
-          }
+        const item = decodeRecord<CacheEntry>(entry.value)
+        if (item && typeof item.key === 'string' && (item.kind === 'public' || item.kind === 'private') && typeof item.bytes === 'number') {
+          map.set(`${item.kind}:${item.key}`, { ...item, pinned: Boolean(item.pinned) })
         }
-      } catch { /* ignore corrupt cache index */ }
+      } catch { /* ignore corrupt entry */ }
+    }
+    if (this.#options.store.iteratePrefix !== undefined) {
+      for await (const entry of this.#options.store.iteratePrefix(entryPrefix)) ingest(entry)
+    } else if (this.#options.store.iterateEntries !== undefined) {
+      for await (const entry of this.#options.store.iterateEntries()) ingest(entry)
+    } else if (this.#options.store.entries !== undefined) {
+      for (const entry of await this.#options.store.entries()) ingest(entry)
     }
     this.#cacheIndex = map
     return map
   }
-  async #saveCacheIndex(map: Map<string, CacheEntry>): Promise<void> {
-    await this.#options.store.put(`${this.#prefix}/cache-index`, encodeRecord([...map.values()]))
+  async #saveCacheEntry(entry: CacheEntry): Promise<void> {
+    await this.#options.store.put(this.#cacheEntryKey(entry.kind, entry.key), encodeRecord(entry), { durability: 'relaxed' })
   }
   async #touchCacheEntry(kind: 'public' | 'private', key: string, bytes: number, reference?: ContentReference): Promise<void> {
     const map = await this.#loadCacheIndex()
     const id = `${kind}:${key}`
     const prev = map.get(id)
-    map.set(id, {
+    const next: CacheEntry = {
       kind,
       key,
       bytes,
       lastAccessMs: Date.now(),
       pinned: prev?.pinned ?? false,
       ...(reference !== undefined ? { reference } : prev?.reference !== undefined ? { reference: prev.reference } : {}),
-    })
-    await this.#saveCacheIndex(map)
+    }
+    map.set(id, next)
+    await this.#saveCacheEntry(next)
   }
   async #dropCacheEntry(kind: 'public' | 'private', key: string): Promise<void> {
     const map = await this.#loadCacheIndex()
     if (map.delete(`${kind}:${key}`)) {
-      await this.#saveCacheIndex(map)
+      await this.#remove(this.#cacheEntryKey(kind, key))
     }
   }
   #cacheIdOf(target: BlobReference | string): { readonly kind: 'public' | 'private'; readonly key: string } {
@@ -737,17 +745,19 @@ export class ApplicationContent {
       if (existing !== undefined) {
         existing.pinned = true
         existing.lastAccessMs = Date.now()
+        await this.#saveCacheEntry(existing)
       } else {
-        map.set(id, {
+        const created: CacheEntry = {
           kind,
           key,
           bytes: typeof target === 'string' ? 0 : target.bytes,
           lastAccessMs: Date.now(),
           pinned: true,
           ...(isPrivateContentReference(target) ? { reference: this.#reference(target) } : {}),
-        })
+        }
+        map.set(id, created)
+        await this.#saveCacheEntry(created)
       }
-      await this.#saveCacheIndex(map)
     })
   }
   async unpin(target: BlobReference | string): Promise<void> {
@@ -758,7 +768,7 @@ export class ApplicationContent {
       const existing = map.get(`${kind}:${key}`)
       if (existing !== undefined) {
         existing.pinned = false
-        await this.#saveCacheIndex(map)
+        await this.#saveCacheEntry(existing)
       }
     })
   }

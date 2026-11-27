@@ -51,6 +51,8 @@ export interface CommandOptions {
   readonly operationId?: string
   readonly authorTimestampMs?: bigint
   readonly visibility?: 'public' | 'encrypted'
+  /** Wait for background materialization before resolving submit/command (defaults to false for instant local append). */
+  readonly awaitMaterialized?: boolean
   /** Explicit signed causal and/or state assumptions evaluated deterministically before applying updates. */
   readonly assumptions?: OperationAssumptionsConfig
   /** Shorthand for op_accepted assumptions (automatically clamps authorTimestampMs past referenced ops). */
@@ -69,9 +71,14 @@ export interface ApplicationChange {
   readonly changedTables?: readonly string[]
 }
 
+export type SessionKeyState = 'public' | 'ready' | 'missing-lockbox' | 'pending-unseal'
+
 export interface SessionStatus {
   readonly pendingDependencies?: readonly string[]
   readonly canAuthor: boolean
+  readonly canAuthorData?: boolean
+  readonly canAuthorControl?: boolean
+  readonly keyState?: SessionKeyState
   readonly phase: 'ready' | 'awaiting-keys' | 'closed'
   readonly database: 'idle' | 'opening' | 'ready' | 'failed' | 'closed'
   readonly connectedPeers: number

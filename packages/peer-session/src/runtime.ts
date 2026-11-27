@@ -17,6 +17,7 @@ export interface CreateApplicationSessionOptions<D extends ApplicationDefinition
   readonly blindHostMode?: boolean
   readonly blockchainVerifier?: BlockchainAnchorVerifier
   readonly sqliteWasmModule?: WebAssembly.Module
+  readonly sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly sqliteWasmBytes?: Uint8Array
   readonly materializedSnapshot?: Uint8Array
   readonly maxOperations?: number

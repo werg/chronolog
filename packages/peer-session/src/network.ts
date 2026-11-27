@@ -288,12 +288,14 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     const knowledge = new PeerFactKnowledge()
 
     const retainIncoming = async (facts: SessionFacts): Promise<void> => {
+      const batch: { readonly proposalId: string; readonly author: string; readonly envelopeDigest: string }[] = []
       for (const raw of facts.publicOps) {
         try {
           const signed = decodeSignedOperation(raw)
           const core = decodeOperationCore(signed.coreBytes)
           const proposalId = bytesToHex(operationIdDigest(signed.coreBytes))
-          await session.retain(proposalId, {
+          batch.push({
+            proposalId,
             author: bytesToHex(core.author),
             envelopeDigest: bytesToHex(sha256Sync(raw)),
           })
@@ -304,10 +306,11 @@ export async function connectApplicationPeer(session: ApplicationSession, option
           const envDigest = bytesToHex(encryptedEnvelopeDigest(raw))
           const inspected = session.inspectOperation(envDigest)
           if (inspected.stored) {
-            await session.retain(inspected.proposalId, { author: inspected.author, envelopeDigest: envDigest })
+            batch.push({ proposalId: inspected.proposalId, author: inspected.author, envelopeDigest: envDigest })
           }
         } catch { /* ignore */ }
       }
+      if (batch.length > 0) await session.retainMany(batch)
     }
 
     let sendTail: Promise<void> = Promise.resolve()

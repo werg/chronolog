@@ -4,9 +4,9 @@ import { combineShares, decryptEpochPayload, encryptEpochPayload, splitSecret } 
 import {
   computeCasHash,
   ContentAddressedStore,
-  decodeCasNode,
-  hashCasNode,
+  writeBytesMany,
   type BytesStore,
+  type BytesStoreEntry,
   type CasPartition,
 } from '@chronolog/records'
 import {
@@ -14,6 +14,7 @@ import {
   compareOperationOrder,
   decodeEncryptedEnvelope,
   decodeLogGenesis,
+  decodeOperationCore,
   decodeSignedOperation,
   encodeEncryptedEnvelope,
   encodeLogGenesis,
@@ -103,6 +104,7 @@ import {
   type ApplicationReadView,
   type CommandOptions,
   type MaterializedRevision,
+  type SessionKeyState,
   type SessionStatus,
   type WaitOptions,
 } from './session-types.js'
@@ -224,6 +226,7 @@ export interface OpenApplicationSessionOptions<D extends ApplicationDefinition =
   readonly blindHostMode?: boolean
   readonly blockchainVerifier?: BlockchainAnchorVerifier
   readonly sqliteWasmModule?: WebAssembly.Module
+  readonly sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly materializedSnapshot?: Uint8Array
   readonly maxOperations?: number
   readonly release: () => void | Promise<void>
@@ -329,6 +332,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #blockchainVerifier?: BlockchainAnchorVerifier
   readonly #sandboxOptions: QuickJsSandboxOptions
   readonly #sqliteWasmModule?: WebAssembly.Module
+  readonly #sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly #maxOperations: number
 
   #sqliteDriver?: SqliteBuiltinDriver
@@ -340,6 +344,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   readonly #publicOps = new Map<string, StoredPublicOp>()
   readonly #encryptedEnvelopes = new Map<string, StoredEncryptedEnvelope>()
+  readonly #undecryptedEnvelopes = new Set<string>()
   readonly #localPending = new Map<string, LocalPendingOp>()
   readonly #retentions = new Map<string, Map<string, RetentionEvidence>>()
   readonly #checkpoints = new Map<string, FinalityCheckpoint>()
@@ -366,13 +371,24 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
   #cachedDescription: { stateRoot: string; value: ApplicationDescription } | null = null
   #evaluatedPermissions: EvaluatedPermissionsSummary | null = null
+  #lastPermsStateJson = ''
   #pendingMaterializedCache: KernelMaterializedCache | null = null
+  #pendingSnapshotBundle: {
+    readonly cache: KernelMaterializedCache
+    readonly casNodes: readonly SessionCasNode[]
+    readonly maxAuthorTimestampMs: bigint
+  } | null = null
   #pendingEncryptedSnapshot: Uint8Array | null = null
   #lastPersistedCacheDigest = ''
+  #cachePersistTimer: ReturnType<typeof setTimeout> | undefined
   #materializedCacheHits = 0
+  #lastSyncSeq = 0
   #closed = false
   #closing?: Promise<void>
   #tail: Promise<unknown> = Promise.resolve()
+  #writeTail: Promise<unknown> = Promise.resolve()
+  #materializeDirty = false
+  #materializePromise: Promise<void> | null = null
 
   private constructor(
     options: OpenApplicationSessionOptions<D>,
@@ -393,6 +409,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#blindHostMode = options.blindHostMode ?? false
     if (options.blockchainVerifier !== undefined) this.#blockchainVerifier = options.blockchainVerifier
     if (options.sqliteWasmModule !== undefined) this.#sqliteWasmModule = options.sqliteWasmModule
+    if (options.sqliteWasmLoader !== undefined) this.#sqliteWasmLoader = options.sqliteWasmLoader
     if (options.materializedSnapshot !== undefined) this.#pendingEncryptedSnapshot = options.materializedSnapshot.slice()
     this.#maxOperations = options.maxOperations ?? 50_000
     this.#sandboxOptions = {
@@ -457,22 +474,25 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     options: OpenApplicationSessionOptions<D>,
   ): Promise<ApplicationSession<D>> {
     const cas = new ContentAddressedStore({ store: options.store })
-    await cas.preload()
+    const initialSeq = (await options.store.latestChangeSeq?.()) ?? 0
 
-    if (options.casNodes !== undefined) {
-      for (const node of options.casNodes) {
-        const expected = computeCasHash(node.bytes, [])
-        if (expected === node.hash) {
-          await cas.put(node.bytes, [], node.partition)
-        } else if (hashCasNode(node.bytes) === node.hash) {
-          await cas.putRaw(node.hash, node.bytes, node.partition)
-        } else {
-          throw new Error(`CAS_NODE_HASH_MISMATCH:${node.hash}`)
-        }
+    // Single-pass store scan: index CAS entries + locate genesis + collect log entries in ONE read!
+    const allEntries = await readAllStoreEntries(options.store)
+    let discoveredGenesis: Uint8Array | null = null
+    const nonCasEntries: BytesStoreEntry[] = []
+    for (const entry of allEntries) {
+      if (cas.indexPersistedEntry(entry, { verifyHash: false })) continue
+      nonCasEntries.push(entry)
+      if (discoveredGenesis === null && entry.key.startsWith('v2/') && entry.key.endsWith('/genesis')) {
+        discoveredGenesis = entry.value
       }
     }
 
-    let genesisBytes: Uint8Array | null = null
+    if (options.casNodes !== undefined && options.casNodes.length > 0) {
+      await cas.putManyVerified(options.casNodes)
+    }
+
+    let genesisBytes: Uint8Array | null
     if (options.genesis !== undefined) {
       genesisBytes = options.genesis instanceof Uint8Array
         ? options.genesis.slice()
@@ -481,44 +501,61 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       if (options.logId !== undefined && options.logId !== logId) {
         throw new Error('SESSION_CHAIN_ID_MISMATCH')
       }
-      const existing = await options.store.get(`v2/${logId}/genesis`)
+      const existingEntry = nonCasEntries.find(e => e.key === `v2/${logId}/genesis`)
+      const existing = existingEntry?.value ?? null
       if (existing !== null && !sameBytes(existing, genesisBytes)) {
         throw new Error('SESSION_GENESIS_MISMATCH')
       }
-      if (existing === null) await options.store.put(`v2/${logId}/genesis`, genesisBytes)
+      if (existing === null) await options.store.put(`v2/${logId}/genesis`, genesisBytes, { durability: 'strict' })
     } else if (options.logId !== undefined) {
-      genesisBytes = await options.store.get(`v2/${options.logId}/genesis`)
+      const found = nonCasEntries.find(e => e.key === `v2/${options.logId}/genesis`)
+      genesisBytes = found?.value ?? null
     } else {
-      const all = await readAllStoreEntries(options.store)
-      for (const entry of all) {
-        if (entry.key.startsWith('v2/') && entry.key.endsWith('/genesis')) {
-          genesisBytes = entry.value
-          break
-        }
-      }
+      genesisBytes = discoveredGenesis
     }
     if (genesisBytes === null) throw new Error('SESSION_GENESIS_NOT_FOUND')
 
     const session = new ApplicationSession<D>(options, genesisBytes, cas)
+    session.#lastSyncSeq = initialSeq
     if (options.epochKeys !== undefined) {
       for (const [epoch, key] of options.epochKeys) {
         await session.installEpochKey(epoch, key)
       }
     }
-    await session.#hydrateFromStore()
+    await session.#hydrateFromEntries(nonCasEntries)
     await session.#rematerialize()
     return session
   }
 
   get signal(): AbortSignal { return this.#lifetime.signal }
 
+  #computeKeyState(): SessionKeyState {
+    if (!this.genesis.privateLog || this.#blindHostMode) return 'public'
+    const epoch = this.currentEpoch()
+    if (epoch < 0) return 'ready'
+    if (this.#epochKeys.has(epoch)) return 'ready'
+    const hasBox = this.keysState().epochs?.[String(epoch)]?.boxes?.[this.identity.publicKey] !== undefined
+    return hasBox ? 'pending-unseal' : 'missing-lockbox'
+  }
+
   get status(): SessionStatus {
     const pendingOps = this.#countPendingOps()
-    const canAuthor = !this.#closed && !this.#blindHostMode && this.#canLocallyAuthor()
-    const awaitingKeys = this.genesis.privateLog && !this.#blindHostMode && this.isReader(this.identity.publicKey) && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())
+    const keyState = this.#computeKeyState()
+    const pk = this.identity.publicKey
+    const isAdmin = this.isAdministrator(pk)
+    const isPub = this.#evaluatedPermissions !== null
+      ? this.#evaluatedPermissions.publishers.has(pk)
+      : this.member(pk)?.publisher === true
+    const canAuthorControl = !this.#closed && !this.#blindHostMode && (isAdmin || isPub)
+    const canAuthorData = !this.#closed && !this.#blindHostMode && this.isWriter(pk) && (keyState === 'public' || keyState === 'ready')
+    const canAuthor = canAuthorData || canAuthorControl
+    const awaitingKeys = this.genesis.privateLog && !this.#blindHostMode && this.isReader(pk) && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())
     return Object.freeze({
       ...(this.#kernel.pendingDependencies.length > 0 ? { pendingDependencies: this.#kernel.pendingDependencies } : {}),
       canAuthor,
+      canAuthorData,
+      canAuthorControl,
+      keyState,
       phase: this.#closed ? 'closed' : awaitingKeys ? 'awaiting-keys' : 'ready',
       database: this.#closed ? 'closed' : this.#materializationError !== null ? 'failed' : 'ready',
       connectedPeers: this.#connectedPeers,
@@ -662,32 +699,81 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return this.#ringKeys.get(ring)?.get(epoch)?.slice() ?? null
   }
 
-  async unlockEpochsFromKeysTopic(wrapPrivateKey: CryptoKey, wrapPublicKeyHex: string): Promise<number> {
+  /**
+   * Heal any admitted reader missing HPKE lockboxes in `$keys` for epochs we hold
+   * (e.g. concurrent admission + epoch rotation, multisig approvals, or late wrapKey addition).
+   */
+  async backfillMissingEpochBoxes(options: { readonly minEpoch?: number } = {}): Promise<number> {
+    if (!this.genesis.privateLog || this.#blindHostMode) return 0
+    await this.#flushPendingMaterialization()
+    const keysState = this.keysState()
+    if (keysState.currentEpoch < 0) return 0
+    const minEp = Math.max(0, options.minEpoch ?? 0)
+    const members = this.permissions().members
+    let sealedMembers = 0
+    for (const member of members) {
+      if (!member.reader || !member.wrapKey) continue
+      const epochBoxes: Record<string, EpochKeyBox> = {}
+      for (let ep = minEp; ep <= keysState.currentEpoch; ep++) {
+        const epKey = this.#epochKeys.get(ep)
+        if (epKey === undefined) continue
+        if (keysState.epochs?.[String(ep)]?.boxes?.[member.publicKey] !== undefined) continue
+        epochBoxes[String(ep)] = await hpkeSealEpochKey(member.wrapKey, epKey, this.logId, ep)
+      }
+      if (Object.keys(epochBoxes).length === 0) continue
+      await this.submit({
+        visibility: 'public',
+        awaitMaterialized: true,
+        updates: [{
+          topic: '$keys',
+          input: {
+            action: 'grantBoxes',
+            member: member.publicKey,
+            epochBoxes: epochBoxes as unknown as JsonValue,
+          },
+        }],
+      })
+      sealedMembers++
+    }
+    return sealedMembers
+  }
+
+  /** Incrementally pull facts written by a sibling tab/PWA into the shared multi-tab BytesStore. */
+  async syncFromStore(): Promise<boolean> {
+    if (this.#closed || this.#store.readChangesSince === undefined) return false
     return this.#serial(async () => {
-      if (!this.genesis.privateLog || this.#blindHostMode) return 0
-      const keys = this.keysState()
-      let unlocked = 0
-      for (const entry of Object.values(keys.epochs ?? {})) {
-        if (this.#epochKeys.has(entry.epoch)) continue
-        const box = entry.boxes?.[this.identity.publicKey]
-        if (box === undefined) continue
-        try {
-          const plainKey = await hpkeOpenEpochKey(
-            wrapPrivateKey,
-            wrapPublicKeyHex,
-            box,
-            this.logId,
-            entry.epoch,
-          )
-          if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
-          await this.installEpochKey(entry.epoch, plainKey)
-          unlocked++
-        } catch {
-          // Wrong wrap key or corrupted lockbox — ignore
+      const { latestSeq, changes } = await this.#store.readChangesSince!(this.#lastSyncSeq)
+      if (latestSeq <= this.#lastSyncSeq || changes.length === 0) {
+        this.#lastSyncSeq = Math.max(this.#lastSyncSeq, latestSeq)
+        return false
+      }
+      this.#lastSyncSeq = latestSeq
+      const uniqueKeys = new Set<string>()
+      const prefix = `${this.#prefix}/`
+      for (const ch of changes) {
+        if (ch.deleted) continue
+        if (ch.key.startsWith('cas/') || (ch.key.startsWith(prefix) && ch.key !== `${prefix}materialized-cache`)) {
+          uniqueKeys.add(ch.key)
         }
       }
-      if (unlocked > 0) await this.#rematerialize()
-      return unlocked
+      if (uniqueKeys.size === 0) return false
+      let changed = false
+      for (const key of uniqueKeys) {
+        const val = await this.#store.get(key)
+        if (val === null) continue
+        if (this.cas.indexPersistedEntry({ key, value: val }, { verifyHash: false })) {
+          changed = true
+          continue
+        }
+        if (await this.#ingestSingleStoreEntry({ key, value: val })) {
+          changed = true
+        }
+      }
+      if (changed) {
+        await this.#rematerialize()
+        this.#emitFacts()
+      }
+      return changed
     })
   }
 
@@ -706,26 +792,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     await this.#serial(() => this.#rematerialize())
   }
 
-  #canLocallyAuthor(): boolean {
-    const pk = this.identity.publicKey
-    const isAdmin = this.isAdministrator(pk)
-    const isPub = this.#evaluatedPermissions !== null
-      ? this.#evaluatedPermissions.publishers.has(pk)
-      : this.member(pk)?.publisher === true
-    if (!this.isWriter(pk) && !isAdmin && !isPub) return false
-    if (this.genesis.privateLog && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())) {
-      return isAdmin
-    }
-    return true
-  }
-
   #countPendingOps(): number {
-    let count = this.#kernel.pendingDependencies.length
-    if (!this.#blindHostMode) {
-      for (const entry of this.#encryptedEnvelopes.values()) {
-        if (entry.decrypted === undefined) count++
-      }
-    }
+    let count = this.#kernel.pendingDependencies.length + this.#undecryptedEnvelopes.size
+    if (this.#materializeDirty) count++
     return count
   }
 
@@ -736,6 +805,72 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
     this.#tail = task.catch(() => undefined)
     return task
+  }
+
+  #writeLane<T>(work: () => Promise<T>): Promise<T> {
+    const task = this.#writeTail.then(() => {
+      if (this.#closed) throw new Error('SESSION_CLOSED')
+      return work()
+    })
+    this.#writeTail = task.catch(() => undefined)
+    return task
+  }
+
+  #scheduleMaterialize(): Promise<void> {
+    this.#materializeDirty = true
+    if (this.#materializePromise !== null) return this.#materializePromise
+    this.#materializePromise = this.#serial(async () => {
+      try {
+        while (this.#materializeDirty && !this.#closed) {
+          this.#materializeDirty = false
+          await this.#rematerialize()
+        }
+      } finally {
+        this.#materializePromise = null
+        if (this.#materializeDirty && !this.#closed) {
+          void this.#scheduleMaterialize().catch(() => undefined)
+        }
+      }
+    })
+    return this.#materializePromise
+  }
+
+  async #flushPendingMaterialization(): Promise<void> {
+    if (this.#closed) return
+    if (this.#materializePromise !== null) {
+      await this.#materializePromise
+    } else if (this.#materializeDirty) {
+      await this.#scheduleMaterialize()
+    }
+  }
+
+  #scheduleCachePersist(): void {
+    if (this.#closed || this.#cachePersistTimer !== undefined) return
+    this.#cachePersistTimer = setTimeout(() => {
+      this.#cachePersistTimer = undefined
+      void this.#persistMaterializedCacheNow().catch(() => undefined)
+    }, 1_500)
+    this.#cachePersistTimer.unref?.()
+  }
+
+  async #persistMaterializedCacheNow(): Promise<void> {
+    if (this.#closed) return
+    const rev = this.#lastLocalRevision.digest
+    if (
+      this.#kernel.pendingDependencies.length > 0 ||
+      this.#kernel.outcomes.length === 0 ||
+      rev === this.#lastPersistedCacheDigest
+    ) {
+      return
+    }
+    try {
+      await this.#store.put(
+        `${this.#prefix}/materialized-cache`,
+        encodeRecord(this.#kernel.exportMaterializedCache()),
+        { durability: 'relaxed' },
+      )
+      this.#lastPersistedCacheDigest = rev
+    } catch { /* best-effort cache persistence */ }
   }
 
   #emitStatus(): void {
@@ -842,9 +977,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (!needsSqlite) return false
 
     this.#sqliteLoadPromise ??= (async () => {
+      const wasmModule = this.#sqliteWasmModule ?? (this.#sqliteWasmLoader !== undefined ? await this.#sqliteWasmLoader() : undefined)
       const mod = await import('chronolog-db')
       const driver = await mod.createSqliteCasDriver({
-        ...(this.#sqliteWasmModule === undefined ? {} : { wasmModule: this.#sqliteWasmModule }),
+        ...(wasmModule === undefined ? {} : { wasmModule }),
       })
       this.#sqliteDriver = driver
       return driver
@@ -854,6 +990,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   async #refreshPermissionsCache(kernel: TopicKernel = this.#kernel): Promise<void> {
+    const rawPerms = kernel.topic('$permissions')
+    const rawJson = JSON.stringify(rawPerms)
+    if (this.#evaluatedPermissions !== null && rawJson === this.#lastPermsStateJson) {
+      return
+    }
     const parseStringList = (val: unknown): { readonly keys: Set<string>; readonly open: boolean } => {
       const keys = new Set<string>()
       let open = false
@@ -977,83 +1118,115 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     } else {
       this.#evaluatedPermissions = null
     }
+    this.#lastPermsStateJson = JSON.stringify(kernel.topic('$permissions'))
   }
 
-  async #hydrateFromStore(): Promise<void> {
-    const entries = await readAllStoreEntries(this.#store)
+  async #ingestSingleStoreEntry(entry: BytesStoreEntry): Promise<boolean> {
     const prefix = `${this.#prefix}/`
-    for (const entry of entries) {
-      if (!entry.key.startsWith(prefix)) continue
-      const rest = entry.key.slice(prefix.length)
-      if (rest.startsWith('epoch-key/')) {
-        const ep = Number(rest.slice('epoch-key/'.length))
-        if (Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32 && !this.#epochKeys.has(ep)) {
-          this.#epochKeys.set(ep, entry.value.slice())
+    if (!entry.key.startsWith(prefix)) return false
+    const rest = entry.key.slice(prefix.length)
+    if (rest.startsWith('epoch-key/')) {
+      const ep = Number(rest.slice('epoch-key/'.length))
+      if (Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32 && !this.#epochKeys.has(ep)) {
+        this.#epochKeys.set(ep, entry.value.slice())
+        return true
+      }
+    } else if (rest.startsWith('ring-key/')) {
+      const parts = rest.slice('ring-key/'.length).split('/')
+      const ring = parts[0]
+      const ep = Number(parts[1])
+      if (ring && ring !== 'default' && Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32) {
+        let map = this.#ringKeys.get(ring)
+        if (map === undefined) { map = new Map(); this.#ringKeys.set(ring, map) }
+        if (!map.has(ep)) { map.set(ep, entry.value.slice()); return true }
+      }
+    } else if (rest.startsWith('public-op/')) {
+      const keyOpId = rest.slice('public-op/'.length)
+      if (this.#publicOps.has(keyOpId)) return false
+      try {
+        // Local BytesStore records are already envelope-SHA256 authenticated and Ed25519-verified at ingress.
+        const signed = decodeSignedOperation(entry.value)
+        const core = decodeOperationCore(signed.coreBytes)
+        const opId = bytesToHex(operationIdDigest(signed.coreBytes))
+        if (bytesToHex(core.logId) === this.logId && core.visibility === 'public' && !this.#publicOps.has(opId)) {
+          this.#publicOps.set(opId, { raw: entry.value.slice(), signed, core })
+          return true
         }
-      } else if (rest.startsWith('ring-key/')) {
-        const parts = rest.slice('ring-key/'.length).split('/')
-        const ring = parts[0]
-        const ep = Number(parts[1])
-        if (ring && ring !== 'default' && Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32) {
-          let map = this.#ringKeys.get(ring)
-          if (map === undefined) { map = new Map(); this.#ringKeys.set(ring, map) }
-          if (!map.has(ep)) map.set(ep, entry.value.slice())
-        }
-      } else if (rest.startsWith('public-op/')) {
-        try {
-          const signed = decodeSignedOperation(entry.value)
-          const verified = await verifySignedOperation(signed)
-          if (bytesToHex(verified.core.logId) === this.logId && verified.core.visibility === 'public') {
-            this.#publicOps.set(bytesToHex(verified.opId), { raw: entry.value.slice(), signed, core: verified.core })
-          }
-        } catch { /* ignore corrupt entry */ }
-      } else if (rest.startsWith('enc-env/')) {
-        try {
-          const envelope = decodeEncryptedEnvelope(entry.value)
-          if (bytesToHex(envelope.logId) === this.logId) {
-            const digest = bytesToHex(encryptedEnvelopeDigest(entry.value))
+      } catch { /* ignore corrupt entry */ }
+    } else if (rest.startsWith('enc-env/')) {
+      const keyDigest = rest.slice('enc-env/'.length)
+      if (this.#encryptedEnvelopes.has(keyDigest)) return false
+      try {
+        const envelope = decodeEncryptedEnvelope(entry.value)
+        if (bytesToHex(envelope.logId) === this.logId) {
+          const digest = bytesToHex(encryptedEnvelopeDigest(entry.value))
+          if (!this.#encryptedEnvelopes.has(digest)) {
             this.#encryptedEnvelopes.set(digest, { digest, raw: entry.value.slice(), envelope })
+            this.#undecryptedEnvelopes.add(digest)
+            return true
           }
-        } catch { /* ignore corrupt entry */ }
-      } else if (rest.startsWith('local-pending/')) {
-        try {
-          const rec = decodeRecord<{ readonly raw: Uint8Array; readonly envelopeDigest: string; readonly epoch: number }>(entry.value)
-          const signed = decodeSignedOperation(rec.raw)
-          const verified = await verifySignedOperation(signed)
-          this.#localPending.set(bytesToHex(verified.opId), {
+        }
+      } catch { /* ignore corrupt entry */ }
+    } else if (rest.startsWith('local-pending/')) {
+      try {
+        const rec = decodeRecord<{ readonly raw: Uint8Array; readonly envelopeDigest: string; readonly epoch: number }>(entry.value)
+        const signed = decodeSignedOperation(rec.raw)
+        const core = decodeOperationCore(signed.coreBytes)
+        const opId = bytesToHex(operationIdDigest(signed.coreBytes))
+        if (!this.#localPending.has(opId)) {
+          this.#localPending.set(opId, {
             raw: rec.raw.slice(),
             signed,
-            core: verified.core,
+            core,
             currentEnvelopeDigest: rec.envelopeDigest,
             currentEpoch: rec.epoch,
           })
-        } catch { /* ignore */ }
-      } else if (rest.startsWith('retention/')) {
-        try {
-          const ev = decodeRecord<RetentionEvidence>(entry.value)
-          await verifyRecord('operation-retention', ev, ev.signer)
-          let byPeer = this.#retentions.get(ev.payload.proposalId)
-          if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(ev.payload.proposalId, byPeer) }
+          return true
+        }
+      } catch { /* ignore */ }
+    } else if (rest.startsWith('retention/')) {
+      try {
+        const ev = decodeRecord<RetentionEvidence>(entry.value)
+        let byPeer = this.#retentions.get(ev.payload.proposalId)
+        if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(ev.payload.proposalId, byPeer) }
+        if (!byPeer.has(ev.signer)) {
           byPeer.set(ev.signer, ev)
-        } catch { /* ignore */ }
-      } else if (rest.startsWith('checkpoint/')) {
-        try {
-          const cp = decodeRecord<FinalityCheckpoint>(entry.value)
-          const key = await recordDigest(cp.payload)
-          this.#checkpoints.set(key, cp)
-        } catch { /* ignore */ }
-      } else if (rest === 'materialized-cache') {
-        try {
-          const cached = decodeRecord<KernelMaterializedCache>(entry.value)
-          if (cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode) {
-            this.#pendingMaterializedCache = cached
-          }
-        } catch { /* ignore corrupt cache */ }
-      }
+          return true
+        }
+      } catch { /* ignore */ }
+    } else if (rest.startsWith('checkpoint/')) {
+      const key = rest.slice('checkpoint/'.length)
+      if (this.#checkpoints.has(key)) return false
+      try {
+        const cp = decodeRecord<FinalityCheckpoint>(entry.value)
+        const computedKey = await recordDigest(cp.payload)
+        if (!this.#checkpoints.has(computedKey)) {
+          this.#checkpoints.set(computedKey, cp)
+          return true
+        }
+      } catch { /* ignore */ }
+    } else if (rest === 'materialized-cache') {
+      try {
+        const cached = decodeRecord<KernelMaterializedCache>(entry.value)
+        if (cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode) {
+          this.#pendingMaterializedCache = cached
+        }
+      } catch { /* ignore corrupt cache */ }
+    }
+    return false
+  }
+
+  async #hydrateFromEntries(entries: readonly BytesStoreEntry[]): Promise<void> {
+    for (const entry of entries) {
+      await this.#ingestSingleStoreEntry(entry)
     }
   }
 
-  async #decodeMaterializedSnapshot(bytes: Uint8Array): Promise<KernelMaterializedCache | null> {
+  async #decodeMaterializedSnapshot(bytes: Uint8Array): Promise<{
+    readonly cache: KernelMaterializedCache
+    readonly casNodes: readonly SessionCasNode[]
+    readonly maxAuthorTimestampMs: bigint
+  } | null> {
     try {
       const env = decodeRecord<{
         readonly v?: unknown
@@ -1063,28 +1236,63 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         readonly nonce?: unknown
         readonly ciphertext?: unknown
         readonly cache?: unknown
+        readonly bundle?: unknown
       }>(bytes)
-      if (env.v !== 1 || env.logId !== this.logId) return null
+      if ((env.v !== 1 && env.v !== 2) || env.logId !== this.logId) return null
+      let plainBytes: Uint8Array | null = null
       if (env.private === true) {
         if (!this.genesis.privateLog || this.#blindHostMode) return null
         if (typeof env.epoch !== 'number' || !Number.isSafeInteger(env.epoch) || env.epoch < 0) return null
         if (!(env.nonce instanceof Uint8Array) || !(env.ciphertext instanceof Uint8Array)) return null
         const epochKey = this.#epochKeys.get(env.epoch)
         if (epochKey === undefined) return null
-        const aad = utf8(`chronolog-v2-snapshot:${this.logId}:${env.epoch}`)
-        const plain = await decryptEpochPayload(epochKey, {
+        const aad = utf8(`chronolog-v${String(env.v)}-snapshot:${this.logId}:${env.epoch}`)
+        plainBytes = await decryptEpochPayload(epochKey, {
           epoch: BigInt(env.epoch),
           nonce: env.nonce,
           ciphertext: env.ciphertext,
         }, aad)
-        const cached = decodeRecord<KernelMaterializedCache>(plain)
-        return cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode ? cached : null
       }
-      if (env.private === false && env.cache !== undefined && env.cache !== null && typeof env.cache === 'object') {
-        const cached = env.cache as KernelMaterializedCache
-        return cached.v === 1 && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode ? cached : null
+      if (env.v === 1) {
+        const cached = plainBytes !== null
+          ? decodeRecord<KernelMaterializedCache>(plainBytes)
+          : (env.cache as KernelMaterializedCache | undefined)
+        if (!cached || cached.v !== 1 || cached.logId !== this.logId || cached.blindHostMode !== this.#blindHostMode) return null
+        return { cache: cached, casNodes: [], maxAuthorTimestampMs: 0n }
       }
-      return null
+      // v2 self-contained member-signed Snapshot Bundle (includes reachable private SQLite-CAS & seenOps nodes)
+      const signedBundle = plainBytes !== null
+        ? decodeRecord<{
+            readonly payload: {
+              readonly logId: string
+              readonly cache: KernelMaterializedCache
+              readonly casNodes: readonly SessionCasNode[]
+              readonly maxAuthorTimestampMs: string
+            }
+            readonly signer: string
+            readonly signature: string
+          }>(plainBytes)
+        : (env.bundle as {
+            readonly payload: {
+              readonly logId: string
+              readonly cache: KernelMaterializedCache
+              readonly casNodes: readonly SessionCasNode[]
+              readonly maxAuthorTimestampMs: string
+            }
+            readonly signer: string
+            readonly signature: string
+          } | undefined)
+      if (!signedBundle || typeof signedBundle !== 'object') return null
+      await verifyRecord('materialized-snapshot-v2', signedBundle, signedBundle.signer)
+      const payload = signedBundle.payload
+      if (!payload || payload.logId !== this.logId) return null
+      const cached = payload.cache
+      if (!cached || cached.v !== 1 || cached.logId !== this.logId || cached.blindHostMode !== this.#blindHostMode) return null
+      // Reject snapshots signed by revoked members when $permissions is already known.
+      if (this.#evaluatedPermissions !== null && !this.isMember(signedBundle.signer)) return null
+      const casNodes = Array.isArray(payload.casNodes) ? payload.casNodes : []
+      const maxTs = typeof payload.maxAuthorTimestampMs === 'string' ? BigInt(payload.maxAuthorTimestampMs) : 0n
+      return { cache: cached, casNodes, maxAuthorTimestampMs: maxTs }
     } catch {
       return null
     }
@@ -1152,9 +1360,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   async #decryptPendingEnvelopes(): Promise<void> {
-    if (!this.genesis.privateLog || this.#blindHostMode) return
-    for (const entry of this.#encryptedEnvelopes.values()) {
-      if (entry.decrypted !== undefined) continue
+    if (!this.genesis.privateLog || this.#blindHostMode || this.#undecryptedEnvelopes.size === 0) return
+    for (const digest of [...this.#undecryptedEnvelopes]) {
+      const entry = this.#encryptedEnvelopes.get(digest)
+      if (entry === undefined || entry.decrypted !== undefined) {
+        this.#undecryptedEnvelopes.delete(digest)
+        continue
+      }
       const ring = entry.envelope.ring ?? 'default'
       const epochKey = ring === 'default'
         ? this.#epochKeys.get(entry.envelope.epoch)
@@ -1173,6 +1385,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (verified.core.visibility !== 'encrypted') continue
         if (!sameBytes(verified.opId, entry.envelope.opId) || !sameBytes(verified.core.author, entry.envelope.author)) continue
         entry.decrypted = { opId: bytesToHex(verified.opId), signed, core: verified.core }
+        this.#undecryptedEnvelopes.delete(digest)
       } catch {
         // Cannot decrypt / forged ciphertext — stays undecryptable
       }
@@ -1240,7 +1453,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #collectDecryptedKernelInputs(): Map<string, KernelOperationInput> {
     const byOpId = new Map<string, KernelOperationInput>()
     for (const [opId, entry] of this.#publicOps) {
-      byOpId.set(opId, { opId: hexToBytes(opId), core: entry.core })
+      byOpId.set(opId, { opId: hexToBytes(opId), core: entry.core, verified: true })
     }
     if (!this.#blindHostMode) {
       for (const entry of this.#encryptedEnvelopes.values()) {
@@ -1249,6 +1462,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           byOpId.set(entry.decrypted.opId, {
             opId: hexToBytes(entry.decrypted.opId),
             core: entry.decrypted.core,
+            verified: true,
           })
         }
       }
@@ -1264,7 +1478,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     try {
       const publicInputs: KernelOperationInput[] = []
       for (const [opId, entry] of this.#publicOps) {
-        publicInputs.push({ opId: hexToBytes(opId), core: entry.core })
+        publicInputs.push({ opId: hexToBytes(opId), core: entry.core, verified: true })
       }
 
       let controlKernel: TopicKernel
@@ -1321,6 +1535,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
       const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'))
       if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
+        this.#kernel.sandbox.dispose()
         const nextKernel = new TopicKernel({
           genesis: this.genesisBytes,
           cas: this.cas,
@@ -1330,24 +1545,28 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         })
         this.#kernel = nextKernel
         this.#kernelHasSqlite = true
+        this.#finalKernel?.sandbox.dispose()
         this.#finalKernel = null
       }
 
-      // Attempt O(1) or suffix-only restore from local or imported materialized cache before full replay.
-      if (this.#pendingEncryptedSnapshot !== null && eligibleLocal.length > 0) {
+      // Attempt O(1) or suffix-only restore from local cache or host-cached encrypted Snapshot Bundle.
+      if (this.#pendingEncryptedSnapshot !== null) {
         const decoded = await this.#decodeMaterializedSnapshot(this.#pendingEncryptedSnapshot)
         if (decoded !== null) {
-          this.#pendingMaterializedCache = decoded
+          if (decoded.casNodes.length > 0) {
+            await this.cas.putManyVerified(decoded.casNodes)
+          }
+          this.#pendingSnapshotBundle = decoded
           this.#pendingEncryptedSnapshot = null
         } else if (this.#epochKeys.size > 0 || !this.genesis.privateLog) {
-          // Discard invalid/unusable snapshot once keys are available
           this.#pendingEncryptedSnapshot = null
         }
       }
-      if (this.#pendingMaterializedCache !== null && eligibleLocal.length > 0) {
-        const cached = this.#pendingMaterializedCache
-        this.#pendingMaterializedCache = null
-        if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(cached.topics.$reducers) && this.#sqliteDriver !== undefined) {
+      if (this.#pendingSnapshotBundle !== null) {
+        const bundle = this.#pendingSnapshotBundle
+        this.#pendingSnapshotBundle = null
+        if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(bundle.cache.topics.$reducers) && this.#sqliteDriver !== undefined) {
+          this.#kernel.sandbox.dispose()
           this.#kernel = new TopicKernel({
             genesis: this.genesisBytes,
             cas: this.cas,
@@ -1356,6 +1575,41 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             sqliteDriver: this.#sqliteDriver,
           })
           this.#kernelHasSqlite = true
+          this.#finalKernel?.sandbox.dispose()
+          this.#finalKernel = null
+        }
+        // Try exact prefix restore first if all ops are local; otherwise bootstrap at the snapshot frontier!
+        let restored = eligibleLocal.length >= bundle.cache.orderOpIds.length
+          ? await this.#kernel.restoreMaterializedCache(bundle.cache, eligibleLocal)
+          : false
+        if (!restored && bundle.cache.orderOpIds.length > 0) {
+          restored = await this.#kernel.restoreSnapshotFrontier({
+            topics: bundle.cache.topics,
+            seenOpsRoot: bundle.cache.seenOpsRoot,
+            historyDigest: bundle.cache.historyDigest,
+            stateRoot: bundle.cache.stateRoot,
+            orderOpIds: bundle.cache.orderOpIds,
+            maxAuthorTimestampMs: bundle.maxAuthorTimestampMs,
+          })
+        }
+        if (restored) {
+          this.#materializedCacheHits++
+        }
+      }
+      if (this.#pendingMaterializedCache !== null && eligibleLocal.length > 0) {
+        const cached = this.#pendingMaterializedCache
+        this.#pendingMaterializedCache = null
+        if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(cached.topics.$reducers) && this.#sqliteDriver !== undefined) {
+          this.#kernel.sandbox.dispose()
+          this.#kernel = new TopicKernel({
+            genesis: this.genesisBytes,
+            cas: this.cas,
+            blindHostMode: this.#blindHostMode,
+            ...this.#sandboxOptions,
+            sqliteDriver: this.#sqliteDriver,
+          })
+          this.#kernelHasSqlite = true
+          this.#finalKernel?.sandbox.dispose()
           this.#finalKernel = null
         }
         const restored = await this.#kernel.restoreMaterializedCache(cached, eligibleLocal)
@@ -1365,8 +1619,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       let localResult = await this.#kernel.materialize(eligibleLocal)
-      // On public logs or when $reducers was just loaded into #kernel, check if SQLite is newly
-      // required by a freshly applied $reducers op and upgrade atomically if so.
       if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(this.#kernel.topic('$reducers')) && this.#sqliteDriver !== undefined) {
         const nextKernel = new TopicKernel({
           genesis: this.genesisBytes,
@@ -1376,23 +1628,22 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           sqliteDriver: this.#sqliteDriver,
         })
         localResult = await nextKernel.materialize(eligibleLocal)
+        this.#kernel.sandbox.dispose()
         this.#kernel = nextKernel
         this.#kernelHasSqlite = true
+        this.#finalKernel?.sandbox.dispose()
         this.#finalKernel = null
       }
       await this.#refreshPermissionsCache(this.#kernel)
       this.#lastLocalRevision = toMaterializedRevision(localResult.revision)
 
-      // Persist clean local materialized cache for instant next reopen / suffix catch-up.
+      // Debounce local materialized cache persistence (off the critical write path; flushed on close).
       if (
         localResult.pendingDependencies.length === 0 &&
-        eligibleLocal.length > 0 &&
+        (eligibleLocal.length > 0 || this.#kernel.frontierOrderLength > 0) &&
         localResult.revision.digest !== this.#lastPersistedCacheDigest
       ) {
-        try {
-          await this.#store.put(`${this.#prefix}/materialized-cache`, encodeRecord(this.#kernel.exportMaterializedCache()))
-          this.#lastPersistedCacheDigest = localResult.revision.digest
-        } catch { /* best-effort cache persistence */ }
+        this.#scheduleCachePersist()
       }
 
       if (this.#verifiedFinality.closedThroughMs !== null) {
@@ -1495,9 +1746,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return this.#cachedSignalPolicy
   }
 
-  /** Author locally and durably before network delivery. */
-  submit(input: ApplicationSubmission): Promise<ApplicationOperation> {
-    return this.#serial(async () => {
+  /** Author locally and durably before network delivery (fast local-append lane; materializes in background unless awaitMaterialized is true). */
+  async submit(input: ApplicationSubmission): Promise<ApplicationOperation> {
+    const op = await this.#writeLane(async () => {
       check(!this.#blindHostMode, 'SESSION_BLIND_HOST_CANNOT_AUTHOR')
       check(Array.isArray(input.updates) && input.updates.length > 0, 'OPERATION_UPDATES_REQUIRED')
       const updatesList: readonly TopicUpdate[] = input.updates
@@ -1587,7 +1838,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const opIdHex = bytesToHex(opIdBytes)
 
       if (visibility === 'public') {
-        await this.#store.put(`${this.#prefix}/public-op/${opIdHex}`, opBytes)
+        await this.#store.put(`${this.#prefix}/public-op/${opIdHex}`, opBytes, { durability: 'strict' })
         this.#publicOps.set(opIdHex, { raw: opBytes, signed, core })
       } else {
         const keysState = this.keysState()
@@ -1616,12 +1867,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
         const envBytes = encodeEncryptedEnvelope(env)
         const envDigest = bytesToHex(encryptedEnvelopeDigest(envBytes))
-        await this.#store.put(`${this.#prefix}/enc-env/${envDigest}`, envBytes)
-        await this.#store.put(`${this.#prefix}/local-pending/${opIdHex}`, encodeRecord({
-          raw: opBytes,
-          envelopeDigest: envDigest,
-          epoch,
-        }))
+        // Single atomic multi-key write instead of two sequential transactions!
+        await writeBytesMany(this.#store, [
+          { key: `${this.#prefix}/enc-env/${envDigest}`, value: envBytes },
+          {
+            key: `${this.#prefix}/local-pending/${opIdHex}`,
+            value: encodeRecord({ raw: opBytes, envelopeDigest: envDigest, epoch }),
+          },
+        ], { durability: 'strict' })
         this.#encryptedEnvelopes.set(envDigest, {
           digest: envDigest,
           raw: envBytes,
@@ -1637,10 +1890,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         })
       }
 
-      await this.#rematerialize()
+      if (this.#store.latestChangeSeq !== undefined) {
+        this.#lastSyncSeq = Math.max(this.#lastSyncSeq, await this.#store.latestChangeSeq())
+      }
       this.#emitFacts()
+      void this.#scheduleMaterialize().catch(() => undefined)
       return new ApplicationOperation(opIdHex, operationId, this)
     })
+    if (input.awaitMaterialized === true) {
+      await this.#flushPendingMaterialization()
+    }
+    return op
   }
 
   /** Execute a named command (via local ApplicationDefinition if present, else direct topic dispatch). */
@@ -1689,6 +1949,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly revision: MaterializedRevision
     readonly value: unknown
   }> {
+    await this.#flushPendingMaterialization()
     if (this.definition !== undefined && Object.hasOwn(this.definition.queries, name)) {
       const view = await this.readView()
       try {
@@ -1736,6 +1997,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   /** Describe available commands and queries (from local definition or in-chain reducer describe() exports). */
   async describe(): Promise<ApplicationDescription> {
+    await this.#flushPendingMaterialization()
     if (this.definition !== undefined) return describeApplication(this.definition)
     const stateRoot = this.#lastLocalRevision.stateRoot
     if (this.#cachedDescription !== null && this.#cachedDescription.stateRoot === stateRoot) {
@@ -1835,6 +2097,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly targetOpId: string | null
     readonly value: JsonValue
   }> {
+    await this.#flushPendingMaterialization()
     const res = await this.#kernel.queryAt(topic, input, target)
     return {
       applicationId: this.applicationId,
@@ -1849,6 +2112,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
    * Run speculative queries/mutations, compute exact row-level diffs, and optionally export a guarded proposal.
    */
   async forkSql(topic: string): Promise<SqlBranch> {
+    await this.#flushPendingMaterialization()
     const topicState = this.#kernel.topic(topic) as { readonly dbRoot?: unknown } | null
     const baseRoot = topicState !== null && typeof topicState === 'object' && typeof topicState.dbRoot === 'string'
       ? topicState.dbRoot
@@ -1872,6 +2136,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   /** Capture a coherent read snapshot for reactive views, queries, and event pagination. */
   async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<ApplicationReadView> {
+    await this.#flushPendingMaterialization()
     const viewKind = options.view ?? 'local'
     if (viewKind === 'final' && !this.#hasActiveFinalityPolicy()) {
       throw Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' })
@@ -2024,6 +2289,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       updates,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
@@ -2037,6 +2303,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly authorTimestampMs?: bigint
   } = {}): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> {
     check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_LOG_ONLY')
+    await this.#flushPendingMaterialization()
     const keysState = this.keysState()
     const nextEpoch = keysState.currentEpoch + 1
     const key = options.newEpochKey ?? crypto.getRandomValues(new Uint8Array(32))
@@ -2051,6 +2318,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     const operation = await this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2081,6 +2349,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   ): Promise<{ readonly ring: string; readonly epoch: number; readonly operation: ApplicationOperation }> {
     check(this.genesis.privateLog, 'COMPARTMENT_PRIVATE_LOG_ONLY')
     check(typeof ringName === 'string' && ringName.length > 0 && ringName !== 'default', 'RING_NAME_INVALID')
+    await this.#flushPendingMaterialization()
     const keysState = this.keysState()
     const prevRing = keysState.rings?.[ringName]
     const nextEpoch = (prevRing?.currentEpoch ?? -1) + 1
@@ -2094,6 +2363,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     const operation = await this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2181,6 +2451,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       updates,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
@@ -2201,6 +2472,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const verificationCode = options.verificationCode ?? String(codeNum).padStart(6, '0')
     const operation = await this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2266,6 +2538,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       updates,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
@@ -2362,6 +2635,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       updates,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
@@ -2380,8 +2654,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       let hash = f.hash
       let size = f.size
       if (f.bytes !== undefined) {
-        // Store publication bytes in the lazy-pull public blob pipe (never eager CAS)
-        // and index by exact raw SHA-256 so HTTP caches and P2P peers share one hash.
         const computedHash = bytesToHex(sha256Sync(f.bytes))
         if (hash !== undefined) check(hash === computedHash, 'PUBLICATION_FILE_HASH_MISMATCH')
         hash = computedHash
@@ -2395,6 +2667,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2418,6 +2691,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     check(options.revision !== undefined || options.opId !== undefined, 'PUBLICATION_ROLLBACK_TARGET_REQUIRED')
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2439,6 +2713,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }): Promise<ApplicationOperation> {
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2471,6 +2746,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     return this.submit({
       visibility: 'public',
+      awaitMaterialized: true,
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
@@ -2723,47 +2999,109 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   // ---- Retention ----
 
   async retain(proposalId: string, subject: { readonly author: string; readonly envelopeDigest: string }): Promise<RetentionEvidence> {
-    const evidence = await signRecord('operation-retention', {
-      applicationId: this.applicationId,
-      proposalId,
-      author: subject.author,
-      envelopeDigest: subject.envelopeDigest,
-      peer: this.identity.publicKey,
-      storageId: this.device.storageId,
-    }, this.device.identity)
-    let byPeer = this.#retentions.get(proposalId)
-    if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(proposalId, byPeer) }
-    byPeer.set(this.identity.publicKey, evidence)
-    await this.#store.put(`${this.#prefix}/retention/${proposalId}/${this.identity.publicKey}`, encodeRecord(evidence))
-    this.#emitFacts()
-    return evidence
+    const [evidence] = await this.retainMany([{ proposalId, author: subject.author, envelopeDigest: subject.envelopeDigest }])
+    return evidence!
+  }
+
+  /** Sign and persist a batch of retention receipts in ONE batched store write + ONE fact emission. */
+  async retainMany(
+    items: readonly { readonly proposalId: string; readonly author: string; readonly envelopeDigest: string }[],
+  ): Promise<readonly RetentionEvidence[]> {
+    if (items.length === 0) return []
+    const results: RetentionEvidence[] = []
+    const toWrite: BytesStoreEntry[] = []
+    for (const item of items) {
+      const existing = this.#retentions.get(item.proposalId)?.get(this.identity.publicKey)
+      if (existing !== undefined && existing.payload.envelopeDigest === item.envelopeDigest) {
+        results.push(existing)
+        continue
+      }
+      const evidence = await signRecord('operation-retention', {
+        applicationId: this.applicationId,
+        proposalId: item.proposalId,
+        author: item.author,
+        envelopeDigest: item.envelopeDigest,
+        peer: this.identity.publicKey,
+        storageId: this.device.storageId,
+      }, this.device.identity)
+      let byPeer = this.#retentions.get(item.proposalId)
+      if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(item.proposalId, byPeer) }
+      byPeer.set(this.identity.publicKey, evidence)
+      toWrite.push({
+        key: `${this.#prefix}/retention/${item.proposalId}/${this.identity.publicKey}`,
+        value: encodeRecord(evidence),
+      })
+      results.push(evidence)
+    }
+    if (toWrite.length > 0) {
+      for (let i = 0; i < toWrite.length; i += 128) {
+        await writeBytesMany(this.#store, toWrite.slice(i, i + 128), { durability: 'relaxed' })
+      }
+      this.#emitFacts()
+    }
+    return results
   }
 
   // ---- Facts export & merge (P2P + blind host sync) ----
 
-  /** Read a decoded CAS node payload & links cleanly without touching internal wire envelopes. */
   /** Number of times this session skipped full replay by restoring a verified materialized cache/snapshot. */
   get materializedCacheHits(): number {
     return this.#materializedCacheHits
   }
 
   /**
-   * Export a compact, self-verifying materialized snapshot.
-   * On private logs, encrypts the snapshot under the current epoch key (AEAD) so blind hosts
-   * and ephemeral participants (e.g. Hosted MCP) can cache it with ZERO plaintext at rest.
+   * Export a self-contained, member-signed Snapshot Bundle (v2) including reachable private
+   * SQLite-CAS Merkle pages + seenOpsRoot (excluding built-in standard modules).
+   * On private logs, AEAD-encrypts under the current epoch key so blind hosts can cache it
+   * in R2 with ZERO plaintext at rest and cold browsers can bootstrap in 1 fetch.
    */
-  async exportMaterializedSnapshot(): Promise<Uint8Array | null> {
-    if (this.#kernel.outcomes.length === 0 || this.#kernel.pendingDependencies.length > 0) return null
+  async exportMaterializedSnapshot(options: { readonly includeReachableCas?: boolean } = {}): Promise<Uint8Array | null> {
+    await this.#flushPendingMaterialization()
+    if (
+      (this.#kernel.outcomes.length === 0 && this.#kernel.frontierOrderLength === 0) ||
+      this.#kernel.pendingDependencies.length > 0
+    ) {
+      return null
+    }
     const cache = this.#kernel.exportMaterializedCache()
+    const casNodes: SessionCasNode[] = []
+    if (options.includeReachableCas !== false) {
+      const stdHashes = new Set(Object.values(STANDARD_MODULE_SOURCES).map(src => computeCasHash(utf8(src), [])))
+      const roots = this.#kernel.gcRoots()
+      const reachable = await this.cas.reachable(roots)
+      for (const hash of reachable) {
+        if (stdHashes.has(hash)) continue
+        const pubRaw = await this.cas.getRaw(hash, 'public')
+        if (pubRaw !== null) {
+          casNodes.push({ hash, bytes: pubRaw, partition: 'public' })
+          continue
+        }
+        const privRaw = await this.cas.getRaw(hash, 'private')
+        if (privRaw !== null) {
+          casNodes.push({ hash, bytes: privRaw, partition: 'private' })
+        }
+      }
+    }
+    let maxTs = this.#kernel.frontierMaxTimestampMs
+    for (const o of cache.outcomes) {
+      if (o.authorTimestampMs > maxTs) maxTs = o.authorTimestampMs
+    }
+    const signedBundle = await signRecord('materialized-snapshot-v2', {
+      logId: this.logId,
+      cache,
+      casNodes,
+      maxAuthorTimestampMs: maxTs.toString(),
+    }, this.device.identity)
+
     if (this.genesis.privateLog && !this.#blindHostMode) {
       const epoch = this.#currentEpochFrom(this.#kernel)
       const epochKey = epoch >= 0 ? this.#epochKeys.get(epoch) : undefined
       if (epochKey === undefined) return null
-      const plain = encodeRecord(cache)
+      const plain = encodeRecord(signedBundle)
       const aad = utf8(`chronolog-v2-snapshot:${this.logId}:${epoch}`)
       const enc = await encryptEpochPayload(epochKey, BigInt(epoch), plain, aad)
       return encodeRecord({
-        v: 1,
+        v: 2,
         private: true,
         logId: this.logId,
         epoch,
@@ -2772,25 +3110,26 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       })
     }
     return encodeRecord({
-      v: 1,
+      v: 2,
       private: false,
       logId: this.logId,
-      cache,
+      bundle: signedBundle,
     })
   }
 
   /**
-   * Stage or immediately apply an exported materialized snapshot (AEAD-decrypted on private logs).
-   * Returns true if validated and accepted (either applied now or staged for the next mergeFacts).
+   * Stage or immediately apply an exported materialized snapshot bundle (AEAD-decrypted on private logs).
+   * Works even on cold browsers with ZERO historical ops downloaded yet (frontier bootstrap)!
    */
   importMaterializedSnapshot(bytes: Uint8Array): Promise<boolean> {
     return this.#serial(async () => {
       const decoded = await this.#decodeMaterializedSnapshot(bytes)
       if (decoded === null) return false
-      this.#pendingMaterializedCache = decoded
-      if (this.#publicOps.size > 0 || this.#encryptedEnvelopes.size > 0) {
-        await this.#rematerialize()
+      if (decoded.casNodes.length > 0) {
+        await this.cas.putManyVerified(decoded.casNodes)
       }
+      this.#pendingSnapshotBundle = decoded
+      await this.#rematerialize()
       return true
     })
   }
@@ -2855,21 +3194,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       let materializedChanged = false
       let factsChanged = false
 
-      for (const node of facts.casNodes ?? []) {
-        if (this.cas.hasSync(node.hash, node.partition)) continue
-        if (hashCasNode(node.bytes) === node.hash) {
-          decodeCasNode(node.bytes)
-          await this.cas.putRaw(node.hash, node.bytes, node.partition)
+      if (facts.casNodes !== undefined && facts.casNodes.length > 0) {
+        const addedCas = await this.cas.putManyVerified(facts.casNodes)
+        if (addedCas > 0) {
           materializedChanged = true
           factsChanged = true
-        } else if (computeCasHash(node.bytes, []) === node.hash) {
-          await this.cas.put(node.bytes, [], node.partition)
-          materializedChanged = true
-          factsChanged = true
-        } else {
-          throw new Error(`CAS_NODE_HASH_MISMATCH:${node.hash}`)
         }
       }
+
+      const storeBatch: BytesStoreEntry[] = []
 
       for (const raw of facts.publicOps ?? []) {
         const signed = decodeSignedOperation(raw)
@@ -2879,8 +3212,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const opId = bytesToHex(verified.opId)
         if (this.#publicOps.has(opId)) continue
         check(this.#publicOps.size + this.#encryptedEnvelopes.size < this.#maxOperations, 'SESSION_OPERATION_LIMIT')
-        await this.#store.put(`${this.#prefix}/public-op/${opId}`, raw.slice())
-        this.#publicOps.set(opId, { raw: raw.slice(), signed, core: verified.core })
+        const copy = raw.slice()
+        storeBatch.push({ key: `${this.#prefix}/public-op/${opId}`, value: copy })
+        this.#publicOps.set(opId, { raw: copy, signed, core: verified.core })
         materializedChanged = true
         factsChanged = true
       }
@@ -2891,8 +3225,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const digest = bytesToHex(encryptedEnvelopeDigest(raw))
         if (this.#encryptedEnvelopes.has(digest)) continue
         check(this.#publicOps.size + this.#encryptedEnvelopes.size < this.#maxOperations, 'SESSION_OPERATION_LIMIT')
-        await this.#store.put(`${this.#prefix}/enc-env/${digest}`, raw.slice())
-        this.#encryptedEnvelopes.set(digest, { digest, raw: raw.slice(), envelope })
+        const copy = raw.slice()
+        storeBatch.push({ key: `${this.#prefix}/enc-env/${digest}`, value: copy })
+        this.#encryptedEnvelopes.set(digest, { digest, raw: copy, envelope })
+        this.#undecryptedEnvelopes.add(digest)
         materializedChanged = true
         factsChanged = true
       }
@@ -2904,7 +3240,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(ev.payload.proposalId, byPeer) }
         if (!byPeer.has(ev.signer)) {
           byPeer.set(ev.signer, ev)
-          await this.#store.put(`${this.#prefix}/retention/${ev.payload.proposalId}/${ev.signer}`, encodeRecord(ev))
+          storeBatch.push({
+            key: `${this.#prefix}/retention/${ev.payload.proposalId}/${ev.signer}`,
+            value: encodeRecord(ev),
+          })
           factsChanged = true
         }
       }
@@ -2914,9 +3253,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const key = await recordDigest(cp.payload)
         if (!this.#checkpoints.has(key)) {
           this.#checkpoints.set(key, cp)
-          await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(cp))
+          storeBatch.push({ key: `${this.#prefix}/checkpoint/${key}`, value: encodeRecord(cp) })
           materializedChanged = true
           factsChanged = true
+        }
+      }
+
+      if (storeBatch.length > 0) {
+        for (let i = 0; i < storeBatch.length; i += 128) {
+          await writeBytesMany(this.#store, storeBatch.slice(i, i + 128), { durability: 'relaxed' })
+        }
+        if (this.#store.latestChangeSeq !== undefined) {
+          this.#lastSyncSeq = Math.max(this.#lastSyncSeq, await this.#store.latestChangeSeq())
         }
       }
 
@@ -2933,6 +3281,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async collectGarbage(): Promise<{ readonly kept: number; readonly deleted: number }> {
     return this.#serial(async () => {
+      await this.#flushPendingMaterialization()
       const roots = this.#kernel.gcRoots()
       if (this.#controlKernel !== null) {
         for (const r of this.#controlKernel.gcRoots()) roots.add(r)
@@ -2965,9 +3314,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   close(): Promise<void> {
     return this.#closing ??= (async () => {
+      if (this.#cachePersistTimer !== undefined) {
+        clearTimeout(this.#cachePersistTimer)
+        this.#cachePersistTimer = undefined
+      }
+      try { await this.#flushPendingMaterialization() } catch { /* ignore on close */ }
+      try { await this.#persistMaterializedCacheNow() } catch { /* ignore on close */ }
       this.#closed = true
       this.#lifetime.abort(new Error('SESSION_CLOSED'))
       this.#emitStatus()
+      this.#kernel.sandbox.dispose()
+      this.#controlKernel?.sandbox.dispose()
+      this.#finalKernel?.sandbox.dispose()
       await this.content.close()
       await this.#release()
     })()

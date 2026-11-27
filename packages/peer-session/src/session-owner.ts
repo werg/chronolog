@@ -157,12 +157,14 @@ export function createApplicationOwner(session: ApplicationSession, options: App
 
         if (method === 'submit') {
           allow('commands'); check(effective.rawSubmit ?? effective.commands === undefined, 'ENDPOINT_RAW_SUBMIT_FORBIDDEN')
+          active(request)
           const operation = await session.submit(args[0] as Parameters<ApplicationSession['submit']>[0])
           return { id: operation.id, operationId: operation.operationId }
         }
         if (method === 'command') {
           allow('commands'); const name = String(args[0])
           check(effective.commands === undefined || effective.commands.includes(name), 'ENDPOINT_COMMAND_FORBIDDEN')
+          active(request)
           const input = options.prepareCommand === undefined ? args[1] : options.prepareCommand(binding(), name, args[1])
           const operation = await session.command(name, input, args[2] as Parameters<ApplicationSession['command']>[2])
           return { id: operation.id, operationId: operation.operationId }
@@ -437,7 +439,11 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           error => { pending.delete(requestId); post({ protocol: APPLICATION_OWNER_PROTOCOL, attachment, kind: 'response', id: requestId, error: error instanceof Error ? error.message : String(error) }); if (requestMethod === 'hello' || requestMethod === 'close') close() },
         )
       }
-      const expiry = setInterval(() => { if (!suspended && performance.now() - lastReceived > 60_000) close() }, 15_000); expiry.unref?.()
+      const inactivityTimeoutMs = options.inactivityTimeoutMs ?? null
+      const expiry = inactivityTimeoutMs !== null && inactivityTimeoutMs > 0
+        ? setInterval(() => { if (!suspended && performance.now() - lastReceived > inactivityTimeoutMs) close() }, Math.max(1000, Math.floor(inactivityTimeoutMs / 4)))
+        : undefined
+      expiry?.unref?.()
       attachments.set(endpointId, { binding, state: () => suspended ? 'suspended' : 'active', close })
       endpoint.addEventListener('message', receive); physical.addEventListener('close', physicalClose); physical.addEventListener('messageerror', physicalClose); physical.on?.('close', close); physical.on?.('messageerror', close)
       endpoint.start?.()

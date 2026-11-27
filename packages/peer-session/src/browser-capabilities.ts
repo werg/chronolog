@@ -1,5 +1,4 @@
 import { probeIndexedDbBytesStore } from '@chronolog/records/indexeddb-browser'
-import { probeOpfsWritable } from '@chronolog/records/browser'
 
 export interface BrowserCapabilityReport {
   readonly secureContext: boolean
@@ -7,13 +6,10 @@ export interface BrowserCapabilityReport {
   readonly sharedWorker: boolean
   readonly indexedDb: { readonly supported: boolean; readonly writable: boolean }
   readonly webLocks: boolean
-  readonly opfs: { readonly directory: boolean; readonly createWritable: boolean; readonly syncAccessHandle: boolean }
   readonly crypto: { readonly ed25519: boolean; readonly x25519: boolean }
   readonly wasm: boolean
-  /** For a new store only. This does not inspect a device's persisted backend pin. */
-  readonly events: { readonly supported: boolean; readonly backend: 'opfs' | 'indexeddb' | null; readonly reason?: string }
-  /** API eligibility is not an application SQL/WASM qualification. */
-  readonly sql: { readonly apiEligible: boolean; readonly qualified: false; readonly reason: string }
+  readonly events: { readonly supported: boolean; readonly backend: 'indexeddb' | null; readonly reason?: string }
+  readonly sql: { readonly apiEligible: boolean; readonly qualified: boolean; readonly reason: string }
 }
 
 async function ed25519(): Promise<boolean> {
@@ -36,27 +32,9 @@ async function x25519(): Promise<boolean> {
   } catch { return false }
 }
 
-async function syncOpfsHandle(): Promise<boolean> {
-  if (typeof navigator === 'undefined' || navigator.storage?.getDirectory === undefined || typeof document !== 'undefined') return false
-  const root = await navigator.storage.getDirectory()
-  const name = 'chronolog-sync-probe-' + crypto.randomUUID()
-  let created = false
-  try {
-    const file = await root.getFileHandle(name, { create: true })
-    created = true
-    const method = (file as FileSystemFileHandle & { createSyncAccessHandle?: () => Promise<{ close(): void }> }).createSyncAccessHandle
-    if (typeof method !== 'function') return false
-    let handle: { close(): void } | undefined
-    try { handle = await method.call(file); return true }
-    finally { handle?.close() }
-  } finally {
-    if (created) try { await root.removeEntry(name) } catch { /* Scratch cleanup is best effort. */ }
-  }
-}
-
 /**
- * Explicit scratch-only probe for an owning dedicated Worker. No application
- * metadata, signer, Web Lock, backend pin, SQL pool or real data store is opened.
+ * Explicit scratch-only probe for an owning dedicated Worker.
+ * Chronolog v2 uses multi-tab IndexedDB + WASM sqlite-cas (no OPFS sync handles or exclusive storage locks).
  */
 export async function probeBrowserCapabilities(): Promise<BrowserCapabilityReport> {
   const secureContext = globalThis.isSecureContext === true
@@ -67,40 +45,30 @@ export async function probeBrowserCapabilities(): Promise<BrowserCapabilityRepor
   const webLocks = typeof navigator !== 'undefined' && typeof navigator.locks?.request === 'function'
   const indexedSupported = typeof indexedDB !== 'undefined'
   const wasm = typeof WebAssembly !== 'undefined'
-  const directory = typeof navigator !== 'undefined' && typeof navigator.storage?.getDirectory === 'function'
 
   const [ed, x] = await Promise.all([ed25519(), x25519()])
-  let idbWritable = false, opfsWritable = false, syncHandle = false, reason: string | undefined
+  let idbWritable = false, reason: string | undefined
   try {
     if (indexedSupported) idbWritable = await probeIndexedDbBytesStore()
-    if (directory) {
-      opfsWritable = await probeOpfsWritable()
-    }
   } catch (error) {
-    // Quota, security and unknown I/O errors are not evidence that it is safe
-    // to select another backend. Diagnostics preserve the failure explicitly.
     reason = error instanceof Error ? error.name + ': ' + error.message : String(error)
   }
-  const backend = reason === undefined && directory ? (opfsWritable ? 'opfs' : idbWritable ? 'indexeddb' : null) : null
-  const supported = secureContext && ownerWorker && webLocks && ed && x && idbWritable && backend !== null
-  const unavailable = reason ?? (!secureContext ? 'Secure context required' : !ownerWorker ? 'Dedicated or shared owner Worker required'
-    : !webLocks ? 'Web Locks unavailable' : !ed || !x ? 'Required native WebCrypto algorithms unavailable'
-    : !idbWritable ? 'Writable IndexedDB is required for device metadata'
-      : !directory ? 'The OPFS directory must be inspectable before choosing a record backend'
-      : backend === null ? 'Neither durable record backend is writable' : undefined)
-  let sqlError: string | undefined
-  if (directory && ownerWorker && wasm) {
-    try { syncHandle = await syncOpfsHandle() }
-    catch (error) { sqlError = error instanceof Error ? error.name + ': ' + error.message : String(error) }
-  }
-  const eligible = ownerWorker && wasm && syncHandle
+  const backend = reason === undefined && idbWritable ? 'indexeddb' : null
+  const supported = secureContext && ownerWorker && ed && x && backend !== null
+  const unavailable = reason ?? (!secureContext ? 'Secure context required' : !ownerWorker ? 'Dedicated owner Worker required'
+    : !ed || !x ? 'Required native WebCrypto algorithms unavailable'
+    : !idbWritable ? 'Writable IndexedDB is required for device and application storage' : undefined)
+  const eligible = ownerWorker && wasm && idbWritable
   return {
     secureContext, dedicatedWorker, sharedWorker, indexedDb: { supported: indexedSupported, writable: idbWritable },
-    webLocks, opfs: { directory, createWritable: opfsWritable, syncAccessHandle: syncHandle },
-    crypto: { ed25519: ed, x25519: x }, wasm,
+    webLocks, crypto: { ed25519: ed, x25519: x }, wasm,
     events: { supported, backend: supported ? backend : null, ...(supported ? {} : { reason: unavailable ?? 'Event prerequisites unavailable' }) },
-    sql: { apiEligible: eligible, qualified: false, reason: eligible
-      ? 'SQL/WASM application and VFS have not been qualified on this browser'
-      : sqlError ?? 'SQL/WASM requires an owner Worker, WebAssembly and OPFS sync access handles' },
+    sql: {
+      apiEligible: eligible,
+      qualified: eligible,
+      reason: eligible
+        ? 'SQLite-CAS WASM over multi-tab IndexedDB is supported'
+        : 'SQLite-CAS requires a Worker, WebAssembly, and writable IndexedDB',
+    },
   }
 }

@@ -8,7 +8,7 @@ import {
   hexToBytes,
   type CborValue,
 } from '@chronolog/canonical'
-import { writeBytesMany, type BytesStore, type BytesStoreEntry } from './bytes-store.js'
+import { deleteBytesMany, writeBytesMany, type BytesStore, type BytesStoreEntry } from './bytes-store.js'
 
 export type CasPartition = 'public' | 'private'
 
@@ -108,31 +108,49 @@ export class ContentAddressedStore {
 
   /** Preload persisted CAS entries from BytesStore into the in-memory index/cache. */
   async preload(): Promise<void> {
+    if (this.#store.iteratePrefix !== undefined) {
+      for await (const entry of this.#store.iteratePrefix(this.#prefix)) this.indexPersistedEntry(entry)
+      return
+    }
     if (this.#store.iterateEntries !== undefined) {
-      for await (const entry of this.#store.iterateEntries()) this.#indexPersistedEntry(entry)
+      for await (const entry of this.#store.iterateEntries()) this.indexPersistedEntry(entry)
       return
     }
     if (this.#store.entries !== undefined) {
-      for (const entry of await this.#store.entries()) this.#indexPersistedEntry(entry)
+      for (const entry of await this.#store.entries()) this.indexPersistedEntry(entry)
     }
   }
 
-  #indexPersistedEntry(entry: BytesStoreEntry): void {
-    if (!entry.key.startsWith(this.#prefix)) return
+  /**
+   * Index a single persisted BytesStore entry if it belongs to this CAS prefix.
+   * Returns true if the key was a CAS entry (allowing single-pass hydration in ApplicationSession.open).
+   */
+  indexPersistedEntry(
+    entry: BytesStoreEntry,
+    options: { readonly verifyHash?: boolean; readonly preloadCache?: boolean } = {},
+  ): boolean {
+    if (!entry.key.startsWith(this.#prefix)) return false
     const rest = entry.key.slice(this.#prefix.length)
     let partition: CasPartition
     let hash: string
     if (rest.startsWith('pub/')) { partition = 'public'; hash = rest.slice(4) }
     else if (rest.startsWith('priv/')) { partition = 'private'; hash = rest.slice(5) }
-    else return
-    if (!HEX32.test(hash)) return
-    const verifiedHash = hashCasNode(entry.value)
-    if (verifiedHash !== hash) throw new Error(`CAS_CORRUPT: ${hash}`)
-    const node = decodeCasNode(entry.value)
+    else return true
+    if (!HEX32.test(hash)) return true
+    const verifyHash = options.verifyHash ?? true
+    if (verifyHash) {
+      const verifiedHash = hashCasNode(entry.value)
+      if (verifiedHash !== hash) throw new Error(`CAS_CORRUPT: ${hash}`)
+    }
     const parts = this.#known.get(hash) ?? new Set<CasPartition>()
     parts.add(partition)
     this.#known.set(hash, parts)
-    this.#touchCache(hash, entry.value, node, partition)
+    const shouldPreload = options.preloadCache ?? (partition === 'public' || this.#cache.size < this.#maxCacheEntries)
+    if (shouldPreload) {
+      const node = decodeCasNode(entry.value)
+      this.#touchCache(hash, entry.value, node, partition)
+    }
+    return true
   }
 
   /** Begin a staged replay batch: synchronous puts stay in RAM until flushBatch(). */
@@ -158,7 +176,7 @@ export class ContentAddressedStore {
       entries.push({ key: this.#key(item.partition, hash), value: item.encoded })
     }
     for (let i = 0; i < entries.length; i += 128) {
-      await writeBytesMany(this.#store, entries.slice(i, i + 128))
+      await writeBytesMany(this.#store, entries.slice(i, i + 128), { durability: 'relaxed' })
     }
     for (const [hash, item] of this.#staged) {
       if (keepHashes !== undefined && !keepHashes.has(hash)) continue
@@ -189,7 +207,7 @@ export class ContentAddressedStore {
     const hash = hashCasNode(encoded)
     const node: CasNode = { bytes: bytes.slice(), links: [...new Set(links)].sort() }
     if (!this.#known.get(hash)?.has(partition)) {
-      await this.#store.put(this.#key(partition, hash), encoded)
+      await this.#store.put(this.#key(partition, hash), encoded, { durability: 'relaxed' })
       const parts = this.#known.get(hash) ?? new Set<CasPartition>()
       parts.add(partition)
       this.#known.set(hash, parts)
@@ -206,11 +224,58 @@ export class ContentAddressedStore {
     if (actual !== expectedHash) throw new Error(`CAS_HASH_MISMATCH: expected ${expectedHash}, got ${actual}`)
     const node = decodeCasNode(encoded)
     if (!equalBytes(encodeCasNode(node.bytes, node.links), encoded)) throw new Error('CAS_NODE_NOT_CANONICAL')
-    await this.#store.put(this.#key(partition, expectedHash), encoded)
+    await this.#store.put(this.#key(partition, expectedHash), encoded, { durability: 'relaxed' })
     const parts = this.#known.get(expectedHash) ?? new Set<CasPartition>()
     parts.add(partition)
     this.#known.set(expectedHash, parts)
     this.#touchCache(expectedHash, encoded, node, partition)
+  }
+
+  /** Batched put for peer/host CAS sync (single putMany per 128 chunks instead of N transactions). */
+  async putManyVerified(
+    items: readonly { readonly hash: string; readonly bytes: Uint8Array; readonly partition: CasPartition }[],
+  ): Promise<number> {
+    const toWrite: BytesStoreEntry[] = []
+    const stagedMeta: { hash: string; encoded: Uint8Array; node: CasNode; partition: CasPartition }[] = []
+    for (const item of items) {
+      if (this.hasSync(item.hash, item.partition)) continue
+      assertHashHex(item.hash)
+      let encoded: Uint8Array
+      let node: CasNode
+      if (hashCasNode(item.bytes) === item.hash) {
+        if (item.bytes.byteLength > this.#maxChunkBytes + 65_536) throw new Error('CAS_CHUNK_TOO_LARGE')
+        node = decodeCasNode(item.bytes)
+        if (!equalBytes(encodeCasNode(node.bytes, node.links), item.bytes)) throw new Error('CAS_NODE_NOT_CANONICAL')
+        encoded = item.bytes.slice()
+      } else if (computeCasHash(item.bytes, []) === item.hash) {
+        if (item.bytes.byteLength > this.#maxChunkBytes) throw new Error('CAS_CHUNK_TOO_LARGE')
+        encoded = encodeCasNode(item.bytes, [])
+        node = { bytes: item.bytes.slice(), links: [] }
+      } else {
+        throw new Error(`CAS_NODE_HASH_MISMATCH:${item.hash}`)
+      }
+      toWrite.push({ key: this.#key(item.partition, item.hash), value: encoded })
+      stagedMeta.push({ hash: item.hash, encoded, node, partition: item.partition })
+    }
+    if (toWrite.length === 0) return 0
+    for (let i = 0; i < toWrite.length; i += 128) {
+      await writeBytesMany(this.#store, toWrite.slice(i, i + 128), { durability: 'relaxed' })
+    }
+    for (const meta of stagedMeta) {
+      const parts = this.#known.get(meta.hash) ?? new Set<CasPartition>()
+      parts.add(meta.partition)
+      this.#known.set(meta.hash, parts)
+      this.#touchCache(meta.hash, meta.encoded, meta.node, meta.partition)
+    }
+    return stagedMeta.length
+  }
+
+  /** Fault a known-on-disk CAS node back into the synchronous RAM LRU (demand paging for >16 MiB DBs). */
+  async ensureLoaded(hash: string, allowedPartition: CasPartition | 'any' = 'any'): Promise<boolean> {
+    if (!HEX32.test(hash)) return false
+    if (this.getSync(hash, allowedPartition) !== null) return true
+    const loaded = await this.get(hash, allowedPartition)
+    return loaded !== null
   }
 
   /** Synchronous read from staged RAM + LRU cache (respecting partition visibility). */
@@ -296,21 +361,30 @@ export class ContentAddressedStore {
     return visited
   }
 
-  /** Exact local mark-and-sweep GC preserving everything reachable from rootHashes. */
+  /** Exact local mark-and-sweep GC preserving everything reachable from rootHashes, deleting in yielding batches. */
   async collectGarbage(rootHashes: Iterable<string>): Promise<{ readonly kept: number; readonly deleted: number }> {
     if (this.#inBatch) throw new Error('CAS_GC_DURING_BATCH')
     const keep = await this.reachable(rootHashes)
-    let deleted = 0
+    const keysToDelete: string[] = []
+    const hashesToDrop: string[] = []
     for (const [hash, partitions] of [...this.#known.entries()]) {
       if (keep.has(hash)) continue
       for (const partition of partitions) {
-        await this.#store.delete?.(this.#key(partition, hash))
-        deleted++
+        keysToDelete.push(this.#key(partition, hash))
       }
+      hashesToDrop.push(hash)
+    }
+    for (let i = 0; i < keysToDelete.length; i += 32) {
+      await deleteBytesMany(this.#store, keysToDelete.slice(i, i + 32), { durability: 'relaxed' })
+      if (i + 32 < keysToDelete.length) {
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
+      }
+    }
+    for (const hash of hashesToDrop) {
       this.#known.delete(hash)
       this.#cache.delete(hash)
     }
-    return { kept: keep.size, deleted }
+    return { kept: keep.size, deleted: keysToDelete.length }
   }
 
   listKnownHashes(partition?: CasPartition): readonly string[] {

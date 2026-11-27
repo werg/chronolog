@@ -91,7 +91,9 @@ export class BrowserMetadataStore implements DeviceMetadataStore {
   #transaction<T>(mode: IDBTransactionMode, enqueue: (table: IDBObjectStore) => () => T): Promise<T> {
     if (this.#closed) return Promise.reject(new Error('BROWSER_METADATA_CLOSED'))
     return new Promise((resolve, reject) => {
-      const transaction = this.#database.transaction(TABLE, mode, { durability: 'strict' })
+      const transaction = mode === 'readonly'
+        ? this.#database.transaction(TABLE, mode)
+        : this.#database.transaction(TABLE, mode, { durability: 'strict' })
       const value = enqueue(transaction.objectStore(TABLE))
       transaction.oncomplete = () => { try { resolve(value()) } catch (error) { reject(error) } }
       transaction.onabort = () => { reject(transaction.error ?? new Error('BROWSER_METADATA_ABORTED')) }

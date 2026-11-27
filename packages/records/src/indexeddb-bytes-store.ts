@@ -1,11 +1,18 @@
-import type { BytesStore, BytesStoreEntry } from './bytes-store.js'
-import { assertRecordKey, decodeRecordValue, encodeRecordValue, MAX_RECORD_ENVELOPE_BYTES, MAX_RECORD_VALUE_BYTES } from './record-envelope.js'
+import type { BytesStore, BytesStoreChange, BytesStoreEntry, BytesStoreWriteOptions } from './bytes-store.js'
+import {
+  assertRecordKey,
+  decodeRecordValueSync,
+  encodeRecordValueSync,
+  MAX_RECORD_ENVELOPE_BYTES,
+  MAX_RECORD_VALUE_BYTES,
+} from './record-envelope.js'
 
 const TABLE = 'values'
 const STAGING = 'checkpoint-staging'
-const VERSION = 2
+const CHANGELOG = 'changelog'
+const VERSION = 3
 
-/** Transaction-complete, per-key atomic durable records; no signer or protocol state lives here. */
+/** Multi-tab ACID IndexedDB BytesStore with atomic delta changelog and configurable durability. */
 export class IndexedDbBytesStore implements BytesStore {
   readonly #database: IDBDatabase
   #pending: Promise<void> = Promise.resolve()
@@ -35,6 +42,9 @@ export class IndexedDbBytesStore implements BytesStore {
         }
         if (!request.result.objectStoreNames.contains(TABLE)) request.result.createObjectStore(TABLE)
         if (!request.result.objectStoreNames.contains(STAGING)) request.result.createObjectStore(STAGING)
+        if (!request.result.objectStoreNames.contains(CHANGELOG)) {
+          request.result.createObjectStore(CHANGELOG, { autoIncrement: true })
+        }
       }
       request.onerror = () => {
         reject(missing ? new Error('APPLICATION_DATA_STORAGE_MISSING') : request.error ?? new Error('INDEXEDDB_STORE_OPEN_FAILED'))
@@ -50,13 +60,13 @@ export class IndexedDbBytesStore implements BytesStore {
   async get(key: string): Promise<Uint8Array | null> {
     assertRecordKey(key)
     return this.#enqueue(async () => {
-      const raw = await this.#transaction('readonly', table => {
+      const raw = await this.#readTx(TABLE, table => {
         const request = table.get(key)
         return () => request.result as unknown
       })
       if (raw === undefined) return null
       if (!(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) throw new Error('INDEXEDDB_VALUE_CORRUPT')
-      return decodeRecordValue(key, raw, 'INDEXEDDB_VALUE_CORRUPT')
+      return decodeRecordValueSync(key, raw, 'INDEXEDDB_VALUE_CORRUPT')
     })
   }
 
@@ -65,80 +75,153 @@ export class IndexedDbBytesStore implements BytesStore {
     if (captured.length > 128) return Promise.reject(new Error('BYTES_STORE_BATCH_LIMIT'))
     for (const key of captured) assertRecordKey(key)
     return this.#enqueue(async () => {
-      const raw = await this.#transaction('readonly', table => {
+      const raw = await this.#readTx(TABLE, table => {
         const requests = captured.map(key => table.get(key))
         return () => requests.map(request => request.result as unknown)
       })
-      return Promise.all(raw.map(async (value, index) => {
+      return raw.map((value, index) => {
         if (value === undefined) return null
         if (!(value instanceof Uint8Array) || value.length > MAX_RECORD_ENVELOPE_BYTES) throw new Error('INDEXEDDB_VALUE_CORRUPT')
-        return decodeRecordValue(captured[index]!, value, 'INDEXEDDB_VALUE_CORRUPT')
-      }))
+        return decodeRecordValueSync(captured[index]!, value, 'INDEXEDDB_VALUE_CORRUPT')
+      })
     })
   }
 
-  async put(key: string, input: Uint8Array): Promise<void> {
+  async put(key: string, input: Uint8Array, options?: BytesStoreWriteOptions): Promise<void> {
     assertRecordKey(key)
     if (input.length > MAX_RECORD_VALUE_BYTES) return Promise.reject(new Error('BYTES_STORE_VALUE_LIMIT'))
-    const bytes = input.slice()
+    const raw = encodeRecordValueSync(key, input)
+    const durability = options?.durability ?? 'relaxed'
     return this.#enqueue(async () => {
-      // Hash and encode outside the transaction: an await inside would auto-close it.
-      const raw = await encodeRecordValue(key, bytes)
-      await this.#transaction('readwrite', table => { table.put(raw, key); return () => undefined })
-    })
-  }
-
-  async putMany(entries: readonly BytesStoreEntry[]): Promise<void> {
-    if (entries.length === 0) return
-    if (entries.length > 128) return Promise.reject(new Error('BYTES_STORE_BATCH_LIMIT'))
-    const staged = new Map<string, Uint8Array>()
-    for (const entry of entries) {
-      assertRecordKey(entry.key)
-      if (entry.value.length > MAX_RECORD_VALUE_BYTES) return Promise.reject(new Error('BYTES_STORE_VALUE_LIMIT'))
-      staged.set(entry.key, entry.value.slice())
-    }
-    return this.#enqueue(async () => {
-      const encoded: { key: string; value: Uint8Array }[] = []
-      for (const [key, value] of staged) encoded.push({ key, value: await encodeRecordValue(key, value) })
-      await this.#transaction('readwrite', table => {
-        for (const entry of encoded) table.put(entry.value, entry.key)
+      await this.#writeTx([TABLE, CHANGELOG], durability, tx => {
+        tx.objectStore(TABLE).put(raw, key)
+        tx.objectStore(CHANGELOG).add({ key, deleted: false })
         return () => undefined
       })
     })
   }
 
-  async delete(key: string): Promise<void> {
+  async putMany(entries: readonly BytesStoreEntry[], options?: BytesStoreWriteOptions): Promise<void> {
+    if (entries.length === 0) return
+    if (entries.length > 128) return Promise.reject(new Error('BYTES_STORE_BATCH_LIMIT'))
+    const encoded: { key: string; value: Uint8Array }[] = []
+    const seen = new Map<string, number>()
+    for (const entry of entries) {
+      assertRecordKey(entry.key)
+      if (entry.value.length > MAX_RECORD_VALUE_BYTES) return Promise.reject(new Error('BYTES_STORE_VALUE_LIMIT'))
+      const raw = encodeRecordValueSync(entry.key, entry.value)
+      const prevIdx = seen.get(entry.key)
+      if (prevIdx !== undefined) {
+        encoded[prevIdx] = { key: entry.key, value: raw }
+      } else {
+        seen.set(entry.key, encoded.length)
+        encoded.push({ key: entry.key, value: raw })
+      }
+    }
+    const durability = options?.durability ?? 'relaxed'
+    return this.#enqueue(async () => {
+      await this.#writeTx([TABLE, CHANGELOG], durability, tx => {
+        const table = tx.objectStore(TABLE)
+        const log = tx.objectStore(CHANGELOG)
+        for (const entry of encoded) {
+          table.put(entry.value, entry.key)
+          log.add({ key: entry.key, deleted: false })
+        }
+        return () => undefined
+      })
+    })
+  }
+
+  async delete(key: string, options?: BytesStoreWriteOptions): Promise<void> {
     assertRecordKey(key)
-    return this.#enqueue(() => this.#transaction('readwrite', table => { table.delete(key); return () => undefined }))
+    const durability = options?.durability ?? 'relaxed'
+    return this.#enqueue(() => this.#writeTx([TABLE, CHANGELOG], durability, tx => {
+      tx.objectStore(TABLE).delete(key)
+      tx.objectStore(CHANGELOG).add({ key, deleted: true })
+      return () => undefined
+    }))
+  }
+
+  async deleteMany(keys: readonly string[], options?: BytesStoreWriteOptions): Promise<void> {
+    if (keys.length === 0) return
+    const unique = [...new Set(keys)]
+    for (const key of unique) assertRecordKey(key)
+    const durability = options?.durability ?? 'relaxed'
+    return this.#enqueue(async () => {
+      for (let i = 0; i < unique.length; i += 128) {
+        const chunk = unique.slice(i, i + 128)
+        await this.#writeTx([TABLE, CHANGELOG], durability, tx => {
+          const table = tx.objectStore(TABLE)
+          const log = tx.objectStore(CHANGELOG)
+          for (const key of chunk) {
+            table.delete(key)
+            log.add({ key, deleted: true })
+          }
+          return () => undefined
+        })
+      }
+    })
   }
 
   async putAllIfEmpty(entries: readonly { readonly key: string; readonly value: Uint8Array }[]): Promise<boolean> {
-    const captured = entries.map(entry => ({ key: entry.key, value: entry.value.slice() }))
+    const encoded: { key: string; value: Uint8Array }[] = []
     const seen = new Set<string>()
-    for (const entry of captured) {
+    for (const entry of entries) {
       assertRecordKey(entry.key)
       if (entry.value.length > MAX_RECORD_VALUE_BYTES) throw new Error('BYTES_STORE_VALUE_LIMIT')
       if (seen.has(entry.key)) throw new Error('BYTES_STORE_DUPLICATE_KEY')
       seen.add(entry.key)
+      encoded.push({ key: entry.key, value: encodeRecordValueSync(entry.key, entry.value) })
     }
-    return this.#enqueue(async () => {
-      const encoded: { key: string; value: Uint8Array }[] = []
-      for (const entry of captured) encoded.push({ key: entry.key, value: await encodeRecordValue(entry.key, entry.value) })
-      return this.#transaction('readwrite', table => {
-        let initialized = false
-        const count = table.count()
-        count.onsuccess = () => {
-          if (count.result !== 0) return
-          for (const entry of encoded) table.add(entry.value, entry.key)
-          initialized = true
+    return this.#enqueue(() => this.#writeTx([TABLE, CHANGELOG], 'strict', tx => {
+      const table = tx.objectStore(TABLE)
+      const log = tx.objectStore(CHANGELOG)
+      let initialized = false
+      const count = table.count()
+      count.onsuccess = () => {
+        if (count.result !== 0) return
+        for (const entry of encoded) {
+          table.add(entry.value, entry.key)
+          log.add({ key: entry.key, deleted: false })
         }
-        return () => initialized
-      })
-    })
+        initialized = true
+      }
+      return () => initialized
+    }))
   }
+
+  async *iteratePrefix(prefix: string): AsyncIterable<BytesStoreEntry> {
+    const upper = prefix + '\uffff'
+    let after: string | undefined
+    for (;;) {
+      const items = await this.#enqueue(() => this.#readTx(TABLE, table => {
+        const entries: { key: string; value: Uint8Array }[] = []
+        let failure: Error | undefined, bytes = 0
+        const range = after === undefined
+          ? IDBKeyRange.bound(prefix, upper, false, true)
+          : IDBKeyRange.bound(after, upper, true, true)
+        const request = table.openCursor(range)
+        request.onsuccess = () => {
+          const cursor = request.result
+          if (cursor === null) return
+          const key = cursor.key, raw: unknown = cursor.value
+          if (typeof key !== 'string' || !(raw instanceof Uint8Array) || raw.length > MAX_RECORD_ENVELOPE_BYTES) {
+            failure = new Error('INDEXEDDB_VALUE_CORRUPT'); return
+          }
+          entries.push({ key, value: raw }); bytes += raw.length
+          if (entries.length < 128 && bytes < 2 * 1024 * 1024) cursor.continue()
+        }
+        return () => { if (failure !== undefined) throw failure; return entries }
+      }))
+      if (items.length === 0) break
+      for (const entry of items) {
+        after = entry.key
+        yield { key: entry.key, value: decodeRecordValueSync(entry.key, entry.value, 'INDEXEDDB_VALUE_CORRUPT') }
+      }
+    }
+  }
+
   async *iterateEntries(): AsyncIterable<BytesStoreEntry> {
-    // The storage contract has one mutation owner. Hold its queue across pages
-    // so neither caller backpressure nor async hashing permits an interleaved put.
     let release!: () => void, started!: () => void
     const held = new Promise<void>(resolve => { release = resolve }), ready = new Promise<void>(resolve => { started = resolve })
     const owner = this.#enqueue(async () => { started(); await held })
@@ -146,7 +229,7 @@ export class IndexedDbBytesStore implements BytesStore {
     try {
       let after: string | undefined
       for (;;) {
-        const items = await this.#transaction('readonly', table => {
+        const items = await this.#readTx(TABLE, table => {
           const entries: { key: string; value: Uint8Array }[] = []
           let failure: Error | undefined, bytes = 0
           const request = table.openCursor(after === undefined ? undefined : IDBKeyRange.lowerBound(after, true))
@@ -158,40 +241,72 @@ export class IndexedDbBytesStore implements BytesStore {
               failure = new Error('INDEXEDDB_VALUE_CORRUPT'); return
             }
             entries.push({ key, value: raw }); bytes += raw.length
-            if (entries.length < 64 && bytes < 1024 * 1024) cursor.continue()
+            if (entries.length < 128 && bytes < 2 * 1024 * 1024) cursor.continue()
           }
           return () => { if (failure !== undefined) throw failure; return entries }
         })
         if (items.length === 0) break
         for (const entry of items) {
           after = entry.key
-          yield { key: entry.key, value: await decodeRecordValue(entry.key, entry.value, 'INDEXEDDB_VALUE_CORRUPT') }
+          yield { key: entry.key, value: decodeRecordValueSync(entry.key, entry.value, 'INDEXEDDB_VALUE_CORRUPT') }
         }
       }
     } finally { release(); await owner }
   }
+
+  async latestChangeSeq(): Promise<number> {
+    return this.#enqueue(() => this.#readTx(CHANGELOG, log => {
+      let latest = 0
+      const req = log.openKeyCursor(null, 'prev')
+      req.onsuccess = () => {
+        const cursor = req.result
+        if (cursor !== null && typeof cursor.key === 'number') latest = cursor.key
+      }
+      return () => latest
+    }))
+  }
+
+  async readChangesSince(afterSeq: number): Promise<{ readonly latestSeq: number; readonly changes: readonly BytesStoreChange[] }> {
+    return this.#enqueue(() => this.#readTx(CHANGELOG, log => {
+      const changes: BytesStoreChange[] = []
+      let latestSeq = afterSeq
+      const range = afterSeq > 0 ? IDBKeyRange.lowerBound(afterSeq, true) : undefined
+      const req = log.openCursor(range)
+      req.onsuccess = () => {
+        const cursor = req.result
+        if (cursor === null) return
+        const seq = typeof cursor.key === 'number' ? cursor.key : 0
+        const val = cursor.value as { readonly key?: unknown; readonly deleted?: unknown } | undefined
+        if (seq > latestSeq) latestSeq = seq
+        if (val && typeof val.key === 'string') {
+          changes.push({ seq, key: val.key, deleted: val.deleted === true })
+        }
+        if (changes.length < 4096) cursor.continue()
+      }
+      return () => ({ latestSeq, changes })
+    }))
+  }
+
   async entries(): Promise<readonly BytesStoreEntry[]> {
     const entries: BytesStoreEntry[] = []
     for await (const entry of this.iterateEntries()) entries.push(entry)
     return entries.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
   }
+
   putStreamIfEmpty(entries: AsyncIterable<BytesStoreEntry>): Promise<boolean> {
     return this.#enqueue(async () => {
-      const empty = await this.#transaction('readonly', table => { const count = table.count(); return () => count.result === 0 })
+      const empty = await this.#readTx(TABLE, table => { const count = table.count(); return () => count.result === 0 })
       if (!empty) return false
-      const clear = () => this.#transaction('readwrite', table => { table.clear(); return () => undefined }, STAGING)
+      const clear = () => this.#writeTx([STAGING], 'relaxed', tx => { tx.objectStore(STAGING).clear(); return () => undefined })
       await clear()
       try {
         for await (const entry of entries) {
           assertRecordKey(entry.key)
-          const raw = await encodeRecordValue(entry.key, entry.value)
-          await this.#transaction('readwrite', table => { table.add(raw, entry.key); return () => undefined }, STAGING)
+          const raw = encodeRecordValueSync(entry.key, entry.value)
+          await this.#writeTx([STAGING], 'relaxed', tx => { tx.objectStore(STAGING).add(raw, entry.key); return () => undefined })
         }
-        // Staged envelopes stay on disk until the authenticated input ends.
-        // Publish them in one IDB transaction, including the empty-store check.
-        return await new Promise<boolean>((resolve, reject) => {
-          const tx = this.#database.transaction([TABLE, STAGING], 'readwrite', { durability: 'strict' })
-          const table = tx.objectStore(TABLE), staging = tx.objectStore(STAGING)
+        return await this.#writeTx([TABLE, STAGING, CHANGELOG], 'strict', tx => {
+          const table = tx.objectStore(TABLE), staging = tx.objectStore(STAGING), log = tx.objectStore(CHANGELOG)
           let initialized = false
           const count = table.count()
           count.onsuccess = () => {
@@ -201,11 +316,12 @@ export class IndexedDbBytesStore implements BytesStore {
             cursor.onsuccess = () => {
               const entry = cursor.result
               if (entry === null) { staging.clear(); return }
-              table.add(entry.value, entry.key); entry.continue()
+              table.add(entry.value, entry.key)
+              if (typeof entry.key === 'string') log.add({ key: entry.key, deleted: false })
+              entry.continue()
             }
           }
-          tx.oncomplete = () => resolve(initialized)
-          tx.onabort = () => reject(tx.error ?? new Error('INDEXEDDB_RESTORE_FAILED'))
+          return () => initialized
         })
       } finally { await clear() }
     })
@@ -229,13 +345,30 @@ export class IndexedDbBytesStore implements BytesStore {
     return task
   }
 
-  #transaction<T>(mode: IDBTransactionMode, enqueue: (table: IDBObjectStore) => () => T, name = TABLE): Promise<T> {
+  #readTx<T>(storeName: string, enqueue: (table: IDBObjectStore) => () => T): Promise<T> {
     return new Promise((resolve, reject) => {
       let transaction: IDBTransaction
-      try { transaction = this.#database.transaction(name, mode, { durability: 'strict' }) }
+      try { transaction = this.#database.transaction(storeName, 'readonly') }
       catch (error) { reject(error); return }
       let value: () => T
-      try { value = enqueue(transaction.objectStore(name)) }
+      try { value = enqueue(transaction.objectStore(storeName)) }
+      catch (error) {
+        try { transaction.abort() } catch { /* Preserve the original request failure. */ }
+        reject(error); return
+      }
+      transaction.oncomplete = () => { try { resolve(value()) } catch (error) { reject(error) } }
+      transaction.onabort = () => { reject(transaction.error ?? new Error('INDEXEDDB_TRANSACTION_ABORTED')) }
+      transaction.onerror = () => { /* The abort event carries the transaction failure. */ }
+    })
+  }
+
+  #writeTx<T>(storeNames: readonly string[], durability: 'strict' | 'relaxed', enqueue: (tx: IDBTransaction) => () => T): Promise<T> {
+    return new Promise((resolve, reject) => {
+      let transaction: IDBTransaction
+      try { transaction = this.#database.transaction([...storeNames], 'readwrite', { durability }) }
+      catch (error) { reject(error); return }
+      let value: () => T
+      try { value = enqueue(transaction) }
       catch (error) {
         try { transaction.abort() } catch { /* Preserve the original request failure. */ }
         reject(error); return

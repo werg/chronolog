@@ -126,15 +126,17 @@ export class WorkerApplicationSession {
     })
   }
 
-  async initialize(options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext }): Promise<void> {
+  async initialize(options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext; readonly heartbeat?: boolean }): Promise<void> {
     const value = await this.request<{ applicationId: string; identity: { publicKey: string }; status: SessionStatus; binding: InlineApplicationEndpointBinding; definition: InlineApplicationDescription }>('hello', [options])
     this.applicationId = value.applicationId; this.identity = value.identity; this.#status = value.status; this.#binding = value.binding; this.#description = value.definition
-    this.#heartbeat = setInterval(() => {
-      if (this.#pinging || this.signal.aborted || this.#attachmentState === 'suspended') return
-      this.#pinging = true
-      void this.request('attachment.ping', [], { timeoutMs: 20_000 }).catch(error => this.#detach(error)).finally(() => { this.#pinging = false })
-    }, 5000)
-    this.#heartbeat.unref?.()
+    if (options.heartbeat === true) {
+      this.#heartbeat = setInterval(() => {
+        if (this.#pinging || this.signal.aborted || this.#attachmentState === 'suspended') return
+        this.#pinging = true
+        void this.request('attachment.ping', [], { timeoutMs: 20_000 }).catch(error => this.#detach(error)).finally(() => { this.#pinging = false })
+      }, 5000)
+      this.#heartbeat.unref?.()
+    }
   }
 
   async suspendAttachment(): Promise<void> { await this.request('attachment.suspend', []); this.#attachmentState = 'suspended'; this.#ownedViews.clear() }
@@ -433,7 +435,7 @@ export class WorkerApplicationSession {
 
 export async function connectApplicationOwner(
   endpoint: ApplicationWorkerEndpoint & { start?(): void },
-  options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext },
+  options: { readonly applicationId: string; readonly context?: InlineApplicationEndpointContext; readonly heartbeat?: boolean },
 ): Promise<WorkerApplicationSession> {
   endpoint.start?.()
   const session = new WorkerApplicationSession(endpoint)
