@@ -26,8 +26,8 @@ Inspired by Martin Kleppmann's work on timestamp-ordered operation logs with rol
 
 - **A flat set of independent operations — expressly *not* a Merkle chain:** Every mutation is an immutable, standalone Ed25519-signed operation stamped with `(authorTimestampMs, author, opId)` and scoped by `logId` (the hash of its `LogGenesis`). Input operations **never** reference preceding operations, blocks, or state roots by hash; there are no `parents` pointers and no forks to merge. Individual operations may reference content-addressed CAS hashes for blobs or module code, while remaining independent timestamp-sorted records.
 - **One total order, zero sequencers:** Every replica sorts the set of operations it has seen by `(authorTimestampMs, author, opId)` and folds them forward deterministically. No peer, relay, host, or validator ever assigns operation order.
-- **Offline first, O(1) rewind on late arrivals:** Author locally and durably without waiting for a network or quorum. When an earlier-timestamped operation arrives later from a reconnecting peer, Chronolog doesn't need inverse functions or custom merge logic — it jumps back in **O(1)** to the nearest content-addressed snapshot before that timestamp and deterministically replays the suffix.
-- **One pure Merkle-DAG CAS for artifacts & derived snapshots:** Large immutable values — reducer ES Module source code, SQLite database pages, binary blobs, and *derived* replay snapshots — live in one content-addressed DAG (`ContentAddressedStore`) with explicit links, strict public/private partitions, and exact mark-and-sweep garbage collection. Input operations remain an unlinked flat set; the Merkle DAG exists solely for content deduplication and O(1) snapshot rewind.
+- **Offline first, instant cold reopen & O(1) rewind on late arrivals:** Author locally and durably without waiting for a network or quorum. `ApplicationSession` automatically caches self-verifying materialized state locally (`materialized-cache`) — and exports portable **epoch-AEAD-encrypted snapshots** (`exportMaterializedSnapshot` / `importMaterializedSnapshot`) for ephemeral edge participants — turning cold reopens into **O(1)** or suffix-only catch-up. When an earlier-timestamped operation arrives later from a reconnecting peer, Chronolog doesn't need inverse functions or custom merge logic — it jumps back in **O(1)** to the nearest content-addressed snapshot before that timestamp and deterministically replays the suffix.
+- **One pure Merkle-DAG CAS + unified streaming P2P content pipe:** Large immutable values — reducer ES Module source code, SQLite database pages, and *derived* replay snapshots — live in one content-addressed DAG (`ContentAddressedStore`) with explicit links, strict public/private partitions, `session.readCasPayload`, and exact mark-and-sweep garbage collection. Rich media and large attachments flow through `session.content` (`put`, `get`, `putStream`, `readStream`, `pin`, `unpin`, `stats`, `pruneCache`) with epoch encryption or public hash addressing and bounded LRU cache eviction. Input operations remain an unlinked flat set.
 
 ---
 
@@ -66,7 +66,7 @@ Under the hood, `chronolog-db` (`packages/sqlite-cas`) compiles **stock SQLite +
 
 - **A whole SQL database is one 32-byte hash:** The topic state stores `{ dbRoot, schemaVersion, policies, allowUserDdl }`. Every `db.commit()` writes only dirty 4 KiB pages into CAS and returns the new 32-byte `dbRoot`. Rolling back a failed transaction or rewinding to replay an earlier offline operation across a `CREATE TABLE`, `ALTER TABLE`, `UNIQUE` constraint, foreign key, FTS5 index, or `sqlite-vec` table is **O(1)** — simply open the previous `dbRoot`.
 - **Multiple independent SQL databases in one log:** Bind `inventory`, `analytics`, and `scratch` to `chronolog/sql` in the same chronolog to get three isolated, hash-addressed relational databases sharing one identity, encryption, and permission boundary.
-- **Bit-for-bit deterministic everywhere:** Works identically in Chromium, WebKit, Node.js, and Cloudflare Workers. `random()` and `randomblob()` are disabled; `datetime('now')` and `localtime` are pinned to the signed operation's UTC `op_time()`; and `actor()`, `op_id()`, and `op_time()` are bound directly in the host kernel so reducers and SQL queries can never forge the caller.
+- **Bit-for-bit deterministic everywhere:** Works identically in Chromium, WebKit, Node.js, and Cloudflare Workers. `random()` and `randomblob()` are disabled; `datetime('now')` and `localtime` are pinned to the signed operation's UTC `op_time()`; read-only `PRAGMA page_size` / `PRAGMA data_version` are permitted in `mode: 'user'` so FTS5 and `sqlite-vec` (`vec0`) writes work directly in user transactions; and `actor()`, `op_id()`, and `op_time()` are bound directly in the host kernel so reducers and SQL queries can never forge the caller.
 
 ---
 
@@ -154,18 +154,19 @@ Signed Operations (flat set sorted by authorTimestampMs, author, opId)
   ContentAddressedStore (CAS) ──► BytesStore (Memory | IndexedDB / OPFS | Node 22+ node:sqlite)
 ```
 
-### Six Audited Standard Modules
+### Seven Audited Standard Modules
 
-Chronolog ships six small, audited ES Modules pinned into public CAS at genesis:
+Chronolog ships seven small, audited ES Modules pinned into public CAS at genesis:
 
 | Module | Topic / Role | What It Does |
 | --- | --- | --- |
-| `chronolog/permissions` | `$permissions`, `$reducers`, `$signal_policy` | Pluggable authority presets (`attestedMembers`, `multisigMembers`, `openMembers`) answering capability queries (`{ check, actor }`, `{ list }`, `{ admission: true }`), admin-only `$reducers` upgrades, and ephemeral signal policy. |
+| `chronolog/permissions` | `$permissions`, `$reducers`, `$signal_policy` | Pluggable authority presets (`attestedMembers`, `multisigMembers`, `openMembers` with `blockAuthor`/`unblockAuthor` moderation) returning a unified `{ summary: true }` permissions shape and answering capability queries (`{ check, actor }`, `{ list }`, `{ admission: true }`), admin-only `$reducers` upgrades, and ephemeral signal policy. |
 | `chronolog/keys` | `$keys` | HPKE (X25519 + AES-256-GCM) epoch key lockboxes, key rotation, and fresh-device historical epoch grants (`grantBoxes`). |
 | `chronolog/finality` | `$finality` | Time-scoped optional finality schedule (`none`, `signed-frontier`, `fixed-validator`, `blockchain-anchor`) with clean `none -> P1` bootstrap and `P1 -> P2` handoffs. |
 | `chronolog/publications` | `$publications` | Signed static UI release manifests referencing public CAS hashes. |
 | `chronolog/rls` | Utility library | Postgres-style write RLS triggers validated via SQLite's `mode: 'readonly'` authorizer (`applyRls`) plus dynamic user-table ownership helpers. |
 | `chronolog/sql` | Any SQL topic(s) | First-class deterministic SQLite-CAS topic reducer (`migrate`, `setRls`, `setConfig`, `exec` with atomic preconditions/postconditions + rollback, user-owned dynamic DDL, `query({ sql, params, format })`, `schema`, and `describe()`). |
+| `chronolog/sqlite-helpers` | Custom SQLite reducers | Zero-boilerplate helpers (`defineSqlReducer`, `withDb`, `rowsToObjects`) for custom `chronolog:sqlite` ES Module reducers with automatic schema/table/SQL query introspection. |
 
 ---
 
