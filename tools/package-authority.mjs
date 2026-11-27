@@ -72,7 +72,7 @@ const runtimeModules = Object.fromEntries(Object.entries(result.metafile.outputs
   [relative(output, resolve(root, path)).replaceAll('\\', '/'), { inputs: Object.keys(module.inputs).sort(), imports: module.imports }]));
 await writeFile(join(output, 'provenance.json'), JSON.stringify({
   format: 'chronolog-authority-package/v2',
-  repository: 'werg/chronolog-db', source, sourceTree, profile: 'chronolog-crdt-v2', dirty: Boolean(changed), inputs, runtimeModules,
+  repository: 'werg/chronolog', source, sourceTree, profile: 'chronolog-crdt-v2', dirty: Boolean(changed), inputs, runtimeModules,
   sha256: Object.fromEntries(await Promise.all(files.map(async name => [name, await digest(name)]))),
 }, null, 2) + '\n');
 const packed = JSON.parse(execNpmSync(['pack', '--ignore-scripts', '--json', '--pack-destination', output], {

@@ -186,7 +186,7 @@ assert.equal(git(['status', '--porcelain', '--untracked-files=all', '--', ...inp
 const sha256 = Object.fromEntries([...files].map(([path, content]) => [path, hash(content)]));
 await writeFile(join(packageRoot, 'provenance.json'), JSON.stringify({
   format: 'chronolog-peer-session-package/v2',
-  repository: 'werg/chronolog-db',
+  repository: 'werg/chronolog',
   source,
   sourceTree,
   dirty,

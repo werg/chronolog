@@ -29,9 +29,6 @@ importers:
       '@chronolog/signals':
         specifier: workspace:*
         version: link:packages/signals
-      '@chronolog/sqlite-cas':
-        specifier: workspace:*
-        version: link:packages/sqlite-cas
       '@chronolog/transport-webrtc':
         specifier: workspace:*
         version: link:packages/transport-webrtc
@@ -50,6 +47,9 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^3.2.4
         version: 3.2.7(vitest@3.2.7(@types/node@24.13.3)(tsx@4.23.1)(yaml@2.9.0))
+      chronolog-db:
+        specifier: workspace:*
+        version: link:packages/sqlite-cas
       esbuild:
         specifier: 0.28.2
         version: 0.28.2
@@ -146,15 +146,15 @@ importers:
       '@chronolog/signals':
         specifier: workspace:*
         version: link:../signals
-      '@chronolog/sqlite-cas':
-        specifier: workspace:*
-        version: link:../sqlite-cas
       '@chronolog/transport-webrtc':
         specifier: workspace:*
         version: link:../transport-webrtc
       '@chronolog/transport-websocket':
         specifier: workspace:*
         version: link:../transport-websocket
+      chronolog-db:
+        specifier: workspace:*
+        version: link:../sqlite-cas
 
   packages/protocol:
     dependencies:

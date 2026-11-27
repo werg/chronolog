@@ -1,6 +1,6 @@
-# Working with Chronolog-DB
+# Working with Chronolog
 
-Chronolog-DB is the local-first Merkle-DAG CRDT runtime for Tendriller and standalone peer applications: Ed25519/X25519 identity, flat timestamp-ordered operation sets, pure Merkle-DAG `CAS` (`ContentAddressedStore`), QuickJS-NG Import-Map ES Module reducers (`TopicKernel`), deterministic Merkle-paged SQLite+FTS5+`sqlite-vec` (`@chronolog/sqlite-cas`), reactive views (`createLiveView`), local view stores (`createViewStore`), encrypted device checkpoints, durable event forwarding (`forwardSessionEvents`), scoped tools (`createScopedApplicationTools`), ephemeral signals (`@chronolog/signals`), and direct/relayed replication.
+Chronolog is the local-first deterministic undo-do-redo runtime for Tendriller and standalone peer applications: Ed25519/X25519 identity, flat timestamp-ordered operation sets, pure Merkle-DAG `CAS` (`ContentAddressedStore`), QuickJS-NG Import-Map ES Module reducers (`TopicKernel`), deterministic Merkle-paged SQLite+FTS5+`sqlite-vec` (`chronolog-db`), reactive views (`createLiveView`), local view stores (`createViewStore`), encrypted device checkpoints, durable event forwarding (`forwardSessionEvents`), scoped tools (`createScopedApplicationTools`), ephemeral signals (`@chronolog/signals`), and direct/relayed replication.
 
 ## Architectural Invariants
 

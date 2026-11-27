@@ -1,8 +1,8 @@
-# Chronolog-DB
+# Chronolog
 
-**Universal deterministic undo-do-redo over a flat set of signed operations — a minimally bootstrapped reducer of reducers, with a full vanilla SQLite database as a CRDT, malleable write RLS, declarative transaction preconditions, and a consensus-agnostic finality layer.**
+**Universal deterministic undo-do-redo over a flat set of signed operations — a minimally bootstrapped reducer of reducers, with a full vanilla SQLite database as a CRDT (`chronolog-db`), malleable write RLS, declarative transaction preconditions, and a consensus-agnostic finality layer.**
 
-Chronolog-DB lets browsers, Node.js agents, and blind edge hosts (such as Cloudflare Workers) author offline and converge bit-for-bit to the exact same state — with **zero native C/C++ builds**, no central sequencer, and no mandatory consensus protocol.
+Chronolog lets browsers, Node.js agents, and blind edge hosts (such as Cloudflare Workers) author offline and converge bit-for-bit to the exact same state — with **zero native C/C++ builds**, no central sequencer, and no mandatory consensus protocol.
 
 ---
 
@@ -14,7 +14,7 @@ Most distributed systems force an unnecessary fork in the road:
 - **Pick a replicated SQL database**, and you end up wrapping a mutable native binary around a central leader or bolting on lossy per-column LWW merge hacks that silently break invariants.
 - **Pick a blockchain**, and you get deterministic state transitions and finality, but you pay for global consensus on every keystroke, lose offline authoring, and inherit a rigid virtual machine.
 
-Chronolog-DB collapses all three into a single, radical abstraction:
+Chronolog collapses all three into a single, radical abstraction:
 
 > **What if a CRDT weren't a special data structure at all — just a pure, deterministic fold over a flat set of signed operations, where "undo-do-redo" applies to *anything*, and the rules of the fold live inside the state being folded?**
 
@@ -58,11 +58,11 @@ Look at what falls out of reducing *state that contains the reducers over other 
 
 ---
 
-## 3. The Special Case: A Full Vanilla SQL Database as a CRDT
+## 3. Chronolog-DB: A Full Vanilla SQL Database as a CRDT
 
-Because undo-do-redo applies to *any* pure reducer over Merkle-DAG CAS, **a complete, real SQL database is just one standard topic reducer (`chronolog/sql`)**.
+Because undo-do-redo applies to *any* pure reducer over Merkle-DAG CAS, **a complete, real SQL database (`chronolog-db`) is just one standard topic reducer (`chronolog/sql`)**.
 
-Under the hood, `@chronolog/sqlite-cas` compiles **stock SQLite + FTS5 full-text search + `sqlite-vec` vector search** to a single static 1.34 MB `sqlite-cas.wasm` binary backed by a 4 KiB Merkle-paged `CAS` VFS:
+Under the hood, `chronolog-db` (`packages/sqlite-cas`) compiles **stock SQLite + FTS5 full-text search + `sqlite-vec` vector search** to a single static 1.34 MB `sqlite-cas.wasm` binary backed by a 4 KiB Merkle-paged `CAS` VFS:
 
 - **A whole SQL database is one 32-byte hash:** The topic state stores `{ dbRoot, schemaVersion, policies, allowUserDdl }`. Every `db.commit()` writes only dirty 4 KiB pages into CAS and returns the new 32-byte `dbRoot`. Rolling back a failed transaction or rewinding to replay an earlier offline operation across a `CREATE TABLE`, `ALTER TABLE`, `UNIQUE` constraint, foreign key, FTS5 index, or `sqlite-vec` table is **O(1)** — simply open the previous `dbRoot`.
 - **Multiple independent SQL databases in one log:** Bind `inventory`, `analytics`, and `scratch` to `chronolog/sql` in the same chronolog to get three isolated, hash-addressed relational databases sharing one identity, encryption, and permission boundary.
@@ -243,7 +243,7 @@ await session.close()
 
 ## Zero Native Builds
 
-Chronolog-DB requires **Node.js >= 22.15** and has **zero `node-gyp` / C++ native dependencies**:
+Chronolog requires **Node.js >= 22.15** and has **zero `node-gyp` / C++ native dependencies**:
 
 - **Node durable storage:** Node's built-in `node:sqlite` (`DatabaseSync`) on one pooled worker thread per process.
 - **Browser durable storage:** IndexedDB and OPFS (`OpfsBytesStore`).
@@ -264,4 +264,4 @@ pnpm package:session     # Universal zero-native-build @chronolog/peer-session t
 - [Chronolog v2 CRDT Contract](docs/CRDT_CONTRACT.md) — core invariants, ordering, partitioning, encryption, finality, and deterministic SQLite profile.
 - [Authored Operation-Set Model](docs/authored-operation-set.md) — operation lifecycle, offline authoring, reconnect rewrapping, and checkpoint bootstrap.
 - [Browser Storage Architecture](docs/browser-storage.md) — OPFS, IndexedDB, and worker ownership.
-- [Documentation Index](docs/README.md) — package guides (`@chronolog/peer-session`, `@chronolog/materializer`, `@chronolog/sqlite-cas`, `@chronolog/authority`, `@chronolog/signals`, `@chronolog/transport-webrtc`).
+- [Documentation Index](docs/README.md) — package guides (`@chronolog/peer-session`, `@chronolog/materializer`, `chronolog-db`, `@chronolog/authority`, `@chronolog/signals`, `@chronolog/transport-webrtc`).

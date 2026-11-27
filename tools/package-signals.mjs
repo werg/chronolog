@@ -51,7 +51,7 @@ await writeFile(join(output, 'package.json'), JSON.stringify(packageJson, null, 
 const sha256 = Object.fromEntries(await Promise.all(['index.mjs', 'index.d.ts', 'payload.d.ts', 'README.md', 'package.json']
   .map(async name => [name, hash(await readFile(join(output, name)))])));
 await writeFile(join(output, 'provenance.json'), JSON.stringify({ format: 'chronolog-signals-package/v1',
-  repository: 'werg/chronolog-db', source, dirty, inputs, runtimeInputs, sha256 }, null, 2) + '\n');
+  repository: 'werg/chronolog', source, dirty, inputs, runtimeInputs, sha256 }, null, 2) + '\n');
 const packed = JSON.parse(execNpmSync(['pack', '--ignore-scripts', '--json', '--pack-destination', output], {
   cwd: output, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 }))[0];

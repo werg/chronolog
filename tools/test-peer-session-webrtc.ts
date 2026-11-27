@@ -28,7 +28,7 @@ const workspace = resolve(import.meta.dirname, '..')
 const { values } = parseArgs({ options: { output: { type: 'string', default: 'artifacts/peer-session-webrtc' }, 'build-only': { type: 'boolean', default: false }, 'allow-dirty': { type: 'boolean', default: false } } })
 const output = resolve(values.output)
 const git = (args: readonly string[]) => execFileSync('git', [...args], { cwd: workspace, encoding: 'utf8' }).trim()
-const source = { repository: 'werg/chronolog-db', head: git(['rev-parse', 'HEAD']), tree: git(['rev-parse', 'HEAD^{tree}']), dirty: git(['status', '--porcelain']) !== '' }
+const source = { repository: 'werg/chronolog', head: git(['rev-parse', 'HEAD']), tree: git(['rev-parse', 'HEAD^{tree}']), dirty: git(['status', '--porcelain']) !== '' }
 const digest = (value: Uint8Array | string) => createHash('sha256').update(value).digest('hex')
 await mkdir(output, { recursive: true })
 const bundle = await build({ absWorkingDir: workspace, entryPoints: {

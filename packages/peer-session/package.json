@@ -22,7 +22,7 @@
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",
     "@chronolog/signals": "workspace:*",
-    "@chronolog/sqlite-cas": "workspace:*",
+    "chronolog-db": "workspace:*",
     "@chronolog/transport-webrtc": "workspace:*",
     "@chronolog/transport-websocket": "workspace:*"
   }

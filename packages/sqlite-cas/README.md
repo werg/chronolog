@@ -1,4 +1,4 @@
-# `@chronolog/sqlite-cas`
+# `chronolog-db`
 
 Deterministic stock SQLite + FTS5 + `sqlite-vec` compiled to static `sqlite-cas.wasm` (1.34 MB) on top of a 4 KiB Merkle-paged `ContentAddressedStore` VFS.
 

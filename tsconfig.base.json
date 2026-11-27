@@ -24,7 +24,7 @@
       "@chronolog/crypto": ["packages/crypto/src/index.ts"],
       "@chronolog/materializer": ["packages/materializer/src/index.ts"],
       "@chronolog/materializer/std-modules": ["packages/materializer/src/std-modules.ts"],
-      "@chronolog/sqlite-cas": ["packages/sqlite-cas/src/index.ts"],
+      "chronolog-db": ["packages/sqlite-cas/src/index.ts"],
       "@chronolog/records": ["packages/records/src/index.ts"],
       "@chronolog/records/native": ["packages/records/src/native.ts"],
       "@chronolog/records/browser": ["packages/records/src/browser.ts"],

@@ -723,7 +723,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (!needsSqlite) return
 
     this.#sqliteLoadPromise ??= (async () => {
-      const mod = await import('@chronolog/sqlite-cas')
+      const mod = await import('chronolog-db')
       const driver = await mod.createSqliteCasDriver({
         ...(this.#sqliteWasmModule === undefined ? {} : { wasmModule: this.#sqliteWasmModule }),
       })
