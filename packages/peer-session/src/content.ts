@@ -1,15 +1,21 @@
 import type { BytesStore } from '@chronolog/records'
 import { encryptEpochPayload, decryptEpochPayload, type EncryptedEpochPayload } from '@chronolog/crypto'
-import { bytesToHex, sha256 } from '@chronolog/canonical'
+import { bytesToHex, concatBytes, sha256, utf8 } from '@chronolog/canonical'
 import { check, decodeRecord, encodeRecord, equalRecord, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from '@chronolog/authority'
 import {
   CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_CONTENT_BYTES,
+  isPublicBlobReference, isPrivateContentReference,
   putContentBytes, readContentBytes,
-  type BlobGetOptions, type BlobInfo, type BlobPutOptions, type ContentPutBytesOptions, type ContentReadBytesOptions,
+  type BlobGetOptions, type BlobInfo, type BlobPutOptions, type BlobReference,
+  type ContentGetOptions, type ContentPutBytesOptions, type ContentPutOptions, type ContentReadBytesOptions,
 } from './content-bytes.js'
 import { awaitOwnedTask } from './lifetime.js'
-export { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_BLOB_CHUNKS } from './content-bytes.js'
-export type { BlobGetOptions, BlobInfo, BlobPutOptions, ContentPutBytesOptions, ContentReadBytesOptions } from './content-bytes.js'
+export { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_BLOB_CHUNKS, isPublicBlobReference, isPrivateContentReference } from './content-bytes.js'
+export type {
+  BlobGetOptions, BlobInfo, BlobPutOptions, BlobReference,
+  ContentGetOptions, ContentPutBytesOptions, ContentPutOptions, ContentReadBytesOptions,
+  PublicBlobReference,
+} from './content-bytes.js'
 
 export interface ContentAuthority {
   readonly applicationId: string
@@ -513,5 +519,105 @@ export class ApplicationContent {
   }
   putBytes(bytes: Uint8Array, options?: ContentPutBytesOptions): Promise<ContentReference> { return putContentBytes(this, bytes, options) }
   readBytes(reference: ContentReference, options: ContentReadBytesOptions): Promise<Uint8Array> { return readContentBytes(this, reference, options) }
+  /**
+   * Keyed-convergent deterministic encryption under the current epoch key:
+   * identical plaintext uploaded by different readers in the same epoch produces
+   * the exact same `ContentReference` and chunk hashes, while remaining opaque
+   * to any party without the epoch key.
+   */
+  async #putPrivateConvergent(input: Uint8Array, options: ContentPutBytesOptions = {}): Promise<ContentReference> {
+    this.#reader()
+    check(input instanceof Uint8Array && input.byteLength <= MAX_CONTENT_BYTES, 'CONTENT_RANGE_INVALID')
+    const signal = options.signal === undefined ? this.#lifetime.signal : AbortSignal.any([this.#lifetime.signal, options.signal])
+    signal.throwIfAborted()
+    const bytes = input.slice()
+    const epoch = this.#options.authority.currentEpoch()
+    const mediaType = options.mediaType ?? 'application/octet-stream'
+    const refBody: Omit<ContentReference, 'id'> = {
+      profile: 'authored-content-v1',
+      applicationId: this.#options.authority.applicationId,
+      epoch,
+      bytes: bytes.byteLength,
+      mediaType,
+    }
+    assertReferenceBody(refBody)
+    const epochKey = this.#options.authority.epochKey(epoch)
+    check(epochKey !== null, 'CONTENT_KEY_MISSING')
+    const plainDigest = await awaitOwnedTask(signal, () => sha256(bytes))
+    const stageBytes = await awaitOwnedTask(signal, () =>
+      sha256(concatBytes(utf8('chronolog/convergent-stage/v2:'), epochKey, utf8(this.#prefix), utf8(mediaType), plainDigest)),
+    )
+    const uuidHex = bytesToHex(stageBytes.subarray(0, 16))
+    const id = `${uuidHex.slice(0, 8)}-${uuidHex.slice(8, 12)}-4${uuidHex.slice(13, 16)}-8${uuidHex.slice(17, 20)}-${uuidHex.slice(20, 32)}`
+    const count = Math.ceil(bytes.byteLength / CONTENT_CHUNK_BYTES)
+    const encryptedChunks: { hash: string; bytes: Uint8Array }[] = []
+    for (let index = 0; index < count; index++) {
+      signal.throwIfAborted()
+      const plainChunk = bytes.subarray(index * CONTENT_CHUNK_BYTES, Math.min(bytes.byteLength, (index + 1) * CONTENT_CHUNK_BYTES))
+      const nonceDigest = await awaitOwnedTask(signal, () =>
+        sha256(concatBytes(utf8('chronolog/convergent-nonce/v2:'), epochKey, utf8(this.#prefix), plainDigest, utf8(`:${index}`))),
+      )
+      const encrypted = encodeRecord(await awaitOwnedTask(signal, () =>
+        encryptEpochPayload(epochKey, BigInt(epoch), plainChunk, encodeRecord([this.#prefix, id, index]), nonceDigest.subarray(0, 12)),
+      ))
+      const hash = bytesToHex(await awaitOwnedTask(signal, () => sha256(encrypted)))
+      encryptedChunks.push({ hash, bytes: encrypted })
+    }
+    const manifest: ContentManifest = {
+      stageId: id,
+      reference: refBody,
+      chunks: encryptedChunks.map(c => ({ hash: c.hash, bytes: c.bytes.length })),
+    }
+    const reference: ContentReference = { ...refBody, id: await recordDigest(manifest) }
+    await this.#serial(async () => {
+      signal.throwIfAborted(); this.#reader()
+      for (const chunk of encryptedChunks) {
+        await this.#options.store.put(`${this.#prefix}/chunk/${chunk.hash}`, chunk.bytes)
+      }
+      await this.#options.store.put(`${this.#prefix}/manifest/${reference.id}`, encodeRecord(manifest))
+    })
+    return reference
+  }
+  /** Unified lazy-pull blob write: supports both public raw-SHA-256 blobs and private epoch-encrypted blobs. */
+  async put(bytes: Uint8Array, options: ContentPutOptions = {}): Promise<BlobReference> {
+    const visibility = options.visibility ?? 'private'
+    const mediaType = options.mediaType ?? 'application/octet-stream'
+    if (visibility === 'public') {
+      check(typeof mediaType === 'string' && mediaType.length > 0 && mediaType.length <= 256 && /^[\x20-\x7e]+$/u.test(mediaType), 'CONTENT_REFERENCE_INVALID')
+      const info = await this.putBlob(bytes, options.signal === undefined ? {} : { signal: options.signal })
+      return { profile: 'chronolog-blob-v2', visibility: 'public', hash: info.hash, bytes: info.bytes, mediaType }
+    }
+    const putOpts: ContentPutBytesOptions = {
+      mediaType,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    }
+    return options.deduplicate === true ? this.#putPrivateConvergent(bytes, putOpts) : this.putBytes(bytes, putOpts)
+  }
+  /** Unified lazy-pull blob read: accepts a raw SHA-256 hex hash, a PublicBlobReference, or a private ContentReference. */
+  async get(target: BlobReference | string, options: ContentGetOptions = {}): Promise<Uint8Array | null> {
+    if (typeof target === 'string') {
+      return this.getBlob(target, options)
+    }
+    if (isPublicBlobReference(target)) {
+      return this.getBlob(target.hash, {
+        ...options,
+        expectedBytes: options.expectedBytes ?? target.bytes,
+      })
+    }
+    if (isPrivateContentReference(target)) {
+      try {
+        return await this.readBytes(target, {
+          maxBytes: options.maxBytes ?? target.bytes,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        })
+      } catch (error) {
+        if (error instanceof Error && (error.message === 'CONTENT_MANIFEST_MISSING' || error.message === 'CONTENT_CHUNK_MISSING')) {
+          return null
+        }
+        throw error
+      }
+    }
+    throw new Error('CONTENT_REFERENCE_INVALID')
+  }
   async close(): Promise<void> { this.#lifetime.abort(new Error('CONTENT_CLOSED')); this.#sources.clear(); await this.#tail }
 }

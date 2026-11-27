@@ -16,6 +16,34 @@ export interface BlobGetOptions {
   readonly cache?: boolean
   readonly signal?: AbortSignal
 }
+export interface PublicBlobReference {
+  readonly profile: 'chronolog-blob-v2'
+  readonly visibility: 'public'
+  readonly hash: string
+  readonly bytes: number
+  readonly mediaType: string
+}
+export type BlobReference = PublicBlobReference | ContentReference
+export interface ContentPutOptions {
+  readonly visibility?: 'public' | 'private'
+  readonly mediaType?: string
+  readonly deduplicate?: boolean
+  readonly signal?: AbortSignal
+}
+export interface ContentGetOptions {
+  readonly expectedBytes?: number
+  readonly maxBytes?: number
+  readonly localOnly?: boolean
+  readonly cache?: boolean
+  readonly signal?: AbortSignal
+}
+export function isPublicBlobReference(value: unknown): value is PublicBlobReference {
+  return value !== null && typeof value === 'object' && (value as { profile?: unknown }).profile === 'chronolog-blob-v2' &&
+    (value as { visibility?: unknown }).visibility === 'public'
+}
+export function isPrivateContentReference(value: unknown): value is ContentReference {
+  return value !== null && typeof value === 'object' && (value as { profile?: unknown }).profile === 'authored-content-v1'
+}
 interface ByteContent {
   stage(options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload>
   read(reference: ContentReference, options?: { readonly signal?: AbortSignal }): AsyncIterable<Uint8Array>

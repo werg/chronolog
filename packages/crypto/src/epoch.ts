@@ -25,10 +25,17 @@ export async function encryptEpochPayload(
   epoch: bigint,
   plaintext: Uint8Array,
   associatedData: Uint8Array,
+  explicitNonce?: Uint8Array,
 ): Promise<EncryptedEpochPayload> {
   protocolInvariant(contentKey.length === 32, 'INVALID_KEY', 'Epoch content key must contain 32 bytes')
   const key = await globalThis.crypto.subtle.importKey('raw', source(contentKey), 'AES-GCM', false, ['encrypt'])
-  const nonce = globalThis.crypto.getRandomValues(new Uint8Array(12))
+  let nonce: Uint8Array
+  if (explicitNonce !== undefined) {
+    protocolInvariant(explicitNonce.length === 12, 'SCHEMA_INVALID', 'Epoch payload nonce must contain 12 bytes')
+    nonce = explicitNonce.slice()
+  } else {
+    nonce = globalThis.crypto.getRandomValues(new Uint8Array(12))
+  }
   const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: source(nonce), additionalData: source(payloadAad(epoch, associatedData)), tagLength: 128 },
     key,

@@ -10,8 +10,9 @@ import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, C
 import type { ApplicationSubmission, MaterializedOperation, OperationInspection, RetentionEvidence } from './operation.js'
 import type { ContentReference, ContentUpload, ContentRetention } from './content.js'
 import {
-  CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, putContentBytes, readContentBytes,
-  type BlobGetOptions, type BlobInfo, type BlobPutOptions, type ContentPutBytesOptions, type ContentReadBytesOptions,
+  CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, isPrivateContentReference, isPublicBlobReference, putContentBytes, readContentBytes,
+  type BlobGetOptions, type BlobInfo, type BlobPutOptions, type BlobReference,
+  type ContentGetOptions, type ContentPutBytesOptions, type ContentPutOptions, type ContentReadBytesOptions,
 } from './content-bytes.js'
 
 export interface WorkerApplicationReadView {
@@ -276,6 +277,50 @@ export class WorkerApplicationSession {
     },
     hasBlob: (hash: string): Promise<boolean> => this.request('content.hasBlob', [hash]),
     deleteBlob: (hash: string): Promise<void> => this.request('content.deleteBlob', [hash]),
+    put: async (bytes: Uint8Array, options: ContentPutOptions = {}): Promise<BlobReference> => {
+      const visibility = options.visibility ?? 'private'
+      const mediaType = options.mediaType ?? 'application/octet-stream'
+      if (visibility === 'public') {
+        const info = await this.content.putBlob(bytes, options.signal === undefined ? {} : { signal: options.signal })
+        return { profile: 'chronolog-blob-v2', visibility: 'public', hash: info.hash, bytes: info.bytes, mediaType }
+      }
+      if (options.deduplicate === true) {
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_BLOB_BYTES) throw new Error('CONTENT_RANGE_INVALID')
+        const reqOptions = options.signal === undefined ? {} : { signal: options.signal }
+        const id = await this.request<string>('content.blobOpenWrite', [bytes.byteLength], reqOptions)
+        try {
+          for (let offset = 0; offset < bytes.byteLength; offset += CONTENT_CHUNK_BYTES) {
+            const chunk = Uint8Array.from(bytes.subarray(offset, Math.min(bytes.byteLength, offset + CONTENT_CHUNK_BYTES)))
+            await this.request('content.blobWriteChunk', [id, offset / CONTENT_CHUNK_BYTES, chunk], reqOptions)
+          }
+          return await this.request<ContentReference>('content.blobCommitPrivate', [id, mediaType], reqOptions)
+        } catch (error) {
+          void this.request('content.blobAbortWrite', [id]).catch(() => undefined)
+          throw error
+        }
+      }
+      return this.content.putBytes(bytes, { mediaType, ...(options.signal === undefined ? {} : { signal: options.signal }) })
+    },
+    get: async (target: BlobReference | string, options: ContentGetOptions = {}): Promise<Uint8Array | null> => {
+      if (typeof target === 'string') return this.content.getBlob(target, options)
+      if (isPublicBlobReference(target)) {
+        return this.content.getBlob(target.hash, { ...options, expectedBytes: options.expectedBytes ?? target.bytes })
+      }
+      if (isPrivateContentReference(target)) {
+        try {
+          return await this.content.readBytes(target, {
+            maxBytes: options.maxBytes ?? target.bytes,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          })
+        } catch (error) {
+          if (error instanceof Error && (error.message === 'CONTENT_MANIFEST_MISSING' || error.message === 'CONTENT_CHUNK_MISSING')) {
+            return null
+          }
+          throw error
+        }
+      }
+      throw new Error('CONTENT_REFERENCE_INVALID')
+    },
   }
 
   #detach(error: unknown): void {

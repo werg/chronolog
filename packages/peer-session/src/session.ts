@@ -1528,7 +1528,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly operationId?: string
     readonly authorTimestampMs?: bigint
   } = {}): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> {
-    check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_CHAIN_ONLY')
+    check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_LOG_ONLY')
     const keysState = this.keysState()
     const nextEpoch = keysState.currentEpoch + 1
     const key = options.newEpochKey ?? crypto.getRandomValues(new Uint8Array(32))
@@ -1605,8 +1605,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       let hash = f.hash
       let size = f.size
       if (f.bytes !== undefined) {
-        hash = await this.cas.put(f.bytes, [], 'public')
+        // Store publication bytes in the lazy-pull public blob pipe (never eager CAS)
+        // and index by exact raw SHA-256 so HTTP caches and P2P peers share one hash.
+        const computedHash = bytesToHex(sha256Sync(f.bytes))
+        if (hash !== undefined) check(hash === computedHash, 'PUBLICATION_FILE_HASH_MISMATCH')
+        hash = computedHash
         size = f.bytes.length
+        if (this.isReader(this.identity.publicKey)) {
+          await this.content.putBlob(f.bytes)
+        }
       }
       check(hash !== undefined && size !== undefined, 'PUBLICATION_FILE_INVALID')
       descriptors.push({ path: f.path, hash, size, type: f.type })
@@ -1622,6 +1629,28 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           entry: options.entry,
           files: descriptors as unknown as JsonValue,
           ...(options.expectedRevision === undefined ? {} : { expectedRevision: options.expectedRevision }),
+        },
+      }],
+    })
+  }
+
+  async rollbackRelease(options: {
+    readonly revision?: number
+    readonly opId?: string
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  }): Promise<ApplicationOperation> {
+    check(options.revision !== undefined || options.opId !== undefined, 'PUBLICATION_ROLLBACK_TARGET_REQUIRED')
+    return this.submit({
+      visibility: 'public',
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$publications',
+        input: {
+          action: 'rollback',
+          ...(options.revision === undefined ? {} : { revision: options.revision }),
+          ...(options.opId === undefined ? {} : { opId: options.opId }),
         },
       }],
     })

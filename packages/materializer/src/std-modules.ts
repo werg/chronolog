@@ -139,7 +139,11 @@ export const attestedMembers = {
       const next = normalizeMember(input.member);
       const members = cur.members.filter(m => m.publicKey !== next.publicKey).concat([next]);
       members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-      return { ok: true, state: { ...cur, members }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
+      let admission = cur.admission;
+      if (authorIsAdmin && admission && Array.isArray(admission.removed) && admission.removed.includes(next.publicKey)) {
+        admission = { ...admission, removed: admission.removed.filter(k => k !== next.publicKey) };
+      }
+      return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
     }
 
     if (!authorIsAdmin) return { ok: false, code: 'admin_required' };
@@ -148,7 +152,37 @@ export const attestedMembers = {
       if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
       const members = cur.members.filter(m => m.publicKey !== input.publicKey);
       if (!members.some(m => m.administrator)) return { ok: false, code: 'last_admin_required' };
-      return { ok: true, state: { ...cur, members }, events: [{ topic: '$permissions.removed', payload: { publicKey: input.publicKey } }] };
+      let admission = cur.admission;
+      if (admission && typeof admission === 'object') {
+        const prevRemoved = Array.isArray(admission.removed) ? admission.removed : [];
+        const removed = sortedKeys(prevRemoved.concat([input.publicKey])).slice(-512);
+        admission = { ...admission, removed };
+      }
+      return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$permissions.removed', payload: { publicKey: input.publicKey } }] };
+    }
+
+    if (input.action === 'createInvite') {
+      const inv = input.invite;
+      if (!inv || typeof inv !== 'object' || typeof inv.inviteId !== 'string' || inv.inviteId.length < 1 || inv.inviteId.length > 128) {
+        return { ok: false, code: 'invalid_invite' };
+      }
+      const admission = cur.admission && typeof cur.admission === 'object' ? cur.admission : { mode: 'attested' };
+      const invites = (Array.isArray(admission.invites) ? admission.invites : []).filter(i => i.inviteId !== inv.inviteId).concat([{ ...inv, revoked: false }]).slice(-128);
+      return { ok: true, state: { ...cur, admission: { ...admission, invites } }, events: [{ topic: '$permissions.invite_created', payload: { inviteId: inv.inviteId } }] };
+    }
+
+    if (input.action === 'revokeInvite') {
+      if (typeof input.inviteId !== 'string' || !input.inviteId) return { ok: false, code: 'invalid_invite' };
+      const admission = cur.admission && typeof cur.admission === 'object' ? cur.admission : null;
+      if (!admission || !Array.isArray(admission.invites)) return { ok: false, code: 'invite_not_found' };
+      let found = false;
+      const invites = admission.invites.map(i => {
+        if (i.inviteId !== input.inviteId) return i;
+        found = true;
+        return { ...i, revoked: true };
+      });
+      if (!found) return { ok: false, code: 'invite_not_found' };
+      return { ok: true, state: { ...cur, admission: { ...admission, invites } }, events: [{ topic: '$permissions.invite_revoked', payload: { inviteId: input.inviteId } }] };
     }
 
     if (input.action === 'setAdmission') {
@@ -679,36 +713,89 @@ function isPublisher(ctx, author) {
   return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && (m.publisher === true || m.administrator === true)));
 }
 
+function validPublicationPath(path) {
+  if (typeof path !== 'string' || path.length === 0 || path.length > 512 || path.startsWith('/')) return false;
+  for (let i = 0; i < path.length; i++) {
+    const code = path.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f || code === 0x5c) return false;
+  }
+  const parts = path.split('/');
+  return !parts.some(p => p.length === 0 || p === '.' || p === '..');
+}
+
 export const signedReleases = {
   reduce(state, tx, ctx) {
     if (!isPublisher(ctx, tx.author)) return { ok: false, code: 'publisher_required' };
     const cur = state && typeof state === 'object' ? state : { revision: 0, current: null, history: [] };
     const input = tx.payload;
-    if (!input || input.action !== 'publish' || typeof input.entry !== 'string' || !Array.isArray(input.files) || input.files.length === 0) {
+    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_publication' };
+
+    if (input.action === 'rollback') {
+      const hist = Array.isArray(cur.history) ? cur.history : [];
+      const target = input.opId !== undefined
+        ? hist.find(r => r.opId === input.opId)
+        : Number.isSafeInteger(input.revision)
+          ? hist.find(r => r.revision === input.revision)
+          : null;
+      if (!target || !Array.isArray(target.files)) return { ok: false, code: 'publication_not_found' };
+      const revision = cur.revision + 1;
+      const release = {
+        revision,
+        opId: tx.opId,
+        author: tx.author,
+        timestampMs: tx.authorTimestampMs,
+        entry: target.entry,
+        files: target.files,
+        rollbackOf: target.revision,
+      };
+      const history = hist.concat([release]).slice(-128);
+      return {
+        ok: true,
+        state: { revision, current: release, history },
+        events: [{ topic: '$publications.published', payload: { revision, opId: tx.opId, rollbackOf: target.revision } }],
+      };
+    }
+
+    if (input.action !== 'publish' || typeof input.entry !== 'string' || !Array.isArray(input.files) || input.files.length === 0) {
       return { ok: false, code: 'invalid_publication' };
     }
     if (input.expectedRevision !== undefined && input.expectedRevision !== cur.revision) {
       return { ok: false, code: 'publication_revision_conflict' };
     }
     const files = [];
+    const seenPaths = new Set();
     for (const f of input.files) {
-      if (!f || typeof f.path !== 'string' || !HEX32.test(f.hash || '') || !Number.isSafeInteger(f.size) || f.size < 0 || typeof f.type !== 'string') {
+      if (!f || !validPublicationPath(f.path) || seenPaths.has(f.path) || !HEX32.test(f.hash || '') || !Number.isSafeInteger(f.size) || f.size < 0 || typeof f.type !== 'string' || f.type.length === 0) {
         return { ok: false, code: 'invalid_publication_file' };
       }
+      seenPaths.add(f.path);
       files.push({ path: f.path, hash: f.hash, size: f.size, type: f.type });
     }
     if (!files.some(f => f.path === input.entry)) return { ok: false, code: 'publication_entry_missing' };
     const revision = cur.revision + 1;
     const release = { revision, opId: tx.opId, author: tx.author, timestampMs: tx.authorTimestampMs, entry: input.entry, files };
-    const history = (cur.history || []).concat([{ revision, opId: tx.opId, author: tx.author, entry: input.entry }]).slice(-32);
+    const history = (Array.isArray(cur.history) ? cur.history : []).concat([release]).slice(-128);
     return {
       ok: true,
       state: { revision, current: release, history },
       events: [{ topic: '$publications.published', payload: { revision, opId: tx.opId } }],
     };
   },
-  query(state) {
-    return state || { revision: 0, current: null, history: [] };
+  query(state, input) {
+    const cur = state && typeof state === 'object' ? state : { revision: 0, current: null, history: [] };
+    if (input && typeof input === 'object') {
+      const hist = Array.isArray(cur.history) ? cur.history : [];
+      if (typeof input.opId === 'string') {
+        if (cur.current && cur.current.opId === input.opId) return cur.current;
+        return hist.find(r => r.opId === input.opId) || null;
+      }
+      if (Number.isSafeInteger(input.revision)) {
+        if (cur.current && cur.current.revision === input.revision) return cur.current;
+        return hist.find(r => r.revision === input.revision) || null;
+      }
+      if (input.history === true) return hist;
+    }
+    return cur;
   },
 };
 `.trimStart()

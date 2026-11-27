@@ -293,6 +293,22 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           }
           return session.content.putBlob(assembled, { signal: request.signal })
         }
+        if (method === 'content.blobCommitPrivate') {
+          allow('content'); const id = String(args[0]), write = blobWrites.get(id); check(write !== undefined, 'CONTENT_UPLOAD_UNKNOWN')
+          blobWrites.delete(id)
+          const assembled = new Uint8Array(write.totalBytes)
+          for (let index = 0; index < write.chunks.length; index++) {
+            const chunk = write.chunks[index]; check(chunk !== undefined, 'CONTENT_INCOMPLETE')
+            assembled.set(chunk, index * CONTENT_CHUNK_BYTES)
+          }
+          const mediaType = typeof args[1] === 'string' ? args[1] : undefined
+          return session.content.put(assembled, {
+            visibility: 'private',
+            deduplicate: true,
+            ...(mediaType === undefined ? {} : { mediaType }),
+            signal: request.signal,
+          })
+        }
         if (method === 'content.blobOpenRead') {
           allow('content'); check(blobReads.size < 4, 'ENDPOINT_READER_LIMIT')
           const rawOptions = (args[1] ?? {}) as Omit<BlobGetOptions, 'signal'>
