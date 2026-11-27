@@ -1,10 +1,12 @@
 import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
 import type { JsonValue } from '@chronolog/protocol'
 import type { ApplicationEndpointBinding as InlineApplicationEndpointBinding, ApplicationEndpointContext as InlineApplicationEndpointContext } from './owner-types.js'
-import type { ApplicationDescription as InlineApplicationDescription, FinalityCheckpoint as InlineFinalityCheckpoint, ScheduledFinalityEntry, VerifiedFinalityV2 } from '@chronolog/authority'
+import type { ApplicationDescription as InlineApplicationDescription, EquivocationProof, FinalityCheckpoint as InlineFinalityCheckpoint, ScheduledFinalityEntry, VerifiedFinalityV2 } from '@chronolog/authority'
+import type { SqliteExecOptions, SqliteExecResult, SqliteQueryResult } from '@chronolog/materializer'
 import type { ApplicationPeerDiagnostics as InlineApplicationPeerDiagnostics } from './network.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
-import type { CheckpointBootstrapSnapshot, SessionFacts as InlineSessionFacts } from './session.js'
+import type { CheckpointBootstrapSnapshot, GuardianMember, PermissionsTopicState, SessionFacts as InlineSessionFacts } from './session.js'
+import type { SqlBranchDiff, SqlBranchProposal } from './sql-extensions.js'
 import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from './worker-application-protocol.js'
 import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, SessionStatus, WaitOptions } from './session-types.js'
 import type { ApplicationSubmission, MaterializedOperation, OperationInspection, RetentionEvidence } from './operation.js'
@@ -14,6 +16,17 @@ import {
   type BlobGetOptions, type BlobInfo, type BlobPutOptions, type BlobReference,
   type ContentGetOptions, type ContentPutBytesOptions, type ContentPutOptions, type ContentReadBytesOptions,
 } from './content-bytes.js'
+
+export interface WorkerSqlBranch {
+  readonly topic: string
+  readonly baseRoot: string | null
+  exec(sql: string, params?: readonly JsonValue[], options?: SqliteExecOptions): Promise<SqliteExecResult>
+  query(sql: string, params?: readonly JsonValue[]): Promise<SqliteQueryResult>
+  commitBranch(): Promise<string>
+  diff(): Promise<SqlBranchDiff>
+  toProposal(options?: { readonly withRowGuards?: boolean }): Promise<SqlBranchProposal>
+  close(): Promise<void>
+}
 
 export interface WorkerApplicationReadView {
   readonly applicationId: string
@@ -96,8 +109,8 @@ export class WorkerApplicationSession {
   request<T>(method: string, args: readonly unknown[], options: WaitOptions = {}): Promise<T> {
     if (this.signal.aborted) return Promise.reject(this.signal.reason)
     if (options.signal?.aborted) return Promise.reject(options.signal.reason)
-    const control = ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'].includes(method)
-    if ([...this.#pending.values()].filter(request => ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'].includes(request.method) === control).length >= (control ? 8 : 32)) return Promise.reject(new Error('ENDPOINT_REQUEST_LIMIT'))
+    const control = ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'sqlBranch.close', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'].includes(method)
+    if ([...this.#pending.values()].filter(request => ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'sqlBranch.close', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'].includes(request.method) === control).length >= (control ? 8 : 32)) return Promise.reject(new Error('ENDPOINT_REQUEST_LIMIT'))
     const timeoutMs = options.timeoutMs ?? 30_000
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) return Promise.reject(new Error('ENDPOINT_TIMEOUT_LIMIT'))
     const id = ++this.#next, startedAt = performance.now()
@@ -132,6 +145,76 @@ export class WorkerApplicationSession {
   async command(name: string, input: unknown, options: CommandOptions = {}): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('command', [name, input, options]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
   query(name: string, input: unknown = null): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly value: unknown }> { return this.request('query', [name, input]) }
   topic(name: string): Promise<JsonValue | null> { return this.request('topic', [name]) }
+  queryAsOf(topic: string, input: JsonValue = null, target: { readonly opId: string } | { readonly atTimestampMs: bigint }): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly targetOpId: string | null; readonly value: JsonValue }> {
+    return this.request('queryAsOf', [topic, input, target])
+  }
+  opOutcome(opId: string): Promise<'accepted' | 'rejected' | null> { return this.request('opOutcome', [opId]) }
+  topicLastOpId(topic: string): Promise<string | null> { return this.request('topicLastOpId', [topic]) }
+  permissions(): Promise<PermissionsTopicState> { return this.request('permissions.summary', []) }
+  finalityStatus(opId: string): Promise<'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local'> { return this.request('finality.opStatus', [opId]) }
+  equivocationProofs(): Promise<readonly EquivocationProof[]> { return this.request('finality.equivocationProofs', []) }
+
+  async forkSql(topic: string): Promise<WorkerSqlBranch> {
+    const opened = await this.request<{ readonly id: string; readonly topic: string; readonly baseRoot: string | null }>('sqlBranch.open', [topic])
+    let closed = false
+    const checkOpen = (): void => { if (closed) throw new Error('SQL_BRANCH_CLOSED') }
+    return {
+      topic: opened.topic,
+      baseRoot: opened.baseRoot,
+      exec: (sql, params = [], options = { mode: 'user' }) => { checkOpen(); return this.request('sqlBranch.exec', [opened.id, sql, params, options]) },
+      query: (sql, params = []) => { checkOpen(); return this.request('sqlBranch.query', [opened.id, sql, params]) },
+      commitBranch: () => { checkOpen(); return this.request('sqlBranch.commit', [opened.id]) },
+      diff: () => { checkOpen(); return this.request('sqlBranch.diff', [opened.id]) },
+      toProposal: (options = {}) => { checkOpen(); return this.request('sqlBranch.toProposal', [opened.id, options]) },
+      close: async () => { if (closed) return; closed = true; await this.request('sqlBranch.close', [opened.id]) },
+    }
+  }
+
+  async createCompartment(
+    ringName: string,
+    options: {
+      readonly topics: readonly string[]
+      readonly members: readonly { readonly publicKey: string; readonly wrapKey: string }[]
+      readonly operationId?: string
+      readonly authorTimestampMs?: bigint
+    },
+  ): Promise<{ readonly ring: string; readonly epoch: number; readonly operation: WorkerApplicationOperation }> {
+    const res = await this.request<{ readonly ring: string; readonly epoch: number; readonly operation: { readonly id: string; readonly operationId: string } }>('compartment.create', [ringName, options])
+    return { ring: res.ring, epoch: res.epoch, operation: new WorkerApplicationOperation(res.operation.id, res.operation.operationId, this) }
+  }
+
+  async setupSocialRecovery(options: {
+    readonly guardians: readonly GuardianMember[]
+    readonly threshold: number
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  }): Promise<WorkerApplicationOperation> {
+    const res = await this.request<{ readonly id: string; readonly operationId: string }>('recovery.setup', [options])
+    return new WorkerApplicationOperation(res.id, res.operationId, this)
+  }
+
+  async requestSocialRecovery(options: {
+    readonly requestId?: string
+    readonly label?: string
+    readonly verificationCode?: string
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  } = {}): Promise<{ readonly requestId: string; readonly verificationCode: string; readonly operation: WorkerApplicationOperation }> {
+    const res = await this.request<{ readonly requestId: string; readonly verificationCode: string; readonly operation: { readonly id: string; readonly operationId: string } }>('recovery.request', [options])
+    return { requestId: res.requestId, verificationCode: res.verificationCode, operation: new WorkerApplicationOperation(res.operation.id, res.operation.operationId, this) }
+  }
+
+  async approveSocialRecovery(
+    requestId: string,
+    options: { readonly operationId?: string; readonly authorTimestampMs?: bigint } = {},
+  ): Promise<WorkerApplicationOperation> {
+    const res = await this.request<{ readonly id: string; readonly operationId: string }>('recovery.approve', [requestId, options])
+    return new WorkerApplicationOperation(res.id, res.operationId, this)
+  }
+
+  completeSocialRecovery(): Promise<{ readonly restoredEpochs: number; readonly restoredRings: number }> {
+    return this.request('recovery.complete', [])
+  }
   readEvents(options: ApplicationEventOptions & { readonly view?: 'local' | 'final' } = {}): Promise<ReturnType<ApplicationReadView['readEvents']>> { return this.request('readEvents', [options]) }
   wait<T>(id: string, fact: string, options: WaitOptions = {}): Promise<T> { const timeoutMs = options.timeoutMs ?? 30_000; return this.request('operation.wait', [id, fact, timeoutMs], { ...options, timeoutMs: Math.min(120_000, timeoutMs + 1000) }) }
 

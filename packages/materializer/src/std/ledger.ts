@@ -261,14 +261,16 @@ export const doubleEntryLedger = {
   },
 
   describe() {
+    const optInt = { anyOf: [{ type: 'integer' }, { type: 'null' }] };
+    const postingItem = { type: 'object', properties: { account: { type: 'string' }, delta: { type: 'integer' } }, required: ['account', 'delta'] };
     return {
       commands: [
         { name: 'createAccount', description: 'Create a ledger account.', input: { type: 'object', properties: { id: { type: 'string' }, currency: { type: 'string' }, allowNegative: { type: 'boolean' } }, required: ['id'] } },
-        { name: 'post', description: 'Submit balanced double-entry postings.', input: { type: 'object', properties: { postings: { type: 'array' }, memo: { type: 'string' } }, required: ['postings'] } },
-        { name: 'hold', description: 'Reserve funds in an expiring hold/escrow.', input: { type: 'object', properties: { holdId: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, amount: { type: 'integer' }, expiresAtMs: { type: ['integer', 'null'] } }, required: ['from', 'to', 'amount'] } },
+        { name: 'post', description: 'Submit balanced double-entry postings.', input: { type: 'object', properties: { postings: { type: 'array', items: postingItem }, memo: { type: 'string' } }, required: ['postings'] } },
+        { name: 'hold', description: 'Reserve funds in an expiring hold/escrow.', input: { type: 'object', properties: { holdId: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, amount: { type: 'integer' }, expiresAtMs: optInt }, required: ['from', 'to', 'amount'] } },
         { name: 'captureHold', description: 'Settle an active hold.', input: { type: 'object', properties: { holdId: { type: 'string' }, amount: { type: 'integer' } }, required: ['holdId'] } },
         { name: 'releaseHold', description: 'Release an active hold.', input: { type: 'object', properties: { holdId: { type: 'string' } }, required: ['holdId'] } },
-        { name: 'grantAllowance', description: 'Reserve an offline Escrow CRDT spending allowance for a peer or agent.', input: { type: 'object', properties: { allowanceId: { type: 'string' }, fromAccount: { type: 'string' }, grantee: { type: 'string' }, amount: { type: 'integer' }, expiresAtMs: { type: ['integer', 'null'] } }, required: ['fromAccount', 'grantee', 'amount'] } },
+        { name: 'grantAllowance', description: 'Reserve an offline Escrow CRDT spending allowance for a peer or agent.', input: { type: 'object', properties: { allowanceId: { type: 'string' }, fromAccount: { type: 'string' }, grantee: { type: 'string' }, amount: { type: 'integer' }, expiresAtMs: optInt }, required: ['fromAccount', 'grantee', 'amount'] } },
         { name: 'spendFromAllowance', description: 'Spend offline from a granted allowance without global consensus.', input: { type: 'object', properties: { allowanceId: { type: 'string' }, toAccount: { type: 'string' }, amount: { type: 'integer' }, memo: { type: 'string' } }, required: ['allowanceId', 'toAccount', 'amount'] } },
         { name: 'reclaimAllowance', description: 'Reclaim unused funds from an allowance.', input: { type: 'object', properties: { allowanceId: { type: 'string' } }, required: ['allowanceId'] } },
       ],

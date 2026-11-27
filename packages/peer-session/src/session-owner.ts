@@ -2,6 +2,7 @@ import { check, type FinalityCheckpoint } from '@chronolog/authority'
 import type { JsonValue } from '@chronolog/protocol'
 import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
 import type { ApplicationSession, SessionFacts } from './session.js'
+import type { SqlBranch } from './sql-extensions.js'
 import { awaitOwnedTask } from './lifetime.js'
 import {
   APPLICATION_DEFAULT_ATTACHMENT_CAPABILITIES,
@@ -25,7 +26,7 @@ interface BlobRead { readonly bytes: Uint8Array; offset: number }
 interface RequestContext { readonly lifetime: AbortController; readonly signal: AbortSignal; readonly method: string; readonly control: boolean }
 
 const isArray = (value: unknown): boolean => Array.isArray(value)
-const CONTROLS = new Set(['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'])
+const CONTROLS = new Set(['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'sqlBranch.close', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'])
 
 function requestBudget(value: unknown): void {
   let nodes = 0, bytes = 0
@@ -75,7 +76,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
     attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }, policy: ApplicationAttachmentPolicy = {}) {
       check(!closed && attachments.size < maxAttachments, 'OWNER_ATTACHMENT_LIMIT')
       const endpointId = crypto.randomUUID(), endpointIncarnation = crypto.randomUUID(), lifetime = new AbortController()
-      const views = new Map<string, ApplicationReadView>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), blobWrites = new Map<string, BlobWrite>(), blobReads = new Map<string, BlobRead>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
+      const views = new Map<string, ApplicationReadView>(), branches = new Map<string, SqlBranch>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), blobWrites = new Map<string, BlobWrite>(), blobReads = new Map<string, BlobRead>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
       let effective = policy, attachment = '', initialized = false, detached = false, suspended = false, highestRequest = 0, viewReservations = 0, uploadReservations = 0, lastReceived = performance.now(), context: ApplicationEndpointContext = policy.context ?? {}
       let claimedViewId: string | undefined
       let stopStatus: (() => void) | undefined, stopChange: (() => void) | undefined, stopExtension: (() => void) | undefined
@@ -95,6 +96,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
       const post = (message: unknown): void => { if (!detached) endpoint.postMessage(message) }
       const releaseResources = (): void => {
         for (const view of views.values()) view.release(); views.clear()
+        for (const branch of branches.values()) { try { branch.close() } catch { /* ignore */ } }; branches.clear()
         for (const reader of readers.values()) { reader.lifetime.abort(); void reader.iterator.return?.().catch(() => undefined) }; readers.clear()
         blobWrites.clear(); blobReads.clear()
         for (const stream of streams.values()) { stream.lifetime.abort(); void stream.iterator.return?.().catch(() => undefined) }; streams.clear()
@@ -145,6 +147,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'attachment.suspend') { suspended = true; for (const work of pending.values()) if (!work.control) work.lifetime.abort(new Error('ENDPOINT_SUSPENDED')); releaseResources(); return null }
         if (method === 'attachment.resume') { suspended = false; return session.status }
         if (method === 'view.release') { const id = String(args[0]), view = views.get(id); views.delete(id); view?.release(); return null }
+        if (method === 'sqlBranch.close') { const id = String(args[0]), br = branches.get(id); branches.delete(id); br?.close(); return null }
         if (method === 'content.cancel') { const id = String(args[0]), reader = readers.get(id); readers.delete(id); reader?.lifetime.abort(); await reader?.iterator.return?.(); return null }
         if (method === 'content.blobAbortWrite') { blobWrites.delete(String(args[0])); return null }
         if (method === 'content.blobCloseRead') { blobReads.delete(String(args[0])); return null }
@@ -172,6 +175,62 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'topic') {
           allow('queries')
           return session.topic(String(args[0]))
+        }
+        if (method === 'queryAsOf') {
+          allow('queries')
+          return session.queryAsOf(String(args[0]), (args[1] ?? null) as JsonValue, args[2] as { readonly opId: string } | { readonly atTimestampMs: bigint })
+        }
+        if (method === 'opOutcome') {
+          allow('operations')
+          return session.opOutcome(String(args[0]))
+        }
+        if (method === 'topicLastOpId') {
+          allow('queries')
+          return session.topicLastOpId(String(args[0]))
+        }
+        if (method === 'permissions.summary') {
+          allow('queries')
+          return session.permissions()
+        }
+        if (method === 'sqlBranch.open') {
+          allow('queries'); check(branches.size < 4, 'ENDPOINT_BRANCH_LIMIT')
+          const branch = await session.forkSql(String(args[0]))
+          const id = crypto.randomUUID()
+          branches.set(id, branch)
+          return { id, topic: branch.topic, baseRoot: branch.baseRoot }
+        }
+        if (method === 'sqlBranch.exec' || method === 'sqlBranch.query' || method === 'sqlBranch.commit' || method === 'sqlBranch.diff' || method === 'sqlBranch.toProposal') {
+          allow('queries')
+          const br = branches.get(String(args[0])); check(br !== undefined, 'SQL_BRANCH_CLOSED')
+          if (method === 'sqlBranch.exec') return br.exec(String(args[1]), (args[2] ?? []) as readonly JsonValue[], args[3] as Parameters<SqlBranch['exec']>[2])
+          if (method === 'sqlBranch.query') return br.query(String(args[1]), (args[2] ?? []) as readonly JsonValue[])
+          if (method === 'sqlBranch.commit') return br.commitBranch()
+          if (method === 'sqlBranch.diff') return br.diff()
+          return br.toProposal(args[1] as Parameters<SqlBranch['toProposal']>[0])
+        }
+        if (method === 'compartment.create') {
+          allow('commands')
+          const res = await session.createCompartment(String(args[0]), args[1] as Parameters<ApplicationSession['createCompartment']>[1])
+          return { ring: res.ring, epoch: res.epoch, operation: { id: res.operation.id, operationId: res.operation.operationId } }
+        }
+        if (method === 'recovery.setup') {
+          allow('commands')
+          const op = await session.setupSocialRecovery(args[0] as Parameters<ApplicationSession['setupSocialRecovery']>[0])
+          return { id: op.id, operationId: op.operationId }
+        }
+        if (method === 'recovery.request') {
+          allow('commands')
+          const res = await session.requestSocialRecovery(args[0] as Parameters<ApplicationSession['requestSocialRecovery']>[0])
+          return { requestId: res.requestId, verificationCode: res.verificationCode, operation: { id: res.operation.id, operationId: res.operation.operationId } }
+        }
+        if (method === 'recovery.approve') {
+          allow('commands')
+          const op = await session.approveSocialRecovery(String(args[0]), args[1] as Parameters<ApplicationSession['approveSocialRecovery']>[1])
+          return { id: op.id, operationId: op.operationId }
+        }
+        if (method === 'recovery.complete') {
+          allow('commands')
+          return session.completeSocialRecovery()
         }
         if (method === 'readEvents') {
           allow('events')
@@ -221,6 +280,8 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'facts.export') { allow('replication'); return session.exportFacts(args[0] as Parameters<ApplicationSession['exportFacts']>[0]) }
         if (method === 'facts.merge') { allow('replication'); return session.mergeFacts(args[0] as SessionFacts) }
         if (method === 'finality.status') { allow('finality'); return session.finality.status() }
+        if (method === 'finality.opStatus') { allow('finality'); return session.finalityStatus(String(args[0])) }
+        if (method === 'finality.equivocationProofs') { allow('finality'); return session.equivocationProofs() }
         if (method === 'finality.createCheckpoint') { allow('finality'); return session.finality.createCheckpoint(args[0] as { throughMs: bigint }) }
         if (method === 'finality.submitCheckpoints') { allow('finality'); return session.finality.submitCheckpoints(args[0] as readonly FinalityCheckpoint[]) }
         if (method === 'extension.call') {

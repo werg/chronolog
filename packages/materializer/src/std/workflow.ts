@@ -173,10 +173,11 @@ export const stateMachine = {
   },
 
   describe() {
+    const anyPayload = { anyOf: [{ type: 'object', properties: {} }, { type: 'string' }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] };
     return {
       commands: [
-        { name: 'configure', description: 'Configure states, transitions, role guards, and SLA rules.', input: { type: 'object', properties: { definition: { type: 'object' } }, required: ['definition'] } },
-        { name: 'create', description: 'Create a workflow item or AI proposal.', input: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, payload: {} } } },
+        { name: 'configure', description: 'Configure states, transitions, role guards, and SLA rules.', input: { type: 'object', properties: { definition: { type: 'object', properties: {} } }, required: ['definition'] } },
+        { name: 'create', description: 'Create a workflow item or AI proposal.', input: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, payload: anyPayload } } },
         { name: 'transition', description: 'Approve or execute a state transition.', input: { type: 'object', properties: { id: { type: 'string' }, transition: { type: 'string' }, note: { type: 'string' } }, required: ['id', 'transition'] } },
         { name: 'expire', description: 'Transition an item past its SLA deadline.', input: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
       ],

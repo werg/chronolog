@@ -80,11 +80,12 @@ export const lwwMap = {
     return out;
   },
   describe() {
+    const anyScalar = { anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] };
     return {
       commands: [
-        { name: 'set', description: 'Set a key in the LWW map.', input: { type: 'object', properties: { key: { type: 'string' }, value: {} }, required: ['key'] } },
+        { name: 'set', description: 'Set a key in the LWW map.', input: { type: 'object', properties: { key: { type: 'string' }, value: anyScalar }, required: ['key'] } },
         { name: 'delete', description: 'Tombstone a key in the LWW map.', input: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } },
-        { name: 'merge', description: 'Merge multiple key-value pairs into the LWW map.', input: { type: 'object', properties: { values: { type: 'object' } }, required: ['values'] } },
+        { name: 'merge', description: 'Merge multiple key-value pairs into the LWW map.', input: { type: 'object', properties: { values: { type: 'object', properties: {} } }, required: ['values'] } },
       ],
       queries: [
         { name: 'get', description: 'Read all live entries or a single key.', input: { type: 'object', properties: { key: { type: 'string' } } } },
@@ -294,11 +295,13 @@ export const orderedList = {
     return { items };
   },
   describe() {
+    const anyScalar = { anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] };
+    const optStr = { anyOf: [{ type: 'string' }, { type: 'null' }] };
     return {
       commands: [
-        { name: 'insert', description: 'Insert an item after an anchor ID (or null for head).', input: { type: 'object', properties: { id: { type: 'string' }, afterId: { type: ['string', 'null'] }, value: {} } } },
-        { name: 'move', description: 'Move an existing item after another anchor ID.', input: { type: 'object', properties: { id: { type: 'string' }, afterId: { type: ['string', 'null'] } }, required: ['id'] } },
-        { name: 'update', description: 'Update an item value.', input: { type: 'object', properties: { id: { type: 'string' }, value: {} }, required: ['id'] } },
+        { name: 'insert', description: 'Insert an item after an anchor ID (or null for head).', input: { type: 'object', properties: { id: { type: 'string' }, afterId: optStr, value: anyScalar } } },
+        { name: 'move', description: 'Move an existing item after another anchor ID.', input: { type: 'object', properties: { id: { type: 'string' }, afterId: optStr }, required: ['id'] } },
+        { name: 'update', description: 'Update an item value.', input: { type: 'object', properties: { id: { type: 'string' }, value: anyScalar }, required: ['id'] } },
         { name: 'delete', description: 'Tombstone an item.', input: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
       ],
       queries: [

@@ -212,10 +212,12 @@ export const virtualFs = {
   },
 
   describe() {
+    const optStr = { anyOf: [{ type: 'string' }, { type: 'null' }] };
+    const optRef = { anyOf: [{ type: 'object', properties: {} }, { type: 'string' }, { type: 'null' }] };
     return {
       commands: [
         { name: 'mkdir', description: 'Create a directory.', input: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
-        { name: 'writeFile', description: 'Write file metadata and content ref (auto-forks on concurrent version mismatch).', input: { type: 'object', properties: { path: { type: 'string' }, ref: {}, bytes: { type: 'integer' }, mediaType: { type: 'string' }, expectedOpId: { type: ['string', 'null'] } }, required: ['path'] } },
+        { name: 'writeFile', description: 'Write file metadata and content ref (auto-forks on concurrent version mismatch).', input: { type: 'object', properties: { path: { type: 'string' }, ref: optRef, bytes: { type: 'integer' }, mediaType: { type: 'string' }, expectedOpId: optStr }, required: ['path'] } },
         { name: 'move', description: 'Move or rename a file or directory.', input: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] } },
         { name: 'delete', description: 'Delete a file or directory recursively.', input: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
         { name: 'resolveConflict', description: 'Resolve an auto-forked conflict file.', input: { type: 'object', properties: { conflictPath: { type: 'string' }, strategy: { type: 'string', enum: ['keep_original', 'replace_original', 'keep_both'] } }, required: ['conflictPath'] } },

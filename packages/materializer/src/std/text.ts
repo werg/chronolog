@@ -181,13 +181,14 @@ export const collaborativeText = {
   },
 
   describe() {
+    const optStr = { anyOf: [{ type: 'string' }, { type: 'null' }] };
     return {
       commands: [
-        { name: 'insert', description: 'Insert text anchored after a stable node ID (or null for start).', input: { type: 'object', properties: { afterId: { type: ['string', 'null'] }, text: { type: 'string' } }, required: ['text'] } },
+        { name: 'insert', description: 'Insert text anchored after a stable node ID (or null for start).', input: { type: 'object', properties: { afterId: optStr, text: { type: 'string' } }, required: ['text'] } },
         { name: 'insertAt', description: 'Insert text at a character index.', input: { type: 'object', properties: { index: { type: 'integer', minimum: 0 }, text: { type: 'string' } }, required: ['text'] } },
         { name: 'delete', description: 'Delete characters by stable node IDs.', input: { type: 'object', properties: { ids: { type: 'array', items: { type: 'string' } } }, required: ['ids'] } },
         { name: 'deleteRange', description: 'Delete a visible character range.', input: { type: 'object', properties: { index: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 0 } }, required: ['index', 'length'] } },
-        { name: 'setAnchor', description: 'Save a named cursor/comment anchor on a stable node ID.', input: { type: 'object', properties: { name: { type: 'string' }, nodeId: { type: ['string', 'null'] } }, required: ['name'] } },
+        { name: 'setAnchor', description: 'Save a named cursor/comment anchor on a stable node ID.', input: { type: 'object', properties: { name: { type: 'string' }, nodeId: optStr }, required: ['name'] } },
       ],
       queries: [
         { name: 'text', description: 'Read the converged string and tail node ID.', input: { type: 'object', properties: {} } },
