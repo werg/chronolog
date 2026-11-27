@@ -267,6 +267,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #sqliteDriver?: SqliteBuiltinDriver
   #sqliteLoadPromise?: Promise<SqliteBuiltinDriver>
   #kernel: TopicKernel
+  #kernelHasSqlite = false
+  #controlKernel: TopicKernel | null = null
   #finalKernel: TopicKernel | null = null
 
   readonly #publicOps = new Map<string, StoredPublicOp>()
@@ -323,7 +325,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
       ...(options.sqliteDriver === undefined ? {} : { sqliteDriver: options.sqliteDriver }),
     }
-    if (options.sqliteDriver !== undefined) this.#sqliteDriver = options.sqliteDriver
+    if (options.sqliteDriver !== undefined) {
+      this.#sqliteDriver = options.sqliteDriver
+      this.#kernelHasSqlite = true
+    }
 
     this.#kernel = new TopicKernel({
       genesis: this.genesisBytes,
@@ -331,6 +336,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       blindHostMode: this.#blindHostMode,
       ...this.#sandboxOptions,
     })
+    if (this.genesis.privateLog && !this.#blindHostMode) {
+      this.#controlKernel = new TopicKernel({
+        genesis: this.genesisBytes,
+        cas: this.cas,
+        blindHostMode: true,
+        ...this.#sandboxOptions,
+      })
+    }
     this.#lastLocalRevision = toMaterializedRevision(this.#kernel.revision('local'))
 
     this.content = new ApplicationContent({
@@ -678,10 +691,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#emitStatus()
   }
 
-  async #ensureSqliteIfNeeded(): Promise<void> {
-    if (this.#sqliteDriver !== undefined) return
-    const reducersRaw = this.#kernel.topic('$reducers')
-    if (reducersRaw === null) return
+  async #ensureSqliteIfNeeded(reducersOverride?: JsonValue | null): Promise<boolean> {
+    if (this.#sqliteDriver !== undefined) return !this.#kernelHasSqlite
+    const reducersRaw = reducersOverride !== undefined ? reducersOverride : this.#kernel.topic('$reducers')
+    if (reducersRaw === null) return false
     let needsSqlite = false
     try {
       const cfg = assertValidReducersConfig(reducersRaw)
@@ -719,8 +732,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           }
         }
       }
-    } catch { return }
-    if (!needsSqlite) return
+    } catch { return false }
+    if (!needsSqlite) return false
 
     this.#sqliteLoadPromise ??= (async () => {
       const mod = await import('chronolog-db')
@@ -728,20 +741,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         ...(this.#sqliteWasmModule === undefined ? {} : { wasmModule: this.#sqliteWasmModule }),
       })
       this.#sqliteDriver = driver
-      this.#kernel = new TopicKernel({
-        genesis: this.genesisBytes,
-        cas: this.cas,
-        blindHostMode: this.#blindHostMode,
-        ...this.#sandboxOptions,
-        sqliteDriver: driver,
-      })
-      this.#finalKernel = null
       return driver
     })()
     await this.#sqliteLoadPromise
+    return !this.#kernelHasSqlite
   }
 
-  async #refreshPermissionsCache(): Promise<void> {
+  async #refreshPermissionsCache(kernel: TopicKernel = this.#kernel): Promise<void> {
     const parseStringList = (val: unknown): { readonly keys: Set<string>; readonly open: boolean } => {
       const keys = new Set<string>()
       let open = false
@@ -759,7 +765,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
 
     try {
-      const summary = await this.#kernel.query('$permissions', { summary: true })
+      const summary = await kernel.query('$permissions', { summary: true })
       if (
         summary !== null &&
         typeof summary === 'object' &&
@@ -789,12 +795,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       const [rRaw, wRaw, aRaw, pRaw, mRaw, admRaw] = await Promise.all([
-        this.#kernel.query('$permissions', { list: 'readers' }).catch(() => null),
-        this.#kernel.query('$permissions', { list: 'writers' }).catch(() => null),
-        this.#kernel.query('$permissions', { list: 'administrators' }).catch(() => null),
-        this.#kernel.query('$permissions', { list: 'publishers' }).catch(() => null),
-        this.#kernel.query('$permissions', { list: 'members' }).catch(() => null),
-        this.#kernel.query('$permissions', { admission: true }).catch(() => null),
+        kernel.query('$permissions', { list: 'readers' }).catch(() => null),
+        kernel.query('$permissions', { list: 'writers' }).catch(() => null),
+        kernel.query('$permissions', { list: 'administrators' }).catch(() => null),
+        kernel.query('$permissions', { list: 'publishers' }).catch(() => null),
+        kernel.query('$permissions', { list: 'members' }).catch(() => null),
+        kernel.query('$permissions', { admission: true }).catch(() => null),
       ])
       if (Array.isArray(rRaw) || Array.isArray(wRaw) || Array.isArray(aRaw)) {
         const readers = parseStringList(rRaw)
@@ -820,7 +826,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       // Fall through to legacy raw topic inspection
     }
 
-    const raw = this.#kernel.topic('$permissions') as PermissionsTopicState | null
+    const raw = kernel.topic('$permissions') as PermissionsTopicState | null
     if (raw !== null && typeof raw === 'object' && Array.isArray(raw.members)) {
       const members = parseMembers(raw.members)
       this.#evaluatedPermissions = {
@@ -896,9 +902,22 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
   }
 
-  async #unsealAvailableEpochKeys(): Promise<boolean> {
+  #keysStateFrom(kernel: TopicKernel): KeysTopicState {
+    const raw = kernel.topic('$keys') as KeysTopicState | null
+    if (raw === null || typeof raw !== 'object') return { currentEpoch: -1, epochs: {} }
+    return raw
+  }
+
+  #currentEpochFrom(kernel: TopicKernel): number {
+    const state = this.#keysStateFrom(kernel)
+    if (state.currentEpoch >= 0) return state.currentEpoch
+    if (this.#epochKeys.size > 0) return Math.max(...this.#epochKeys.keys())
+    return -1
+  }
+
+  async #unsealAvailableEpochKeys(kernel: TopicKernel = this.#kernel): Promise<boolean> {
     if (!this.genesis.privateLog || this.#blindHostMode) return false
-    const keys = this.keysState()
+    const keys = this.#keysStateFrom(kernel)
     let unlockedAny = false
     for (const entry of Object.values(keys.epochs ?? {})) {
       if (this.#epochKeys.has(entry.epoch)) continue
@@ -953,9 +972,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
    * re-encrypt the EXACT original SignedOperation bytes under the newest epoch so peers can
    * decrypt them without changing opId, authorTimestampMs, or signature!
    */
-  async #rewrapPendingLocalOps(): Promise<boolean> {
+  async #rewrapPendingLocalOps(kernel: TopicKernel = this.#kernel): Promise<boolean> {
     if (!this.genesis.privateLog || this.#blindHostMode) return false
-    const newestEpoch = this.currentEpoch()
+    const newestEpoch = this.#currentEpochFrom(kernel)
     if (newestEpoch < 0) return false
     const newestKey = this.#epochKeys.get(newestEpoch)
     if (newestKey === undefined || !this.isWriter(this.identity.publicKey)) return false
@@ -1030,21 +1049,46 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const prevOutcomes = new Map(this.#kernel.outcomes.map(o => [o.opId, `${o.outcome}:${o.rejectionCode ?? ''}`]))
 
     try {
-      await this.#ensureSqliteIfNeeded()
-
       const publicInputs: KernelOperationInput[] = []
       for (const [opId, entry] of this.#publicOps) {
         publicInputs.push({ opId: hexToBytes(opId), core: entry.core })
       }
-      await this.#kernel.materialize(publicInputs)
-      await this.#refreshPermissionsCache()
 
-      await this.#unsealAvailableEpochKeys()
-      await this.#decryptPendingEnvelopes()
-      const rewrapped = await this.#rewrapPendingLocalOps()
+      let controlKernel: TopicKernel
+      let rewrapped = false
+      let allByOpId: Map<string, KernelOperationInput>
 
-      const allByOpId = this.#collectDecryptedKernelInputs()
-      const schedule = parseFinalitySchedule(this.#kernel.topic('$finality'))
+      if (this.#controlKernel !== null) {
+        // Private log full replica: run the public control pass on the isolated #controlKernel
+        // so this.#kernel never loses private ops or suffix snapshots mid-rematerialization.
+        controlKernel = this.#controlKernel
+        await controlKernel.materialize(publicInputs)
+        await this.#refreshPermissionsCache(controlKernel)
+        await this.#unsealAvailableEpochKeys(controlKernel)
+        await this.#decryptPendingEnvelopes()
+        rewrapped = await this.#rewrapPendingLocalOps(controlKernel)
+        allByOpId = this.#collectDecryptedKernelInputs()
+      } else {
+        // Public log or blind host: only public ops exist in the local kernel.
+        // If finality checkpoints exist, probe $finality on an isolated kernel so this.#kernel
+        // never transiently exposes excluded operations.
+        allByOpId = this.#collectDecryptedKernelInputs()
+        if (this.#checkpoints.size > 0) {
+          await this.#ensureSqliteIfNeeded()
+          controlKernel = new TopicKernel({
+            genesis: this.genesisBytes,
+            cas: this.cas,
+            blindHostMode: this.#blindHostMode,
+            ...this.#sandboxOptions,
+            ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
+          })
+          await controlKernel.materialize(publicInputs)
+        } else {
+          controlKernel = this.#kernel
+        }
+      }
+
+      const schedule = parseFinalitySchedule(controlKernel.topic('$finality'))
       this.#verifiedFinality = await verifyFinalityV2({
         logId: this.logId,
         schedule,
@@ -1061,9 +1105,40 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (this.#verifiedFinality.excludedOpIds.has(opId)) continue
         eligibleLocal.push(input)
       }
-      await this.#ensureSqliteIfNeeded()
-      const localResult = await this.#kernel.materialize(eligibleLocal)
-      await this.#refreshPermissionsCache()
+
+      const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'))
+      let localResult
+      if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
+        const nextKernel = new TopicKernel({
+          genesis: this.genesisBytes,
+          cas: this.cas,
+          blindHostMode: this.#blindHostMode,
+          ...this.#sandboxOptions,
+          sqliteDriver: this.#sqliteDriver,
+        })
+        localResult = await nextKernel.materialize(eligibleLocal)
+        this.#kernel = nextKernel
+        this.#kernelHasSqlite = true
+        this.#finalKernel = null
+      } else {
+        localResult = await this.#kernel.materialize(eligibleLocal)
+      }
+      // On public logs or when $reducers was just loaded into #kernel, check if SQLite is newly
+      // required by a freshly applied $reducers op and upgrade atomically if so.
+      if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(this.#kernel.topic('$reducers')) && this.#sqliteDriver !== undefined) {
+        const nextKernel = new TopicKernel({
+          genesis: this.genesisBytes,
+          cas: this.cas,
+          blindHostMode: this.#blindHostMode,
+          ...this.#sandboxOptions,
+          sqliteDriver: this.#sqliteDriver,
+        })
+        localResult = await nextKernel.materialize(eligibleLocal)
+        this.#kernel = nextKernel
+        this.#kernelHasSqlite = true
+        this.#finalKernel = null
+      }
+      await this.#refreshPermissionsCache(this.#kernel)
       this.#lastLocalRevision = toMaterializedRevision(localResult.revision)
 
       if (this.#verifiedFinality.closedThroughMs !== null) {
@@ -1383,7 +1458,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       throw Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' })
     }
     const kernel = viewKind === 'final' ? this.#finalKernel : this.#kernel
-    const revision = this.revision(viewKind)
+    const revision = kernel === null ? this.revision(viewKind) : toMaterializedRevision(kernel.revision(viewKind))
     const topicsSnap = kernel === null ? {} : kernel.topics
     const outcomesSnap = kernel === null ? [] : kernel.outcomes
     const events: ApplicationEvent[] = []
@@ -1420,7 +1495,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       throw Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' })
     }
     const kernel = viewKind === 'final' ? this.#finalKernel : this.#kernel
-    const revision = this.revision(viewKind)
+    const revision = kernel === null ? this.revision(viewKind) : toMaterializedRevision(kernel.revision(viewKind))
     const events: ApplicationEvent[] = []
     if (kernel !== null) {
       for (const outcome of kernel.outcomes) {
@@ -1800,6 +1875,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         this.#checkpoints.set(key, checkpoint)
         await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(checkpoint))
         await this.#kernel.bootstrapFromCheckpoint(snapshot)
+        if (this.#controlKernel !== null) {
+          await this.#controlKernel.bootstrapFromCheckpoint(snapshot)
+        }
         this.#lastLocalRevision = toMaterializedRevision(this.#kernel.revision('local'))
         this.#emitChange({ kind: 'finalized', revision: this.#lastLocalRevision, revisedProposalIds: [] })
         this.#emitStatus()
@@ -2005,17 +2083,20 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         check(sameBytes(facts.genesisBytes, this.genesisBytes), 'FACTS_GENESIS_MISMATCH')
       }
 
-      let changed = false
+      let materializedChanged = false
+      let factsChanged = false
 
       for (const node of facts.casNodes ?? []) {
         if (this.cas.hasSync(node.hash, node.partition)) continue
         if (hashCasNode(node.bytes) === node.hash) {
           decodeCasNode(node.bytes)
           await this.cas.putRaw(node.hash, node.bytes, node.partition)
-          changed = true
+          materializedChanged = true
+          factsChanged = true
         } else if (computeCasHash(node.bytes, []) === node.hash) {
           await this.cas.put(node.bytes, [], node.partition)
-          changed = true
+          materializedChanged = true
+          factsChanged = true
         } else {
           throw new Error(`CAS_NODE_HASH_MISMATCH:${node.hash}`)
         }
@@ -2031,7 +2112,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         check(this.#publicOps.size + this.#encryptedEnvelopes.size < this.#maxOperations, 'SESSION_OPERATION_LIMIT')
         await this.#store.put(`${this.#prefix}/public-op/${opId}`, raw.slice())
         this.#publicOps.set(opId, { raw: raw.slice(), signed, core: verified.core })
-        changed = true
+        materializedChanged = true
+        factsChanged = true
       }
 
       for (const raw of facts.encryptedEnvelopes ?? []) {
@@ -2042,7 +2124,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         check(this.#publicOps.size + this.#encryptedEnvelopes.size < this.#maxOperations, 'SESSION_OPERATION_LIMIT')
         await this.#store.put(`${this.#prefix}/enc-env/${digest}`, raw.slice())
         this.#encryptedEnvelopes.set(digest, { digest, raw: raw.slice(), envelope })
-        changed = true
+        materializedChanged = true
+        factsChanged = true
       }
 
       for (const ev of facts.retentions ?? []) {
@@ -2053,7 +2136,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (!byPeer.has(ev.signer)) {
           byPeer.set(ev.signer, ev)
           await this.#store.put(`${this.#prefix}/retention/${ev.payload.proposalId}/${ev.signer}`, encodeRecord(ev))
-          changed = true
+          factsChanged = true
         }
       }
 
@@ -2063,12 +2146,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (!this.#checkpoints.has(key)) {
           this.#checkpoints.set(key, cp)
           await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(cp))
-          changed = true
+          materializedChanged = true
+          factsChanged = true
         }
       }
 
-      if (changed) {
+      if (materializedChanged) {
         await this.#rematerialize()
+      } else if (factsChanged) {
+        this.#emitStatus()
+      }
+      if (factsChanged) {
         this.#emitFacts()
       }
     })
@@ -2077,6 +2165,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async collectGarbage(): Promise<{ readonly kept: number; readonly deleted: number }> {
     return this.#serial(async () => {
       const roots = this.#kernel.gcRoots()
+      if (this.#controlKernel !== null) {
+        for (const r of this.#controlKernel.gcRoots()) roots.add(r)
+      }
       if (this.#finalKernel !== null) {
         for (const r of this.#finalKernel.gcRoots()) roots.add(r)
       }

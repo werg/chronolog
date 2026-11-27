@@ -393,4 +393,64 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     expect(gc.kept).toBeGreaterThan(0)
     expect((await sessA.query('listTasks')).value).toEqual([{ id: 't1', owner: devA.identity.publicKey, title: 'Ship v2' }])
   })
+
+  it('never drops private events or exposes torn readViews during concurrent rematerialization on private logs', async () => {
+    const devA = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const devB = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const created = await createLogGenesis({
+      creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
+      members: [{ publicKey: devB.identity.publicKey, wrapKey: devB.wrapKey.publicKey, reader: true, writer: true }],
+      privateLog: true,
+      imports: { 'app/kv': KV_REDUCER },
+      topics: { kv: { module: 'app/kv', initialState: {} } },
+    })
+
+    const sessA = await createApplicationSession({ device: devA, genesis: created.genesisBytes, casNodes: created.casNodes, epochKeys: new Map([[0, created.epoch0Key!]]) })
+    const sessB = await createApplicationSession({ device: devB, genesis: created.genesisBytes, casNodes: created.casNodes, epochKeys: new Map([[0, created.epoch0Key!]]) })
+    closes.push(() => sessA.close(), () => sessB.close())
+
+    await (await sessA.command('set', { key: 'k1', value: 'v1' }, { operationId: 'op-1', authorTimestampMs: 100n })).materialized()
+    await (await sessA.command('set', { key: 'k2', value: 'v2' }, { operationId: 'op-2', authorTimestampMs: 200n })).materialized()
+    await sessB.mergeFacts(await sessA.exportFacts())
+
+    // Continuously poll readView() and readEvents() while triggering rematerializations
+    // (including late out-of-order ops that rewind snapshots and concurrent retryMaterialization).
+    let polling = true
+    const failures: string[] = []
+    const reader = (async () => {
+      while (polling) {
+        const view = await sessA.readView()
+        try {
+          const kv = view.topic('kv') as Record<string, { readonly value?: string }> | null
+          const batch = view.readEvents({ limit: 64 })
+          const opIds = new Set(batch.events.map(e => e.operationId))
+          if (kv?.k1?.value !== 'v1' || kv?.k2?.value !== 'v2') {
+            failures.push(`missing kv keys during rematerialize: ${JSON.stringify(kv)}`)
+          }
+          if (!opIds.has('op-1') || !opIds.has('op-2')) {
+            failures.push(`missing private events during rematerialize: ${JSON.stringify([...opIds])}`)
+          }
+        } finally {
+          view.release()
+        }
+        await new Promise(r => setTimeout(r, 0))
+      }
+    })()
+
+    // Trigger repeated rematerializations: retryMaterialization + late earlier-timestamp op + retention-only merge
+    await (await sessB.command('set', { key: 'k0', value: 'v0' }, { operationId: 'op-0', authorTimestampMs: 50n })).materialized()
+    await Promise.all([
+      sessA.retryMaterialization(),
+      sessA.mergeFacts(await sessB.exportFacts()),
+      sessA.retryMaterialization(),
+    ])
+    polling = false
+    await reader
+
+    expect(failures).toEqual([])
+    const finalKv = sessA.topic('kv') as Record<string, { readonly value?: string }> | null
+    expect(finalKv?.k0?.value).toBe('v0')
+    expect(finalKv?.k1?.value).toBe('v1')
+    expect(finalKv?.k2?.value).toBe('v2')
+  })
 })

@@ -72,6 +72,14 @@ export interface KernelSnapshot {
   readonly orderLength: number
 }
 
+interface KernelMutableState {
+  topics: Record<string, JsonValue>
+  seenOps: Set<string>
+  seenOpsRoot: string
+  historyDigest: string
+  stateRoot: string
+}
+
 export interface KernelMaterializeResult {
   readonly revision: KernelRevision
   readonly outcomes: readonly KernelOperationOutcome[]
@@ -209,6 +217,17 @@ export class TopicKernel {
     this.#snapshots.set(0, this.#captureSnapshot(0))
   }
 
+  #captureSnapshotFrom(state: KernelMutableState, orderLength: number): KernelSnapshot {
+    return {
+      topics: structuredClone(state.topics),
+      seenOps: new Set(state.seenOps),
+      seenOpsRoot: state.seenOpsRoot,
+      historyDigest: state.historyDigest,
+      stateRoot: state.stateRoot,
+      orderLength,
+    }
+  }
+
   #captureSnapshot(orderLength: number): KernelSnapshot {
     return {
       topics: structuredClone(this.#topics),
@@ -218,14 +237,6 @@ export class TopicKernel {
       stateRoot: this.#stateRoot,
       orderLength,
     }
-  }
-
-  #restoreSnapshot(snap: KernelSnapshot): void {
-    this.#topics = structuredClone(snap.topics)
-    this.#seenOps = new Set(snap.seenOps)
-    this.#seenOpsRoot = snap.seenOpsRoot
-    this.#historyDigest = snap.historyDigest
-    this.#stateRoot = snap.stateRoot
   }
 
   get topics(): Readonly<Record<string, JsonValue>> {
@@ -346,6 +357,15 @@ export class TopicKernel {
       if (bytesToHex(this.#order[diff]!.opId) !== bytesToHex(eligible[diff]!.opId)) break
       diff++
     }
+    // Fast path: identical eligible set and no pending dependencies — nothing to re-evaluate
+    if (diff === eligible.length && this.#order.length === eligible.length && this.#pendingDependencies.size === 0) {
+      return {
+        revision: this.revision('local'),
+        outcomes: this.#outcomes.slice(),
+        pendingDependencies: this.pendingDependencies,
+        skippedOpIds: [...this.#skippedOpIds],
+      }
+    }
     // If previous run had missing dependencies, re-evaluate from earliest missing point (0 if uncertain)
     if (this.#pendingDependencies.size > 0) diff = 0
 
@@ -355,15 +375,22 @@ export class TopicKernel {
       if (idx <= diff && idx > snapIndex) snapIndex = idx
     }
     const snap = this.#snapshots.get(snapIndex)!
-    this.#restoreSnapshot(snap)
-    for (const idx of [...this.#snapshots.keys()]) {
-      if (idx > snapIndex) this.#snapshots.delete(idx)
+    const work: KernelMutableState = {
+      topics: structuredClone(snap.topics),
+      seenOps: new Set(snap.seenOps),
+      seenOpsRoot: snap.seenOpsRoot,
+      historyDigest: snap.historyDigest,
+      stateRoot: snap.stateRoot,
+    }
+    const nextSnapshots = new Map<number, KernelSnapshot>()
+    for (const [idx, s] of this.#snapshots) {
+      if (idx <= snapIndex) nextSnapshots.set(idx, s)
     }
 
     const nextOutcomes = this.#outcomes.slice(0, snapIndex)
     const nextOrder = this.#order.slice(0, snapIndex)
-    this.#pendingDependencies.clear()
-    this.#skippedOpIds.clear()
+    const nextPendingDeps = new Set<string>()
+    const nextSkippedOps = new Set<string>()
 
     this.cas.beginBatch()
     try {
@@ -372,22 +399,32 @@ export class TopicKernel {
         const opIdHex = bytesToHex(entry.opId)
         const authorHex = bytesToHex(entry.core.author)
 
-        const step = await this.#applyOne(entry, opIdHex, authorHex)
+        const step = await this.#applyOne(work, entry, opIdHex, authorHex)
         if (step.kind === 'missing') {
-          this.#pendingDependencies.add(step.dependency)
-          this.#skippedOpIds.add(opIdHex)
+          nextPendingDeps.add(step.dependency)
+          nextSkippedOps.add(opIdHex)
           // Stop advancing past an unresolved dependency so later ops never execute against incomplete causal state
           break
         }
         nextOrder.push(entry)
         nextOutcomes.push(step.outcome)
         if (nextOrder.length % this.#snapshotInterval === 0) {
-          this.#snapshots.set(nextOrder.length, this.#captureSnapshot(nextOrder.length))
+          nextSnapshots.set(nextOrder.length, this.#captureSnapshotFrom(work, nextOrder.length))
         }
       }
+      await this.cas.flushBatch()
+      // Atomically commit all derived state once replay and CAS flush succeed so concurrent
+      // readers never observe a rewound or partially materialized kernel.
+      this.#topics = work.topics
+      this.#seenOps = work.seenOps
+      this.#seenOpsRoot = work.seenOpsRoot
+      this.#historyDigest = work.historyDigest
+      this.#stateRoot = work.stateRoot
       this.#order = nextOrder
       this.#outcomes = nextOutcomes
-      await this.cas.flushBatch()
+      this.#pendingDependencies = nextPendingDeps
+      this.#skippedOpIds = nextSkippedOps
+      this.#snapshots = nextSnapshots
     } catch (err) {
       this.cas.rollbackBatch()
       throw err
@@ -402,6 +439,7 @@ export class TopicKernel {
   }
 
   async #applyOne(
+    work: KernelMutableState,
     entry: KernelOperationInput,
     opIdHex: string,
     authorHex: string,
@@ -419,7 +457,7 @@ export class TopicKernel {
         ...(detail === undefined ? {} : { rejectionDetail: detail }),
         events: [],
       }
-      this.#historyDigest = advanceHistoryDigest(this.#historyDigest, opIdHex, 'rejected', code, [])
+      work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'rejected', code, [])
       return { kind: 'done', outcome }
     }
 
@@ -442,7 +480,7 @@ export class TopicKernel {
 
     // Scoped idempotency check: (visibility, author, operationId)
     const dedupKey = seenOpKey(core.visibility, authorHex, core.operationId)
-    if (this.#seenOps.has(dedupKey)) {
+    if (work.seenOps.has(dedupKey)) {
       return makeRejected('operation_conflict')
     }
 
@@ -450,7 +488,7 @@ export class TopicKernel {
     const casPartition: CasPartition = (this.genesis.privateLog && core.visibility === 'public') ? 'public' : 'private'
 
     // Copy-on-write working topics map
-    const workingTopics: Record<string, JsonValue> = structuredClone(this.#topics)
+    const workingTopics: Record<string, JsonValue> = structuredClone(work.topics)
     const emitted: EmittedKernelEvent[] = []
     let ordinal = 0
 
@@ -507,42 +545,42 @@ export class TopicKernel {
       }
 
       if (!res.ok) {
-        this.#seenOps.add(dedupKey)
-        this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-        this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+        work.seenOps.add(dedupKey)
+        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
         return makeRejected(res.code, res.detail)
       }
 
       const outObj = res.value
       if (outObj === null || typeof outObj !== 'object' || Array.isArray(outObj)) {
-        this.#seenOps.add(dedupKey)
-        this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-        this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+        work.seenOps.add(dedupKey)
+        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
         return makeRejected('vm:invalid_reducer_return')
       }
       const outRec = outObj as Readonly<Record<string, JsonValue>>
       if (typeof outRec.ok !== 'boolean') {
-        this.#seenOps.add(dedupKey)
-        this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-        this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+        work.seenOps.add(dedupKey)
+        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
         return makeRejected('vm:invalid_reducer_return')
       }
 
       if (!outRec.ok) {
         const rejCode = typeof outRec.code === 'string' && outRec.code.length > 0 ? outRec.code : 'reducer:rejected'
         const rejDetail = typeof outRec.detail === 'string' ? outRec.detail : undefined
-        this.#seenOps.add(dedupKey)
-        this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-        this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+        work.seenOps.add(dedupKey)
+        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
         return makeRejected(rejCode, rejDetail)
       }
 
       const nextTopicState: JsonValue = outRec.state === undefined ? null : outRec.state
       const encodedTopic = encodeCanonicalJsonCbor(nextTopicState)
       if (encodedTopic.length > this.genesis.limits.maxTopicStateBytes) {
-        this.#seenOps.add(dedupKey)
-        this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-        this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+        work.seenOps.add(dedupKey)
+        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
         return makeRejected('limit:max_topic_state_bytes')
       }
 
@@ -550,9 +588,9 @@ export class TopicKernel {
       if (update.topic === '$reducers') {
         try { assertValidReducersConfig(nextTopicState) }
         catch (err) {
-          this.#seenOps.add(dedupKey)
-          this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-          this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+          work.seenOps.add(dedupKey)
+          work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+          work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
           return makeRejected('reducers_config_invalid', err instanceof Error ? err.message : String(err))
         }
       }
@@ -580,11 +618,11 @@ export class TopicKernel {
     }
 
     // Atomic commit of all topic updates in this op
-    this.#seenOps.add(dedupKey)
-    this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, casPartition)
-    this.#topics = workingTopics
-    this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
-    this.#historyDigest = advanceHistoryDigest(this.#historyDigest, opIdHex, 'accepted', null, emitted)
+    work.seenOps.add(dedupKey)
+    work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+    work.topics = workingTopics
+    work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+    work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'accepted', null, emitted)
 
     return {
       kind: 'done',
