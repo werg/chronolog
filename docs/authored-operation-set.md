@@ -4,10 +4,10 @@ This guide walks through how operations flow from local authoring through replic
 
 ## 1. Genesis & Chain Identity
 
-Use `createChainGenesis()` from `@chronolog/peer-session`:
+Use `createLogGenesis()` from `@chronolog/peer-session`:
 - Pins the 5 standard modules (`chronolog/permissions`, `chronolog/keys`, `chronolog/finality`, `chronolog/publications`, `chronolog/rls`) and your application ES Modules into public CAS (`cas:sha256-...`).
 - Configures `$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, and your app topics.
-- Produces canonical `genesisBytes`, deterministic `chainId`, `casNodes`, and (for private chains) an initial `epoch0Key`.
+- Produces canonical `genesisBytes`, deterministic `logId`, `casNodes`, and (for private chains) an initial `epoch0Key`.
 
 ## 2. Local Durable Authoring
 

@@ -106,9 +106,9 @@ export interface GenesisLimits {
   readonly maxUpdatesPerOp: number
 }
 
-export interface GenesisBlock {
+export interface LogGenesis {
   readonly version: 1
-  readonly privateChain: boolean
+  readonly privateLog: boolean
   readonly initialTopics: Readonly<Record<string, JsonValue>>
   readonly limits: GenesisLimits
   readonly salt: Uint8Array
@@ -121,7 +121,7 @@ export interface TopicUpdate {
 
 export interface OperationCore {
   readonly version: 1
-  readonly chainId: Uint8Array
+  readonly logId: Uint8Array
   readonly author: Uint8Array
   readonly operationId: string
   readonly authorTimestampMs: bigint
@@ -137,7 +137,7 @@ export interface SignedOperation {
 
 export interface EncryptedOperationEnvelope {
   readonly version: 1
-  readonly chainId: Uint8Array
+  readonly logId: Uint8Array
   readonly opId: Uint8Array
   readonly author: Uint8Array
   readonly epoch: number
@@ -298,9 +298,9 @@ export function assertValidReducersConfig(value: unknown): ReducersConfig {
   return { runtime: { js: rtObj.js, builtins }, imports, topics }
 }
 
-export function encodeGenesisBlock(genesis: GenesisBlock): Uint8Array {
+export function encodeLogGenesis(genesis: LogGenesis): Uint8Array {
   protocolInvariant(genesis.version === 1, 'UNSUPPORTED_VERSION', 'Genesis version must be 1')
-  protocolInvariant(typeof genesis.privateChain === 'boolean', 'SCHEMA_INVALID', 'Genesis privateChain must be boolean')
+  protocolInvariant(typeof genesis.privateLog === 'boolean', 'SCHEMA_INVALID', 'Genesis privateLog must be boolean')
   protocolInvariant(genesis.salt instanceof Uint8Array && genesis.salt.length >= 16 && genesis.salt.length <= 64, 'SCHEMA_INVALID', 'Genesis salt must be 16..64 bytes')
   for (const n of [genesis.limits.maxMemoryBytes, genesis.limits.maxTopicStateBytes, genesis.limits.maxUpdatesPerOp]) {
     protocolInvariant(Number.isSafeInteger(n) && n > 0, 'SCHEMA_INVALID', 'Invalid genesis limits')
@@ -317,7 +317,7 @@ export function encodeGenesisBlock(genesis: GenesisBlock): Uint8Array {
   }
   const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
-    [1n, genesis.privateChain],
+    [1n, genesis.privateLog],
     [2n, topicsMap],
     [3n, new Map<CborMapKey, CborValue>([
       [0n, BigInt(genesis.limits.maxMemoryBytes)],
@@ -329,13 +329,13 @@ export function encodeGenesisBlock(genesis: GenesisBlock): Uint8Array {
   return encodeCanonicalCbor(map)
 }
 
-export function decodeGenesisBlock(bytes: Uint8Array): GenesisBlock {
+export function decodeLogGenesis(bytes: Uint8Array): LogGenesis {
   const raw = assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
   protocolInvariant(raw instanceof Map && raw.size === 5, 'SCHEMA_INVALID', 'Genesis must be a 5-entry map')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'UNSUPPORTED_VERSION', 'Unsupported genesis version')
-  const privateChain = map.get(1n)
-  protocolInvariant(typeof privateChain === 'boolean', 'SCHEMA_INVALID', 'Invalid privateChain')
+  const privateLog = map.get(1n)
+  protocolInvariant(typeof privateLog === 'boolean', 'SCHEMA_INVALID', 'Invalid privateLog')
   const topicsRaw = map.get(2n)
   protocolInvariant(topicsRaw instanceof Map, 'SCHEMA_INVALID', 'Invalid initialTopics')
   const initialTopics: Record<string, JsonValue> = {}
@@ -353,9 +353,9 @@ export function decodeGenesisBlock(bytes: Uint8Array): GenesisBlock {
   }
   const salt = map.get(4n)
   protocolInvariant(salt instanceof Uint8Array && salt.length >= 16 && salt.length <= 64, 'SCHEMA_INVALID', 'Invalid genesis salt')
-  const genesis: GenesisBlock = {
+  const genesis: LogGenesis = {
     version: 1,
-    privateChain,
+    privateLog,
     initialTopics,
     limits: {
       maxMemoryBytes: num(limitsMap.get(0n)),
@@ -364,18 +364,18 @@ export function decodeGenesisBlock(bytes: Uint8Array): GenesisBlock {
     },
     salt: salt.slice(),
   }
-  protocolInvariant(equalBytes(encodeGenesisBlock(genesis), bytes), 'CBOR_NON_CANONICAL', 'Genesis bytes not canonical')
+  protocolInvariant(equalBytes(encodeLogGenesis(genesis), bytes), 'CBOR_NON_CANONICAL', 'Genesis bytes not canonical')
   return genesis
 }
 
-export function genesisChainId(genesis: GenesisBlock | Uint8Array): Uint8Array {
-  const bytes = genesis instanceof Uint8Array ? genesis : encodeGenesisBlock(genesis)
+export function genesisLogId(genesis: LogGenesis | Uint8Array): Uint8Array {
+  const bytes = genesis instanceof Uint8Array ? genesis : encodeLogGenesis(genesis)
   return hashDomainSync('genesis', bytes)
 }
 
 export function encodeOperationCore(core: OperationCore): Uint8Array {
   protocolInvariant(core.version === 1, 'UNSUPPORTED_VERSION', 'Operation version must be 1')
-  protocolInvariant(core.chainId instanceof Uint8Array && core.chainId.length === 32, 'SCHEMA_INVALID', 'chainId must be 32 bytes')
+  protocolInvariant(core.logId instanceof Uint8Array && core.logId.length === 32, 'SCHEMA_INVALID', 'logId must be 32 bytes')
   protocolInvariant(core.author instanceof Uint8Array && core.author.length === 32, 'SCHEMA_INVALID', 'author must be 32 bytes')
   protocolInvariant(
     typeof core.operationId === 'string' && core.operationId.length > 0 && utf8(core.operationId).length <= MAX_OP_ID_BYTES &&
@@ -394,7 +394,7 @@ export function encodeOperationCore(core: OperationCore): Uint8Array {
   })
   const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
-    [1n, core.chainId],
+    [1n, core.logId],
     [2n, core.author],
     [3n, core.operationId],
     [4n, core.authorTimestampMs],
@@ -410,14 +410,14 @@ export function decodeOperationCore(bytes: Uint8Array): OperationCore {
   protocolInvariant(raw instanceof Map && raw.size === 8, 'SCHEMA_INVALID', 'OperationCore must be an 8-entry map')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'UNSUPPORTED_VERSION', 'Unsupported op version')
-  const chainId = map.get(1n)
+  const logId = map.get(1n)
   const author = map.get(2n)
   const operationId = map.get(3n)
   const authorTimestampMs = map.get(4n)
   const nonce = map.get(5n)
   const vis = map.get(6n)
   const rawUpdates = map.get(7n)
-  protocolInvariant(chainId instanceof Uint8Array && chainId.length === 32, 'SCHEMA_INVALID', 'Invalid chainId')
+  protocolInvariant(logId instanceof Uint8Array && logId.length === 32, 'SCHEMA_INVALID', 'Invalid logId')
   protocolInvariant(author instanceof Uint8Array && author.length === 32, 'SCHEMA_INVALID', 'Invalid author')
   protocolInvariant(typeof operationId === 'string', 'SCHEMA_INVALID', 'Invalid operationId')
   protocolInvariant(typeof authorTimestampMs === 'bigint', 'SCHEMA_INVALID', 'Invalid authorTimestampMs')
@@ -431,7 +431,7 @@ export function decodeOperationCore(bytes: Uint8Array): OperationCore {
   })
   const core: OperationCore = {
     version: 1,
-    chainId: chainId.slice(),
+    logId: logId.slice(),
     author: author.slice(),
     operationId,
     authorTimestampMs,
@@ -480,12 +480,12 @@ export function decodeSignedOperation(bytes: Uint8Array): SignedOperation {
 
 export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8Array {
   protocolInvariant(env.version === 1, 'UNSUPPORTED_VERSION', 'Envelope version must be 1')
-  protocolInvariant(env.chainId.length === 32 && env.opId.length === 32 && env.author.length === 32, 'SCHEMA_INVALID', 'Invalid envelope 32-byte field')
+  protocolInvariant(env.logId.length === 32 && env.opId.length === 32 && env.author.length === 32, 'SCHEMA_INVALID', 'Invalid envelope 32-byte field')
   protocolInvariant(Number.isSafeInteger(env.epoch) && env.epoch >= 0, 'SCHEMA_INVALID', 'Invalid epoch')
   protocolInvariant(env.nonce.length === 12 && env.ciphertext.length > 0, 'SCHEMA_INVALID', 'Invalid ciphertext/nonce')
   return encodeCanonicalCbor(new Map<CborMapKey, CborValue>([
     [0n, 1n],
-    [1n, env.chainId],
+    [1n, env.logId],
     [2n, env.opId],
     [3n, env.author],
     [4n, BigInt(env.epoch)],
@@ -499,9 +499,9 @@ export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEn
   protocolInvariant(raw instanceof Map && raw.size === 7, 'SCHEMA_INVALID', 'Invalid envelope')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'SCHEMA_INVALID', 'Invalid envelope')
-  const chainId = map.get(1n), opId = map.get(2n), author = map.get(3n), epoch = map.get(4n), nonce = map.get(5n), ciphertext = map.get(6n)
+  const logId = map.get(1n), opId = map.get(2n), author = map.get(3n), epoch = map.get(4n), nonce = map.get(5n), ciphertext = map.get(6n)
   protocolInvariant(
-    chainId instanceof Uint8Array && chainId.length === 32 &&
+    logId instanceof Uint8Array && logId.length === 32 &&
       opId instanceof Uint8Array && opId.length === 32 &&
       author instanceof Uint8Array && author.length === 32 &&
       typeof epoch === 'bigint' && epoch >= 0n && epoch <= BigInt(Number.MAX_SAFE_INTEGER) &&
@@ -512,7 +512,7 @@ export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEn
   )
   return {
     version: 1,
-    chainId: chainId.slice(),
+    logId: logId.slice(),
     opId: opId.slice(),
     author: author.slice(),
     epoch: Number(epoch),
@@ -527,8 +527,8 @@ export function encryptedEnvelopeDigest(env: EncryptedOperationEnvelope | Uint8A
   return hashDomainSync('envelope', bytes)
 }
 
-export function envelopeAad(chainId: Uint8Array, opId: Uint8Array, author: Uint8Array): Uint8Array {
-  return encodeCanonicalCbor([chainId, opId, author])
+export function envelopeAad(logId: Uint8Array, opId: Uint8Array, author: Uint8Array): Uint8Array {
+  return encodeCanonicalCbor([logId, opId, author])
 }
 
 export function compareOperationOrder(left: OperationOrderKey, right: OperationOrderKey): number {

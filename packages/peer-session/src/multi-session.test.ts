@@ -8,7 +8,7 @@ import { createSigningIdentity, type SigningIdentity } from '@chronolog/authorit
 import { defineApplication, defineCommand } from './definition.js'
 import type { ApplicationDevice } from './device.js'
 import { exitCleanupCount } from './exit-cleanup.js'
-import { createChainGenesis } from './genesis.js'
+import { createLogGenesis } from './genesis.js'
 import { forwardManySessionEvents, mergeSessionChanges, type MergeableSession, type MergedSessionChange } from './multi-session.js'
 import { openDisposableNativeDevice, openNativeDevice } from './native.js'
 import { createApplicationSession } from './runtime.js'
@@ -41,7 +41,7 @@ const definition = defineApplication({
 })
 
 async function openSession(device: ApplicationDevice) {
-  const created = await createChainGenesis({
+  const created = await createLogGenesis({
     creator: {
       publicKey: device.identity.publicKey,
       wrapKey: device.wrapKey.publicKey,
@@ -49,7 +49,7 @@ async function openSession(device: ApplicationDevice) {
       writer: true,
       administrator: true,
     },
-    privateChain: true,
+    privateLog: true,
     imports: { 'app/notes': NOTE_REDUCER },
     topics: { notes: { module: 'app/notes', initialState: [] } },
   })

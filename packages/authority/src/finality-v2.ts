@@ -20,7 +20,7 @@ export interface FinalityInclusionV2 {
 }
 
 export interface FinalityCheckpointPayload {
-  readonly chainId: string
+  readonly logId: string
   readonly policyScopeId: string
   readonly closedThroughMs: bigint
   readonly includedSetDigest: string
@@ -51,8 +51,8 @@ export interface VerifiedFinalityV2 {
   readonly verifiedCheckpoints: readonly FinalityCheckpoint[]
 }
 
-export async function policyScopeId(chainId: string, entry: ScheduledFinalityEntry): Promise<string> {
-  return recordDigest(['chronolog/finality-scope/v2', chainId, entry.effectiveAfterMs, entry.policy])
+export async function policyScopeId(logId: string, entry: ScheduledFinalityEntry): Promise<string> {
+  return recordDigest(['chronolog/finality-scope/v2', logId, entry.effectiveAfterMs, entry.policy])
 }
 
 export function computeIncludedSetDigest(opIds: readonly string[]): string {
@@ -123,18 +123,18 @@ async function verifyAttestationForPolicy(
  * - Computes admitted/excluded opIds (proposals with authorTimestampMs <= closedThroughMs not in includedOpIds are excluded).
  */
 export async function verifyFinalityV2(options: {
-  readonly chainId: string
+  readonly logId: string
   readonly schedule: readonly ScheduledFinalityEntry[]
   readonly checkpoints: readonly FinalityCheckpoint[]
   readonly knownOps?: readonly { readonly opId: string; readonly authorTimestampMs: bigint }[]
   readonly blockchainVerifier?: BlockchainAnchorVerifier
 }): Promise<VerifiedFinalityV2> {
-  hex(options.chainId)
+  hex(options.logId)
   const scopeEntries = await Promise.all(
     options.schedule.map(async (entry, index) => ({
       index,
       entry,
-      scopeId: await policyScopeId(options.chainId, entry),
+      scopeId: await policyScopeId(options.logId, entry),
     })),
   )
   const byScope = new Map(scopeEntries.map(s => [s.scopeId, s]))
@@ -151,7 +151,7 @@ export async function verifyFinalityV2(options: {
 
   for (const cp of sorted) {
     const p = cp.payload
-    if (p.chainId !== options.chainId) continue
+    if (p.logId !== options.logId) continue
     const scope = byScope.get(p.policyScopeId)
     if (scope === undefined) continue
     if (scope.entry.policy.kind === 'none') continue

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { MemoryBytesStore } from '@chronolog/records'
-import { createChainGenesis } from './genesis.js'
+import { createLogGenesis } from './genesis.js'
 import { openApplicationDevice } from './device.js'
 import { createApplicationSession } from './runtime.js'
 import { createFramedPeerConnectionPair } from './network-wire.js'
@@ -18,7 +18,7 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
     const devAlice = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devBob = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
 
-    const created = await createChainGenesis({
+    const created = await createLogGenesis({
       creator: {
         publicKey: devAdmin.identity.publicKey,
         wrapKey: devAdmin.wrapKey.publicKey,
@@ -30,7 +30,7 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
         { publicKey: devAlice.identity.publicKey, wrapKey: devAlice.wrapKey.publicKey, reader: true, writer: true },
         { publicKey: devBob.identity.publicKey, wrapKey: devBob.wrapKey.publicKey, reader: true, writer: true },
       ],
-      privateChain: true,
+      privateLog: true,
       topics: {
         inventory: { module: 'chronolog/sql' },
         audit: { module: 'chronolog/sql', config: { allowUserDdl: false } },
@@ -315,9 +315,9 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
     const devStranger = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
 
     // Open public SQL bulletin board — zero host attestation, strangers can write!
-    const openCreated = await createChainGenesis({
+    const openCreated = await createLogGenesis({
       creator: { publicKey: devCreator.identity.publicKey, administrator: true, reader: true, writer: true },
-      privateChain: false,
+      privateLog: false,
       topics: {
         $permissions: {
           module: 'chronolog/permissions',

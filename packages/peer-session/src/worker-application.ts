@@ -9,7 +9,10 @@ import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from
 import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, SessionStatus, WaitOptions } from './session-types.js'
 import type { ApplicationSubmission, MaterializedOperation, OperationInspection, RetentionEvidence } from './operation.js'
 import type { ContentReference, ContentUpload, ContentRetention } from './content.js'
-import { putContentBytes, readContentBytes, type ContentPutBytesOptions, type ContentReadBytesOptions } from './content-bytes.js'
+import {
+  CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, putContentBytes, readContentBytes,
+  type BlobGetOptions, type BlobInfo, type BlobPutOptions, type ContentPutBytesOptions, type ContentReadBytesOptions,
+} from './content-bytes.js'
 
 export interface WorkerApplicationReadView {
   readonly applicationId: string
@@ -92,8 +95,8 @@ export class WorkerApplicationSession {
   request<T>(method: string, args: readonly unknown[], options: WaitOptions = {}): Promise<T> {
     if (this.signal.aborted) return Promise.reject(this.signal.reason)
     if (options.signal?.aborted) return Promise.reject(options.signal.reason)
-    const control = ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'signals.close', 'upload.discard'].includes(method)
-    if ([...this.#pending.values()].filter(request => ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'signals.close', 'upload.discard'].includes(request.method) === control).length >= (control ? 8 : 32)) return Promise.reject(new Error('ENDPOINT_REQUEST_LIMIT'))
+    const control = ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'].includes(method)
+    if ([...this.#pending.values()].filter(request => ['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'].includes(request.method) === control).length >= (control ? 8 : 32)) return Promise.reject(new Error('ENDPOINT_REQUEST_LIMIT'))
     const timeoutMs = options.timeoutMs ?? 30_000
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) return Promise.reject(new Error('ENDPOINT_TIMEOUT_LIMIT'))
     const id = ++this.#next, startedAt = performance.now()
@@ -235,6 +238,44 @@ export class WorkerApplicationSession {
     retention: (reference: ContentReference, options: { readonly signal?: AbortSignal } = {}): Promise<readonly ContentRetention[]> => this.request('content.retention', [reference], options),
     retained: (reference: ContentReference): Promise<readonly ContentRetention[]> => this.request('content.retained', [reference]),
     discard: (reference: ContentReference): Promise<void> => this.request('content.discard', [reference]),
+    putBlob: async (bytes: Uint8Array, options: BlobPutOptions = {}): Promise<BlobInfo> => {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_BLOB_BYTES) throw new Error('CONTENT_RANGE_INVALID')
+      const reqOptions = options.signal === undefined ? {} : { signal: options.signal }
+      const id = await this.request<string>('content.blobOpenWrite', [bytes.byteLength], reqOptions)
+      try {
+        for (let offset = 0; offset < bytes.byteLength; offset += CONTENT_CHUNK_BYTES) {
+          const chunk = Uint8Array.from(bytes.subarray(offset, Math.min(bytes.byteLength, offset + CONTENT_CHUNK_BYTES)))
+          await this.request('content.blobWriteChunk', [id, offset / CONTENT_CHUNK_BYTES, chunk], reqOptions)
+        }
+        return await this.request<BlobInfo>('content.blobCommitWrite', [id], reqOptions)
+      } catch (error) {
+        void this.request('content.blobAbortWrite', [id]).catch(() => undefined)
+        throw error
+      }
+    },
+    getBlob: async (hash: string, options: BlobGetOptions = {}): Promise<Uint8Array | null> => {
+      const { signal, ...rest } = options
+      const reqOptions = signal === undefined ? {} : { signal }
+      const opened = await this.request<{ readonly id: string; readonly bytes: number } | null>('content.blobOpenRead', [hash, rest], reqOptions)
+      if (opened === null) return null
+      const result = new Uint8Array(opened.bytes)
+      let offset = 0
+      try {
+        while (offset < opened.bytes) {
+          const chunk = await this.request<Uint8Array | null>('content.blobNextChunk', [opened.id], reqOptions)
+          if (chunk === null) break
+          if (!(chunk instanceof Uint8Array) || chunk.byteLength === 0 || offset + chunk.byteLength > opened.bytes) throw new Error('CONTENT_CHUNK_SIZE_INVALID')
+          result.set(chunk, offset)
+          offset += chunk.byteLength
+        }
+        if (offset !== opened.bytes) throw new Error('CONTENT_INCOMPLETE')
+        return result
+      } finally {
+        void this.request('content.blobCloseRead', [opened.id]).catch(() => undefined)
+      }
+    },
+    hasBlob: (hash: string): Promise<boolean> => this.request('content.hasBlob', [hash]),
+    deleteBlob: (hash: string): Promise<void> => this.request('content.deleteBlob', [hash]),
   }
 
   #detach(error: unknown): void {

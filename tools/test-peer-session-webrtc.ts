@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
 import {
-  createApplicationSession, bytesToHex, createChainGenesis,
+  createApplicationSession, bytesToHex, createLogGenesis,
   type ApplicationDevice, type ApplicationPeerLink, type ApplicationSession, type ApplicationEventBatch,
 } from '@chronolog/peer-session'
 import { openNativeDevice } from '@chronolog/peer-session/native'
@@ -111,10 +111,10 @@ try {
   const identity = await page.evaluate(name => (globalThis as unknown as TestWindow).authoredRtcTest.prepare(name), `authored-rtc-${crypto.randomUUID()}`)
   nativeDevice = await openNativeDevice({ path: join(directory, 'native.sqlite'), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32))
-  const created = await createChainGenesis({
+  const created = await createLogGenesis({
     creator: { publicKey: identity.publicKey, reader: true, writer: true, administrator: true, finalizer: true },
     members: [{ publicKey: nativeDevice.identity.publicKey, wrapKey: nativeDevice.wrapKey.publicKey, reader: true, writer: true }],
-    privateChain: true,
+    privateLog: true,
     imports: { 'app/messages': RTC_MESSAGES_REDUCER },
     topics: { messages: { module: 'app/messages', initialState: [] } },
     finalitySchedule: [{ effectiveAfterMs: -1n, policy: { kind: 'signed-frontier', signer: identity.publicKey } }],
@@ -126,7 +126,7 @@ try {
     try { for await (const value of owned.signals.subscribe({ signal: owned.signal })) nativeSignals.push(value) }
     catch (error) { if (!owned.signal.aborted) errors.push(String(error)) }
   })()
-  await page.evaluate(bootstrap => (globalThis as unknown as TestWindow).authoredRtcTest.open(bootstrap), { chainId: created.chainId, genesisBytes: created.genesisBytes, casNodes: created.casNodes, epoch: 0, epochKey: bytesToHex(key) })
+  await page.evaluate(bootstrap => (globalThis as unknown as TestWindow).authoredRtcTest.open(bootstrap), { logId: created.logId, genesisBytes: created.genesisBytes, casNodes: created.casNodes, epoch: 0, epochKey: bytesToHex(key) })
   const upload = await native.content.stage({ bytes: content.length })
   for (let offset = 0; offset < content.length; offset += 65_536) await upload.write(offset / 65_536, content.slice(offset, offset + 65_536))
   const reference = await upload.commit()

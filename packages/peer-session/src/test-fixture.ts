@@ -2,7 +2,7 @@ import { createSigningIdentity, type FinalityPolicyV2, type SigningIdentity } fr
 import { MemoryBytesStore } from '@chronolog/records'
 import { defineApplication, defineCommand, defineQuery } from './definition.js'
 import { openApplicationDevice } from './device.js'
-import { createChainGenesis } from './genesis.js'
+import { createLogGenesis } from './genesis.js'
 import { createApplicationSession } from './runtime.js'
 import type { ApplicationReadView } from './session-types.js'
 import { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
@@ -53,7 +53,7 @@ export async function sessionFixture(options: {
   readonly count?: number
   readonly identities?: readonly SigningIdentity[]
   readonly finalityPolicy?: FinalityPolicyV2
-  readonly privateChain?: boolean
+  readonly privateLog?: boolean
 } = {}) {
   const identities = options.identities ?? await Promise.all(Array.from({ length: options.count ?? 2 }, () => createSigningIdentity()))
   const wrapPairs = await Promise.all(identities.map(async () => {
@@ -70,10 +70,10 @@ export async function sessionFixture(options: {
     publisher: i === 0,
     finalizer: i === 0,
   }))
-  const created = await createChainGenesis({
+  const created = await createLogGenesis({
     creator: members[0]!,
     members: members.slice(1),
-    privateChain: options.privateChain ?? true,
+    privateLog: options.privateLog ?? true,
     imports: { 'app/messages': MESSAGES_REDUCER_SOURCE },
     topics: { messages: { module: 'app/messages', initialState: [] } },
     epoch0Key: epochKey,
@@ -84,8 +84,8 @@ export async function sessionFixture(options: {
   const stores = identities.map(() => new MemoryBytesStore())
 
   return {
-    applicationId: created.chainId,
-    chainId: created.chainId,
+    applicationId: created.logId,
+    logId: created.logId,
     genesis: created.genesis,
     genesisBytes: created.genesisBytes,
     casNodes: created.casNodes,

@@ -1,4 +1,4 @@
-import type { GenesisBlock } from '@chronolog/protocol'
+import type { LogGenesis } from '@chronolog/protocol'
 import type { BlockchainAnchorVerifier } from '@chronolog/authority'
 import type { QuickJsSandboxOptions } from '@chronolog/materializer'
 import { claimApplicationDevice, type ApplicationDevice } from './device.js'
@@ -7,9 +7,9 @@ import { ApplicationSession, type SessionCasNode } from './session.js'
 
 export interface CreateApplicationSessionOptions<D extends ApplicationDefinition = ApplicationDefinition> extends QuickJsSandboxOptions {
   readonly device: ApplicationDevice
-  readonly genesis?: GenesisBlock | Uint8Array
-  readonly chainId?: string
-  /** Optional host-level application scope ID (defaults to `chainId`). */
+  readonly genesis?: LogGenesis | Uint8Array
+  readonly logId?: string
+  /** Optional host-level application scope ID (defaults to `logId`). */
   readonly applicationId?: string
   readonly casNodes?: readonly SessionCasNode[]
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>

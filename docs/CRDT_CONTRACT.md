@@ -2,7 +2,7 @@
 
 ## 1. Core Model: Flat Timestamp-Ordered Operation Set
 
-A Chronolog chain is identified by `chainId = hashDomain('genesis', encodeGenesisBlock(genesis))`.
+A Chronolog chain is identified by `logId = hashDomain('genesis', encodeLogGenesis(genesis))`.
 
 All state is deterministically derived by folding a **flat set** of signed operations (no `parents` hash-links) sorted strictly by the canonical comparator:
 
@@ -14,7 +14,7 @@ No peer, host, relay, finalizer, transport receipt, or selected branch may assig
 
 ## 2. Two-Way Public/Encrypted Control Partition
 
-On chains with `privateChain: true`:
+On chains with `privateLog: true`:
 - Control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`) may ONLY be mutated by `visibility: 'public'` operations.
 - Public operations can ONLY read `$*` topics and `public` CAS nodes.
 - Application (non-`$`) topics may ONLY be mutated by `visibility: 'encrypted'` operations (wrapped in `EncryptedOperationEnvelope` under an epoch key).

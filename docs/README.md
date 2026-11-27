@@ -6,7 +6,7 @@
 
 ## Package Guides
 
-- [`@chronolog/peer-session`](../packages/peer-session/README.md) — full session API, `createChainGenesis`, `ApplicationDevice`, `ApplicationSessionOwner`, `createLiveView`, `forwardSessionEvents`, and `createScopedApplicationTools`.
+- [`@chronolog/peer-session`](../packages/peer-session/README.md) — full session API, `createLogGenesis`, `ApplicationDevice`, `ApplicationSessionOwner`, `createLiveView`, `forwardSessionEvents`, and `createScopedApplicationTools`.
 - [`@chronolog/materializer`](../packages/materializer/README.md) — `TopicKernel`, `QuickJsSandbox`, and the 5 audited standard ES Modules.
 - [`@chronolog/sqlite-cas`](../packages/sqlite-cas/README.md) — Merkle-paged SQLite + FTS5 + `sqlite-vec` WASM driver and deterministic profile.
 - [`@chronolog/authority`](../packages/authority/README.md) — portable signed records, `ApplicationDescription`, and time-scoped `$finality` verification.

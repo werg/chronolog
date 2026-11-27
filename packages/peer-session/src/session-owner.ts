@@ -15,14 +15,17 @@ import {
 import { APPLICATION_OWNER_PROTOCOL, type OwnerRequest } from './worker-application-protocol.js'
 import type { ApplicationReadView } from './session-types.js'
 import type { ContentUpload } from './content.js'
+import { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, type BlobGetOptions } from './content-bytes.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
 
 interface SignalStream { readonly iterator: AsyncIterator<EphemeralSignal>; readonly lifetime: AbortController; pending: Promise<IteratorResult<EphemeralSignal>> | null; busy: boolean }
 interface Reader { readonly iterator: AsyncIterator<Uint8Array>; readonly lifetime: AbortController; busy: boolean }
+interface BlobWrite { readonly totalBytes: number; readonly chunks: (Uint8Array | undefined)[] }
+interface BlobRead { readonly bytes: Uint8Array; offset: number }
 interface RequestContext { readonly lifetime: AbortController; readonly signal: AbortSignal; readonly method: string; readonly control: boolean }
 
 const isArray = (value: unknown): boolean => Array.isArray(value)
-const CONTROLS = new Set(['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'signals.close', 'upload.discard'])
+const CONTROLS = new Set(['close', 'attachment.ping', 'attachment.suspend', 'attachment.resume', 'view.release', 'content.cancel', 'content.blobAbortWrite', 'content.blobCloseRead', 'signals.close', 'upload.discard'])
 
 function requestBudget(value: unknown): void {
   let nodes = 0, bytes = 0
@@ -72,7 +75,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
     attach(endpoint: ApplicationWorkerEndpoint & { start?(): void }, policy: ApplicationAttachmentPolicy = {}) {
       check(!closed && attachments.size < maxAttachments, 'OWNER_ATTACHMENT_LIMIT')
       const endpointId = crypto.randomUUID(), endpointIncarnation = crypto.randomUUID(), lifetime = new AbortController()
-      const views = new Map<string, ApplicationReadView>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
+      const views = new Map<string, ApplicationReadView>(), uploads = new Map<string, ContentUpload>(), completedUploads = new Map<string, ContentUpload>(), readers = new Map<string, Reader>(), blobWrites = new Map<string, BlobWrite>(), blobReads = new Map<string, BlobRead>(), streams = new Map<string, SignalStream>(), pending = new Map<number, RequestContext>()
       let effective = policy, attachment = '', initialized = false, detached = false, suspended = false, highestRequest = 0, viewReservations = 0, uploadReservations = 0, lastReceived = performance.now(), context: ApplicationEndpointContext = policy.context ?? {}
       let claimedViewId: string | undefined
       let stopStatus: (() => void) | undefined, stopChange: (() => void) | undefined, stopExtension: (() => void) | undefined
@@ -93,6 +96,7 @@ export function createApplicationOwner(session: ApplicationSession, options: App
       const releaseResources = (): void => {
         for (const view of views.values()) view.release(); views.clear()
         for (const reader of readers.values()) { reader.lifetime.abort(); void reader.iterator.return?.().catch(() => undefined) }; readers.clear()
+        blobWrites.clear(); blobReads.clear()
         for (const stream of streams.values()) { stream.lifetime.abort(); void stream.iterator.return?.().catch(() => undefined) }; streams.clear()
       }
       const close = (): void => {
@@ -142,6 +146,8 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'attachment.resume') { suspended = false; return session.status }
         if (method === 'view.release') { const id = String(args[0]), view = views.get(id); views.delete(id); view?.release(); return null }
         if (method === 'content.cancel') { const id = String(args[0]), reader = readers.get(id); readers.delete(id); reader?.lifetime.abort(); await reader?.iterator.return?.(); return null }
+        if (method === 'content.blobAbortWrite') { blobWrites.delete(String(args[0])); return null }
+        if (method === 'content.blobCloseRead') { blobReads.delete(String(args[0])); return null }
         if (method === 'signals.close') { const id = String(args[0]), stream = streams.get(id); streams.delete(id); stream?.lifetime.abort(); await stream?.iterator.return?.(); return null }
         if (method === 'upload.discard') { const id = String(args[0]), upload = uploads.get(id) ?? completedUploads.get(id); uploads.delete(id); completedUploads.delete(id); await upload?.discard(); return null }
         check(!suspended, 'ENDPOINT_SUSPENDED')
@@ -260,6 +266,50 @@ export function createApplicationOwner(session: ApplicationSession, options: App
             if (next.done) { readers.delete(id); return null }
             check(next.value.length <= 65536, 'CONTENT_CHUNK_LIMIT'); return next.value
           } finally { request.signal.removeEventListener('abort', abort); reader.busy = false }
+        }
+        if (method === 'content.hasBlob') { allow('content'); return session.content.hasBlob(String(args[0])) }
+        if (method === 'content.deleteBlob') { allow('content'); return session.content.deleteBlob(String(args[0])) }
+        if (method === 'content.blobOpenWrite') {
+          allow('content'); check(blobWrites.size < 4, 'ENDPOINT_UPLOAD_LIMIT')
+          const totalBytes = Number(args[0])
+          check(Number.isSafeInteger(totalBytes) && totalBytes >= 0 && totalBytes <= MAX_BLOB_BYTES, 'CONTENT_RANGE_INVALID')
+          const id = crypto.randomUUID(), count = Math.ceil(totalBytes / CONTENT_CHUNK_BYTES)
+          blobWrites.set(id, { totalBytes, chunks: new Array<Uint8Array | undefined>(count) })
+          return id
+        }
+        if (method === 'content.blobWriteChunk') {
+          allow('content'); const write = blobWrites.get(String(args[0])); check(write !== undefined, 'CONTENT_UPLOAD_UNKNOWN')
+          const index = Number(args[1]), chunk = args[2]
+          check(Number.isSafeInteger(index) && index >= 0 && index < write.chunks.length && chunk instanceof Uint8Array && chunk.byteLength === Math.min(CONTENT_CHUNK_BYTES, write.totalBytes - index * CONTENT_CHUNK_BYTES), 'CONTENT_CHUNK_SIZE_INVALID')
+          write.chunks[index] = chunk.slice(); return null
+        }
+        if (method === 'content.blobCommitWrite') {
+          allow('content'); const id = String(args[0]), write = blobWrites.get(id); check(write !== undefined, 'CONTENT_UPLOAD_UNKNOWN')
+          blobWrites.delete(id)
+          const assembled = new Uint8Array(write.totalBytes)
+          for (let index = 0; index < write.chunks.length; index++) {
+            const chunk = write.chunks[index]; check(chunk !== undefined, 'CONTENT_INCOMPLETE')
+            assembled.set(chunk, index * CONTENT_CHUNK_BYTES)
+          }
+          return session.content.putBlob(assembled, { signal: request.signal })
+        }
+        if (method === 'content.blobOpenRead') {
+          allow('content'); check(blobReads.size < 4, 'ENDPOINT_READER_LIMIT')
+          const rawOptions = (args[1] ?? {}) as Omit<BlobGetOptions, 'signal'>
+          const bytes = await session.content.getBlob(String(args[0]), { ...rawOptions, signal: request.signal })
+          if (bytes === null) return null
+          const id = crypto.randomUUID()
+          blobReads.set(id, { bytes, offset: 0 })
+          return { id, bytes: bytes.byteLength }
+        }
+        if (method === 'content.blobNextChunk') {
+          allow('content'); const id = String(args[0]), read = blobReads.get(id); check(read !== undefined, 'CONTENT_READER_UNKNOWN')
+          if (read.offset >= read.bytes.byteLength) { blobReads.delete(id); return null }
+          const nextOffset = Math.min(read.bytes.byteLength, read.offset + CONTENT_CHUNK_BYTES)
+          const slice = read.bytes.subarray(read.offset, nextOffset).slice()
+          read.offset = nextOffset
+          if (read.offset >= read.bytes.byteLength) blobReads.delete(id)
+          return slice
         }
         if (method === 'signals.send') {
           allow('signals')

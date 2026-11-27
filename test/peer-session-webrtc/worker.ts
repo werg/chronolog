@@ -24,7 +24,7 @@ async function open(cached = false): Promise<void> {
     device,
     definition,
     ...(cached
-      ? { chainId: bootstrap.chainId }
+      ? { logId: bootstrap.logId }
       : { genesis: bootstrap.genesisBytes, casNodes: bootstrap.casNodes, epochKeys: new Map([[bootstrap.epoch, hexToBytes(bootstrap.epochKey)]]) }),
   })
   const owned = session

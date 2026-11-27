@@ -57,7 +57,7 @@ assert.ok(!Object.keys(bundle.metafile.inputs).some(path => /werift|transport-we
 const v2Probe = `
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { createChainGenesis, createApplicationSession } from '@chronolog/peer-session';
+import { createLogGenesis, createApplicationSession } from '@chronolog/peer-session';
 import { openNativeDevice } from '@chronolog/peer-session/native';
 
 const dbPath = join(process.cwd(), 'offline.sqlite');
@@ -77,7 +77,7 @@ export default {
   },
 };
 \`;
-const created = await createChainGenesis({
+const created = await createLogGenesis({
   creator: { publicKey: dev.identity.publicKey, wrapKey: dev.wrapKey.publicKey, reader: true, writer: true, administrator: true },
   imports: { 'app/items': reducer },
   topics: { items: { module: 'app/items', initialState: null } },
@@ -93,7 +93,7 @@ await sess.close();
 
 // Offline reopen from disk (zero node-gyp, node:sqlite + sqlite-cas.wasm!)
 const dev2 = await openNativeDevice({ path: dbPath });
-const sess2 = await createApplicationSession({ device: dev2, chainId: created.chainId });
+const sess2 = await createApplicationSession({ device: dev2, logId: created.logId });
 const rows = (await sess2.query('items')).value;
 assert.deepEqual(rows, [['a', 'packaged-v2']]);
 await sess2.close();

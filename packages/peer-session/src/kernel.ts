@@ -27,9 +27,9 @@ export {
   type CasPartition,
 } from '@chronolog/records'
 export {
-  decodeGenesisBlock,
-  encodeGenesisBlock,
-  genesisChainId,
+  decodeLogGenesis,
+  encodeLogGenesis,
+  genesisLogId,
   decodeSignedOperation,
   encodeSignedOperation,
   decodeOperationCore,
@@ -40,7 +40,7 @@ export {
   encryptedEnvelopeDigest,
   operationIdDigest,
   isControlTopic,
-  type GenesisBlock,
+  type LogGenesis,
   type OperationCore,
   type SignedOperation,
   type EncryptedOperationEnvelope,

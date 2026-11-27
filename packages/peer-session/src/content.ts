@@ -2,10 +2,14 @@ import type { BytesStore } from '@chronolog/records'
 import { encryptEpochPayload, decryptEpochPayload, type EncryptedEpochPayload } from '@chronolog/crypto'
 import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { check, decodeRecord, encodeRecord, equalRecord, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from '@chronolog/authority'
-import { CONTENT_CHUNK_BYTES, MAX_CONTENT_BYTES, putContentBytes, readContentBytes, type ContentPutBytesOptions, type ContentReadBytesOptions } from './content-bytes.js'
+import {
+  CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_CONTENT_BYTES,
+  putContentBytes, readContentBytes,
+  type BlobGetOptions, type BlobInfo, type BlobPutOptions, type ContentPutBytesOptions, type ContentReadBytesOptions,
+} from './content-bytes.js'
 import { awaitOwnedTask } from './lifetime.js'
-export { CONTENT_CHUNK_BYTES } from './content-bytes.js'
-export type { ContentPutBytesOptions, ContentReadBytesOptions } from './content-bytes.js'
+export { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_BLOB_CHUNKS } from './content-bytes.js'
+export type { BlobGetOptions, BlobInfo, BlobPutOptions, ContentPutBytesOptions, ContentReadBytesOptions } from './content-bytes.js'
 
 export interface ContentAuthority {
   readonly applicationId: string
@@ -26,6 +30,8 @@ export interface ContentSource {
   manifest(reference: ContentReference, options?: ContentOptions): Promise<ContentManifest | null>
   chunk(reference: ContentReference, index: number, options?: ContentOptions): Promise<Uint8Array | null>
   retained?(reference: ContentReference, options?: ContentOptions): Promise<ContentRetention>
+  blobInfo?(hash: string, options?: ContentOptions): Promise<BlobInfo | null>
+  blobChunk?(hash: string, index: number, options?: ContentOptions): Promise<Uint8Array | null>
 }
 export interface ContentUpload {
   readonly id: string
@@ -71,6 +77,10 @@ export function assertContentRetention(value: unknown): asserts value is Content
   assertContentReference(value.payload.reference)
   check(value.payload.peer === value.signer && typeof value.payload.storageId === 'string' && value.payload.storageId.length > 0 && value.payload.storageId.length <= 256, 'CONTENT_RETENTION_INVALID')
 }
+export function assertBlobInfo(value: unknown): asserts value is BlobInfo {
+  object(value, ['hash', 'bytes'])
+  check(digest(value.hash) && Number.isSafeInteger(value.bytes) && Number(value.bytes) >= 0 && Number(value.bytes) <= MAX_BLOB_BYTES, 'CONTENT_BLOB_INVALID')
+}
 function body(reference: ContentReference): Omit<ContentReference, 'id'> { const { id: _id, ...rest } = reference; return rest }
 function envelope(bytes: Uint8Array, epoch: number, plaintextBytes: number): EncryptedEpochPayload {
   check(bytes.length > 0 && bytes.length <= MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, 'CONTENT_CHUNK_INVALID')
@@ -105,15 +115,21 @@ export class ApplicationContent {
     this.#tail = task.catch(() => undefined)
     return task
   }
-  #readScope(reference: ContentReference, options: ContentOptions): { signal: AbortSignal; release(): void } {
+  #scopeKey(key: string, options: ContentOptions): { signal: AbortSignal; release(): void } {
     this.#reader(); options.signal?.throwIfAborted()
     const controller = new AbortController()
-    let reads = this.#reads.get(reference.id)
-    if (reads === undefined) { reads = new Set(); this.#reads.set(reference.id, reads) }
+    let reads = this.#reads.get(key)
+    if (reads === undefined) { reads = new Set(); this.#reads.set(key, reads) }
     reads.add(controller)
     const signal = AbortSignal.any([this.#lifetime.signal, controller.signal, ...(options.signal === undefined ? [] : [options.signal])])
     signal.throwIfAborted()
-    return { signal, release: () => { reads.delete(controller); if (reads.size === 0) this.#reads.delete(reference.id) } }
+    return { signal, release: () => { reads.delete(controller); if (reads.size === 0) this.#reads.delete(key) } }
+  }
+  #readScope(reference: ContentReference, options: ContentOptions): { signal: AbortSignal; release(): void } {
+    return this.#scopeKey(reference.id, options)
+  }
+  #blobScope(hash: string, options: ContentOptions): { signal: AbortSignal; release(): void } {
+    return this.#scopeKey(`blob:${hash}`, options)
   }
   attachSource(id: string, source: ContentSource): () => void {
     this.#lifetime.signal.throwIfAborted()
@@ -331,6 +347,131 @@ export class ApplicationContent {
       for (const chunk of manifest?.chunks ?? []) await this.#remove(`${this.#prefix}/chunk/${chunk.hash}`)
     })
   }
+  async #localBlobInfo(hash: string, signal: AbortSignal): Promise<BlobInfo | null> {
+    signal.throwIfAborted(); this.#reader()
+    const raw = await awaitOwnedTask(signal, () => this.#options.store.get(`${this.#prefix}/blob/${hash}/meta`))
+    if (raw === null || raw.length === 0) return null
+    check(raw.length <= 1024, 'CONTENT_BLOB_INVALID')
+    const info = decodeRecord<BlobInfo>(raw)
+    assertBlobInfo(info)
+    check(info.hash === hash, 'CONTENT_BLOB_INVALID')
+    signal.throwIfAborted()
+    return info
+  }
+  async #localBlobChunk(hash: string, info: BlobInfo, index: number, signal: AbortSignal): Promise<Uint8Array | null> {
+    signal.throwIfAborted(); this.#reader()
+    const count = Math.ceil(info.bytes / CONTENT_CHUNK_BYTES)
+    check(Number.isSafeInteger(index) && index >= 0 && index < count, 'CONTENT_CHUNK_INDEX_INVALID')
+    const expectedLen = Math.min(CONTENT_CHUNK_BYTES, info.bytes - index * CONTENT_CHUNK_BYTES)
+    const stored = await awaitOwnedTask(signal, () => this.#options.store.get(`${this.#prefix}/blob/${hash}/chunk/${index}`))
+    if (stored === null || stored.length === 0) return null
+    check(stored.length === expectedLen, 'CONTENT_BLOB_INVALID')
+    signal.throwIfAborted()
+    return stored.slice()
+  }
+  async #storeLocalBlob(hash: string, bytes: Uint8Array, signal: AbortSignal): Promise<BlobInfo> {
+    const info: BlobInfo = { hash, bytes: bytes.byteLength }
+    await this.#serial(async () => {
+      signal.throwIfAborted(); this.#reader()
+      const count = Math.ceil(bytes.byteLength / CONTENT_CHUNK_BYTES)
+      for (let index = 0; index < count; index++) {
+        signal.throwIfAborted()
+        const chunk = bytes.subarray(index * CONTENT_CHUNK_BYTES, Math.min(bytes.byteLength, (index + 1) * CONTENT_CHUNK_BYTES))
+        await this.#options.store.put(`${this.#prefix}/blob/${hash}/chunk/${index}`, chunk.slice())
+      }
+      // Write metadata last so an interrupted write is never mistaken for a complete blob.
+      await this.#options.store.put(`${this.#prefix}/blob/${hash}/meta`, encodeRecord(info))
+    })
+    return info
+  }
+  /** Store raw bytes locally indexed by SHA-256 hash so peers can recover historical blobs by hash. */
+  async putBlob(input: Uint8Array, options: BlobPutOptions = {}): Promise<BlobInfo> {
+    this.#reader()
+    check(input instanceof Uint8Array && input.byteLength <= MAX_BLOB_BYTES, 'CONTENT_RANGE_INVALID')
+    const signal = options.signal === undefined ? this.#lifetime.signal : AbortSignal.any([this.#lifetime.signal, options.signal])
+    signal.throwIfAborted()
+    const bytes = input.slice()
+    const hash = bytesToHex(await awaitOwnedTask(signal, () => sha256(bytes)))
+    return this.#storeLocalBlob(hash, bytes, signal)
+  }
+  async hasBlob(hash: string): Promise<boolean> {
+    this.#reader(); check(digest(hash), 'CONTENT_BLOB_INVALID')
+    const info = await this.#localBlobInfo(hash, this.#lifetime.signal)
+    if (info === null) return false
+    const count = Math.ceil(info.bytes / CONTENT_CHUNK_BYTES)
+    for (let index = 0; index < count; index++) {
+      if (await this.#localBlobChunk(hash, info, index, this.#lifetime.signal) === null) return false
+    }
+    return true
+  }
+  /** Retrieve a SHA-256 hash-addressed blob locally, falling back to connected peers and verifying the digest. */
+  async getBlob(hash: string, options: BlobGetOptions = {}): Promise<Uint8Array | null> {
+    check(digest(hash), 'CONTENT_BLOB_INVALID')
+    const maxBytes = options.maxBytes ?? MAX_BLOB_BYTES
+    check(Number.isSafeInteger(maxBytes) && maxBytes >= 0 && maxBytes <= MAX_BLOB_BYTES, 'CONTENT_READ_LIMIT_INVALID')
+    if (options.expectedBytes !== undefined) {
+      check(Number.isSafeInteger(options.expectedBytes) && options.expectedBytes >= 0 && options.expectedBytes <= MAX_BLOB_BYTES, 'CONTENT_BLOB_INVALID')
+      check(options.expectedBytes <= maxBytes, 'CONTENT_READ_LIMIT_EXCEEDED')
+    }
+    const scope = this.#blobScope(hash, options)
+    try {
+      const localInfo = await this.#localBlobInfo(hash, scope.signal)
+      if (localInfo !== null) {
+        if (options.expectedBytes !== undefined) check(localInfo.bytes === options.expectedBytes, 'CONTENT_BLOB_INVALID')
+        check(localInfo.bytes <= maxBytes, 'CONTENT_READ_LIMIT_EXCEEDED')
+        const count = Math.ceil(localInfo.bytes / CONTENT_CHUNK_BYTES)
+        const assembled = new Uint8Array(localInfo.bytes)
+        let complete = true
+        for (let index = 0; index < count; index++) {
+          const chunk = await this.#localBlobChunk(hash, localInfo, index, scope.signal)
+          if (chunk === null) { complete = false; break }
+          assembled.set(chunk, index * CONTENT_CHUNK_BYTES)
+        }
+        if (complete) {
+          check(bytesToHex(await awaitOwnedTask(scope.signal, () => sha256(assembled))) === hash, 'CONTENT_BLOB_INVALID')
+          scope.signal.throwIfAborted()
+          return assembled
+        }
+      }
+      if (options.localOnly === true) return null
+      let failure: unknown
+      for (const source of [...this.#sources.values()]) {
+        if (source.blobInfo === undefined || source.blobChunk === undefined) continue
+        try {
+          const info = await awaitOwnedTask(scope.signal, () => source.blobInfo!(hash, { signal: scope.signal }))
+          if (info === null) continue
+          assertBlobInfo(info)
+          check(info.hash === hash, 'CONTENT_BLOB_INVALID')
+          if (options.expectedBytes !== undefined) check(info.bytes === options.expectedBytes, 'CONTENT_BLOB_INVALID')
+          check(info.bytes <= maxBytes, 'CONTENT_READ_LIMIT_EXCEEDED')
+          const count = Math.ceil(info.bytes / CONTENT_CHUNK_BYTES)
+          const assembled = new Uint8Array(info.bytes)
+          for (let index = 0; index < count; index++) {
+            const expectedLen = Math.min(CONTENT_CHUNK_BYTES, info.bytes - index * CONTENT_CHUNK_BYTES)
+            const chunk = await awaitOwnedTask(scope.signal, () => source.blobChunk!(hash, index, { signal: scope.signal }))
+            check(chunk instanceof Uint8Array && chunk.byteLength === expectedLen, 'CONTENT_BLOB_INVALID')
+            assembled.set(chunk, index * CONTENT_CHUNK_BYTES)
+          }
+          check(bytesToHex(await awaitOwnedTask(scope.signal, () => sha256(assembled))) === hash, 'CONTENT_BLOB_INVALID')
+          scope.signal.throwIfAborted()
+          if (options.cache !== false) await this.#storeLocalBlob(hash, assembled, scope.signal)
+          return assembled
+        } catch (error) { scope.signal.throwIfAborted(); failure = error }
+      }
+      if (failure !== undefined) throw failure instanceof Error ? failure : new Error('CONTENT_SOURCE_FAILED', { cause: failure })
+      return null
+    } finally { scope.release() }
+  }
+  async deleteBlob(hash: string): Promise<void> {
+    this.#reader(); check(digest(hash), 'CONTENT_BLOB_INVALID')
+    for (const read of this.#reads.get(`blob:${hash}`) ?? []) read.abort(new Error('CONTENT_DISCARDED'))
+    await this.#serial(async () => {
+      const info = await this.#localBlobInfo(hash, this.#lifetime.signal).catch(() => null)
+      await this.#remove(`${this.#prefix}/blob/${hash}/meta`)
+      const count = info === null ? 0 : Math.ceil(info.bytes / CONTENT_CHUNK_BYTES)
+      for (let index = 0; index < count; index++) await this.#remove(`${this.#prefix}/blob/${hash}/chunk/${index}`)
+    })
+  }
   /** Serve only verified local bytes. Serving never recursively consults remote sources. */
   source(): ContentSource {
     return {
@@ -352,6 +493,20 @@ export class ApplicationContent {
           const manifest = await this.#manifest(reference, scope.signal, true); check(manifest !== null, 'CONTENT_MANIFEST_MISSING')
           for (let index = 0; index < manifest.chunks.length; index++) check(await this.#chunk(reference, manifest, index, scope.signal, true) !== null, 'CONTENT_INCOMPLETE')
           return await this.#receipt(reference, scope.signal)
+        } finally { scope.release() }
+      },
+      blobInfo: async (hash, options = {}) => {
+        check(digest(hash), 'CONTENT_BLOB_INVALID')
+        const scope = this.#blobScope(hash, options)
+        try { return await this.#localBlobInfo(hash, scope.signal) } finally { scope.release() }
+      },
+      blobChunk: async (hash, index, options = {}) => {
+        check(digest(hash), 'CONTENT_BLOB_INVALID')
+        const scope = this.#blobScope(hash, options)
+        try {
+          const info = await this.#localBlobInfo(hash, scope.signal)
+          if (info === null) return null
+          return await this.#localBlobChunk(hash, info, index, scope.signal)
         } finally { scope.release() }
       },
     }

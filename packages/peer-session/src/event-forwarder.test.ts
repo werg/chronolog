@@ -52,11 +52,11 @@ it('rederives effective event sets, retracts late-rejected proposals, exports in
   await expect.poll(() => deliveries.some(delivery => delivery.id.startsWith(late.id) && delivery.retained === 1)).toBe(true)
 
   // Author an earlier conflicting operation with the same operationId handle (t=5 < t=10)
-  const chainIdBytes = hexToBytes(f.chainId)
+  const logIdBytes = hexToBytes(f.logId)
   const authorBytes = hexToBytes(f.identities[0]!.publicKey)
   const earlierCore: OperationCore = {
     version: 1,
-    chainId: chainIdBytes,
+    logId: logIdBytes,
     author: authorBytes,
     authorTimestampMs: 5n,
     operationId: 'same-handle',
@@ -67,10 +67,10 @@ it('rederives effective event sets, retracts late-rejected proposals, exports in
   const earlierSigned = await signOperationCore(earlierCore, f.identities[0]!.privateKey)
   const earlierBytes = encodeSignedOperation(earlierSigned)
   const opIdBytes = operationIdDigest(earlierSigned.coreBytes)
-  const enc = await encryptEpochPayload(f.epochKey, 0n, earlierBytes, envelopeAad(chainIdBytes, opIdBytes, authorBytes))
+  const enc = await encryptEpochPayload(f.epochKey, 0n, earlierBytes, envelopeAad(logIdBytes, opIdBytes, authorBytes))
   const envBytes = encodeEncryptedEnvelope({
     version: 1,
-    chainId: chainIdBytes,
+    logId: logIdBytes,
     opId: opIdBytes,
     author: authorBytes,
     epoch: 0,

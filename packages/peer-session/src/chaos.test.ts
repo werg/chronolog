@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { bytesToHex, hexToBytes } from '@chronolog/canonical'
 import { MemoryBytesStore } from '@chronolog/records'
-import { createChainGenesis, hpkeSealEpochKey, epochKeyCommitmentV2 } from './genesis.js'
+import { createLogGenesis, hpkeSealEpochKey, epochKeyCommitmentV2 } from './genesis.js'
 import { openApplicationDevice } from './device.js'
 import { createApplicationSession } from './runtime.js'
 import type { ApplicationSession, SessionFacts } from './session.js'
@@ -82,7 +82,7 @@ describe('Chronolog v2 Multi-Replica Chaos Suite', () => {
       const devRevoked = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
       const devBlind = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
 
-      const created = await createChainGenesis({
+      const created = await createLogGenesis({
         creator: {
           publicKey: devAdmin.identity.publicKey,
           wrapKey: devAdmin.wrapKey.publicKey,
@@ -96,7 +96,7 @@ describe('Chronolog v2 Multi-Replica Chaos Suite', () => {
           { publicKey: devC.identity.publicKey, wrapKey: devC.wrapKey.publicKey, reader: true, writer: true },
           { publicKey: devRevoked.identity.publicKey, wrapKey: devRevoked.wrapKey.publicKey, reader: true, writer: true },
         ],
-        privateChain: true,
+        privateLog: true,
         imports: { 'app/counter': COUNTER_REDUCER },
         topics: {
           counter: { module: 'app/counter', initialState: { total: 100, log: [] } },
@@ -126,7 +126,7 @@ describe('Chronolog v2 Multi-Replica Chaos Suite', () => {
       // Publish epoch 0 boxes on $keys so everyone has formal epoch 0 state
       const epoch0Boxes: Record<string, { encapsulatedKey: string; ciphertext: string }> = {}
       for (const dev of [devAdmin, devB, devC, devRevoked]) {
-        epoch0Boxes[dev.identity.publicKey] = await hpkeSealEpochKey(dev.wrapKey.publicKey, epoch0, created.chainId, 0)
+        epoch0Boxes[dev.identity.publicKey] = await hpkeSealEpochKey(dev.wrapKey.publicKey, epoch0, created.logId, 0)
       }
       await admin.submit({
         authorTimestampMs: 10n,

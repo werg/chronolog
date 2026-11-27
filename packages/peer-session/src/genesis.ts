@@ -4,9 +4,9 @@ import { computeCasHash } from '@chronolog/records'
 import {
   DEFAULT_GENESIS_LIMITS,
   DEFAULT_RUNTIME_MANIFEST,
-  encodeGenesisBlock,
-  genesisChainId,
-  type GenesisBlock,
+  encodeLogGenesis,
+  genesisLogId,
+  type LogGenesis,
   type GenesisLimits,
   type JsonValue,
   type RuntimeManifest,
@@ -30,10 +30,10 @@ export function epochKeyCommitmentV2(epochKey: Uint8Array): string {
 export async function hpkeSealEpochKey(
   recipientWrapPublicKeyHex: string,
   epochKey: Uint8Array,
-  chainIdHex: string,
+  logIdHex: string,
   epoch: number,
 ): Promise<EpochKeyBox> {
-  const info = utf8(`chronolog/epoch-key/v2:${chainIdHex}:${epoch}`)
+  const info = utf8(`chronolog/epoch-key/v2:${logIdHex}:${epoch}`)
   const aad = utf8(`epoch:${epoch}`)
   const sealed = await hpkeSealBase(hexToBytes(recipientWrapPublicKeyHex), epochKey, info, aad)
   return {
@@ -46,10 +46,10 @@ export async function hpkeOpenEpochKey(
   recipientWrapPrivateKey: CryptoKey,
   recipientWrapPublicKeyHex: string,
   box: EpochKeyBox,
-  chainIdHex: string,
+  logIdHex: string,
   epoch: number,
 ): Promise<Uint8Array> {
-  const info = utf8(`chronolog/epoch-key/v2:${chainIdHex}:${epoch}`)
+  const info = utf8(`chronolog/epoch-key/v2:${logIdHex}:${epoch}`)
   const aad = utf8(`epoch:${epoch}`)
   return hpkeOpenBase(
     recipientWrapPrivateKey,
@@ -61,7 +61,7 @@ export async function hpkeOpenEpochKey(
   )
 }
 
-export interface ChainMemberSeed {
+export interface LogMemberSeed {
   readonly publicKey: string
   readonly wrapKey?: string
   readonly reader?: boolean
@@ -71,23 +71,23 @@ export interface ChainMemberSeed {
   readonly finalizer?: boolean
 }
 
-export interface ChainTopicSeed {
+export interface LogTopicSeed {
   readonly module: string
   readonly export?: string
   readonly config?: JsonValue
   readonly initialState?: JsonValue
 }
 
-export interface CreateChainGenesisOptions {
-  readonly creator: ChainMemberSeed
-  readonly members?: readonly ChainMemberSeed[]
-  readonly privateChain?: boolean
+export interface CreateLogGenesisOptions {
+  readonly creator: LogMemberSeed
+  readonly members?: readonly LogMemberSeed[]
+  readonly privateLog?: boolean
   /** When true, omits the `$reducers` reducer so topic bindings and import maps are permanently frozen. */
   readonly frozenReducers?: boolean
   /** ES Module sources (specifier -> UTF-8 JS source) pinned into CAS and registered in `$reducers.imports`. */
   readonly imports?: Readonly<Record<string, string>>
   /** Application topics to register in `$reducers.topics` alongside standard `$*` control topics. */
-  readonly topics?: Readonly<Record<string, ChainTopicSeed>>
+  readonly topics?: Readonly<Record<string, LogTopicSeed>>
   /** Optional host public key for `chronolog/permissions` Ed25519 admission attestations. */
   readonly hostPublicKey?: string
   /** Initial `$finality` schedule (defaults to `finality: none`). */
@@ -99,23 +99,23 @@ export interface CreateChainGenesisOptions {
   readonly epoch0Key?: Uint8Array
 }
 
-export interface CreatedChainGenesis {
-  readonly chainId: string
-  readonly genesis: GenesisBlock
+export interface CreatedLogGenesis {
+  readonly logId: string
+  readonly genesis: LogGenesis
   readonly genesisBytes: Uint8Array
   /** Public CAS nodes (standard + app ES module sources) that must accompany this genesis. */
   readonly casNodes: readonly { readonly hash: string; readonly bytes: Uint8Array; readonly partition: 'public' }[]
-  /** Epoch 0 key if `privateChain` is true (undefined for public chains). */
+  /** Epoch 0 key if `privateLog` is true (undefined for public chains). */
   readonly epoch0Key?: Uint8Array
 }
 
 /**
  * Create a Chronolog v2 genesis block with hash-pinned standard and application ES Modules.
- * When `privateChain` is true (the default), generates epoch 0 and seals HPKE lockboxes for
- * all initial readers that provide a `wrapKey` after deriving the deterministic `chainId`.
+ * When `privateLog` is true (the default), generates epoch 0 and seals HPKE lockboxes for
+ * all initial readers that provide a `wrapKey` after deriving the deterministic `logId`.
  */
-export async function createChainGenesis(options: CreateChainGenesisOptions): Promise<CreatedChainGenesis> {
-  const privateChain = options.privateChain ?? true
+export async function createLogGenesis(options: CreateLogGenesisOptions): Promise<CreatedLogGenesis> {
+  const privateLog = options.privateLog ?? true
   const runtime = options.runtime ?? DEFAULT_RUNTIME_MANIFEST
   const casMap = new Map<string, Uint8Array>()
   const imports: Record<string, string> = {}
@@ -148,7 +148,7 @@ export async function createChainGenesis(options: CreateChainGenesisOptions): Pr
   }
 
   const allMembers = [options.creator, ...(options.members ?? [])]
-  const memberByKey = new Map<string, ChainMemberSeed>()
+  const memberByKey = new Map<string, LogMemberSeed>()
   for (const m of allMembers) {
     memberByKey.set(m.publicKey, {
       publicKey: m.publicKey,
@@ -198,19 +198,19 @@ export async function createChainGenesis(options: CreateChainGenesisOptions): Pr
   }
 
   const salt = options.salt ?? crypto.getRandomValues(new Uint8Array(16))
-  const genesis: GenesisBlock = {
+  const genesis: LogGenesis = {
     version: 1,
-    privateChain,
+    privateLog,
     initialTopics,
     limits: options.limits ?? DEFAULT_GENESIS_LIMITS,
     salt,
   }
-  const genesisBytes = encodeGenesisBlock(genesis)
-  const chainId = bytesToHex(genesisChainId(genesisBytes))
+  const genesisBytes = encodeLogGenesis(genesis)
+  const logId = bytesToHex(genesisLogId(genesisBytes))
 
   // For private chains, epoch 0 is seeded either via local epoch0Key (and locked into $keys via initial op or epochKeys option).
-  // Keeping genesis deterministic without needing chainId-before-genesis circularity!
-  const epoch0Key = privateChain ? (options.epoch0Key ?? crypto.getRandomValues(new Uint8Array(32))) : undefined
+  // Keeping genesis deterministic without needing logId-before-genesis circularity!
+  const epoch0Key = privateLog ? (options.epoch0Key ?? crypto.getRandomValues(new Uint8Array(32))) : undefined
 
   const casNodes = [...casMap.entries()].map(([hash, bytes]) => ({
     hash,
@@ -219,7 +219,7 @@ export async function createChainGenesis(options: CreateChainGenesisOptions): Pr
   }))
 
   return {
-    chainId,
+    logId,
     genesis,
     genesisBytes,
     casNodes,

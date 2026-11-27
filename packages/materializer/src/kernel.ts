@@ -7,15 +7,15 @@ import {
 import {
   assertValidReducersConfig,
   compareOperationOrder,
-  decodeGenesisBlock,
+  decodeLogGenesis,
   encodeCanonicalJsonCbor,
-  encodeGenesisBlock,
-  genesisChainId,
+  encodeLogGenesis,
+  genesisLogId,
   isControlTopic,
   jsonToCbor,
   normalizeJsonValue,
   operationIdDigest,
-  type GenesisBlock,
+  type LogGenesis,
   type JsonValue,
   type OperationCore,
   type OperationVisibility,
@@ -80,7 +80,7 @@ export interface KernelMaterializeResult {
 }
 
 export interface TopicKernelOptions extends QuickJsSandboxOptions {
-  readonly genesis: GenesisBlock | Uint8Array
+  readonly genesis: LogGenesis | Uint8Array
   readonly cas: ContentAddressedStore
   /** When true (e.g. blind Cloudflare Worker), only public-control operations are replayed. */
   readonly blindHostMode?: boolean
@@ -164,10 +164,10 @@ function extractCasHashes(value: JsonValue, out: Set<string>): void {
  * - Fresh QuickJSContext per call + uncatchable MissingDependency suspension
  */
 export class TopicKernel {
-  readonly genesis: GenesisBlock
+  readonly genesis: LogGenesis
   readonly genesisBytes: Uint8Array
-  readonly chainId: Uint8Array
-  readonly chainIdHex: string
+  readonly logId: Uint8Array
+  readonly logIdHex: string
   readonly cas: ContentAddressedStore
   readonly sandbox: QuickJsSandbox
   readonly blindHostMode: boolean
@@ -191,10 +191,10 @@ export class TopicKernel {
   constructor(options: TopicKernelOptions) {
     this.genesisBytes = options.genesis instanceof Uint8Array
       ? options.genesis.slice()
-      : encodeGenesisBlock(options.genesis)
-    this.genesis = decodeGenesisBlock(this.genesisBytes)
-    this.chainId = genesisChainId(this.genesisBytes)
-    this.chainIdHex = bytesToHex(this.chainId)
+      : encodeLogGenesis(options.genesis)
+    this.genesis = decodeLogGenesis(this.genesisBytes)
+    this.logId = genesisLogId(this.genesisBytes)
+    this.logIdHex = bytesToHex(this.logId)
     this.cas = options.cas
     this.blindHostMode = options.blindHostMode ?? false
     this.#snapshotInterval = options.snapshotInterval ?? 16
@@ -323,12 +323,12 @@ export class TopicKernel {
    * Rewinds only to the earliest snapshot before the first changed position (suffix replay).
    */
   async materialize(inputs: readonly KernelOperationInput[]): Promise<KernelMaterializeResult> {
-    // Filter for blindHostMode and chainId, sort strictly by canonical comparator
+    // Filter for blindHostMode and logId, sort strictly by canonical comparator
     const eligible: KernelOperationInput[] = []
     const seenIds = new Set<string>()
     for (const item of inputs) {
-      if (bytesToHex(item.core.chainId) !== this.chainIdHex) continue
-      if (this.blindHostMode && this.genesis.privateChain && item.core.visibility !== 'public') continue
+      if (bytesToHex(item.core.logId) !== this.logIdHex) continue
+      if (this.blindHostMode && this.genesis.privateLog && item.core.visibility !== 'public') continue
       const opIdHex = bytesToHex(item.opId)
       if (bytesToHex(operationIdDigest(item.core)) !== opIdHex) throw new Error('KERNEL_OP_ID_MISMATCH')
       if (seenIds.has(opIdHex)) continue
@@ -423,8 +423,8 @@ export class TopicKernel {
       return { kind: 'done', outcome }
     }
 
-    // Strict two-way partition check on privateChain
-    if (this.genesis.privateChain) {
+    // Strict two-way partition check on privateLog
+    if (this.genesis.privateLog) {
       if (core.visibility === 'public') {
         if (core.updates.some(u => !isControlTopic(u.topic))) {
           return makeRejected('partition:public_op_private_topic')
@@ -447,7 +447,7 @@ export class TopicKernel {
     }
 
     // Consume idempotency handle (even if reducer rejects, matching Chronolog's contract)
-    const casPartition: CasPartition = (this.genesis.privateChain && core.visibility === 'public') ? 'public' : 'private'
+    const casPartition: CasPartition = (this.genesis.privateLog && core.visibility === 'public') ? 'public' : 'private'
 
     // Copy-on-write working topics map
     const workingTopics: Record<string, JsonValue> = structuredClone(this.#topics)
@@ -468,8 +468,8 @@ export class TopicKernel {
         return makeRejected(update.topic === '$reducers' ? 'reducers_frozen' : `no_reducer:${update.topic}`)
       }
 
-      // Public-control ops on privateChain only see $* control topics and public CAS
-      const visibleTopics = (this.genesis.privateChain && core.visibility === 'public')
+      // Public-control ops on privateLog only see $* control topics and public CAS
+      const visibleTopics = (this.genesis.privateLog && core.visibility === 'public')
         ? filterPublicTopics(workingTopics)
         : workingTopics
 
@@ -624,8 +624,8 @@ export class TopicKernel {
     const binding = reducersConfig.topics[topic]
     const state = Object.hasOwn(sourceTopics, topic) ? sourceTopics[topic]! : null
     if (binding === undefined) return structuredClone(state)
-    const casPartition: CasPartition = (this.genesis.privateChain && isControlTopic(topic)) ? 'public' : 'private'
-    const visibleTopics = (this.genesis.privateChain && isControlTopic(topic))
+    const casPartition: CasPartition = (this.genesis.privateLog && isControlTopic(topic)) ? 'public' : 'private'
+    const visibleTopics = (this.genesis.privateLog && isControlTopic(topic))
       ? filterPublicTopics(sourceTopics)
       : sourceTopics
     const res = await this.sandbox.invoke({
@@ -666,9 +666,9 @@ export class TopicKernel {
     const reducersConfig = assertValidReducersConfig(this.#topics.$reducers)
     const out: Record<string, JsonValue> = {}
     for (const [topic, binding] of Object.entries(reducersConfig.topics)) {
-      if (this.blindHostMode && this.genesis.privateChain && !isControlTopic(topic)) continue
+      if (this.blindHostMode && this.genesis.privateLog && !isControlTopic(topic)) continue
       const state = Object.hasOwn(this.#topics, topic) ? this.#topics[topic]! : null
-      const casPartition: CasPartition = (this.genesis.privateChain && isControlTopic(topic)) ? 'public' : 'private'
+      const casPartition: CasPartition = (this.genesis.privateLog && isControlTopic(topic)) ? 'public' : 'private'
       const res = await this.sandbox.invoke({
         imports: reducersConfig.imports,
         builtins: reducersConfig.runtime.builtins,

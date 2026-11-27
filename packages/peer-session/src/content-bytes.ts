@@ -3,8 +3,19 @@ import { awaitOwnedTask } from './lifetime.js'
 
 export const CONTENT_CHUNK_BYTES = 65_536
 export const MAX_CONTENT_BYTES = 128 * 1024 * 1024
+export const MAX_BLOB_BYTES = 16 * 1024 * 1024
+export const MAX_BLOB_CHUNKS = MAX_BLOB_BYTES / CONTENT_CHUNK_BYTES
 export interface ContentPutBytesOptions { readonly mediaType?: string; readonly signal?: AbortSignal }
 export interface ContentReadBytesOptions { readonly maxBytes: number; readonly signal?: AbortSignal }
+export interface BlobInfo { readonly hash: string; readonly bytes: number }
+export interface BlobPutOptions { readonly signal?: AbortSignal }
+export interface BlobGetOptions {
+  readonly expectedBytes?: number
+  readonly maxBytes?: number
+  readonly localOnly?: boolean
+  readonly cache?: boolean
+  readonly signal?: AbortSignal
+}
 interface ByteContent {
   stage(options: { readonly bytes: number; readonly mediaType?: string }): Promise<ContentUpload>
   read(reference: ContentReference, options?: { readonly signal?: AbortSignal }): AsyncIterable<Uint8Array>

@@ -24,7 +24,7 @@ Chronolog-DB collapses all three into a single, radical abstraction:
 
 Inspired by Martin Kleppmann's work on timestamp-ordered operation logs with rollback-and-replay, Chronolog pushes the idea all the way to the bottom:
 
-- **A flat set of independent operations — expressly *not* a Merkle chain:** Every mutation is an immutable, standalone Ed25519-signed operation stamped with `(authorTimestampMs, author, opId)`. Input operations **never** reference preceding operations, blocks, or state roots by hash; there are no `parents` pointers and no forks to merge. (Individual operations may reference content-addressed CAS hashes for blobs or module code, and carry a genesis domain-separation ID named `chainId` in the wire struct, but they are never hash-chained together.)
+- **A flat set of independent operations — expressly *not* a Merkle chain:** Every mutation is an immutable, standalone Ed25519-signed operation stamped with `(authorTimestampMs, author, opId)` and scoped by `logId` (the hash of its `LogGenesis`). Input operations **never** reference preceding operations, blocks, or state roots by hash; there are no `parents` pointers and no forks to merge. Individual operations may reference content-addressed CAS hashes for blobs or module code, while remaining independent timestamp-sorted records.
 - **One total order, zero sequencers:** Every replica sorts the set of operations it has seen by `(authorTimestampMs, author, opId)` and folds them forward deterministically. No peer, relay, host, or validator ever assigns operation order.
 - **Offline first, O(1) rewind on late arrivals:** Author locally and durably without waiting for a network or quorum. When an earlier-timestamped operation arrives later from a reconnecting peer, Chronolog doesn't need inverse functions or custom merge logic — it jumps back in **O(1)** to the nearest content-addressed snapshot before that timestamp and deterministically replays the suffix.
 - **One pure Merkle-DAG CAS for artifacts & derived snapshots:** Large immutable values — reducer ES Module source code, SQLite database pages, binary blobs, and *derived* replay snapshots — live in one content-addressed DAG (`ContentAddressedStore`) with explicit links, strict public/private partitions, and exact mark-and-sweep garbage collection. Input operations remain an unlinked flat set; the Merkle DAG exists solely for content deduplication and O(1) snapshot rewind.
@@ -54,7 +54,7 @@ Look at what falls out of reducing *state that contains the reducers over other 
   - `$keys` manages HPKE (X25519 + AES-256-GCM) epoch key lockboxes and key rotation.
   - `$finality` holds the log's time-scoped finality schedule.
   - `$publications` holds signed static web app release manifests referencing public CAS hashes.
-- **Strict blind-host partition:** On private logs (`privateChain: true`), `$*` control topics are mutated *only* by `visibility: 'public'` operations and can read *only* `$*` topics and public CAS. Private application topics are mutated *only* by `visibility: 'encrypted'` operations. A completely blind host (like a Cloudflare Worker with zero decryption keys) runs the exact same `TopicKernel` in `blindHostMode: true` and derives bit-for-bit identical control state (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`) as every full replica.
+- **Strict blind-host partition:** On private logs (`privateLog: true`), `$*` control topics are mutated *only* by `visibility: 'public'` operations and can read *only* `$*` topics and public CAS. Private application topics are mutated *only* by `visibility: 'encrypted'` operations. A completely blind host (like a Cloudflare Worker with zero decryption keys) runs the exact same `TopicKernel` in `blindHostMode: true` and derives bit-for-bit identical control state (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`) as every full replica.
 
 ---
 
@@ -174,11 +174,11 @@ Chronolog ships six small, audited ES Modules pinned into public CAS at genesis:
 Bind any topic directly to `chronolog/sql` (or drop in your own ES Module reducer in `imports`) — zero native builds, zero custom reducer boilerplate:
 
 ```ts
-import { createChainGenesis, createApplicationSession } from '@chronolog/peer-session'
+import { createLogGenesis, createApplicationSession } from '@chronolog/peer-session'
 import { openNativeDevice } from '@chronolog/peer-session/native'
 
 const device = await openNativeDevice({ path: './app.sqlite', create: true })
-const created = await createChainGenesis({
+const created = await createLogGenesis({
   creator: {
     publicKey: device.identity.publicKey,
     wrapKey: device.wrapKey.publicKey,

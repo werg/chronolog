@@ -28,9 +28,9 @@ export * from '@chronolog/authority'
 export {
   bytesToHex,
   hexToBytes,
-  encodeGenesisBlock,
-  decodeGenesisBlock,
-  genesisChainId,
+  encodeLogGenesis,
+  decodeLogGenesis,
+  genesisLogId,
   encodeSignedOperation,
   decodeSignedOperation,
   signOperationCore,
@@ -48,7 +48,7 @@ export {
 } from '@chronolog/protocol'
 export type {
   EventPayload,
-  GenesisBlock,
+  LogGenesis,
   JsonValue,
   OperationCore,
   OperationVisibility,

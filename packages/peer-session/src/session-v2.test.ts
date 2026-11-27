@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { utf8 } from '@chronolog/canonical'
 import { MemoryBytesStore } from '@chronolog/records'
-import { createChainGenesis } from './genesis.js'
+import { createLogGenesis } from './genesis.js'
 import { openApplicationDevice } from './device.js'
 import { openNativeDevice } from './native.js'
 import { createApplicationSession } from './runtime.js'
@@ -106,10 +106,10 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     try {
       const devA = await openNativeDevice({ path: pathA, create: true })
       const devB = await openNativeDevice({ path: pathB, create: true })
-      const created = await createChainGenesis({
+      const created = await createLogGenesis({
         creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
         members: [{ publicKey: devB.identity.publicKey, wrapKey: devB.wrapKey.publicKey, reader: true, writer: true }],
-        privateChain: true,
+        privateLog: true,
         imports: { 'app/kv': KV_REDUCER },
         topics: { kv: { module: 'app/kv', initialState: {} } },
       })
@@ -126,7 +126,7 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
 
       // Reopen A purely from disk (zero genesis or epochKeys passed!)
       const devA2 = await openNativeDevice({ path: pathA })
-      const sessA2 = await createApplicationSession({ device: devA2, chainId: created.chainId })
+      const sessA2 = await createApplicationSession({ device: devA2, logId: created.logId })
       closes.push(() => sessA2.close())
       expect((await sessA2.query('get', { key: 'hello' })).value).toMatchObject({ value: 'world' })
 
@@ -161,9 +161,9 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
   it('fresh-device admission after multiple epoch rotations unseals historical epochs and replays full history', async () => {
     const devA = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devFresh = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
-    const created = await createChainGenesis({
+    const created = await createLogGenesis({
       creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
-      privateChain: true,
+      privateLog: true,
       imports: { 'app/kv': KV_REDUCER },
       topics: { kv: { module: 'app/kv', initialState: {} } },
     })
@@ -211,13 +211,13 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     const devA = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devB = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devRevoked = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
-    const created = await createChainGenesis({
+    const created = await createLogGenesis({
       creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
       members: [
         { publicKey: devB.identity.publicKey, wrapKey: devB.wrapKey.publicKey, reader: true, writer: true },
         { publicKey: devRevoked.identity.publicKey, wrapKey: devRevoked.wrapKey.publicKey, reader: true, writer: true },
       ],
-      privateChain: true,
+      privateLog: true,
       imports: { 'app/kv': KV_REDUCER },
       topics: { kv: { module: 'app/kv', initialState: {} } },
     })
@@ -253,10 +253,10 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
   it('supports none -> P1 finality bootstrap, checkpoint creation, and checkpoint-plus-suffix revision parity', async () => {
     const devA = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devJoiner = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
-    const created = await createChainGenesis({
+    const created = await createLogGenesis({
       creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true, finalizer: true },
       members: [{ publicKey: devJoiner.identity.publicKey, wrapKey: devJoiner.wrapKey.publicKey, reader: true, writer: true }],
-      privateChain: true,
+      privateLog: true,
       imports: { 'app/kv': KV_REDUCER },
       topics: { kv: { module: 'app/kv', initialState: {} } },
     })
@@ -306,10 +306,10 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     const devAdmin = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devMember = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devHost = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
-    const created = await createChainGenesis({
+    const created = await createLogGenesis({
       creator: { publicKey: devAdmin.identity.publicKey, wrapKey: devAdmin.wrapKey.publicKey, reader: true, writer: true, administrator: true, publisher: true },
       members: [{ publicKey: devMember.identity.publicKey, wrapKey: devMember.wrapKey.publicKey, reader: true, writer: true }],
-      privateChain: true,
+      privateLog: true,
       imports: { 'app/kv': KV_REDUCER },
       topics: { kv: { module: 'app/kv', initialState: {} } },
     })
@@ -359,10 +359,10 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
   it('runs SQLite-CAS + chronolog/rls end-to-end via session.command/query/describe/scopedTools and CAS GC', async () => {
     const devA = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devB = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
-    const created = await createChainGenesis({
+    const created = await createLogGenesis({
       creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
       members: [{ publicKey: devB.identity.publicKey, wrapKey: devB.wrapKey.publicKey, reader: true, writer: true }],
-      privateChain: true,
+      privateLog: true,
       imports: { 'app/tasks': SQL_TASKS_REDUCER },
       topics: { tasks: { module: 'app/tasks', initialState: null } },
     })

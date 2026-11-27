@@ -3,9 +3,9 @@ import { bytesToHex, utf8 } from '@chronolog/canonical'
 import {
   canonicalEventPayload,
   generateEd25519KeyPair,
-  genesisChainId,
+  genesisLogId,
   operationIdDigest,
-  type GenesisBlock,
+  type LogGenesis,
   type OperationCore,
   type TopicUpdate,
 } from '@chronolog/protocol'
@@ -15,7 +15,7 @@ import { CAS_BUILTIN_ID, CRYPTO_BUILTIN_ID, QUICKJS_RUNTIME_ID } from './quickjs
 import { seedStandardModules } from './std-modules.js'
 
 function makeOp(
-  chainId: Uint8Array,
+  logId: Uint8Array,
   author: Uint8Array,
   operationId: string,
   authorTimestampMs: bigint,
@@ -25,7 +25,7 @@ function makeOp(
 ): KernelOperationInput {
   const core: OperationCore = {
     version: 1,
-    chainId,
+    logId,
     author,
     operationId,
     authorTimestampMs,
@@ -71,9 +71,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const bobHex = bytesToHex(bob.publicKeyBytes)
 
     // 1. Frozen $reducers chain (omitting '$reducers' from topics)
-    const frozenGenesis: GenesisBlock = {
+    const frozenGenesis: LogGenesis = {
       version: 1,
-      privateChain: false,
+      privateLog: false,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID, 'chronolog:cas': CAS_BUILTIN_ID } },
@@ -90,7 +90,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       salt: new Uint8Array(16).fill(1),
     }
     const frozenKernel = new TopicKernel({ genesis: frozenGenesis, cas })
-    const tryUpgrade = makeOp(frozenKernel.chainId, admin.publicKeyBytes, 'upgrade-frozen', 10n, 'public', [
+    const tryUpgrade = makeOp(frozenKernel.logId, admin.publicKeyBytes, 'upgrade-frozen', 10n, 'public', [
       { topic: '$reducers', input: { imports: { '@app/counter': `cas:sha256-${counterV2Hash}` } } },
     ])
     const frozenRes = await frozenKernel.materialize([tryUpgrade])
@@ -98,7 +98,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     expect(frozenRes.outcomes[0]!.rejectionCode).toBe('reducers_frozen')
 
     // 2. Governed $reducers chain + late earlier upgrade triggering suffix replay
-    const govGenesis: GenesisBlock = {
+    const govGenesis: LogGenesis = {
       ...frozenGenesis,
       salt: new Uint8Array(16).fill(2),
       initialTopics: {
@@ -120,14 +120,14 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       },
     }
     const kernel = new TopicKernel({ genesis: govGenesis, cas })
-    const op1 = makeOp(kernel.chainId, bob.publicKeyBytes, 'b1', 100n, 'public', [{ topic: 'counter', input: { delta: 2 } }])
-    const op2 = makeOp(kernel.chainId, bob.publicKeyBytes, 'b2', 300n, 'public', [{ topic: 'counter', input: { delta: 3 } }])
+    const op1 = makeOp(kernel.logId, bob.publicKeyBytes, 'b1', 100n, 'public', [{ topic: 'counter', input: { delta: 2 } }])
+    const op2 = makeOp(kernel.logId, bob.publicKeyBytes, 'b2', 300n, 'public', [{ topic: 'counter', input: { delta: 3 } }])
     await kernel.materialize([op1, op2])
     expect(kernel.topic('counter')).toBe(5)
     expect(await kernel.query('counter')).toEqual({ count: 5 })
 
     // Late-arriving upgrade to counterV2 at t=200 rewinds & replays op2 with v2 (*10)!
-    const lateUpgrade = makeOp(kernel.chainId, admin.publicKeyBytes, 'u1', 200n, 'public', [
+    const lateUpgrade = makeOp(kernel.logId, admin.publicKeyBytes, 'u1', 200n, 'public', [
       { topic: '$reducers', input: { imports: { '@app/counter': `cas:sha256-${counterV2Hash}` } } },
     ])
     await kernel.materialize([op1, op2, lateUpgrade])
@@ -150,9 +150,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       };
     `), [], 'public')
     const author = await generateEd25519KeyPair()
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: false,
+      privateLog: false,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: {} },
@@ -165,8 +165,8 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       salt: new Uint8Array(16).fill(3),
     }
     const kernel = new TopicKernel({ genesis, cas })
-    const op1 = makeOp(kernel.chainId, author.publicKeyBytes, 'o1', 10n, 'public', [{ topic: 'leaky', input: null }])
-    const op2 = makeOp(kernel.chainId, author.publicKeyBytes, 'o2', 20n, 'public', [{ topic: 'leaky', input: null }])
+    const op1 = makeOp(kernel.logId, author.publicKeyBytes, 'o1', 10n, 'public', [{ topic: 'leaky', input: null }])
+    const op2 = makeOp(kernel.logId, author.publicKeyBytes, 'o2', 20n, 'public', [{ topic: 'leaky', input: null }])
     await kernel.materialize([op1])
     expect(await kernel.query('leaky')).toEqual({ state: 1, leaked: 100 })
     expect(await kernel.query('leaky')).toEqual({ state: 1, leaked: 100 })
@@ -196,9 +196,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     `), [], 'public')
 
     const author = await generateEd25519KeyPair()
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: false,
+      privateLog: false,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:cas': CAS_BUILTIN_ID } },
@@ -211,7 +211,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       salt: new Uint8Array(16).fill(4),
     }
     const kernel = new TopicKernel({ genesis, cas })
-    const op = makeOp(kernel.chainId, author.publicKeyBytes, 'fetch1', 10n, 'public', [{ topic: 'sneaky', input: { hash: blobHash } }])
+    const op = makeOp(kernel.logId, author.publicKeyBytes, 'fetch1', 10n, 'public', [{ topic: 'sneaky', input: { hash: blobHash } }])
 
     const res1 = await kernel.materialize([op])
     // Try/catch MUST NOT swallow the MissingDependency!
@@ -243,9 +243,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const adminHex = bytesToHex(admin.publicKeyBytes)
     const userHex = bytesToHex(user.publicKeyBytes)
 
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: true,
+      privateLog: true,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID, 'chronolog:cas': CAS_BUILTIN_ID } },
@@ -270,21 +270,21 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const blind = new TopicKernel({ genesis, cas: blindCas, blindHostMode: true })
 
     // 1. Earlier encrypted op uses operationId="shared-id"
-    const encOp = makeOp(full.chainId, admin.publicKeyBytes, 'shared-id', 10n, 'encrypted', [{ topic: 'priv', input: null }], 1)
+    const encOp = makeOp(full.logId, admin.publicKeyBytes, 'shared-id', 10n, 'encrypted', [{ topic: 'priv', input: null }], 1)
     // 2. Later public op reuses operationId="shared-id" (cross-partition collision must NOT suppress public op!)
-    const pubGrant = makeOp(full.chainId, admin.publicKeyBytes, 'shared-id', 20n, 'public', [
+    const pubGrant = makeOp(full.logId, admin.publicKeyBytes, 'shared-id', 20n, 'public', [
       { topic: '$permissions', input: { action: 'setMember', member: { publicKey: userHex, reader: true, writer: true, administrator: false, publisher: true, finalizer: false } } },
     ], 2)
     // 3. Adversarial encrypted op trying to mutate $permissions (must reject on full replica!)
-    const badEncControl = makeOp(full.chainId, admin.publicKeyBytes, 'bad-enc', 30n, 'encrypted', [
+    const badEncControl = makeOp(full.logId, admin.publicKeyBytes, 'bad-enc', 30n, 'encrypted', [
       { topic: '$permissions', input: { action: 'removeMember', publicKey: userHex } },
     ], 3)
     // 4. Adversarial public op trying to mutate private topic (must reject on both!)
-    const badPubPriv = makeOp(full.chainId, admin.publicKeyBytes, 'bad-pub', 40n, 'public', [
+    const badPubPriv = makeOp(full.logId, admin.publicKeyBytes, 'bad-pub', 40n, 'public', [
       { topic: 'priv', input: null },
     ], 4)
     // 5. Valid publication by newly granted user
-    const pubRelease = makeOp(full.chainId, user.publicKeyBytes, 'rel-1', 50n, 'public', [
+    const pubRelease = makeOp(full.logId, user.publicKeyBytes, 'rel-1', 50n, 'public', [
       { topic: '$publications', input: { action: 'publish', entry: 'index.html', files: [{ path: 'index.html', hash: 'b'.repeat(64), size: 42, type: 'text/html' }] } },
     ], 5)
 
@@ -317,9 +317,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     await cas2.put(modSrc, [], 'public')
 
     const author = await generateEd25519KeyPair()
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: false,
+      privateLog: false,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: {} },
@@ -333,16 +333,16 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       salt: new Uint8Array(16).fill(6),
     }
 
-    const chainId = genesisChainId(genesis)
-    const op1 = makeOp(chainId, author.publicKeyBytes, 'op-1', 10n, 'public', [{ topic: 'a', input: { add: 5 } }])
+    const logId = genesisLogId(genesis)
+    const op1 = makeOp(logId, author.publicKeyBytes, 'op-1', 10n, 'public', [{ topic: 'a', input: { add: 5 } }])
     // Multi-topic atomic rollback: a succeeds, b fails -> a must remain 5!
-    const op2Fail = makeOp(chainId, author.publicKeyBytes, 'op-2', 20n, 'public', [
+    const op2Fail = makeOp(logId, author.publicKeyBytes, 'op-2', 20n, 'public', [
       { topic: 'a', input: { add: 100 } },
       { topic: 'b', input: { fail: true } },
     ])
     // Reusing consumed op-2 handle after checkpoint must STILL conflict!
-    const op3Reuse = makeOp(chainId, author.publicKeyBytes, 'op-2', 30n, 'public', [{ topic: 'a', input: { add: 999 } }], 9)
-    const op4Ok = makeOp(chainId, author.publicKeyBytes, 'op-4', 40n, 'public', [{ topic: 'b', input: { add: 7 } }])
+    const op3Reuse = makeOp(logId, author.publicKeyBytes, 'op-2', 30n, 'public', [{ topic: 'a', input: { add: 999 } }], 9)
+    const op4Ok = makeOp(logId, author.publicKeyBytes, 'op-4', 40n, 'public', [{ topic: 'b', input: { add: 7 } }])
 
     const full = new TopicKernel({ genesis, cas: cas1 })
     await full.materialize([op1, op2Fail])
@@ -391,9 +391,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const hostHex = bytesToHex(host.publicKeyBytes)
     const newcomerHex = bytesToHex(newcomer.publicKeyBytes)
 
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: true,
+      privateLog: true,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } },
@@ -414,7 +414,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const sigBytes = new Uint8Array(await crypto.subtle.sign('Ed25519', host.privateKey, Uint8Array.from(msg).buffer))
 
     const kernel = new TopicKernel({ genesis, cas })
-    const opGood = makeOp(kernel.chainId, admin.publicKeyBytes, 'admit-1', 10n, 'public', [{
+    const opGood = makeOp(kernel.logId, admin.publicKeyBytes, 'admit-1', 10n, 'public', [{
       topic: '$permissions',
       input: {
         action: 'setMember',
@@ -458,9 +458,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const probeHash = await cas.put(utf8(probeSource), [], 'public')
     const secretHash = await cas.put(utf8(secretSource), [], 'public')
 
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: true,
+      privateLog: true,
       initialTopics: {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } },
@@ -492,9 +492,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const blind = new TopicKernel({ genesis, cas, blindHostMode: true })
 
     // 1. Public control op probing 'secret' via ctx.query() MUST see null (identical on full & blind host)
-    const opProbe = makeOp(full.chainId, s1.publicKeyBytes, 'probe-1', 10n, 'public', [{ topic: '$signal_policy', input: {} }])
+    const opProbe = makeOp(full.logId, s1.publicKeyBytes, 'probe-1', 10n, 'public', [{ topic: '$signal_policy', input: {} }])
     // 2. Multisig 2-of-3 proposal to admit guest
-    const opPropose = makeOp(full.chainId, s1.publicKeyBytes, 'ms-prop-1', 20n, 'public', [{
+    const opPropose = makeOp(full.logId, s1.publicKeyBytes, 'ms-prop-1', 20n, 'public', [{
       topic: '$permissions',
       input: {
         action: 'propose',
@@ -504,7 +504,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       },
     }])
     // 3. Second signer approves -> executes atomically!
-    const opApprove = makeOp(full.chainId, s2.publicKeyBytes, 'ms-app-1', 30n, 'public', [{
+    const opApprove = makeOp(full.logId, s2.publicKeyBytes, 'ms-app-1', 30n, 'public', [{
       topic: '$permissions',
       input: { action: 'approve', proposalId: 'admit-guest' },
     }])

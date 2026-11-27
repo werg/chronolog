@@ -6,7 +6,7 @@ Unified local-first Chronolog v2 session runtime with zero native C/C++ builds.
 
 | Import | Environment | Purpose |
 | --- | --- | --- |
-| `@chronolog/peer-session` | Universal (passive) | `createChainGenesis`, `createApplicationSession` (lazy-loads runtime), `openApplicationDevice`, `createLiveView`, `forwardSessionEvents`, `createScopedApplicationTools`, `createApplicationOwner`, `createApplicationBackend`, encrypted checkpoints. |
+| `@chronolog/peer-session` | Universal (passive) | `createLogGenesis`, `createApplicationSession` (lazy-loads runtime), `openApplicationDevice`, `createLiveView`, `forwardSessionEvents`, `createScopedApplicationTools`, `createApplicationOwner`, `createApplicationBackend`, encrypted checkpoints. |
 | `@chronolog/peer-session/native` | Node.js >= 22.15 | `openNativeDevice`, `openDisposableNativeDevice`, `NativeBytesStore` (built-in `node:sqlite`, zero `node-gyp`). |
 | `@chronolog/peer-session/browser` | Browser main thread | Passive `WorkerApplicationSession` facade (`connectApplicationOwner`), `createLiveView`, `createViewStore`, `createScopedApplicationTools`. Zero storage/QuickJS/SQLite imports. |
 | `@chronolog/peer-session/worker` | Browser Worker | `openBrowserDevice`, `createApplicationSession`, `createApplicationOwner`, `acquireApplicationOwnerLock`. |

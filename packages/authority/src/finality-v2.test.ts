@@ -13,7 +13,7 @@ import {
 
 describe('authority v2 finality schedule & host attestations', () => {
   it('supports none -> P1 bootstrap, enforces P1 -> P2 handoff, and verifies blockchain-anchor providers', async () => {
-    const chainId = 'a'.repeat(64)
+    const logId = 'a'.repeat(64)
     const v1 = await createSigningIdentity()
     const v2 = await createSigningIdentity()
     const v3 = await createSigningIdentity()
@@ -24,9 +24,9 @@ describe('authority v2 finality schedule & host attestations', () => {
       { effectiveAfterMs: 500n, policy: { kind: 'fixed-validator', validators: [v2.publicKey, v3.publicKey], threshold: 2 } },
       { effectiveAfterMs: 1000n, policy: { kind: 'blockchain-anchor', chain: 'ethereum', anchorId: '0xabc' } },
     ]
-    const scope1 = await policyScopeId(chainId, schedule[1]!)
-    const scope2 = await policyScopeId(chainId, schedule[2]!)
-    const scope3 = await policyScopeId(chainId, schedule[3]!)
+    const scope1 = await policyScopeId(logId, schedule[1]!)
+    const scope2 = await policyScopeId(logId, schedule[2]!)
+    const scope3 = await policyScopeId(logId, schedule[3]!)
 
     const opEarly = '1'.repeat(64)
     const opLateUnincluded = '2'.repeat(64)
@@ -34,7 +34,7 @@ describe('authority v2 finality schedule & host attestations', () => {
 
     // P2 tries to finalize at t=600 BEFORE P1 sealed the handoff at t=500 -> must be ignored!
     const cp2Payload = {
-      chainId,
+      logId,
       policyScopeId: scope2,
       closedThroughMs: 600n,
       includedSetDigest: computeIncludedSetDigest([opEarly, opMid]),
@@ -49,12 +49,12 @@ describe('authority v2 finality schedule & host attestations', () => {
         signatures: [await signFinalityCheckpoint(cp2Payload, v2), await signFinalityCheckpoint(cp2Payload, v3)],
       },
     }
-    const resPremature = await verifyFinalityV2({ chainId, schedule, checkpoints: [cp2] })
+    const resPremature = await verifyFinalityV2({ logId, schedule, checkpoints: [cp2] })
     expect(resPremature.closedThroughMs).toBeNull()
 
     // P1 bootstraps from none at t=500 (sealing the handoff to P2!)
     const cp1Payload = {
-      chainId,
+      logId,
       policyScopeId: scope1,
       closedThroughMs: 500n,
       includedSetDigest: computeIncludedSetDigest([opEarly]),
@@ -69,7 +69,7 @@ describe('authority v2 finality schedule & host attestations', () => {
 
     // Now P1 + P2 both verify, and opLateUnincluded (t=300 <= 600, not included) is excluded!
     const resBoth = await verifyFinalityV2({
-      chainId,
+      logId,
       schedule,
       checkpoints: [cp2, cp1],
       knownOps: [
@@ -97,7 +97,7 @@ describe('authority v2 finality schedule & host attestations', () => {
       attestation: { kind: 'blockchain', blockHeight: 42, blockTimestampMs: 1600n, proofBytes: 'deadbeef' },
     }
     const resChain = await verifyFinalityV2({
-      chainId,
+      logId,
       schedule,
       checkpoints: [cp1, cp2Handoff, cp3],
       blockchainVerifier: (pol, cp) => pol.chain === 'ethereum' && cp.attestation.kind === 'blockchain' && cp.attestation.proofBytes === 'deadbeef',

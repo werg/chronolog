@@ -12,21 +12,21 @@ import {
   assertValidReducersConfig,
   compareOperationOrder,
   decodeEncryptedEnvelope,
-  decodeGenesisBlock,
+  decodeLogGenesis,
   decodeSignedOperation,
   encodeEncryptedEnvelope,
-  encodeGenesisBlock,
+  encodeLogGenesis,
   encodeSignedOperation,
   encryptedEnvelopeDigest,
   envelopeAad,
-  genesisChainId,
+  genesisLogId,
   isControlTopic,
   normalizeJsonValue,
   operationIdDigest,
   signOperationCore,
   verifySignedOperation,
   type EncryptedOperationEnvelope,
-  type GenesisBlock,
+  type LogGenesis,
   type JsonValue,
   type OperationCore,
   type OperationVisibility,
@@ -151,9 +151,9 @@ export interface CheckpointBootstrapSnapshot {
 export interface OpenApplicationSessionOptions<D extends ApplicationDefinition = ApplicationDefinition> extends QuickJsSandboxOptions {
   readonly device: ApplicationDevice
   readonly store: BytesStore
-  readonly genesis?: GenesisBlock | Uint8Array
-  readonly chainId?: string
-  /** Optional host-level application scope ID (defaults to `chainId`). */
+  readonly genesis?: LogGenesis | Uint8Array
+  readonly logId?: string
+  /** Optional host-level application scope ID (defaults to `logId`). */
   readonly applicationId?: string
   readonly casNodes?: readonly SessionCasNode[]
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
@@ -244,8 +244,8 @@ function toApplicationEvent(ev: EmittedKernelEvent): ApplicationEvent {
  */
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
   readonly applicationId: string
-  readonly chainId: string
-  readonly genesis: GenesisBlock
+  readonly logId: string
+  readonly genesis: LogGenesis
   readonly genesisBytes: Uint8Array
   readonly device: ApplicationDevice
   readonly identity: { readonly publicKey: string }
@@ -305,15 +305,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     cas: ContentAddressedStore,
   ) {
     this.genesisBytes = genesisBytes.slice()
-    this.genesis = decodeGenesisBlock(this.genesisBytes)
-    this.chainId = bytesToHex(genesisChainId(this.genesisBytes))
-    this.applicationId = options.applicationId ?? this.chainId
+    this.genesis = decodeLogGenesis(this.genesisBytes)
+    this.logId = bytesToHex(genesisLogId(this.genesisBytes))
+    this.applicationId = options.applicationId ?? this.logId
     this.device = options.device
     this.identity = Object.freeze({ publicKey: options.device.identity.publicKey })
     if (options.definition !== undefined) this.definition = options.definition
     this.cas = cas
     this.#store = options.store
-    this.#prefix = `v2/${this.chainId}`
+    this.#prefix = `v2/${this.logId}`
     this.#release = options.release
     this.#blindHostMode = options.blindHostMode ?? false
     if (options.blockchainVerifier !== undefined) this.#blockchainVerifier = options.blockchainVerifier
@@ -389,18 +389,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (options.genesis !== undefined) {
       genesisBytes = options.genesis instanceof Uint8Array
         ? options.genesis.slice()
-        : encodeGenesisBlock(options.genesis)
-      const chainId = bytesToHex(genesisChainId(genesisBytes))
-      if (options.chainId !== undefined && options.chainId !== chainId) {
+        : encodeLogGenesis(options.genesis)
+      const logId = bytesToHex(genesisLogId(genesisBytes))
+      if (options.logId !== undefined && options.logId !== logId) {
         throw new Error('SESSION_CHAIN_ID_MISMATCH')
       }
-      const existing = await options.store.get(`v2/${chainId}/genesis`)
+      const existing = await options.store.get(`v2/${logId}/genesis`)
       if (existing !== null && !sameBytes(existing, genesisBytes)) {
         throw new Error('SESSION_GENESIS_MISMATCH')
       }
-      if (existing === null) await options.store.put(`v2/${chainId}/genesis`, genesisBytes)
-    } else if (options.chainId !== undefined) {
-      genesisBytes = await options.store.get(`v2/${options.chainId}/genesis`)
+      if (existing === null) await options.store.put(`v2/${logId}/genesis`, genesisBytes)
+    } else if (options.logId !== undefined) {
+      genesisBytes = await options.store.get(`v2/${options.logId}/genesis`)
     } else {
       const all = await readAllStoreEntries(options.store)
       for (const entry of all) {
@@ -428,7 +428,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   get status(): SessionStatus {
     const pendingOps = this.#countPendingOps()
     const canAuthor = !this.#closed && !this.#blindHostMode && this.#canLocallyAuthor()
-    const awaitingKeys = this.genesis.privateChain && !this.#blindHostMode && this.isReader(this.identity.publicKey) && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())
+    const awaitingKeys = this.genesis.privateLog && !this.#blindHostMode && this.isReader(this.identity.publicKey) && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())
     return Object.freeze({
       ...(this.#kernel.pendingDependencies.length > 0 ? { pendingDependencies: this.#kernel.pendingDependencies } : {}),
       canAuthor,
@@ -471,7 +471,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   isReader(publicKey: string): boolean {
-    if (!this.genesis.privateChain) return true
+    if (!this.genesis.privateLog) return true
     if (this.#evaluatedPermissions !== null) {
       if (this.#evaluatedPermissions.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
       return this.#evaluatedPermissions.readers.has(publicKey)
@@ -545,7 +545,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async unlockEpochsFromKeysTopic(wrapPrivateKey: CryptoKey, wrapPublicKeyHex: string): Promise<number> {
     return this.#serial(async () => {
-      if (!this.genesis.privateChain || this.#blindHostMode) return 0
+      if (!this.genesis.privateLog || this.#blindHostMode) return 0
       const keys = this.keysState()
       let unlocked = 0
       for (const entry of Object.values(keys.epochs ?? {})) {
@@ -557,7 +557,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             wrapPrivateKey,
             wrapPublicKeyHex,
             box,
-            this.chainId,
+            this.logId,
             entry.epoch,
           )
           if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
@@ -594,7 +594,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       ? this.#evaluatedPermissions.publishers.has(pk)
       : this.member(pk)?.publisher === true
     if (!this.isWriter(pk) && !isAdmin && !isPub) return false
-    if (this.genesis.privateChain && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())) {
+    if (this.genesis.privateLog && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())) {
       return isAdmin
     }
     return true
@@ -688,7 +688,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const queue: string[] = []
       const visited = new Set<string>()
       for (const [topicName, binding] of Object.entries(cfg.topics)) {
-        if (this.#blindHostMode && this.genesis.privateChain && !isControlTopic(topicName)) continue
+        if (this.#blindHostMode && this.genesis.privateLog && !isControlTopic(topicName)) continue
         queue.push(binding.module)
       }
       const importSpecRe = /\bfrom\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gu
@@ -853,14 +853,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         try {
           const signed = decodeSignedOperation(entry.value)
           const verified = await verifySignedOperation(signed)
-          if (bytesToHex(verified.core.chainId) === this.chainId && verified.core.visibility === 'public') {
+          if (bytesToHex(verified.core.logId) === this.logId && verified.core.visibility === 'public') {
             this.#publicOps.set(bytesToHex(verified.opId), { raw: entry.value.slice(), signed, core: verified.core })
           }
         } catch { /* ignore corrupt entry */ }
       } else if (rest.startsWith('enc-env/')) {
         try {
           const envelope = decodeEncryptedEnvelope(entry.value)
-          if (bytesToHex(envelope.chainId) === this.chainId) {
+          if (bytesToHex(envelope.logId) === this.logId) {
             const digest = bytesToHex(encryptedEnvelopeDigest(entry.value))
             this.#encryptedEnvelopes.set(digest, { digest, raw: entry.value.slice(), envelope })
           }
@@ -897,7 +897,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   async #unsealAvailableEpochKeys(): Promise<boolean> {
-    if (!this.genesis.privateChain || this.#blindHostMode) return false
+    if (!this.genesis.privateLog || this.#blindHostMode) return false
     const keys = this.keysState()
     let unlockedAny = false
     for (const entry of Object.values(keys.epochs ?? {})) {
@@ -909,7 +909,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           this.device.wrapKey.privateKey,
           this.device.wrapKey.publicKey,
           box,
-          this.chainId,
+          this.logId,
           entry.epoch,
         )
         if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
@@ -923,13 +923,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   async #decryptPendingEnvelopes(): Promise<void> {
-    if (!this.genesis.privateChain || this.#blindHostMode) return
+    if (!this.genesis.privateLog || this.#blindHostMode) return
     for (const entry of this.#encryptedEnvelopes.values()) {
       if (entry.decrypted !== undefined) continue
       const epochKey = this.#epochKeys.get(entry.envelope.epoch)
       if (epochKey === undefined) continue
       try {
-        const aad = envelopeAad(entry.envelope.chainId, entry.envelope.opId, entry.envelope.author)
+        const aad = envelopeAad(entry.envelope.logId, entry.envelope.opId, entry.envelope.author)
         const plaintext = await decryptEpochPayload(epochKey, {
           epoch: BigInt(entry.envelope.epoch),
           nonce: entry.envelope.nonce,
@@ -937,7 +937,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }, aad)
         const signed = decodeSignedOperation(plaintext)
         const verified = await verifySignedOperation(signed)
-        if (bytesToHex(verified.core.chainId) !== this.chainId) continue
+        if (bytesToHex(verified.core.logId) !== this.logId) continue
         if (verified.core.visibility !== 'encrypted') continue
         if (!sameBytes(verified.opId, entry.envelope.opId) || !sameBytes(verified.core.author, entry.envelope.author)) continue
         entry.decrypted = { opId: bytesToHex(verified.opId), signed, core: verified.core }
@@ -954,7 +954,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
    * decrypt them without changing opId, authorTimestampMs, or signature!
    */
   async #rewrapPendingLocalOps(): Promise<boolean> {
-    if (!this.genesis.privateChain || this.#blindHostMode) return false
+    if (!this.genesis.privateLog || this.#blindHostMode) return false
     const newestEpoch = this.currentEpoch()
     if (newestEpoch < 0) return false
     const newestKey = this.#epochKeys.get(newestEpoch)
@@ -963,13 +963,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     let rewrapped = false
     for (const [opId, pending] of this.#localPending) {
       if (pending.currentEpoch >= newestEpoch) continue
-      const chainIdBytes = hexToBytes(this.chainId)
+      const logIdBytes = hexToBytes(this.logId)
       const opIdBytes = hexToBytes(opId)
-      const aad = envelopeAad(chainIdBytes, opIdBytes, pending.core.author)
+      const aad = envelopeAad(logIdBytes, opIdBytes, pending.core.author)
       const enc = await encryptEpochPayload(newestKey, BigInt(newestEpoch), pending.raw, aad)
       const env: EncryptedOperationEnvelope = {
         version: 1,
-        chainId: chainIdBytes,
+        logId: logIdBytes,
         opId: opIdBytes,
         author: pending.core.author,
         epoch: newestEpoch,
@@ -1046,7 +1046,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const allByOpId = this.#collectDecryptedKernelInputs()
       const schedule = parseFinalitySchedule(this.#kernel.topic('$finality'))
       this.#verifiedFinality = await verifyFinalityV2({
-        chainId: this.chainId,
+        logId: this.logId,
         schedule,
         checkpoints: [...this.#checkpoints.values()],
         knownOps: [...allByOpId.entries()].map(([opId, input]) => ({
@@ -1139,11 +1139,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       check(!anyControl || allControl, 'OPERATION_CROSS_PARTITION_FORBIDDEN')
 
       const visibility: OperationVisibility = input.visibility ?? (
-        this.genesis.privateChain
+        this.genesis.privateLog
           ? (allControl ? 'public' : 'encrypted')
           : 'public'
       )
-      if (this.genesis.privateChain) {
+      if (this.genesis.privateLog) {
         if (allControl) check(visibility === 'public', 'CONTROL_OP_MUST_BE_PUBLIC')
         else check(visibility === 'encrypted', 'PRIVATE_OP_MUST_BE_ENCRYPTED')
       }
@@ -1165,11 +1165,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       const authorTimestampMs = input.authorTimestampMs ?? BigInt(Date.now())
-      const chainIdBytes = hexToBytes(this.chainId)
+      const logIdBytes = hexToBytes(this.logId)
       const authorBytes = hexToBytes(this.identity.publicKey)
       const core: OperationCore = {
         version: 1,
-        chainId: chainIdBytes,
+        logId: logIdBytes,
         author: authorBytes,
         operationId,
         authorTimestampMs,
@@ -1191,11 +1191,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         check(epoch >= 0, 'EPOCH_KEY_REQUIRED')
         const epochKey = this.#epochKeys.get(epoch)
         check(epochKey !== undefined, 'EPOCH_KEY_MISSING')
-        const aad = envelopeAad(chainIdBytes, opIdBytes, authorBytes)
+        const aad = envelopeAad(logIdBytes, opIdBytes, authorBytes)
         const enc = await encryptEpochPayload(epochKey, BigInt(epoch), opBytes, aad)
         const env: EncryptedOperationEnvelope = {
           version: 1,
-          chainId: chainIdBytes,
+          logId: logIdBytes,
           opId: opIdBytes,
           author: authorBytes,
           epoch,
@@ -1362,7 +1362,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     commands.sort((a, b) => a.name.localeCompare(b.name))
     queries.sort((a, b) => a.name.localeCompare(b.name))
     const description = validateApplicationDescription({
-      id: `chain-${this.chainId.slice(0, 16)}`,
+      id: `chain-${this.logId.slice(0, 16)}`,
       version: '2.0.0',
       commands,
       queries,
@@ -1470,7 +1470,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       },
     ]
 
-    if (this.genesis.privateChain && (options.reader ?? true) && options.wrapKey) {
+    if (this.genesis.privateLog && (options.reader ?? true) && options.wrapKey) {
       const keysState = this.keysState()
       if (keysState.currentEpoch < 0) {
         const epoch0 = this.#epochKeys.get(0) ?? crypto.getRandomValues(new Uint8Array(32))
@@ -1482,7 +1482,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
         allReaders.set(options.publicKey, options.wrapKey)
         for (const [pk, wk] of allReaders) {
-          boxes[pk] = await hpkeSealEpochKey(wk, epoch0, this.chainId, 0)
+          boxes[pk] = await hpkeSealEpochKey(wk, epoch0, this.logId, 0)
         }
         updates.push({
           topic: '$keys',
@@ -1499,7 +1499,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         for (let ep = minEp; ep <= keysState.currentEpoch; ep++) {
           const epKey = this.#epochKeys.get(ep)
           if (epKey === undefined) continue
-          epochBoxes[String(ep)] = await hpkeSealEpochKey(options.wrapKey, epKey, this.chainId, ep)
+          epochBoxes[String(ep)] = await hpkeSealEpochKey(options.wrapKey, epKey, this.logId, ep)
         }
         if (Object.keys(epochBoxes).length > 0) {
           updates.push({
@@ -1528,7 +1528,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly operationId?: string
     readonly authorTimestampMs?: bigint
   } = {}): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> {
-    check(this.genesis.privateChain, 'EPOCH_ROTATION_PRIVATE_CHAIN_ONLY')
+    check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_CHAIN_ONLY')
     const keysState = this.keysState()
     const nextEpoch = keysState.currentEpoch + 1
     const key = options.newEpochKey ?? crypto.getRandomValues(new Uint8Array(32))
@@ -1538,7 +1538,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const boxes: Record<string, EpochKeyBox> = {}
     for (const m of this.permissions().members) {
       if (!m.reader || !m.wrapKey || exclude.has(m.publicKey)) continue
-      boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, this.chainId, nextEpoch)
+      boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, this.logId, nextEpoch)
     }
 
     const operation = await this.submit({
@@ -1566,14 +1566,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const updates: TopicUpdate[] = [
       { topic: '$permissions', input: { action: 'removeMember', publicKey } },
     ]
-    if (this.genesis.privateChain && options.rotateEpoch !== false) {
+    if (this.genesis.privateLog && options.rotateEpoch !== false) {
       const nextEpoch = this.keysState().currentEpoch + 1
       const key = crypto.getRandomValues(new Uint8Array(32))
       await this.installEpochKey(nextEpoch, key)
       const boxes: Record<string, EpochKeyBox> = {}
       for (const m of this.permissions().members) {
         if (!m.reader || !m.wrapKey || m.publicKey === publicKey) continue
-        boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, this.chainId, nextEpoch)
+        boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, this.logId, nextEpoch)
       }
       updates.push({
         topic: '$keys',
@@ -1698,7 +1698,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           if (entry.effectiveAfterMs <= options.throughMs) active = entry
         }
         check(active.policy.kind !== 'none', 'FINALITY_NOT_ACTIVE')
-        const scopeId = await policyScopeId(this.chainId, active)
+        const scopeId = await policyScopeId(this.logId, active)
 
         const all = this.#collectDecryptedKernelInputs()
         const included: KernelOperationInput[] = []
@@ -1727,7 +1727,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           author: bytesToHex(i.core.author),
         }))
         const payload: FinalityCheckpointPayload = {
-          chainId: this.chainId,
+          logId: this.logId,
           policyScopeId: scopeId,
           closedThroughMs: options.throughMs,
           includedSetDigest: computeIncludedSetDigest(inclusions.map(i => i.opId)),
@@ -1765,7 +1765,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       snapshot: CheckpointBootstrapSnapshot,
     ): Promise<void> => {
       await this.#serial(async () => {
-        check(checkpoint.payload.chainId === this.chainId, 'CHECKPOINT_CHAIN_MISMATCH')
+        check(checkpoint.payload.logId === this.logId, 'CHECKPOINT_CHAIN_MISMATCH')
         check(checkpoint.payload.stateRoot === snapshot.stateRoot && checkpoint.payload.historyDigest === snapshot.historyDigest, 'CHECKPOINT_SNAPSHOT_MISMATCH')
         const key = await recordDigest(checkpoint.payload)
         this.#checkpoints.set(key, checkpoint)
@@ -1995,7 +1995,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       for (const raw of facts.publicOps ?? []) {
         const signed = decodeSignedOperation(raw)
         const verified = await verifySignedOperation(signed)
-        if (bytesToHex(verified.core.chainId) !== this.chainId) continue
+        if (bytesToHex(verified.core.logId) !== this.logId) continue
         if (verified.core.visibility !== 'public') continue
         const opId = bytesToHex(verified.opId)
         if (this.#publicOps.has(opId)) continue
@@ -2007,7 +2007,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
       for (const raw of facts.encryptedEnvelopes ?? []) {
         const envelope = decodeEncryptedEnvelope(raw)
-        if (bytesToHex(envelope.chainId) !== this.chainId) continue
+        if (bytesToHex(envelope.logId) !== this.logId) continue
         const digest = bytesToHex(encryptedEnvelopeDigest(raw))
         if (this.#encryptedEnvelopes.has(digest)) continue
         check(this.#publicOps.size + this.#encryptedEnvelopes.size < this.#maxOperations, 'SESSION_OPERATION_LIMIT')
@@ -2029,7 +2029,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       for (const cp of facts.checkpoints ?? []) {
-        if (cp.payload.chainId !== this.chainId) continue
+        if (cp.payload.logId !== this.logId) continue
         const key = await recordDigest(cp.payload)
         if (!this.#checkpoints.has(key)) {
           this.#checkpoints.set(key, cp)

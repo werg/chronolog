@@ -5,7 +5,7 @@ import { bytesToHex, utf8 } from '@chronolog/canonical'
 import {
   generateEd25519KeyPair,
   operationIdDigest,
-  type GenesisBlock,
+  type LogGenesis,
   type OperationCore,
   type TopicUpdate,
 } from '@chronolog/protocol'
@@ -21,7 +21,7 @@ import {
 import { createSqliteCasDriver } from './driver.js'
 
 function makeOp(
-  chainId: Uint8Array,
+  logId: Uint8Array,
   author: Uint8Array,
   operationId: string,
   authorTimestampMs: bigint,
@@ -30,7 +30,7 @@ function makeOp(
 ): KernelOperationInput {
   const core: OperationCore = {
     version: 1,
-    chainId,
+    logId,
     author,
     operationId,
     authorTimestampMs,
@@ -92,9 +92,9 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
     `), [], 'public')
 
     const author = await generateEd25519KeyPair()
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: false,
+      privateLog: false,
       initialTopics: {
         $reducers: {
           runtime: {
@@ -111,11 +111,11 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
     }
 
     const kWarm = new TopicKernel({ genesis, cas, sqliteDriver: driver, snapshotInterval: 2 })
-    const initOp = makeOp(kWarm.chainId, author.publicKeyBytes, 'init', 1_700_000_000_000n, [{ topic: 'db', input: { action: 'init' } }])
+    const initOp = makeOp(kWarm.logId, author.publicKeyBytes, 'init', 1_700_000_000_000n, [{ topic: 'db', input: { action: 'init' } }])
     const addOps: KernelOperationInput[] = []
     for (let i = 1; i <= 10; i++) {
       addOps.push(makeOp(
-        kWarm.chainId,
+        kWarm.logId,
         author.publicKeyBytes,
         `add-${i}`,
         1_700_000_000_000n + BigInt(i * 1000),
@@ -138,8 +138,8 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
     expect(vecRes.rows[0]![0]).toBe(1)
 
     // random() must deterministically reject!
-    const randOp = makeOp(kWarm.chainId, author.publicKeyBytes, 'rand', 1_700_000_050_000n, [{ topic: 'db', input: { action: 'tryRandom' } }])
-    const checkOp = makeOp(kWarm.chainId, author.publicKeyBytes, 'chk', 1_700_000_060_000n, [{ topic: 'db', input: { action: 'checkChanges' } }])
+    const randOp = makeOp(kWarm.logId, author.publicKeyBytes, 'rand', 1_700_000_050_000n, [{ topic: 'db', input: { action: 'tryRandom' } }])
+    const checkOp = makeOp(kWarm.logId, author.publicKeyBytes, 'chk', 1_700_000_060_000n, [{ topic: 'db', input: { action: 'checkChanges' } }])
     const r2 = await kWarm.materialize([initOp, ...addOps, randOp, checkOp])
     expect(r2.outcomes.find(o => o.operationId === 'rand')!.outcome).toBe('rejected')
     // changes() and last_insert_rowid() reset to [0, 0] on fresh openDb()
@@ -147,7 +147,7 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
 
     // Late-arriving op at depth 10 triggers O(1) rollback + suffix replay!
     const lateOp = makeOp(
-      kWarm.chainId,
+      kWarm.logId,
       author.publicKeyBytes,
       'late-0',
       1_700_000_000_500n,
@@ -241,9 +241,9 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
     const aliceHex = bytesToHex(alice.publicKeyBytes)
     const bobHex = bytesToHex(bob.publicKeyBytes)
 
-    const genesis: GenesisBlock = {
+    const genesis: LogGenesis = {
       version: 1,
-      privateChain: false,
+      privateLog: false,
       initialTopics: {
         $reducers: {
           runtime: {
@@ -272,7 +272,7 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
     const kernel = new TopicKernel({ genesis, cas, sqliteDriver: driver })
     const ops: KernelOperationInput[] = [
       // 1. Admin creates tasks table + Postgres-style write RLS
-      makeOp(kernel.chainId, admin.publicKeyBytes, 'mig-1', 10n, [{
+      makeOp(kernel.logId, admin.publicKeyBytes, 'mig-1', 10n, [{
         topic: 'sql',
         input: {
           action: 'adminMigrate',
@@ -287,27 +287,27 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
         },
       }]),
       // 2. Alice inserts her own task (allowed)
-      makeOp(kernel.chainId, alice.publicKeyBytes, 'a-1', 20n, [{
+      makeOp(kernel.logId, alice.publicKeyBytes, 'a-1', 20n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: "INSERT INTO tasks VALUES ('t1', actor(), 'Alice task')" },
       }]),
       // 3. Bob tries to overwrite Alice's task via UPDATE (denied by RLS)
-      makeOp(kernel.chainId, bob.publicKeyBytes, 'b-upd', 30n, [{
+      makeOp(kernel.logId, bob.publicKeyBytes, 'b-upd', 30n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: "UPDATE tasks SET title = 'hacked' WHERE id = 't1'" },
       }]),
       // 4. Bob tries INSERT OR REPLACE to bypass DELETE RLS (blocked because recursive_triggers = ON!)
-      makeOp(kernel.chainId, bob.publicKeyBytes, 'b-rep', 40n, [{
+      makeOp(kernel.logId, bob.publicKeyBytes, 'b-rep', 40n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: "INSERT OR REPLACE INTO tasks VALUES ('t1', actor(), 'replaced!')" },
       }]),
       // 5. Bob tries DROP TRIGGER to remove RLS (blocked by mode: 'user'!)
-      makeOp(kernel.chainId, bob.publicKeyBytes, 'b-drop', 50n, [{
+      makeOp(kernel.logId, bob.publicKeyBytes, 'b-drop', 50n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: 'DROP TRIGGER _rls_tasks_update' },
       }]),
       // 6. Non-admin Alice creates her OWN table + index + inserts a row in ONE op!
-      makeOp(kernel.chainId, alice.publicKeyBytes, 'a-tbl', 60n, [{
+      makeOp(kernel.logId, alice.publicKeyBytes, 'a-tbl', 60n, [{
         topic: 'sql',
         input: {
           action: 'userSql',
@@ -319,12 +319,12 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
         },
       }]),
       // 7. Bob tries to edit alice_notes before Alice shares it (denied by default owner-only RLS!)
-      makeOp(kernel.chainId, bob.publicKeyBytes, 'b-note-early', 70n, [{
+      makeOp(kernel.logId, bob.publicKeyBytes, 'b-note-early', 70n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: "UPDATE alice_notes SET body = 'nope' WHERE id = 'n1'" },
       }]),
       // 8. Alice tries SQL injection inside setPolicy (blocked by mode:'readonly' validation!)
-      makeOp(kernel.chainId, alice.publicKeyBytes, 'a-sqli', 80n, [{
+      makeOp(kernel.logId, alice.publicKeyBytes, 'a-sqli', 80n, [{
         topic: 'sql',
         input: {
           action: 'setPolicy',
@@ -333,7 +333,7 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
         },
       }]),
       // 9. Alice installs a clean custom SQL RLS policy allowing Bob via OLD.shared_with = actor()!
-      makeOp(kernel.chainId, alice.publicKeyBytes, 'a-pol', 90n, [{
+      makeOp(kernel.logId, alice.publicKeyBytes, 'a-pol', 90n, [{
         topic: 'sql',
         input: {
           action: 'setPolicy',
@@ -346,12 +346,12 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
         },
       }]),
       // 10. Now Bob CAN update alice_notes (allowed by Alice's custom SQL RLS!)
-      makeOp(kernel.chainId, bob.publicKeyBytes, 'b-note-ok', 100n, [{
+      makeOp(kernel.logId, bob.publicKeyBytes, 'b-note-ok', 100n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: "UPDATE alice_notes SET body = 'collab edit!' WHERE id = 'n1'" },
       }]),
       // 11. Bob STILL cannot DROP Alice's table!
-      makeOp(kernel.chainId, bob.publicKeyBytes, 'b-drop-alice', 110n, [{
+      makeOp(kernel.logId, bob.publicKeyBytes, 'b-drop-alice', 110n, [{
         topic: 'sql',
         input: { action: 'userSql', sql: 'DROP TABLE alice_notes' },
       }]),

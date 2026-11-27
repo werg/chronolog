@@ -34,7 +34,7 @@ export const definition = defineApplication({
 })
 
 export interface Bootstrap {
-  readonly chainId: string
+  readonly logId: string
   readonly genesisBytes: Uint8Array
   readonly casNodes: readonly SessionCasNode[]
   readonly epoch: number

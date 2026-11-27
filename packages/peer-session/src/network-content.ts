@@ -2,7 +2,7 @@ import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { check, encodeRecord } from '@chronolog/authority'
 import {
   assertContentManifest, assertContentReference, assertContentRetention, CONTENT_CHUNK_BYTES,
-  MAX_CONTENT_CHUNKS, MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, MAX_CONTENT_MANIFEST_BYTES,
+  MAX_BLOB_BYTES, MAX_BLOB_CHUNKS, MAX_CONTENT_CHUNKS, MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, MAX_CONTENT_MANIFEST_BYTES,
   type ApplicationContent, type ContentManifest, type ContentOptions, type ContentReference, type ContentRetention,
 } from './content.js'
 import { awaitOwnedTask } from './lifetime.js'
@@ -10,18 +10,24 @@ import { awaitOwnedTask } from './lifetime.js'
 export const CONTENT_NETWORK_LIMITS = Object.freeze({ pending: 4, active: 4, timeoutMs: 30_000,
   chunkBytes: MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, chunkBase64Characters: 4 * Math.ceil(MAX_CONTENT_ENCRYPTED_CHUNK_BYTES / 3),
   messageBytes: MAX_CONTENT_MANIFEST_BYTES + 4096 })
-type Action = 'manifest' | 'chunk' | 'retain'
+type Action = 'manifest' | 'chunk' | 'retain' | 'blob-info' | 'blob-chunk'
 export type ContentWireMessage =
   | { readonly type: 'manifest-request'; readonly id: string; readonly reference: ContentReference }
   | { readonly type: 'chunk-request'; readonly id: string; readonly reference: ContentReference; readonly index: number }
   | { readonly type: 'retain-request'; readonly id: string; readonly reference: ContentReference }
+  | { readonly type: 'blob-info-request'; readonly id: string; readonly hash: string }
+  | { readonly type: 'blob-chunk-request'; readonly id: string; readonly hash: string; readonly index: number }
   | { readonly type: 'manifest-response'; readonly id: string; readonly manifest: ContentManifest | null }
   | { readonly type: 'chunk-response'; readonly id: string; readonly bytes: string | null }
   | { readonly type: 'retain-response'; readonly id: string; readonly receipt: ContentRetention }
+  | { readonly type: 'blob-info-response'; readonly id: string; readonly bytes: number | null }
+  | { readonly type: 'blob-chunk-response'; readonly id: string; readonly bytes: string | null }
   | { readonly type: 'error'; readonly id: string; readonly code: 'CONTENT_UNAVAILABLE' | 'CONTENT_FORBIDDEN' | 'CONTENT_BUSY' }
   | { readonly type: 'cancel'; readonly id: string }
-type Reply = Extract<ContentWireMessage, { type: 'manifest-response' | 'chunk-response' | 'retain-response' | 'error' }>
+type IncomingRequest = Extract<ContentWireMessage, { type: 'manifest-request' | 'chunk-request' | 'retain-request' | 'blob-info-request' | 'blob-chunk-request' }>
+type Reply = Extract<ContentWireMessage, { type: 'manifest-response' | 'chunk-response' | 'retain-response' | 'blob-info-response' | 'blob-chunk-response' | 'error' }>
 interface Pending { readonly action: Action; resolve(value: Reply): void; reject(error: unknown): void; cleanup(): void }
+const digest = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value)
 function fields(value: Record<string, unknown>, keys: readonly string[]): void {
   check(Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)), 'CONTENT_WIRE_INVALID')
 }
@@ -47,11 +53,22 @@ export function assertContentWireMessage(input: unknown): asserts input is Conte
     case 'chunk-request':
       fields(value, ['type', 'id', 'reference', 'index']); assertContentReference(value.reference)
       check(Number.isSafeInteger(value.index) && Number(value.index) >= 0 && Number(value.index) < MAX_CONTENT_CHUNKS && Number(value.index) < Math.ceil(value.reference.bytes / CONTENT_CHUNK_BYTES), 'CONTENT_WIRE_CHUNK_INVALID'); break
+    case 'blob-info-request':
+      fields(value, ['type', 'id', 'hash']); check(digest(value.hash), 'CONTENT_WIRE_INVALID'); break
+    case 'blob-chunk-request':
+      fields(value, ['type', 'id', 'hash', 'index'])
+      check(digest(value.hash) && Number.isSafeInteger(value.index) && Number(value.index) >= 0 && Number(value.index) < MAX_BLOB_CHUNKS, 'CONTENT_WIRE_CHUNK_INVALID'); break
     case 'manifest-response':
       fields(value, ['type', 'id', 'manifest']); if (value.manifest !== null) assertContentManifest(value.manifest); break
     case 'chunk-response':
       fields(value, ['type', 'id', 'bytes']); check(value.bytes === null || typeof value.bytes === 'string', 'CONTENT_WIRE_CHUNK_INVALID')
       if (typeof value.bytes === 'string') decoded(value.bytes); break
+    case 'blob-info-response':
+      fields(value, ['type', 'id', 'bytes'])
+      check(value.bytes === null || (Number.isSafeInteger(value.bytes) && Number(value.bytes) >= 0 && Number(value.bytes) <= MAX_BLOB_BYTES), 'CONTENT_WIRE_INVALID'); break
+    case 'blob-chunk-response':
+      fields(value, ['type', 'id', 'bytes']); check(value.bytes === null || typeof value.bytes === 'string', 'CONTENT_WIRE_CHUNK_INVALID')
+      if (typeof value.bytes === 'string') check(decoded(value.bytes).length <= CONTENT_CHUNK_BYTES, 'CONTENT_WIRE_CHUNK_INVALID'); break
     case 'retain-response':
       fields(value, ['type', 'id', 'receipt']); assertContentRetention(value.receipt); break
     case 'error':
@@ -92,10 +109,12 @@ export function createNetworkContent(options: {
     catch (error) { close(); throw error }
   }
   const cancel = (id: string): void => { if (!signal.aborted && options.authorize()) void send({ type: 'cancel', id }).catch(() => undefined) }
-  const request = (action: Action, reference: ContentReference, input: ContentOptions, index?: number): Promise<Reply> => {
-    allowed(); input.signal?.throwIfAborted(); assertContentReference(reference)
+  const sendRequest = (action: Action, build: (id: string) => IncomingRequest, input: ContentOptions): Promise<Reply> => {
+    allowed(); input.signal?.throwIfAborted()
     check(pending.size < CONTENT_NETWORK_LIMITS.pending, 'CONTENT_REQUEST_LIMIT')
     const id = crypto.randomUUID(), requestSignal = input.signal
+    const message = build(id)
+    assertContentWireMessage(message)
     return new Promise<Reply>((resolve, reject) => {
       const finish = (error: Error): void => {
         const waiter = pending.get(id)
@@ -107,7 +126,6 @@ export function createNetworkContent(options: {
       const cleanup = (): void => { clearTimeout(timer); requestSignal?.removeEventListener('abort', abort) }
       pending.set(id, { action, resolve, reject, cleanup })
       requestSignal?.addEventListener('abort', abort, { once: true })
-      const message: ContentWireMessage = action === 'chunk' ? { type: 'chunk-request', id, reference: { ...reference }, index: index! } : { type: `${action}-request`, id, reference: { ...reference } }
       void send(message).catch(error => {
         const waiter = pending.get(id)
         if (waiter !== undefined) { pending.delete(id); cleanup(); reject(error) }
@@ -116,12 +134,14 @@ export function createNetworkContent(options: {
   }
   const detach = options.content.attachSource(`network:${options.peerId}:${crypto.randomUUID()}`, {
     async manifest(reference, input = {}) {
-      const response = await request('manifest', reference, input)
+      assertContentReference(reference)
+      const response = await sendRequest('manifest', id => ({ type: 'manifest-request', id, reference: { ...reference } }), input)
       check(response.type === 'manifest-response', 'CONTENT_RESPONSE_INVALID')
       return response.manifest
     },
     async chunk(reference, index, input = {}) {
-      const response = await request('chunk', reference, input, index)
+      assertContentReference(reference)
+      const response = await sendRequest('chunk', id => ({ type: 'chunk-request', id, reference: { ...reference }, index }), input)
       check(response.type === 'chunk-response', 'CONTENT_RESPONSE_INVALID')
       if (response.bytes === null) return null
       const bytes = decoded(response.bytes), manifest = await local.manifest(reference, input), expected = manifest?.chunks[index]
@@ -129,16 +149,33 @@ export function createNetworkContent(options: {
       allowed(); input.signal?.throwIfAborted(); return bytes
     },
     async retained(reference, input = {}) {
-      const response = await request('retain', reference, input)
+      assertContentReference(reference)
+      const response = await sendRequest('retain', id => ({ type: 'retain-request', id, reference: { ...reference } }), input)
       check(response.type === 'retain-response', 'CONTENT_RESPONSE_INVALID')
       await options.content.verifyRetention(reference, response.receipt, options.peerId)
       allowed(); input.signal?.throwIfAborted(); return response.receipt
+    },
+    async blobInfo(hash, input = {}) {
+      check(digest(hash), 'CONTENT_BLOB_INVALID')
+      const response = await sendRequest('blob-info', id => ({ type: 'blob-info-request', id, hash }), input)
+      check(response.type === 'blob-info-response', 'CONTENT_RESPONSE_INVALID')
+      allowed(); input.signal?.throwIfAborted()
+      return response.bytes === null ? null : { hash, bytes: response.bytes }
+    },
+    async blobChunk(hash, index, input = {}) {
+      check(digest(hash), 'CONTENT_BLOB_INVALID')
+      const response = await sendRequest('blob-chunk', id => ({ type: 'blob-chunk-request', id, hash, index }), input)
+      check(response.type === 'blob-chunk-response', 'CONTENT_RESPONSE_INVALID')
+      if (response.bytes === null) return null
+      const bytes = decoded(response.bytes)
+      check(bytes.length <= CONTENT_CHUNK_BYTES, 'CONTENT_BLOB_INVALID')
+      allowed(); input.signal?.throwIfAborted(); return bytes
     },
   })
   options.signal.addEventListener('abort', close, { once: true })
   if (options.signal.aborted) close()
 
-  const serve = async (message: Extract<ContentWireMessage, { type: 'manifest-request' | 'chunk-request' | 'retain-request' }>, controller: AbortController): Promise<void> => {
+  const serve = async (message: IncomingRequest, controller: AbortController): Promise<void> => {
     const timer = setTimeout(() => controller.abort(new Error('CONTENT_REQUEST_TIMEOUT')), CONTENT_NETWORK_LIMITS.timeoutMs)
     const requestSignal = AbortSignal.any([signal, controller.signal])
     try {
@@ -148,6 +185,12 @@ export function createNetworkContent(options: {
       else if (message.type === 'chunk-request') {
         const bytes = await awaitOwnedTask(requestSignal, () => local.chunk(message.reference, message.index, { signal: requestSignal }))
         response = { type: 'chunk-response', id: message.id, bytes: bytes === null ? null : base64(bytes) }
+      } else if (message.type === 'blob-info-request') {
+        const info = await awaitOwnedTask(requestSignal, () => local.blobInfo!(message.hash, { signal: requestSignal }))
+        response = { type: 'blob-info-response', id: message.id, bytes: info === null ? null : info.bytes }
+      } else if (message.type === 'blob-chunk-request') {
+        const bytes = await awaitOwnedTask(requestSignal, () => local.blobChunk!(message.hash, message.index, { signal: requestSignal }))
+        response = { type: 'blob-chunk-response', id: message.id, bytes: bytes === null ? null : base64(bytes) }
       } else response = { type: 'retain-response', id: message.id, receipt: await awaitOwnedTask(requestSignal, () => options.content.retain(message.reference, { signal: requestSignal })) }
       requestSignal.throwIfAborted(); allowed(); await send(response)
     } catch {
@@ -157,7 +200,7 @@ export function createNetworkContent(options: {
   return { close, async handle(message) {
     allowed(); assertContentWireMessage(message)
     if (message.type === 'cancel') { active.get(message.id)?.abort(new Error('CONTENT_REQUEST_CANCELLED')); return }
-    if (message.type === 'manifest-request' || message.type === 'chunk-request' || message.type === 'retain-request') {
+    if (message.type === 'manifest-request' || message.type === 'chunk-request' || message.type === 'retain-request' || message.type === 'blob-info-request' || message.type === 'blob-chunk-request') {
       check(!active.has(message.id), 'CONTENT_REQUEST_DUPLICATE')
       if (active.size >= CONTENT_NETWORK_LIMITS.active) { await send({ type: 'error', id: message.id, code: 'CONTENT_BUSY' }); return }
       const controller = new AbortController(); active.set(message.id, controller)
