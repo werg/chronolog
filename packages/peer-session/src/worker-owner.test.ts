@@ -150,15 +150,15 @@ it('diagnostic-only attachments cannot exercise owner finalizer or extension aut
   expect(f.client.status.canAuthor).toBe(false)
   expect(await f.client.diagnostics()).toEqual([])
   expect((await f.client.endpoints()).length).toBe(1)
-  await expect(f.client.finality.createCheckpoint({ throughMs: 1n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  await expect(f.client.finality.submitCheckpoints([])).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  await expect(f.client.admission.createCheckpoint({ throughMs: 1n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  await expect(f.client.admission.submitEvidence([])).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   await expect(f.client.extensions.call('admission.state')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
 })
 
-it('owner extensions are capability-scoped named actions with owner notices, independent of finality', async () => {
+it('owner extensions are capability-scoped named actions with owner notices, independent of admission', async () => {
   const { createSigningIdentity } = await import('@chronolog/authority')
   const identity = await createSigningIdentity()
-  const f = await sessionFixture({ identities: [identity], finalityPolicy: { kind: 'signed-frontier', signer: identity.publicKey } })
+  const f = await sessionFixture({ identities: [identity], admissionPolicy: { kind: 'signed-frontier', signer: identity.publicKey } })
   const session = await f.open(0)
   const listeners = new Set<(value: unknown) => void>(), calls: unknown[] = []
   const owner = createApplicationOwner(session, {
@@ -180,14 +180,14 @@ it('owner extensions are capability-scoped named actions with owner notices, ind
     closes.push(() => client.detach())
     return client
   }
-  const finalizer = await attach(['finality']), extended = await attach(['extensions'])
+  const finalizer = await attach(['admission']), extended = await attach(['extensions'])
   const operation = await session.command('say', 'eligible finalizer', { authorTimestampMs: 1n })
   await operation.materialized()
-  const cp = await finalizer.finality.createCheckpoint({ throughMs: 2n })
-  expect(cp.checkpoint.payload.closedThroughMs).toBe(2n)
+  const cp = await finalizer.admission.createCheckpoint({ throughMs: 2n })
+  expect((cp.evidence.payload as { readonly closedThroughMs: bigint }).closedThroughMs).toBe(2n)
   expect(operation.inspect().finalized).toBe(true)
   await expect(finalizer.extensions.call('admission.state')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  await expect(extended.finality.createCheckpoint({ throughMs: 3n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  await expect(extended.admission.createCheckpoint({ throughMs: 3n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   const notices: unknown[] = []
   const heard = new Promise<void>(resolve => { extended.extensions.subscribe(value => { notices.push(value); resolve() }) })
   const muted: unknown[] = []
@@ -213,7 +213,7 @@ it('replication capability exchanges authenticated operation-set facts with an o
   closes.push(() => owner.close(), () => replica.close())
   const client = await attach(), denied = await attach(['diagnostics'])
   await expect(denied.exportFacts()).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
-  await expect(denied.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: [], retentions: [], checkpoints: [] })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  await expect(denied.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: [], retentions: [], evidence: [] })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   const local = await client.command('say', 'from owner', { operationId: 'owner-1', authorTimestampMs: 20n })
   await local.materialized()
   const remote = await replica.command('say', 'from replica', { operationId: 'replica-1', authorTimestampMs: 10n })

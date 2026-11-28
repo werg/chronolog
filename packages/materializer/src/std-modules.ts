@@ -13,8 +13,10 @@ import { STD_FS_SOURCE } from './std/fs.js'
 import { STD_MOUNTS_SOURCE } from './std/mounts.js'
 import { STD_BUILDERS_SOURCE } from './std/builders.js'
 import { STD_REGISTRY_SOURCE } from './std/registry.js'
+import { STD_ADMISSION_SOURCE } from './std/admission.js'
+import { STD_SEALS_SOURCE } from './std/seals.js'
+import { STD_REDUCER_SOURCE } from './std/reducer.js'
 import {
-  STD_FINALITY_PREDICATES_SOURCE,
   STD_GUARDS_SOURCE,
   STD_QUOTAS_SOURCE,
   STD_QUEUE_SOURCE,
@@ -32,7 +34,9 @@ export {
   STD_MOUNTS_SOURCE,
   STD_BUILDERS_SOURCE,
   STD_REGISTRY_SOURCE,
-  STD_FINALITY_PREDICATES_SOURCE,
+  STD_ADMISSION_SOURCE,
+  STD_SEALS_SOURCE,
+  STD_REDUCER_SOURCE,
   STD_GUARDS_SOURCE,
   STD_QUOTAS_SOURCE,
   STD_QUEUE_SOURCE,
@@ -41,797 +45,12 @@ export {
   STD_AUDIT_SOURCE,
 }
 
-export const STD_PERMISSIONS_SOURCE = `
-import { verifyEd25519, canonicalJson } from 'chronolog:crypto';
-
-const HEX32 = /^[0-9a-f]{64}$/;
-const HEX64 = /^[0-9a-f]{128}$/;
-
-function sortedKeys(list) {
-  return Array.from(new Set(list)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-}
-
-function isLegacyAdmin(perms, author) {
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.administrator === true));
-}
-
-function hasCapability(ctx, capability, actor) {
-  const checked = ctx.query('$permissions', { check: capability, actor });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  if (!perms || !Array.isArray(perms.members)) return false;
-  const m = perms.members.find(x => x.publicKey === actor);
-  if (!m) return false;
-  if (capability === 'administrator') return m.administrator === true;
-  if (capability === 'publisher') return m.publisher === true || m.administrator === true;
-  if (capability === 'writer') return m.writer === true || m.administrator === true;
-  if (capability === 'reader') return m.reader === true;
-  if (capability === 'finalizer') return m.finalizer === true;
-  return true;
-}
-
-function normalizeMember(m) {
-  if (!m || typeof m !== 'object' || !HEX32.test(m.publicKey || '') || (m.wrapKey !== undefined && m.wrapKey !== null && !HEX32.test(m.wrapKey))) {
-    throw new Error('INVALID_MEMBER');
-  }
-  const scopes = Array.isArray(m.scopes)
-    ? sortedKeys(m.scopes.filter(s => typeof s === 'string' && s.length > 0 && s.length <= 128))
-    : undefined;
-  const expiresAtMs = m.expiresAtMs !== undefined && m.expiresAtMs !== null && Number.isSafeInteger(m.expiresAtMs)
-    ? m.expiresAtMs
-    : undefined;
-  return {
-    publicKey: m.publicKey,
-    ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
-    ...(typeof m.label === 'string' && m.label.length > 0 ? { label: m.label } : {}),
-    ...(typeof m.subject === 'string' && m.subject.length > 0 ? { subject: m.subject } : {}),
-    ...(scopes && scopes.length > 0 ? { scopes } : {}),
-    ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
-    reader: Boolean(m.reader),
-    writer: Boolean(m.writer),
-    administrator: Boolean(m.administrator),
-    publisher: Boolean(m.publisher),
-    finalizer: Boolean(m.finalizer),
-  };
-}
-
-function isMemberExpired(member, atMs) {
-  if (!member || member.expiresAtMs === undefined || member.expiresAtMs === null) return false;
-  if (!Number.isSafeInteger(atMs) || atMs <= 0) return false;
-  return atMs > member.expiresAtMs;
-}
-
-function queryMembersList(members, role) {
-  if (role === 'members') return members;
-  if (role === 'readers') return sortedKeys(members.filter(m => m.reader === true).map(m => m.publicKey));
-  if (role === 'writers') return sortedKeys(members.filter(m => m.writer === true || m.administrator === true).map(m => m.publicKey));
-  if (role === 'administrators') return sortedKeys(members.filter(m => m.administrator === true).map(m => m.publicKey));
-  if (role === 'publishers') return sortedKeys(members.filter(m => m.publisher === true || m.administrator === true).map(m => m.publicKey));
-  if (role === 'finalizers') return sortedKeys(members.filter(m => m.finalizer === true).map(m => m.publicKey));
-  return [];
-}
-
-function checkMembersCapability(members, capability, actor, options) {
-  const m = members.find(x => x.publicKey === actor);
-  if (!m) return false;
-  const atMs = options && Number.isSafeInteger(options.atMs) ? options.atMs : 0;
-  if (isMemberExpired(m, atMs)) return false;
-  if (capability === 'scope') {
-    if (m.administrator === true) return true;
-    const scope = options && typeof options.scope === 'string' ? options.scope : '';
-    if (!scope) return false;
-    if (!Array.isArray(m.scopes)) return false;
-    return m.scopes.includes('*') || m.scopes.includes(scope);
-  }
-  if (capability === 'reader') return m.reader === true;
-  if (capability === 'writer') return m.writer === true || m.administrator === true;
-  if (capability === 'administrator') return m.administrator === true;
-  if (capability === 'publisher') return m.publisher === true || m.administrator === true;
-  if (capability === 'finalizer') return m.finalizer === true;
-  if (capability === 'member') return true;
-  return false;
-}
-
-function isLegacyReader(perms, author) {
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.reader === true));
-}
-
-function attestedMatchesPolicy(cur, attPayload, member) {
-  const adm = cur.admission;
-  if (!adm || adm.mode === 'strict') return false;
-  if (Array.isArray(adm.removed) && adm.removed.includes(member.publicKey)) return false;
-  if (cur.members.some(m => m.publicKey === member.publicKey)) return false;
-  const accounts = Array.isArray(adm.accounts) ? adm.accounts : [];
-  const email = typeof attPayload.email === 'string' ? attPayload.email.toLowerCase() : null;
-  const accountOk = accounts.includes(attPayload.accountId) || (email !== null && accounts.includes('email:' + email));
-  if (accountOk) {
-    if (attPayload.subject === 'agent') {
-      return member.administrator !== true && member.finalizer !== true;
-    }
-    const grant = adm.grant || { reader: true, writer: true, administrator: true };
-    return Boolean(member.reader) === Boolean(grant.reader) &&
-      Boolean(member.writer) === Boolean(grant.writer) &&
-      Boolean(member.administrator) === Boolean(grant.administrator);
-  }
-  if (attPayload.inviteId && Array.isArray(adm.invites)) {
-    const inv = adm.invites.find(i => i.inviteId === attPayload.inviteId && !i.revoked);
-    if (!inv) return false;
-    if (inv.binding && inv.binding.kind === 'email' && email !== inv.binding.email) return false;
-    const expected = inv.role === 'admin'
-      ? { reader: true, writer: true, administrator: true }
-      : inv.role === 'reader'
-        ? { reader: true, writer: false, administrator: false }
-        : { reader: true, writer: true, administrator: false };
-    return Boolean(member.reader) === expected.reader &&
-      Boolean(member.writer) === expected.writer &&
-      Boolean(member.administrator) === expected.administrator;
-  }
-  return false;
-}
-
-export const attestedMembers = {
-  reduce(state, tx) {
-    const cur = state && typeof state === 'object' ? state : { members: [], admission: null };
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-    const authorIsAdmin = isLegacyAdmin(cur, tx.author);
-
-    if (input.action === 'setMember') {
-      if (!authorIsAdmin) {
-        if (!isLegacyReader(cur, tx.author) || !input.attestation) {
-          return { ok: false, code: 'admin_required' };
-        }
-      }
-      if (input.attestation) {
-        const att = input.attestation;
-        const hostKey = cur.admission && cur.admission.hostKey;
-        if (!hostKey || !HEX32.test(hostKey) || !HEX64.test(att.signature || '')) {
-          return { ok: false, code: 'attestation_invalid' };
-        }
-        const msg = canonicalJson(['chronolog/host-attestation/v1', att.payload]);
-        if (!verifyEd25519(hostKey, msg, att.signature)) {
-          return { ok: false, code: 'attestation_signature_invalid' };
-        }
-        if (att.payload.publicKey !== input.member.publicKey) {
-          return { ok: false, code: 'attestation_subject_mismatch' };
-        }
-        if (!authorIsAdmin && !attestedMatchesPolicy(cur, att.payload, input.member)) {
-          return { ok: false, code: 'admin_required' };
-        }
-      }
-      const next = normalizeMember(input.member);
-      const members = cur.members.filter(m => m.publicKey !== next.publicKey).concat([next]);
-      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-      let admission = cur.admission;
-      if (authorIsAdmin && admission && Array.isArray(admission.removed) && admission.removed.includes(next.publicKey)) {
-        admission = { ...admission, removed: admission.removed.filter(k => k !== next.publicKey) };
-      }
-      return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
-    }
-
-    if (input.action === 'requestRecovery') {
-      const guardians = cur.guardians;
-      if (!guardians || !Array.isArray(guardians.members) || guardians.members.length === 0) {
-        return { ok: false, code: 'guardians_not_configured' };
-      }
-      if (!HEX32.test(input.newPublicKey || '') || !HEX32.test(input.newWrapKey || '')) {
-        return { ok: false, code: 'invalid_recovery_key' };
-      }
-      if (tx.author !== input.newPublicKey && !authorIsAdmin) {
-        return { ok: false, code: 'recovery_author_mismatch' };
-      }
-      const requestId = typeof input.requestId === 'string' && input.requestId.length > 0 ? input.requestId : tx.opId;
-      const requests = { ...(cur.recoveryRequests || {}) };
-      requests[requestId] = {
-        requestId,
-        newPublicKey: input.newPublicKey,
-        newWrapKey: input.newWrapKey,
-        label: typeof input.label === 'string' ? input.label.slice(0, 80) : 'Recovered device',
-        verificationCode: typeof input.verificationCode === 'string' ? input.verificationCode.slice(0, 32) : '',
-        approvals: [],
-        status: 'pending',
-        createdAtMs: Number(tx.authorTimestampMs || 0),
-      };
-      return {
-        ok: true,
-        state: { ...cur, recoveryRequests: requests },
-        events: [{ topic: '$permissions.recovery_requested', payload: { requestId, newPublicKey: input.newPublicKey } }],
-      };
-    }
-
-    if (input.action === 'approveRecovery') {
-      const guardians = cur.guardians;
-      if (!guardians || !Array.isArray(guardians.members) || !guardians.members.some(g => g.publicKey === tx.author)) {
-        return { ok: false, code: 'guardian_required' };
-      }
-      const requests = { ...(cur.recoveryRequests || {}) };
-      const req = requests[input.requestId];
-      if (!req || req.status !== 'pending') return { ok: false, code: 'recovery_request_not_found' };
-      const approvals = sortedKeys((req.approvals || []).concat([tx.author]));
-      const completed = approvals.length >= guardians.threshold;
-      requests[input.requestId] = { ...req, approvals, status: completed ? 'completed' : 'pending' };
-      let members = cur.members;
-      if (completed) {
-        const promoted = normalizeMember({
-          publicKey: req.newPublicKey,
-          wrapKey: req.newWrapKey,
-          label: req.label,
-          reader: true,
-          writer: true,
-          administrator: true,
-          publisher: true,
-          finalizer: false,
-        });
-        members = cur.members.filter(m => m.publicKey !== promoted.publicKey).concat([promoted]);
-        members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-      }
-      return {
-        ok: true,
-        state: { ...cur, members, recoveryRequests: requests },
-        events: [{ topic: completed ? '$permissions.recovery_completed' : '$permissions.recovery_approved', payload: { requestId: input.requestId, guardian: tx.author, approvals: approvals.length, threshold: guardians.threshold } }],
-      };
-    }
-
-    if (!authorIsAdmin) return { ok: false, code: 'admin_required' };
-
-    if (input.action === 'setGuardians') {
-      if (input.guardians === null) {
-        return { ok: true, state: { ...cur, guardians: null }, events: [{ topic: '$permissions.guardians_cleared', payload: {} }] };
-      }
-      const g = input.guardians;
-      if (!g || typeof g !== 'object' || !Array.isArray(g.members) || g.members.length === 0) {
-        return { ok: false, code: 'invalid_guardians' };
-      }
-      const cleaned = [];
-      const seen = new Set();
-      for (const item of g.members) {
-        if (!item || !HEX32.test(item.publicKey || '') || !HEX32.test(item.wrapKey || '') || seen.has(item.publicKey)) {
-          return { ok: false, code: 'invalid_guardian' };
-        }
-        seen.add(item.publicKey);
-        cleaned.push({
-          publicKey: item.publicKey,
-          wrapKey: item.wrapKey,
-          ...(typeof item.label === 'string' && item.label.length > 0 ? { label: item.label.slice(0, 80) } : {}),
-        });
-      }
-      cleaned.sort((a, b) => (a.publicKey < b.publicKey ? -1 : 1));
-      const threshold = Number(g.threshold);
-      if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > cleaned.length) {
-        return { ok: false, code: 'invalid_guardian_threshold' };
-      }
-      return {
-        ok: true,
-        state: { ...cur, guardians: { threshold, members: cleaned } },
-        events: [{ topic: '$permissions.guardians_updated', payload: { threshold, count: cleaned.length } }],
-      };
-    }
-
-    if (input.action === 'removeMember') {
-      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
-      const members = cur.members.filter(m => m.publicKey !== input.publicKey);
-      if (!members.some(m => m.administrator)) return { ok: false, code: 'last_admin_required' };
-      let admission = cur.admission;
-      if (admission && typeof admission === 'object') {
-        const prevRemoved = Array.isArray(admission.removed) ? admission.removed : [];
-        const removed = sortedKeys(prevRemoved.concat([input.publicKey])).slice(-512);
-        admission = { ...admission, removed };
-      }
-      return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$permissions.removed', payload: { publicKey: input.publicKey } }] };
-    }
-
-    if (input.action === 'createInvite') {
-      const inv = input.invite;
-      if (!inv || typeof inv !== 'object' || typeof inv.inviteId !== 'string' || inv.inviteId.length < 1 || inv.inviteId.length > 128) {
-        return { ok: false, code: 'invalid_invite' };
-      }
-      const admission = cur.admission && typeof cur.admission === 'object' ? cur.admission : { mode: 'attested' };
-      const invites = (Array.isArray(admission.invites) ? admission.invites : []).filter(i => i.inviteId !== inv.inviteId).concat([{ ...inv, revoked: false }]).slice(-128);
-      return { ok: true, state: { ...cur, admission: { ...admission, invites } }, events: [{ topic: '$permissions.invite_created', payload: { inviteId: inv.inviteId } }] };
-    }
-
-    if (input.action === 'revokeInvite') {
-      if (typeof input.inviteId !== 'string' || !input.inviteId) return { ok: false, code: 'invalid_invite' };
-      const admission = cur.admission && typeof cur.admission === 'object' ? cur.admission : null;
-      if (!admission || !Array.isArray(admission.invites)) return { ok: false, code: 'invite_not_found' };
-      let found = false;
-      const invites = admission.invites.map(i => {
-        if (i.inviteId !== input.inviteId) return i;
-        found = true;
-        return { ...i, revoked: true };
-      });
-      if (!found) return { ok: false, code: 'invite_not_found' };
-      return { ok: true, state: { ...cur, admission: { ...admission, invites } }, events: [{ topic: '$permissions.invite_revoked', payload: { inviteId: input.inviteId } }] };
-    }
-
-    if (input.action === 'setAdmission') {
-      return { ok: true, state: { ...cur, admission: input.admission ?? null } };
-    }
-
-    return { ok: false, code: 'unknown_action' };
-  },
-  query(state, input) {
-    const cur = state && typeof state === 'object' ? state : { members: [], admission: null };
-    const members = Array.isArray(cur.members) ? cur.members : [];
-    if (input && typeof input === 'object') {
-      if (typeof input.check === 'string' && typeof input.actor === 'string') {
-        if (input.check === 'guardian') {
-          return Boolean(cur.guardians && Array.isArray(cur.guardians.members) && cur.guardians.members.some(g => g.publicKey === input.actor));
-        }
-        return checkMembersCapability(members, input.check, input.actor, input);
-      }
-      if (typeof input.list === 'string') {
-        if (input.list === 'guardians') return cur.guardians && Array.isArray(cur.guardians.members) ? cur.guardians.members.map(g => g.publicKey) : [];
-        return queryMembersList(members, input.list);
-      }
-      if (input.guardians === true) {
-        return { guardians: cur.guardians ?? null, recoveryRequests: cur.recoveryRequests ?? {} };
-      }
-      if (input.admission === true) {
-        return cur.admission ?? null;
-      }
-      if (input.summary === true) {
-        return {
-          mode: 'attested',
-          members,
-          readers: queryMembersList(members, 'readers'),
-          writers: queryMembersList(members, 'writers'),
-          administrators: queryMembersList(members, 'administrators'),
-          publishers: queryMembersList(members, 'publishers'),
-          openReaders: false,
-          openWriters: false,
-          blockedAuthors: [],
-          admission: cur.admission ?? null,
-          guardians: cur.guardians ?? null,
-          recoveryRequests: cur.recoveryRequests ?? {},
-          multisig: null,
-        };
-      }
-      if (input.publicKey) {
-        return members.find(m => m.publicKey === input.publicKey) || null;
-      }
-    }
-    return cur;
-  },
-};
-
-/**
- * Open public-write / open-read authority model:
- * Any valid Ed25519 key can write (and read when openRead !== false), while listed
- * administrators govern control topics ($reducers, $finality, $publications).
- */
-export const openMembers = {
-  reduce(state, tx) {
-    const cur = state && typeof state === 'object'
-      ? {
-          admins: Array.isArray(state.admins) ? state.admins : [],
-          members: Array.isArray(state.members) ? state.members : [],
-          openRead: state.openRead !== false,
-          openWrite: state.openWrite !== false,
-          blockedAuthors: Array.isArray(state.blockedAuthors) ? state.blockedAuthors : [],
-          vouchedAuthors: Array.isArray(state.vouchedAuthors) ? state.vouchedAuthors : [],
-          antiSpam: state.antiSpam && typeof state.antiSpam === 'object' ? state.antiSpam : null,
-          admission: state.admission ?? null,
-        }
-      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], vouchedAuthors: [], antiSpam: null, admission: null };
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-
-    if (input.action === 'vouchAuthor') {
-      const canVouch = cur.admins.includes(tx.author) || cur.vouchedAuthors.includes(tx.author);
-      if (!canVouch) return { ok: false, code: 'vouch_permission_required' };
-      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
-      if (cur.blockedAuthors.includes(input.publicKey)) return { ok: false, code: 'author_blocked' };
-      const vouchedAuthors = sortedKeys(cur.vouchedAuthors.concat([input.publicKey])).slice(-4096);
-      return { ok: true, state: { ...cur, vouchedAuthors }, events: [{ topic: '$permissions.author_vouched', payload: { publicKey: input.publicKey, by: tx.author } }] };
-    }
-
-    if (!cur.admins.includes(tx.author)) return { ok: false, code: 'admin_required' };
-
-    if (input.action === 'setAntiSpam') {
-      if (input.antiSpam === null) {
-        return { ok: true, state: { ...cur, antiSpam: null } };
-      }
-      const cfg = input.antiSpam;
-      if (!cfg || typeof cfg !== 'object') return { ok: false, code: 'invalid_antispam' };
-      const next = {
-        requireVouch: Boolean(cfg.requireVouch),
-        ...(Number.isSafeInteger(cfg.maxOpsPerWindow) && cfg.maxOpsPerWindow > 0 ? { maxOpsPerWindow: cfg.maxOpsPerWindow } : {}),
-        ...(Number.isSafeInteger(cfg.windowMs) && cfg.windowMs > 0 ? { windowMs: cfg.windowMs } : {}),
-      };
-      return { ok: true, state: { ...cur, antiSpam: next }, events: [{ topic: '$permissions.antispam_updated', payload: next }] };
-    }
-
-    if (input.action === 'setAdmin') {
-      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
-      const admins = input.enabled === false
-        ? cur.admins.filter(k => k !== input.publicKey)
-        : sortedKeys(cur.admins.concat([input.publicKey]));
-      if (admins.length === 0) return { ok: false, code: 'last_admin_required' };
-      const blockedAuthors = input.enabled === false
-        ? cur.blockedAuthors
-        : cur.blockedAuthors.filter(k => k !== input.publicKey);
-      return { ok: true, state: { ...cur, admins, blockedAuthors }, events: [{ topic: '$permissions.admin', payload: { publicKey: input.publicKey, enabled: input.enabled !== false } }] };
-    }
-
-    if (input.action === 'setOpen') {
-      return {
-        ok: true,
-        state: {
-          ...cur,
-          ...(input.openRead === undefined ? {} : { openRead: Boolean(input.openRead) }),
-          ...(input.openWrite === undefined ? {} : { openWrite: Boolean(input.openWrite) }),
-        },
-      };
-    }
-
-    if (input.action === 'blockAuthor') {
-      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
-      if (cur.admins.includes(input.publicKey)) return { ok: false, code: 'cannot_block_admin' };
-      const blockedAuthors = sortedKeys(cur.blockedAuthors.concat([input.publicKey])).slice(-2048);
-      return {
-        ok: true,
-        state: { ...cur, blockedAuthors },
-        events: [{ topic: '$permissions.author_blocked', payload: { publicKey: input.publicKey, ...(typeof input.reason === 'string' && input.reason ? { reason: input.reason.slice(0, 160) } : {}) } }],
-      };
-    }
-
-    if (input.action === 'unblockAuthor') {
-      if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
-      const blockedAuthors = cur.blockedAuthors.filter(k => k !== input.publicKey);
-      return {
-        ok: true,
-        state: { ...cur, blockedAuthors },
-        events: [{ topic: '$permissions.author_unblocked', payload: { publicKey: input.publicKey } }],
-      };
-    }
-
-    if (input.action === 'setMember') {
-      const next = normalizeMember(input.member);
-      const members = cur.members.filter(m => m.publicKey !== next.publicKey).concat([next]);
-      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-      const admins = next.administrator ? sortedKeys(cur.admins.concat([next.publicKey])) : cur.admins;
-      const blockedAuthors = next.administrator ? cur.blockedAuthors.filter(k => k !== next.publicKey) : cur.blockedAuthors;
-      return { ok: true, state: { ...cur, admins, members, blockedAuthors }, events: [{ topic: '$permissions.member', payload: { publicKey: next.publicKey } }] };
-    }
-
-    return { ok: false, code: 'unknown_action' };
-  },
-  query(state, input) {
-    const cur = state && typeof state === 'object'
-      ? {
-          admins: Array.isArray(state.admins) ? state.admins : [],
-          members: Array.isArray(state.members) ? state.members : [],
-          openRead: state.openRead !== false,
-          openWrite: state.openWrite !== false,
-          blockedAuthors: Array.isArray(state.blockedAuthors) ? sortedKeys(state.blockedAuthors.filter(k => HEX32.test(k || ''))) : [],
-          vouchedAuthors: Array.isArray(state.vouchedAuthors) ? sortedKeys(state.vouchedAuthors.filter(k => HEX32.test(k || ''))) : [],
-          antiSpam: state.antiSpam && typeof state.antiSpam === 'object' ? state.antiSpam : null,
-          admission: state.admission ?? null,
-        }
-      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], vouchedAuthors: [], antiSpam: null, admission: null };
-
-    const adminSet = new Set(cur.admins);
-    const blockedSet = new Set(cur.blockedAuthors);
-    const vouchedSet = new Set(cur.vouchedAuthors);
-    const synthesizedMap = new Map();
-    for (const m of cur.members) synthesizedMap.set(m.publicKey, m);
-    for (const a of cur.admins) {
-      const existing = synthesizedMap.get(a);
-      synthesizedMap.set(a, {
-        publicKey: a,
-        ...(existing && existing.wrapKey ? { wrapKey: existing.wrapKey } : {}),
-        reader: true,
-        writer: true,
-        administrator: true,
-        publisher: true,
-        finalizer: Boolean(existing && existing.finalizer),
-      });
-    }
-    const members = Array.from(synthesizedMap.values()).sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-
-    if (input && typeof input === 'object') {
-      if (typeof input.check === 'string' && typeof input.actor === 'string') {
-        if (!HEX32.test(input.actor)) return false;
-        if (input.check === 'blocked') return blockedSet.has(input.actor);
-        if (input.check === 'administrator') return adminSet.has(input.actor);
-        if (input.check === 'publisher') return adminSet.has(input.actor) || checkMembersCapability(members, 'publisher', input.actor);
-        if (input.check === 'writer') {
-          if (blockedSet.has(input.actor)) return false;
-          if (adminSet.has(input.actor)) return true;
-          if (checkMembersCapability(members, 'writer', input.actor, input)) return true;
-          if (!cur.openWrite) return false;
-          if (cur.antiSpam && cur.antiSpam.requireVouch === true) {
-            return vouchedSet.has(input.actor);
-          }
-          return true;
-        }
-        if (input.check === 'reader') return cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'reader', input.actor, input);
-        if (input.check === 'member') return cur.openWrite || cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'member', input.actor, input);
-        return checkMembersCapability(members, input.check, input.actor, input);
-      }
-      if (typeof input.list === 'string') {
-        if (input.list === 'blockedAuthors') return cur.blockedAuthors;
-        if (input.list === 'readers' && cur.openRead) return ['*'];
-        if (input.list === 'writers' && cur.openWrite) return ['*'];
-        return queryMembersList(members, input.list);
-      }
-      if (input.admission === true) return cur.admission;
-      if (input.summary === true) {
-        return {
-          mode: 'open',
-          members,
-          readers: cur.openRead ? ['*'] : queryMembersList(members, 'readers'),
-          writers: cur.openWrite ? ['*'] : queryMembersList(members, 'writers'),
-          administrators: sortedKeys(cur.admins),
-          publishers: queryMembersList(members, 'publishers'),
-          openReaders: cur.openRead,
-          openWriters: cur.openWrite,
-          blockedAuthors: cur.blockedAuthors,
-          admission: cur.admission,
-          multisig: null,
-        };
-      }
-      if (input.publicKey) {
-        return members.find(m => m.publicKey === input.publicKey) || null;
-      }
-    }
-    return cur;
-  },
-};
-
-/**
- * M-of-N multisig authority model (zero host attestation, completely distinct state shape):
- * State: { threshold: number, signers: string[], members: Record<pubkey, { wrapKey?, reader, writer, publisher, finalizer }>, proposals: Record<id, ...> }
- * Signers submit proposals (action: 'propose' | 'approve'); once approvals >= threshold, the proposal executes atomically.
- */
-function normalizeMultisigState(state) {
-  const s = state && typeof state === 'object' ? state : {};
-  const signers = sortedKeys(Array.isArray(s.signers) ? s.signers.filter(k => HEX32.test(k || '')) : []);
-  const threshold = Number.isSafeInteger(s.threshold) && s.threshold >= 1 ? Math.min(s.threshold, Math.max(1, signers.length)) : 1;
-  const members = s.members && typeof s.members === 'object' && !Array.isArray(s.members) ? { ...s.members } : {};
-  const proposals = s.proposals && typeof s.proposals === 'object' && !Array.isArray(s.proposals) ? { ...s.proposals } : {};
-  return { threshold, signers, members, proposals };
-}
-
-function multisigMemberRecords(cur) {
-  const byKey = new Map();
-  for (const [pk, entry] of Object.entries(cur.members)) {
-    if (!HEX32.test(pk) || !entry || typeof entry !== 'object') continue;
-    byKey.set(pk, {
-      publicKey: pk,
-      ...(entry.wrapKey ? { wrapKey: entry.wrapKey } : {}),
-      reader: Boolean(entry.reader),
-      writer: Boolean(entry.writer),
-      administrator: cur.signers.includes(pk),
-      publisher: Boolean(entry.publisher) || cur.signers.includes(pk),
-      finalizer: Boolean(entry.finalizer),
-    });
-  }
-  for (const pk of cur.signers) {
-    if (!byKey.has(pk)) {
-      byKey.set(pk, {
-        publicKey: pk,
-        reader: true,
-        writer: true,
-        administrator: true,
-        publisher: true,
-        finalizer: false,
-      });
-    }
-  }
-  return Array.from(byKey.values()).sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-}
-
-function applyMultisigProposal(cur, prop) {
-  if (prop.kind === 'setMember') {
-    const m = normalizeMember(prop.member);
-    const nextMembers = {
-      ...cur.members,
-      [m.publicKey]: {
-        ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
-        reader: m.reader,
-        writer: m.writer,
-        publisher: m.publisher,
-        finalizer: m.finalizer,
-      },
-    };
-    const nextSigners = m.administrator
-      ? sortedKeys(cur.signers.concat([m.publicKey]))
-      : cur.signers.filter(k => k !== m.publicKey);
-    if (nextSigners.length === 0 || nextSigners.length < cur.threshold) {
-      return { ok: false, code: 'threshold_unsatisfiable' };
-    }
-    return { ok: true, state: { ...cur, signers: nextSigners, members: nextMembers }, event: { topic: '$permissions.member', payload: { publicKey: m.publicKey } } };
-  }
-  if (prop.kind === 'removeMember') {
-    if (!HEX32.test(prop.publicKey || '')) return { ok: false, code: 'invalid_member' };
-    const nextMembers = { ...cur.members };
-    delete nextMembers[prop.publicKey];
-    const nextSigners = cur.signers.filter(k => k !== prop.publicKey);
-    if (nextSigners.length === 0 || nextSigners.length < cur.threshold) return { ok: false, code: 'threshold_unsatisfiable' };
-    return { ok: true, state: { ...cur, signers: nextSigners, members: nextMembers }, event: { topic: '$permissions.removed', payload: { publicKey: prop.publicKey } } };
-  }
-  if (prop.kind === 'setThreshold') {
-    const t = prop.threshold;
-    if (!Number.isSafeInteger(t) || t < 1 || t > cur.signers.length) return { ok: false, code: 'invalid_threshold' };
-    return { ok: true, state: { ...cur, threshold: t }, event: { topic: '$permissions.threshold', payload: { threshold: t } } };
-  }
-  return { ok: false, code: 'unknown_proposal_kind' };
-}
-
-export const multisigMembers = {
-  reduce(state, tx) {
-    const cur = normalizeMultisigState(state);
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-    if (!cur.signers.includes(tx.author)) return { ok: false, code: 'signer_required' };
-
-    if (input.action === 'propose') {
-      const id = typeof input.proposalId === 'string' && input.proposalId.length > 0 ? input.proposalId : tx.opId;
-      if (cur.proposals[id]) return { ok: false, code: 'proposal_exists' };
-      const prop = {
-        kind: input.kind,
-        ...(input.member !== undefined ? { member: input.member } : {}),
-        ...(input.publicKey !== undefined ? { publicKey: input.publicKey } : {}),
-        ...(input.threshold !== undefined ? { threshold: input.threshold } : {}),
-        approvals: [tx.author],
-      };
-      if (prop.approvals.length >= cur.threshold) {
-        const applied = applyMultisigProposal(cur, prop);
-        if (!applied.ok) return applied;
-        return { ok: true, state: applied.state, events: [applied.event] };
-      }
-      const nextProposals = { ...cur.proposals, [id]: prop };
-      return {
-        ok: true,
-        state: { ...cur, proposals: nextProposals },
-        events: [{ topic: '$permissions.proposed', payload: { proposalId: id, approvals: 1, threshold: cur.threshold } }],
-      };
-    }
-
-    if (input.action === 'approve') {
-      const id = input.proposalId;
-      const existing = typeof id === 'string' ? cur.proposals[id] : null;
-      if (!existing) return { ok: false, code: 'proposal_not_found' };
-      const approvals = sortedKeys((existing.approvals || []).concat([tx.author]));
-      const updated = { ...existing, approvals };
-      if (approvals.length >= cur.threshold) {
-        const nextProposals = { ...cur.proposals };
-        delete nextProposals[id];
-        const applied = applyMultisigProposal({ ...cur, proposals: nextProposals }, updated);
-        if (!applied.ok) return applied;
-        return { ok: true, state: applied.state, events: [applied.event] };
-      }
-      return {
-        ok: true,
-        state: { ...cur, proposals: { ...cur.proposals, [id]: updated } },
-        events: [{ topic: '$permissions.approved', payload: { proposalId: id, approvals: approvals.length, threshold: cur.threshold } }],
-      };
-    }
-
-    if (input.action === 'cancel') {
-      const id = input.proposalId;
-      if (typeof id !== 'string' || !cur.proposals[id]) return { ok: false, code: 'proposal_not_found' };
-      const nextProposals = { ...cur.proposals };
-      delete nextProposals[id];
-      return {
-        ok: true,
-        state: { ...cur, proposals: nextProposals },
-        events: [{ topic: '$permissions.cancelled', payload: { proposalId: id } }],
-      };
-    }
-
-    return { ok: false, code: 'unknown_action' };
-  },
-  query(state, input) {
-    const cur = normalizeMultisigState(state);
-    const members = multisigMemberRecords(cur);
-    if (input && typeof input === 'object') {
-      if (typeof input.check === 'string' && typeof input.actor === 'string') {
-        return checkMembersCapability(members, input.check, input.actor);
-      }
-      if (typeof input.list === 'string') {
-        return queryMembersList(members, input.list);
-      }
-      if (input.admission === true) return null;
-      if (input.summary === true) {
-        return {
-          mode: 'multisig',
-          members,
-          readers: queryMembersList(members, 'readers'),
-          writers: queryMembersList(members, 'writers'),
-          administrators: queryMembersList(members, 'administrators'),
-          publishers: queryMembersList(members, 'publishers'),
-          openReaders: false,
-          openWriters: false,
-          blockedAuthors: [],
-          admission: null,
-          multisig: {
-            threshold: cur.threshold,
-            signers: cur.signers,
-            proposals: cur.proposals,
-          },
-        };
-      }
-      if (input.publicKey) {
-        return members.find(m => m.publicKey === input.publicKey) || null;
-      }
-    }
-    return cur;
-  },
-};
-
-export const adminOnlyReducers = {
-  reduce(state, tx, ctx) {
-    if (!hasCapability(ctx, 'administrator', tx.author)) return { ok: false, code: 'admin_required' };
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-    const next = {
-      runtime: state.runtime,
-      imports: { ...(state.imports || {}) },
-      topics: { ...(state.topics || {}) },
-    };
-    if (input.imports && typeof input.imports === 'object') {
-      for (const [k, v] of Object.entries(input.imports)) {
-        if (v === null) delete next.imports[k];
-        else next.imports[k] = v;
-      }
-    }
-    if (input.topics && typeof input.topics === 'object') {
-      for (const [k, v] of Object.entries(input.topics)) {
-        if (v === null) delete next.topics[k];
-        else next.topics[k] = v;
-      }
-    }
-    return { ok: true, state: next, events: [{ topic: '$reducers.updated', payload: { author: tx.author } }] };
-  },
-};
-
-export const defaultSignalPolicy = {
-  reduce(state, tx, ctx) {
-    if (!hasCapability(ctx, 'administrator', tx.author)) return { ok: false, code: 'admin_required' };
-    if (!tx.payload || !Array.isArray(tx.payload.rules)) return { ok: false, code: 'invalid_signal_policy' };
-    return { ok: true, state: { rules: tx.payload.rules } };
-  },
-  query(state, _input, ctx) {
-    if (state && Array.isArray(state.rules)) return state;
-    const queried = ctx.query('$permissions', { list: 'readers' });
-    if (Array.isArray(queried)) {
-      return {
-        rules: [{ topicPattern: '*', allowedAuthors: queried, maxTtlMs: 30000, allowRelay: true }],
-      };
-    }
-    const perms = ctx.topic('$permissions') || { members: [] };
-    const readers = Array.isArray(perms.members) ? perms.members.filter(m => m.reader).map(m => m.publicKey) : [];
-    return {
-      rules: [{ topicPattern: '*', allowedAuthors: readers, maxTtlMs: 30000, allowRelay: true }],
-    };
-  },
-};
-`.trimStart()
-
 export const STD_KEYS_SOURCE = `
 const HEX32 = /^[0-9a-f]{64}$/;
 
-function isAdmin(ctx, author) {
-  const checked = ctx.query('$permissions', { check: 'administrator', actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.administrator === true));
-}
-
-function isReader(ctx, author) {
-  const checked = ctx.query('$permissions', { check: 'reader', actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.reader === true));
-}
-
-function isGuardian(ctx, author) {
-  const checked = ctx.query('$permissions', { check: 'guardian', actor: author });
-  return checked === true;
-}
+function isAdmin(ctx, author) { return ctx.can('administrator', author); }
+function isReader(ctx, author) { return ctx.can('reader', author); }
+function isGuardian(ctx, author) { return ctx.can('guardian', author); }
 
 const RING_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
@@ -1045,68 +264,11 @@ export const hpkeEpochs = {
 };
 `.trimStart()
 
-export const STD_FINALITY_SOURCE = `
-function isAdmin(ctx, author) {
-  const checked = ctx.query('$permissions', { check: 'administrator', actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && m.administrator === true));
-}
-
-function validPolicy(policy) {
-  if (!policy || typeof policy !== 'object') return false;
-  if (policy.kind === 'none') return true;
-  if (policy.kind === 'signed-frontier') return typeof policy.signer === 'string' && /^[0-9a-f]{64}$/.test(policy.signer);
-  if (policy.kind === 'fixed-validator') {
-    return Array.isArray(policy.validators) && policy.validators.length > 0 &&
-      policy.validators.every(v => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v)) &&
-      Number.isSafeInteger(policy.threshold) && policy.threshold >= 1 && policy.threshold <= policy.validators.length;
-  }
-  if (policy.kind === 'blockchain-anchor') {
-    return typeof policy.chain === 'string' && policy.chain.length > 0 && typeof policy.anchorId === 'string' && policy.anchorId.length > 0;
-  }
-  if (policy.kind === 'predicate') {
-    return typeof policy.module === 'string' && policy.module.length > 0 &&
-      (policy.export === undefined || (typeof policy.export === 'string' && policy.export.length > 0));
-  }
-  return false;
-}
-
-export const scheduledFinality = {
-  reduce(state, tx, ctx) {
-    if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
-    const cur = state && Array.isArray(state.schedule) ? state : { schedule: [{ effectiveAfterMs: -1, policy: { kind: 'none' } }] };
-    const input = tx.payload;
-    if (!input || input.action !== 'schedulePolicy' || !validPolicy(input.policy)) return { ok: false, code: 'invalid_finality_policy' };
-    const effectiveAfterMs = input.effectiveAfterMs;
-    const last = cur.schedule[cur.schedule.length - 1];
-    if (!Number.isSafeInteger(effectiveAfterMs) || effectiveAfterMs <= last.effectiveAfterMs) {
-      return { ok: false, code: 'finality_activation_not_monotonic' };
-    }
-    if (effectiveAfterMs < tx.authorTimestampMs) {
-      return { ok: false, code: 'finality_activation_in_past' };
-    }
-    const nextSchedule = cur.schedule.concat([{ effectiveAfterMs, policy: input.policy }]);
-    return {
-      ok: true,
-      state: { schedule: nextSchedule },
-      events: [{ topic: '$finality.scheduled', payload: { effectiveAfterMs, kind: input.policy.kind } }],
-    };
-  },
-  query(state) {
-    return state || { schedule: [{ effectiveAfterMs: -1, policy: { kind: 'none' } }] };
-  },
-};
-`.trimStart()
-
 export const STD_PUBLICATIONS_SOURCE = `
 const HEX32 = /^[0-9a-f]{64}$/;
 
 function isPublisher(ctx, author) {
-  const checked = ctx.query('$permissions', { check: 'publisher', actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === author && (m.publisher === true || m.administrator === true)));
+  return ctx.can('publisher', author);
 }
 
 function validPublicationPath(path) {
@@ -1461,17 +623,7 @@ function extractTouchedTables(sql) {
 }
 
 function hasCapability(ctx, capability, actor, extra) {
-  const queryInput = extra ? { check: capability, actor, ...extra } : { check: capability, actor };
-  const checked = ctx.query('$permissions', queryInput);
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  if (!perms || !Array.isArray(perms.members)) return false;
-  const m = perms.members.find(x => x.publicKey === actor);
-  if (!m) return false;
-  if (capability === 'administrator') return m.administrator === true;
-  if (capability === 'writer') return m.writer === true || m.administrator === true;
-  if (capability === 'reader') return m.reader === true;
-  return false;
+  return ctx.can(capability, actor, extra);
 }
 
 function normalizeSqlState(state, config) {
@@ -2214,15 +1366,7 @@ export function defineSqlReducer(spec) {
   const allowPublicWrite = Boolean(spec && spec.allowPublicWrite);
 
   function checkCap(ctx, cap, actor) {
-    const checked = ctx.query('$permissions', { check: cap, actor });
-    if (typeof checked === 'boolean') return checked;
-    const perms = ctx.topic('$permissions');
-    if (!perms || !Array.isArray(perms.members)) return false;
-    const m = perms.members.find(x => x.publicKey === actor);
-    if (!m) return false;
-    if (cap === 'administrator') return m.administrator === true;
-    if (cap === 'writer') return m.writer === true || m.administrator === true;
-    return m.reader === true;
+    return ctx.can(cap, actor);
   }
 
   return {
@@ -2327,10 +1471,11 @@ export function defineSqlReducer(spec) {
 `.trimStart()
 
 export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.freeze({
-  'chronolog/permissions': STD_PERMISSIONS_SOURCE,
+  'chronolog/admission': STD_ADMISSION_SOURCE,
+  'chronolog/reducer': STD_REDUCER_SOURCE,
   'chronolog/keys': STD_KEYS_SOURCE,
-  'chronolog/finality': STD_FINALITY_SOURCE,
   'chronolog/publications': STD_PUBLICATIONS_SOURCE,
+  'chronolog/seals': STD_SEALS_SOURCE,
   'chronolog/rls': STD_RLS_SOURCE,
   'chronolog/sql': STD_SQL_SOURCE,
   'chronolog/sqlite-helpers': STD_SQLITE_HELPERS_SOURCE,
@@ -2342,7 +1487,6 @@ export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.
   'chronolog/mounts': STD_MOUNTS_SOURCE,
   'chronolog/builders': STD_BUILDERS_SOURCE,
   'chronolog/registry': STD_REGISTRY_SOURCE,
-  'chronolog/finality-predicates': STD_FINALITY_PREDICATES_SOURCE,
   'chronolog/guards': STD_GUARDS_SOURCE,
   'chronolog/quotas': STD_QUOTAS_SOURCE,
   'chronolog/queue': STD_QUEUE_SOURCE,
@@ -2352,9 +1496,10 @@ export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.
 })
 
 export const STANDARD_MODULE_BUILTINS: Readonly<Record<string, readonly ChronologBuiltinName[]>> = Object.freeze({
-  'chronolog/permissions': ['chronolog:crypto'],
+  'chronolog/admission': ['chronolog:crypto'],
+  'chronolog/seals': [],
+  'chronolog/reducer': [],
   'chronolog/keys': ['chronolog:crypto'],
-  'chronolog/finality': ['chronolog:crypto'],
   'chronolog/publications': ['chronolog:crypto'],
   'chronolog/rls': [],
   'chronolog/sql': ['chronolog:sqlite'],
@@ -2367,7 +1512,6 @@ export const STANDARD_MODULE_BUILTINS: Readonly<Record<string, readonly Chronolo
   'chronolog/mounts': ['chronolog:crypto'],
   'chronolog/builders': ['chronolog:crypto'],
   'chronolog/registry': ['chronolog:sqlite', 'chronolog:crypto'],
-  'chronolog/finality-predicates': ['chronolog:crypto'],
   'chronolog/guards': [],
   'chronolog/quotas': [],
   'chronolog/queue': [],

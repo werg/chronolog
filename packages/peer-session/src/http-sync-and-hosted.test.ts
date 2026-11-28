@@ -197,7 +197,7 @@ describe('Binary CBOR HTTP sync-v3, Ephemeral Hosted Runner & Native Supervisor'
         encryptedEnvelopes: delta.newEnvelopes.map(e => e.raw),
         casNodes: [],
         retentions: [],
-        checkpoints: [],
+        evidence: [],
       })
       expect(normal.topic('notes')).toEqual(['hello from ephemeral worker'])
     } finally {

@@ -9,7 +9,7 @@ import type {
   SqliteQueryResult,
 } from '@chronolog/materializer'
 
-export const SQLITE_CAS_BUILTIN_ID = 'sqlite-cas@1#sha256-4b2ef04a5c2f285d7df273e3187665d17ade145075f9f5b4816ec1bab0a0b241'
+export const SQLITE_CAS_BUILTIN_ID = 'sqlite-cas@1#sha256-c1e6ecad7402fc981728ff06143ba9b453724dc4faa144cacb085f60e18e280c'
 import type { JsonValue } from '@chronolog/protocol'
 import { MerklePageFile } from './merkle-pages.js'
 
@@ -86,6 +86,7 @@ interface EmscriptenSqliteModule {
     historyCount?(): number
     historyCol?(row: number, col: number): string | null
     historyNum?(row: number, col: number): number
+    can?(capability: string, actor: string): boolean
   }
 }
 
@@ -220,6 +221,9 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
       },
       topicQueryJson(topic, inputJson) {
         return activeIntrospection?.topicQueryJson?.(topic, inputJson) ?? null
+      },
+      can(capability, actor) {
+        return activeIntrospection?.can?.(capability, actor) === true
       },
       topicsCount() {
         return activeIntrospection?.topics?.length ?? 0

@@ -117,7 +117,7 @@ try {
     privateLog: true,
     imports: { 'app/messages': RTC_MESSAGES_REDUCER },
     topics: { messages: { module: 'app/messages', initialState: [] } },
-    finalitySchedule: [{ effectiveAfterMs: -1n, policy: { kind: 'signed-frontier', signer: identity.publicKey } }],
+    admissionSchedule: [{ effectiveAfterMs: -1, policy: { kind: 'signed-frontier', signer: identity.publicKey } }],
     epoch0Key: key,
   })
   native = await createApplicationSession({ device: nativeDevice, genesis: created.genesisBytes, casNodes: created.casNodes, definition, epochKeys: new Map([[0, key]]) })
@@ -206,7 +206,7 @@ try {
   assert.deepEqual(afterSignals.revision, beforeSignal); assert.deepEqual(native.revision(), nativeRevision)
   passed('signed-live-signals-leave-application-history-unchanged')
   const exactRetry = await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.publish('browser-offline', 'browser with host stopped'))
-  assert.deepEqual(exactRetry.intent, browserOperation.intent); assert.equal(exactRetry.materialized.proposalId, browserOperation.materialized.proposalId)
+  assert.deepEqual(exactRetry.intent, browserOperation.intent); assert.equal(exactRetry.materialized.opId, browserOperation.materialized.opId)
   const coverage = await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.retained('browser-offline'))
   assert(coverage.some(value => value.payload.peer === owned.identity.publicKey))
   const after = await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.transport())

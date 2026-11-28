@@ -83,7 +83,7 @@ When multiple local endpoints or runs share one signing identity, attach `stream
 
 ## Inside `ApplicationSession`
 
-`session.signals` uses the owned signing device, application scope and `$signal_policy` authorization cached per `stateRoot`. Authenticated `session.connectPeer()` links attach the independent live lane; the session forwards application-scoped signals and allows local echo without opening a network route. The page facade provides bounded `send`/`subscribe` RPCs and owner-bound endpoint context, without receiving the private key. For other standalone dispatch policies, configure `SignalChannel` directly. See [the peer-session API](../peer-session/README.md#core-session-api).
+`session.signals` uses the owned signing device, application scope and `$admission` signal authorization cached per `stateRoot`. Authenticated `session.connectPeer()` links attach the independent live lane; the session forwards application-scoped signals and allows local echo without opening a network route. The page facade provides bounded `send`/`subscribe` RPCs and owner-bound endpoint context, without receiving the private key. For other standalone dispatch policies, configure `SignalChannel` directly. See [the peer-session API](../peer-session/README.md#core-session-api).
 
 ## Packaging
 

@@ -20,9 +20,9 @@ Unified local-first Chronolog session runtime with unified Merkle-DAG CAS, scope
 
 ## Core Session API
 
-- **Authoring & Reading:** `session.submit({ updates })`, `session.command(...)`, `session.topic(name)`, `session.query(name, input)`, `session.describe()`, `session.readView({ view })`, `session.readEvents(options)`.
+- **Authoring, Simulation & Reading:** `session.submit({ updates })`, `session.simulate({ updates })`, `session.command(...)`, `session.topic(name)`, `session.query(name, input)`, `session.describe()`, `session.readView({ view })`, `session.readEvents(options)`.
 - **Packages, Derivations & Mounts:** `session.installPackage(...)`, `session.mountLog(name, source)`, `session.evaluateDerivation(drvRef, options)` (with local memo + trusted `$builders` mirror attestation cache), `casMirrors`.
-- **Membership & Keys:** `session.admitMember(...)`, `session.rotateEpoch(...)`, `session.removeMember(...)`.
-- **Releases, Reducers & Finality:** `session.publishRelease(...)` (emits unified `chronolog-tree/v1` `treeRoot` + public CAS blobs), `session.updateReducers(...)`, `session.scheduleFinality(...)`, `session.finality.*`.
+- **Membership, Seals & Keys:** `session.admitMember(...)`, `session.can(...)`, `session.seals()`, `session.seal(...)`, `session.rotateEpoch(...)`, `session.removeMember(...)`.
+- **Releases, Reducers & Admission:** `session.publishRelease(...)` (emits unified `chronolog-tree/v1` `treeRoot` + public CAS blobs), `session.updateReducers(...)`, `session.scheduleAdmissionPolicy(...)`, `session.admission.*`.
 - **Replication & GC:** `session.connectPeer(...)` (`sync-v3` + subgraph `cas-want`), `session.exportFacts(...)`, `session.exportCasNodes(..., { subgraph })`, `session.mergeFacts(...)`, `session.collectGarbage()`.
-- **Ephemeral Signals & Unified Blobs:** `session.signals` (`$signal_policy`-enforced live lane), `session.content` (unified `chronolog-blob/v1` / `chronolog-enc-blob/v1` over `session.cas`).
+- **Ephemeral Signals & Unified Blobs:** `session.signals` (`$admission`-enforced live lane), `session.content` (unified `chronolog-blob/v1` / `chronolog-enc-blob/v1` over `session.cas`).

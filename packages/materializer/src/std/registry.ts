@@ -7,17 +7,11 @@ const HEX32 = /^[0-9a-f]{64}$/;
 const HEX64 = /^[0-9a-f]{128}$/;
 
 function isWriter(ctx, actor) {
-  const checked = ctx.query('$permissions', { check: 'writer', actor });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === actor && m.writer === true));
+  return ctx.can('writer', actor);
 }
 
 function isAdmin(ctx, actor) {
-  const checked = ctx.query('$permissions', { check: 'administrator', actor });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === actor && m.administrator === true));
+  return ctx.can('administrator', actor);
 }
 
 function ensureSchema(db) {

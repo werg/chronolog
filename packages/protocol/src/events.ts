@@ -35,13 +35,13 @@ export function cloneEventOrigin(value: ChronologEventOrigin): ChronologEventOri
 
 export interface EffectiveEvent {
   readonly id: string
-  readonly proposalId: string
+  readonly opId: string
   readonly eventOrdinal: number
   readonly topic: string
   readonly payload: EventPayload
   readonly origin: ChronologEventOrigin
 }
-export interface EventTransaction { readonly proposalId: string; readonly events: readonly EffectiveEvent[] }
+export interface EventTransaction { readonly opId: string; readonly events: readonly EffectiveEvent[] }
 export interface EventReadOptions {
   readonly cursor?: string
   readonly topics?: readonly string[]

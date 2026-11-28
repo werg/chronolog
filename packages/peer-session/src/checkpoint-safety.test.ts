@@ -86,22 +86,3 @@ it('authenticates bounded passphrase KDF parameters and rejects wrong passphrase
   new DataView(altered.buffer).setUint32(7, 0xffff_ffff)
   await expect(restoreDeviceCheckpoint(new MemoryBytesStore(), altered, { secret })).rejects.toMatchObject({ code: 'CHECKPOINT_CORRUPT' })
 })
-
-it('restores legacy passphrase checkpoints with the original PBKDF2 work factor', async () => {
-  const store = new MemoryBytesStore(), raw = generateCheckpointKey(), secret = 'legacy passphrase secret'
-  await store.put('legacy', Uint8Array.of(9))
-  const checkpoint = await exportDeviceCheckpoint(store, { secret: raw, retireSource: false })
-  const aad = new TextEncoder().encode('chronolog-device-checkpoint-v1')
-  const rawKey = await crypto.subtle.importKey('raw', new Uint8Array(raw), 'AES-GCM', false, ['decrypt'])
-  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: checkpoint.bytes.slice(22, 34), additionalData: aad }, rawKey, checkpoint.bytes.slice(34))
-  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12))
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'PBKDF2', false, ['deriveKey'])
-  const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100_000 }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt'])
-  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext))
-  const legacy = new Uint8Array(34 + ciphertext.length)
-  legacy.set(checkpoint.bytes.slice(0, 5)); legacy[5] = 0
-  legacy.set(salt, 6); legacy.set(iv, 22); legacy.set(ciphertext, 34)
-  const target = new MemoryBytesStore()
-  await restoreDeviceCheckpoint(target, legacy, { secret })
-  expect(await target.get('legacy')).toEqual(Uint8Array.of(9))
-})

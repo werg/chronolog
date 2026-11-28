@@ -273,7 +273,7 @@ describe('Reusable WinterCG CAS Mirror, Trusted Derivation Caching & Blind-Host 
     })
 
     // Verify native admission + subject embedded without post-hoc re-encode!
-    const initPerms = genesis.genesis.initialTopics.$permissions as Record<string, unknown>
+    const initPerms = genesis.genesis.initialTopics.$admission as Record<string, unknown>
     expect((initPerms.admission as Record<string, unknown>).mode).toBe('attested')
     expect(((initPerms.members as Record<string, unknown>[])[0])?.subject).toBe('device')
 
@@ -324,9 +324,9 @@ describe('Reusable WinterCG CAS Mirror, Trusted Derivation Caching & Blind-Host 
         publicOps: kernelOps,
         publicCasNodes: facts.casNodes.map(n => ({ hash: n.hash, bytes: n.bytes })),
       })
-      expect(blind.permissions.mode).toBe('attested')
-      expect(blind.permissions.administrators).toContain(owner.device.identity.publicKey)
-      expect(blind.permissions.publishers).toContain(owner.device.identity.publicKey)
+      expect(blind.roster.mode).toBe('attested')
+      expect(blind.roster.administrators).toContain(owner.device.identity.publicKey)
+      expect(blind.roster.publishers).toContain(owner.device.identity.publicKey)
       // Reachability includes transitive package files AND publication treeRoot!
       const refHashes = await collectControlReferencedCasHashes({
         genesis: genesis.genesis,

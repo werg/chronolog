@@ -20,9 +20,9 @@ describe('Phase 3 P2P Merkle-paged SQL extensions', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: { admins: [admin.identity.publicKey], members: [], openRead: true, openWrite: true, admission: null },
         },
         db: { module: 'chronolog/sql' },

@@ -43,7 +43,7 @@ function shuffleFacts(facts: SessionFacts, rng: () => number): SessionFacts {
     encryptedEnvelopes: shuffle(facts.encryptedEnvelopes, rng),
     casNodes: shuffle(facts.casNodes, rng),
     retentions: shuffle(facts.retentions, rng),
-    checkpoints: shuffle(facts.checkpoints, rng),
+    evidence: shuffle(facts.evidence, rng),
   }
 }
 
@@ -290,10 +290,10 @@ describe('Chronolog v2 Multi-Replica Chaos Suite', () => {
         expect(await peer.query('ledger', { sql: 'SELECT id, balance FROM accounts ORDER BY id', format: 'objects' })).toEqual(refAccounts)
       }
 
-      // Assert Blind Host derived IDENTICAL control topics ($permissions, $keys, $reducers) without holding any epoch keys!
+      // Assert Blind Host derived IDENTICAL control topics ($admission, $keys, $reducers) without holding any epoch keys!
       expect(blindHost.hasEpochKey(0)).toBe(false)
       expect(blindHost.hasEpochKey(1)).toBe(false)
-      expect(blindHost.topic('$permissions')).toEqual(admin.topic('$permissions'))
+      expect(blindHost.topic('$admission')).toEqual(admin.topic('$admission'))
       expect(blindHost.topic('$keys')).toEqual(admin.topic('$keys'))
       expect(blindHost.topic('$reducers')).toEqual(admin.topic('$reducers'))
       expect(blindHost.isReader(devRevoked.identity.publicKey)).toBe(false)

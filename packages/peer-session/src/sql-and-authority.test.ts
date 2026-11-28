@@ -319,9 +319,9 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
       creator: { publicKey: devCreator.identity.publicKey, administrator: true, reader: true, writer: true },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: {
             admins: [devCreator.identity.publicKey],
             members: [],
@@ -349,8 +349,8 @@ describe('Chronolog v2 first-class chronolog/sql & pluggable $permissions', () =
     expect(sessStranger.isWriter(devStranger.identity.publicKey)).toBe(true)
     expect(sessStranger.isAdministrator(devStranger.identity.publicKey)).toBe(false)
     expect(sessStranger.status.canAuthor).toBe(true)
-    expect(await sessStranger.checkPermission('writer')).toBe(true)
-    expect(await sessStranger.checkPermission('administrator')).toBe(false)
+    expect(await sessStranger.can('writer')).toBe(true)
+    expect(await sessStranger.can('administrator')).toBe(false)
 
     // Creator migrates board table with author-owned RLS
     const mig = await sessCreator.submit({

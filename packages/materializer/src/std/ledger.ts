@@ -1,14 +1,6 @@
 export const STD_LEDGER_SOURCE = `
 function hasCap(ctx, cap, author) {
-  const checked = ctx.query('$permissions', { check: cap, actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  if (!perms || !Array.isArray(perms.members)) return false;
-  const m = perms.members.find(x => x.publicKey === author);
-  if (!m) return false;
-  if (cap === 'administrator') return m.administrator === true;
-  if (cap === 'writer') return m.writer === true || m.administrator === true;
-  return false;
+  return ctx.can(cap, author);
 }
 
 function normalizeState(state) {

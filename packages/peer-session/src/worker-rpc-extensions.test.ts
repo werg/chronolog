@@ -61,16 +61,16 @@ describe('Worker RPC bridge for SQL branching, time-travel, social recovery, com
       const op2 = await client.command('db:exec', {
         sql: 'UPDATE items SET qty = ? WHERE id = ?',
         params: [12, 'a'],
-      }, { afterOps: [op1.id], authorTimestampMs: 3000n })
+      }, { assumptions: { checks: [{ kind: 'op_accepted', opId: op1.id }] }, authorTimestampMs: 3000n })
       expect((await op2.materialized()).outcome).toBe('accepted')
 
-      // 2. Time-travel queryAsOf, opOutcome, topicLastOpId, finalityStatus, equivocationProofs over RPC
+      // 2. Time-travel queryAsOf, opOutcome, topicLastOpId, admissionStatus, equivocations over RPC
       const hist = await client.queryAsOf('db', { sql: 'SELECT qty FROM items WHERE id = ?', params: ['a'] }, { opId: op1.id })
       expect((hist.value as { rows: unknown[][] }).rows).toEqual([[5]])
       expect(await client.opOutcome(op2.id)).toBe('accepted')
       expect(await client.topicLastOpId('db')).toBe(op2.id)
-      expect(await client.finalityStatus(op2.id)).toBe('local')
-      expect(await client.equivocationProofs()).toEqual([])
+      expect(await client.admissionStatus(op2.id)).toBe('local')
+      expect(await client.admission.equivocations()).toEqual([])
 
       // 3. Zero-copy forkSql branch -> exec -> diff -> toProposal -> close over RPC
       const branch = await client.forkSql('db')

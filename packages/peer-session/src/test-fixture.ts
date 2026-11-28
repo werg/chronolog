@@ -1,4 +1,5 @@
-import { createSigningIdentity, type FinalityPolicyV2, type SigningIdentity } from '@chronolog/authority'
+import { createSigningIdentity, type SigningIdentity } from '@chronolog/authority'
+import type { JsonValue } from '@chronolog/protocol'
 import { MemoryBytesStore } from '@chronolog/records'
 import { defineApplication, defineCommand, defineQuery } from './definition.js'
 import { openApplicationDevice } from './device.js'
@@ -52,7 +53,7 @@ export const fixtureDefinition = defineApplication({
 export async function sessionFixture(options: {
   readonly count?: number
   readonly identities?: readonly SigningIdentity[]
-  readonly finalityPolicy?: FinalityPolicyV2
+  readonly admissionPolicy?: JsonValue
   readonly privateLog?: boolean
 } = {}) {
   const identities = options.identities ?? await Promise.all(Array.from({ length: options.count ?? 2 }, () => createSigningIdentity()))
@@ -77,8 +78,8 @@ export async function sessionFixture(options: {
     imports: { 'app/messages': MESSAGES_REDUCER_SOURCE },
     topics: { messages: { module: 'app/messages', initialState: [] } },
     epoch0Key: epochKey,
-    ...(options.finalityPolicy === undefined ? {} : {
-      finalitySchedule: [{ effectiveAfterMs: -1n, policy: options.finalityPolicy }],
+    ...(options.admissionPolicy === undefined ? {} : {
+      admissionSchedule: [{ effectiveAfterMs: -1, policy: options.admissionPolicy }],
     }),
   })
   const stores = identities.map(() => new MemoryBytesStore())

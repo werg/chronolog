@@ -5,10 +5,7 @@ const HEX32 = /^[0-9a-f]{64}$/;
 const HEX64 = /^[0-9a-f]{128}$/;
 
 function isAdmin(ctx, actor) {
-  const checked = ctx.query('$permissions', { check: 'administrator', actor });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  return Boolean(perms && Array.isArray(perms.members) && perms.members.some(m => m.publicKey === actor && m.administrator === true));
+  return ctx.can('administrator', actor);
 }
 
 export const verifiedMounts = {

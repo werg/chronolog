@@ -16,11 +16,10 @@ import { signDomain, verifyDomain, type ProtocolDomain } from './primitives.js'
 export const V2_OP_DOMAIN = 'chronolog/op/v1' as unknown as ProtocolDomain
 export const CONTROL_TOPICS = Object.freeze([
   '$reducers',
-  '$permissions',
+  '$admission',
+  '$seals',
   '$keys',
-  '$finality',
   '$publications',
-  '$signal_policy',
   '$mounts',
   '$builders',
 ] as const)
@@ -687,7 +686,7 @@ export const DEFAULT_RUNTIME_MANIFEST: RuntimeManifest = Object.freeze({
   builtins: Object.freeze({
     'chronolog:crypto': 'crypto@1',
     'chronolog:cas': 'cas@1',
-    'chronolog:sqlite': 'sqlite-cas@1#sha256-4b2ef04a5c2f285d7df273e3187665d17ade145075f9f5b4816ec1bab0a0b241',
+    'chronolog:sqlite': 'sqlite-cas@1#sha256-c1e6ecad7402fc981728ff06143ba9b453724dc4faa144cacb085f60e18e280c',
     'chronolog:wasm': 'wasm@1',
   }),
 })

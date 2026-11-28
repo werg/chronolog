@@ -1,4 +1,4 @@
-import { check, type FinalityCheckpoint } from '@chronolog/authority'
+import { check, type AdmissionEvidence, type PinnedFrontier } from '@chronolog/authority'
 import type { JsonValue } from '@chronolog/protocol'
 import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
 import type { ApplicationSession, SessionFacts } from './session.js'
@@ -161,6 +161,10 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           const operation = await session.submit(args[0] as Parameters<ApplicationSession['submit']>[0])
           return { id: operation.id, operationId: operation.operationId }
         }
+        if (method === 'simulate') {
+          allow('queries')
+          return session.simulate(args[0] as Parameters<ApplicationSession['simulate']>[0])
+        }
         if (method === 'command') {
           allow('commands'); const name = String(args[0])
           check(effective.commands === undefined || effective.commands.includes(name), 'ENDPOINT_COMMAND_FORBIDDEN')
@@ -281,11 +285,12 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'endpoints.list') { allow('diagnostics'); return owner.endpoints() }
         if (method === 'facts.export') { allow('replication'); return session.exportFacts(args[0] as Parameters<ApplicationSession['exportFacts']>[0]) }
         if (method === 'facts.merge') { allow('replication'); return session.mergeFacts(args[0] as SessionFacts) }
-        if (method === 'finality.status') { allow('finality'); return session.finality.status() }
-        if (method === 'finality.opStatus') { allow('finality'); return session.finalityStatus(String(args[0])) }
-        if (method === 'finality.equivocationProofs') { allow('finality'); return session.equivocationProofs() }
-        if (method === 'finality.createCheckpoint') { allow('finality'); return session.finality.createCheckpoint(args[0] as { throughMs: bigint }) }
-        if (method === 'finality.submitCheckpoints') { allow('finality'); return session.finality.submitCheckpoints(args[0] as readonly FinalityCheckpoint[]) }
+        if (method === 'admission.status') { allow('admission'); return session.admission.status() }
+        if (method === 'admission.opStatus') { allow('admission'); return session.admissionStatus(String(args[0])) }
+        if (method === 'admission.equivocations') { allow('admission'); return session.admission.equivocations() }
+        if (method === 'admission.createCheckpoint') { allow('admission'); return session.admission.createCheckpoint(args[0] as { throughMs: bigint }) }
+        if (method === 'admission.submitEvidence') { allow('admission'); return session.admission.submitEvidence(args[0] as readonly AdmissionEvidence[]) }
+        if (method === 'admission.pinFrontier') { allow('admission'); return session.admission.pinFrontier(args[0] as PinnedFrontier | null) }
         if (method === 'extension.call') {
           allow('extensions'); check(options.extensions !== undefined, 'ENDPOINT_METHOD_UNKNOWN')
           const name = args[0], input = args[1]

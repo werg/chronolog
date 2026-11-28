@@ -176,7 +176,7 @@ describe('Unified CAS, subgraph peer pull, HTTP CAS mirrors, private app code, R
 
       await blind.mergeFacts(await admin.exportFacts({ includePrivateCas: false }))
       expect(blind.topic('$reducers')).toEqual(admin.topic('$reducers'))
-      expect(blind.topic('$permissions')).toEqual(admin.topic('$permissions'))
+      expect(blind.topic('$admission')).toEqual(admin.topic('$admission'))
       // Blind host has zero private package bytes!
       const secretRef = (admin.topic('$reducers') as { imports: Record<string, string> }).imports['@secret/logic']!
       expect(await blind.cas.get(parseCasRef(secretRef), 'any')).toBeNull()

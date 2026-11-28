@@ -11,6 +11,6 @@
 - [`@chronolog/peer-session`](../packages/peer-session/README.md) — full session API, `createLogGenesis`, `createRegistryGenesis`, `/kernel` (`replayBlindHostControl`, `collectControlReferencedCasHashes`, `dryRunReducerUpgrade`), `/mirror` (`createCasMirrorHandler`, `createCasMirrorClient`), blueprints, reactive views, and worker ownership.
 - [`@chronolog/materializer`](../packages/materializer/README.md) — `TopicKernel`, `QuickJsSandbox`, `WasmSandbox`, `evaluateDerivation`, attestations, and the audited standard ES Modules.
 - [`chronolog-db`](../packages/sqlite-cas/README.md) — Merkle-paged SQLite + FTS5 + `sqlite-vec` WASM SQL database driver and deterministic profile.
-- [`@chronolog/authority`](../packages/authority/README.md) — portable signed records, `ApplicationDescription`, and time-scoped `$finality` verification.
+- [`@chronolog/authority`](../packages/authority/README.md) — portable signed records, `ApplicationDescription`, and protocol-agnostic `$admission` evidence evaluation.
 - [`@chronolog/signals`](../packages/signals/README.md) — signed ephemeral live-lane messages.
 - [`@chronolog/transport-webrtc`](../packages/transport-webrtc/README.md) — direct WebRTC data-channel and media/stream transport.

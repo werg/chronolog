@@ -185,10 +185,8 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
 
       export default {
         reduce(state, tx, ctx) {
-          const perms = ctx.topic('$permissions');
-          const member = perms.members.find(m => m.publicKey === tx.author);
-          if (!member || !member.writer) return { ok: false, code: 'unauthorized' };
-          const isAdmin = Boolean(member.administrator);
+          if (!ctx.can('writer')) return { ok: false, code: 'unauthorized' };
+          const isAdmin = ctx.can('administrator');
           const db = openDb(state?.dbRoot ?? null);
 
           if (tx.payload.action === 'adminMigrate') {
@@ -252,11 +250,11 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
           },
           imports: { ...stdImports, '@app/rls': `cas:sha256-${rlsAppHash}` },
           topics: {
-            $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' },
+            $admission: { module: 'chronolog/admission', export: 'attestedAdmission' },
             sql: { module: '@app/rls' },
           },
         },
-        $permissions: {
+        $admission: {
           members: [
             { publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true },
             { publicKey: aliceHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },

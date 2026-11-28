@@ -101,8 +101,9 @@ endpoint.addEventListener('message', event => {
       }
       case 'finalize': {
         const current = await state(), throughMs = current.events.reduce((time, event) => BigInt(event.authorTimestampMs) > time ? BigInt(event.authorTimestampMs) : time, 0n)
-        const cp = await session!.finality.createCheckpoint({ throughMs }), final = await session!.readView({ view: 'final' })
-        try { return { closedThroughMs: cp.checkpoint.payload.closedThroughMs.toString(), events: final.readEvents().events, revision: final.revision, signer: session!.identity.publicKey } } finally { final.release() }
+        const cp = await session!.admission.createCheckpoint({ throughMs }), final = await session!.readView({ view: 'final' })
+        const payload = cp.evidence.payload as { readonly closedThroughMs: bigint }
+        try { return { closedThroughMs: payload.closedThroughMs.toString(), events: final.readEvents().events, revision: final.revision, signer: session!.identity.publicKey } } finally { final.release() }
       }
       case 'state': return state()
       case 'reopen':

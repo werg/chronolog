@@ -1,5 +1,5 @@
 import { bytesToHex } from '@chronolog/canonical'
-import type { FinalityCheckpoint, SigningIdentity } from '@chronolog/authority'
+import type { AdmissionEvidence, SigningIdentity } from '@chronolog/authority'
 import type { QuickJsSandboxOptions } from '@chronolog/materializer'
 import {
   decodeEncryptedEnvelope,
@@ -32,7 +32,7 @@ export interface RunEphemeralHostedSessionOptions {
   readonly encryptedEnvelopes: readonly Uint8Array[]
   readonly publicCasNodes: readonly { readonly hash: string; readonly bytes: Uint8Array }[]
   readonly sealedPrivateCas?: readonly HostedSealedCasItem[]
-  readonly checkpoints?: readonly FinalityCheckpoint[]
+  readonly evidence?: readonly AdmissionEvidence[]
   readonly materializedSnapshot?: Uint8Array
   readonly casMirrors?: readonly string[]
   readonly wasmModule?: QuickJsSandboxOptions['wasmModule']
@@ -121,13 +121,13 @@ export async function runEphemeralHostedSession<T>(
   let snapshot: Uint8Array | null = null
 
   try {
-    if (options.publicOps.length > 0 || options.encryptedEnvelopes.length > 0 || (options.checkpoints?.length ?? 0) > 0) {
+    if (options.publicOps.length > 0 || options.encryptedEnvelopes.length > 0 || (options.evidence?.length ?? 0) > 0) {
       await session.mergeFacts({
         publicOps: [...options.publicOps],
         encryptedEnvelopes: [...options.encryptedEnvelopes],
         casNodes,
         retentions: [],
-        checkpoints: [...(options.checkpoints ?? [])],
+        evidence: [...(options.evidence ?? [])],
       })
     }
     value = await work(session)

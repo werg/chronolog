@@ -28,10 +28,10 @@ describe('protocol v2 codecs', () => {
       initialTopics: {
         $reducers: {
           runtime: { js: 'quickjs-ng@1', builtins: { 'chronolog:crypto': 'crypto@1' } },
-          imports: { 'chronolog/permissions': `cas:sha256-${modHash}` },
-          topics: { $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' } },
+          imports: { 'chronolog/admission': `cas:sha256-${modHash}` },
+          topics: { $admission: { module: 'chronolog/admission', export: 'attestedAdmission' } },
         },
-        $permissions: { members: [] },
+        $admission: { members: [] },
       },
       limits: { maxMemoryBytes: 32 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 32 },
       salt: new Uint8Array(16).fill(7),
@@ -53,7 +53,7 @@ describe('protocol v2 codecs', () => {
       authorTimestampMs: 100n,
       nonce: new Uint8Array(16).fill(2),
       visibility: 'public',
-      updates: [{ topic: '$permissions', input: { action: 'add', member: 'abc' } }],
+      updates: [{ topic: '$admission', input: { action: 'add', member: 'abc' } }],
     }
     const signed = await signOperationCore(opA, keys.privateKey)
     const verified = await verifySignedOperation(signed)

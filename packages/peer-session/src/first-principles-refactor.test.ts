@@ -115,7 +115,7 @@ describe('First-principles Chronolog refactor verification', () => {
     })
     await cas.putManyVerified(casNodes)
     const kernel = new TopicKernel({ genesis, cas, sqliteDriver: driver })
-    const res = await kernel.query('$permissions', { summary: true })
+    const res = await kernel.query('$admission', { kind: 'roster' })
     expect(res).toBeTruthy()
     kernel.sandbox.dispose()
   })
@@ -157,7 +157,7 @@ describe('First-principles Chronolog refactor verification', () => {
           encryptedEnvelopes: [],
           casNodes: pubControl.casNodes,
           retentions: [],
-          checkpoints: [],
+          evidence: [],
         })
         const imported = await sessB.importMaterializedSnapshot(bundle!)
         expect(imported).toBe(true)
@@ -195,12 +195,12 @@ describe('First-principles Chronolog refactor verification', () => {
         visibility: 'public',
         awaitMaterialized: true,
         updates: [{
-          topic: '$permissions',
+          topic: '$admission',
           input: { action: 'setMember', member: { publicKey: devC.identity.publicKey, wrapKey: devC.wrapKey.publicKey, reader: true, writer: true, administrator: false, publisher: false, finalizer: false } },
         }],
       })
       const pub1 = await sessA.exportPublicControlFacts()
-      await sessC.mergeFacts({ publicOps: pub1.publicOps, encryptedEnvelopes: [], casNodes: pub1.casNodes, retentions: [], checkpoints: [] })
+      await sessC.mergeFacts({ publicOps: pub1.publicOps, encryptedEnvelopes: [], casNodes: pub1.casNodes, retentions: [], evidence: [] })
       expect(sessC.status.keyState).toBe('missing-lockbox')
       expect(sessC.hasEpochKey(0)).toBe(false)
 
@@ -208,7 +208,7 @@ describe('First-principles Chronolog refactor verification', () => {
       expect(healed).toBe(1)
 
       const pub2 = await sessA.exportPublicControlFacts()
-      await sessC.mergeFacts({ publicOps: pub2.publicOps, encryptedEnvelopes: [], casNodes: pub2.casNodes, retentions: [], checkpoints: [] })
+      await sessC.mergeFacts({ publicOps: pub2.publicOps, encryptedEnvelopes: [], casNodes: pub2.casNodes, retentions: [], evidence: [] })
       expect(sessC.hasEpochKey(0)).toBe(true)
       expect(sessC.status.keyState).toBe('ready')
       expect(sessC.status.canAuthorData).toBe(true)

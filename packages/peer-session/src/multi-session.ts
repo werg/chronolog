@@ -51,7 +51,7 @@ export function mergeSessionChanges(source: SessionSource<MergeableSession> = []
         await new Promise<void>(resolve => {
           const taken = (): void => { signal.removeEventListener('abort', taken); resolve() }
           signal.addEventListener('abort', taken, { once: true })
-          ready.push({ session, taken, change: Object.freeze({ applicationId: session.applicationId, kind: change.kind, revision: change.revision, revisedProposalIds: change.revisedProposalIds }) })
+          ready.push({ session, taken, change: Object.freeze({ applicationId: session.applicationId, kind: change.kind, revision: change.revision, revisedOpIds: change.revisedOpIds }) })
           notify()
         })
         if (signal.aborted) return

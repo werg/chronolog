@@ -3,11 +3,10 @@ import {
   utf8,
 } from '@chronolog/canonical'
 import {
-  parseFinalitySchedule,
-  verifyFinalityV2,
-  type BlockchainAnchorVerifier,
-  type FinalityCheckpoint,
-  type VerifiedFinalityV2,
+  evaluateAdmission,
+  type AdmissionDecision,
+  type AdmissionEvidence,
+  type PinnedFrontier,
 } from '@chronolog/authority'
 import {
   seedStandardModules,
@@ -128,7 +127,7 @@ export async function collectControlReferencedCasHashes(options: {
   return visited
 }
 
-export interface ControlPermissionsSummary {
+export interface ControlAdmissionSummary {
   readonly mode: 'attested' | 'multisig' | 'open' | 'custom'
   readonly openRead: boolean
   readonly openWrite: boolean
@@ -149,74 +148,36 @@ function stringList(v: unknown): string[] {
 }
 
 /**
- * Extract normalized permissions capabilities from a blind-host `TopicKernel`,
- * supporting `attestedMembers`, `multisigMembers`, `openMembers`, and custom `$permissions` reducers.
+ * Extract normalized admission roster from a blind-host `TopicKernel` via the
+ * universal `$admission` `{ kind: 'roster' }` query contract.
  */
-export async function extractControlPermissions(
-  kernel: TopicKernel,
-  rawPermsTopic: JsonValue | undefined,
-): Promise<ControlPermissionsSummary> {
-  const rawObj = rawPermsTopic !== null && rawPermsTopic !== undefined && typeof rawPermsTopic === 'object' && !Array.isArray(rawPermsTopic)
-    ? rawPermsTopic as Record<string, JsonValue>
-    : {}
-
-  let summary: Record<string, unknown> | null = null
+export async function extractControlAdmission(kernel: TopicKernel): Promise<ControlAdmissionSummary> {
+  let summary: Record<string, unknown> = {}
   try {
-    const q = await kernel.query('$permissions', { summary: true })
+    const q = await kernel.query('$admission', { kind: 'roster' })
     if (q !== null && typeof q === 'object' && !Array.isArray(q)) {
       summary = q as Record<string, unknown>
     }
-  } catch { /* custom reducer without summary query */ }
+  } catch { /* custom $admission without roster query */ }
 
-  const queryList = async (role: string): Promise<readonly unknown[] | null> => {
-    try {
-      const q: unknown = await kernel.query('$permissions', { list: role })
-      if (Array.isArray(q)) return q as readonly unknown[]
-    } catch { /* ignore */ }
-    return null
-  }
-
-  const rawMembers = Array.isArray(summary?.members)
+  const rawMembers = Array.isArray(summary.members)
     ? summary.members.filter((m): m is Record<string, JsonValue> => m !== null && typeof m === 'object' && !Array.isArray(m))
-    : Array.isArray(rawObj.members)
-      ? rawObj.members.filter((m): m is Record<string, JsonValue> => m !== null && typeof m === 'object' && !Array.isArray(m))
-      : []
-
+    : []
   const hasWildcard = (v: unknown): boolean => Array.isArray(v) && v.includes('*')
-  const rawReadersList = summary !== null && Array.isArray(summary.readers) ? summary.readers : await queryList('readers')
-  const rawWritersList = summary !== null && Array.isArray(summary.writers) ? summary.writers : await queryList('writers')
-
-  const readers = rawReadersList !== null
-    ? stringList(rawReadersList)
-    : stringList(rawMembers.filter(m => m.reader === true).map(m => m.publicKey))
-  const writers = rawWritersList !== null
-    ? stringList(rawWritersList)
-    : stringList(rawMembers.filter(m => m.writer === true || m.administrator === true).map(m => m.publicKey))
-  const administrators = summary !== null && Array.isArray(summary.administrators)
-    ? stringList(summary.administrators)
-    : stringList(await queryList('administrators') ?? rawMembers.filter(m => m.administrator === true).map(m => m.publicKey))
-  const publishers = summary !== null && Array.isArray(summary.publishers)
-    ? stringList(summary.publishers)
-    : stringList(await queryList('publishers') ?? rawMembers.filter(m => m.publisher === true || m.administrator === true).map(m => m.publicKey))
-  const finalizers = summary !== null && Array.isArray(summary.finalizers)
-    ? stringList(summary.finalizers)
-    : stringList(await queryList('finalizers') ?? rawMembers.filter(m => m.finalizer === true).map(m => m.publicKey))
-
-  const admission = (summary !== null && summary.admission !== undefined ? summary.admission as JsonValue : rawObj.admission) ?? null
-  const admissionObj = admission !== null && typeof admission === 'object' && !Array.isArray(admission)
-    ? admission as Record<string, JsonValue>
-    : null
-  const removedMembers = stringList(admissionObj?.removed)
-  const blockedAuthors = stringList(summary?.blockedAuthors ?? rawObj.blockedAuthors)
-  const openRead = summary?.openReaders === true || summary?.openRead === true || hasWildcard(rawReadersList) || rawObj.openRead === true
-  const openWrite = summary?.openWriters === true || summary?.openWrite === true || hasWildcard(rawWritersList) || rawObj.openWrite === true
-
-  let mode: ControlPermissionsSummary['mode'] = 'custom'
-  if (summary?.mode === 'open' || summary?.mode === 'multisig' || summary?.mode === 'attested') {
-    mode = summary.mode
-  } else if (openRead || openWrite || rawObj.openRead !== undefined) mode = 'open'
-  else if (typeof rawObj.threshold === 'number' || Array.isArray(rawObj.proposals)) mode = 'multisig'
-  else if (Array.isArray(rawObj.members)) mode = 'attested'
+  const readers = stringList(summary.readers)
+  const writers = stringList(summary.writers)
+  const administrators = stringList(summary.administrators)
+  const publishers = stringList(summary.publishers)
+  const finalizers = stringList(summary.finalizers)
+  const blockedAuthors = stringList(summary.blockedAuthors)
+  const removedMembers = stringList(summary.removedMembers)
+  const admission = (summary.admission as JsonValue | undefined) ?? null
+  const openRead = summary.openReaders === true || summary.openRead === true || hasWildcard(summary.readers)
+  const openWrite = summary.openWriters === true || summary.openWrite === true || hasWildcard(summary.writers)
+  const mode: ControlAdmissionSummary['mode'] =
+    summary.mode === 'open' || summary.mode === 'multisig' || summary.mode === 'attested'
+      ? summary.mode
+      : 'custom'
 
   return {
     mode,
@@ -238,10 +199,10 @@ export interface ReplayBlindHostOptions {
   readonly genesis: LogGenesis
   readonly publicOps: readonly KernelOperationInput[]
   readonly publicCasNodes: readonly BlindHostCasNode[]
-  readonly checkpoints?: readonly FinalityCheckpoint[]
-  readonly anchorVerifier?: BlockchainAnchorVerifier
+  readonly evidence?: readonly AdmissionEvidence[]
+  readonly pinnedFrontier?: PinnedFrontier | null
   readonly wasmModule?: QuickJsSandboxOptions['wasmModule']
-  /** When true (default), replays finalized control topics if checkpoints close a non-empty frontier. */
+  /** When true (default), replays finalized control topics if admission evidence closes a frontier. */
   readonly includeFinalized?: boolean
 }
 
@@ -251,18 +212,18 @@ export interface BlindHostControlResult {
   readonly topics: Readonly<Record<string, JsonValue>>
   readonly outcomes: readonly KernelOperationOutcome[]
   readonly pendingDependencies: readonly string[]
-  readonly permissions: ControlPermissionsSummary
-  readonly initialPermissions: ControlPermissionsSummary
-  readonly finality: VerifiedFinalityV2
+  readonly roster: ControlAdmissionSummary
+  readonly initialRoster: ControlAdmissionSummary
+  readonly admission: AdmissionDecision
   readonly finalizedTopics: Readonly<Record<string, JsonValue>> | null
   readonly referencedCasHashes: ReadonlySet<string>
 }
 
 /**
  * Reusable blind-host control engine: replays public control operations (`$reducers`,
- * `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, `$mounts`, `$builders`)
- * with `blindHostMode: true` and zero decryption keys, derives generic `$permissions` capabilities,
- * verifies `$finality` checkpoints, and computes exact reachable public CAS hashes for GC.
+ * `$admission`, `$keys`, `$publications`, `$mounts`, `$builders`) with `blindHostMode: true`
+ * and zero decryption keys, queries `$admission` roster and `admit(...)` over external
+ * evidence, and computes exact reachable public CAS hashes for GC.
  */
 export async function replayBlindHostControl(options: ReplayBlindHostOptions): Promise<BlindHostControlResult> {
   const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
@@ -282,29 +243,29 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
     ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
   })
   try {
-    const initialPermissions = await extractControlPermissions(kernel, options.genesis.initialTopics.$permissions)
+    const initialRoster = await extractControlAdmission(kernel)
     const result = await kernel.materialize(options.publicOps)
     const snap = kernel.snapshot()
-    const permissions = await extractControlPermissions(kernel, snap.topics.$permissions)
+    const roster = await extractControlAdmission(kernel)
 
     const logIdHex = bytesToHex(kernel.logId)
-    const schedule = parseFinalitySchedule(snap.topics.$finality)
     const opList = options.publicOps.map(op => ({
       opId: bytesToHex(op.opId),
+      author: bytesToHex(op.core.author),
       authorTimestampMs: op.core.authorTimestampMs,
+      visibility: op.core.visibility,
     }))
-    const finality = await verifyFinalityV2({
+    const admission = await evaluateAdmission({
       logId: logIdHex,
-      schedule,
-      checkpoints: options.checkpoints ?? [],
-      knownOps: opList,
-      predicateVerifier: kernel.createFinalityPredicateVerifier(),
-      ...(options.anchorVerifier === undefined ? {} : { blockchainVerifier: options.anchorVerifier }),
+      ops: opList,
+      evidence: options.evidence ?? [],
+      pinnedFrontier: options.pinnedFrontier ?? null,
+      evaluator: kernel.createAdmissionEvaluator(),
     })
 
     let finalizedTopics: Readonly<Record<string, JsonValue>> | null = null
-    if (options.includeFinalized !== false && (options.checkpoints?.length ?? 0) > 0 && finality.closedThroughMs !== null) {
-      const finalOps = options.publicOps.filter(op => finality.includedOpIds.has(bytesToHex(op.opId)))
+    if (options.includeFinalized !== false && admission.closedThroughMs !== null) {
+      const finalOps = options.publicOps.filter(op => admission.includedOpIds.has(bytesToHex(op.opId)))
       const finalKernel = new TopicKernel({
         genesis: options.genesis,
         cas,
@@ -332,9 +293,9 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
       topics: snap.topics,
       outcomes: result.outcomes,
       pendingDependencies: result.pendingDependencies,
-      permissions,
-      initialPermissions,
-      finality,
+      roster,
+      initialRoster,
+      admission,
       finalizedTopics,
       referencedCasHashes,
     }

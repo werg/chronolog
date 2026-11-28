@@ -58,11 +58,11 @@ export async function forwardSessionEvents<Projected extends EventProjection>(op
   let stopStatus: (() => void) | undefined, iterator: AsyncIterator<ApplicationChange> | undefined
   const save = async (): Promise<void> => { check(entries.size <= maxEvents * 2, 'EVENT_FORWARDER_ENTRY_LIMIT'); const state: Checkpoint<Projected> = { format: 'authored-event-outbox-v1', scope, entries: Object.fromEntries([...entries].sort(([a], [b]) => a.localeCompare(b))) }; await awaitOwnedTask(signal, () => checkpoint.save(serialize(state))) }
   const observation = async (event: ApplicationEvent, revision: MaterializedRevision, present: boolean): Promise<EventDeliveryObservation> => {
-    const operation = await session.operations.get(event.proposalId)
+    const operation = await session.operations.get(event.opId)
     check(operation !== null, 'EVENT_FORWARDER_OPERATION_MISSING')
     const inspected = await operation.inspect()
     check(inspected.applicationId === session.applicationId && inspected.author === event.author, 'EVENT_FORWARDER_OPERATION_SCOPE_INVALID')
-    return { stored: inspected.stored, materialized: present ? { proposalId: event.proposalId, revision, outcome: 'accepted', rejectionCode: null } : inspected.materialized, retained: structuredClone(inspected.retained), finalized: present && inspected.finalized, excluded: inspected.excluded }
+    return { stored: inspected.stored, materialized: present ? { opId: event.opId, revision, outcome: 'accepted', rejectionCode: null } : inspected.materialized, retained: structuredClone(inspected.retained), finalized: present && inspected.finalized, excluded: inspected.excluded }
   }
   try {
     const raw = await awaitOwnedTask(signal, () => checkpoint.load())
@@ -72,7 +72,7 @@ export async function forwardSessionEvents<Projected extends EventProjection>(op
       try { parsed = JSON.parse(raw) as Checkpoint<Projected> } catch { throw Object.assign(new Error('EVENT_FORWARDER_CHECKPOINT_INVALID'), { code: 'EVENT_FORWARDER_CHECKPOINT_INVALID' }) }
       check(parsed.format === 'authored-event-outbox-v1' && parsed.scope === scope && parsed.entries !== null && typeof parsed.entries === 'object' && !Array.isArray(parsed.entries), 'EVENT_FORWARDER_CHECKPOINT_SCOPE_INVALID')
       entries = new Map(Object.entries(parsed.entries)); check(entries.size <= maxEvents * 2, 'EVENT_FORWARDER_ENTRY_LIMIT'); serialize(parsed)
-      for (const [id, entry] of entries) check(entry.event?.id === id && typeof entry.event.proposalId === 'string' && entry.projected !== null && typeof entry.projected === 'object' && typeof entry.present === 'boolean' && typeof entry.acknowledged === 'boolean', 'EVENT_FORWARDER_CHECKPOINT_INVALID')
+      for (const [id, entry] of entries) check(entry.event?.id === id && typeof entry.event.opId === 'string' && entry.projected !== null && typeof entry.projected === 'object' && typeof entry.present === 'boolean' && typeof entry.acknowledged === 'boolean', 'EVENT_FORWARDER_CHECKPOINT_INVALID')
     }
     stopStatus = session.onStatus(invalidate)
     iterator = session.changes({ signal })[Symbol.asyncIterator]()

@@ -33,16 +33,16 @@ export class PeerFactKnowledge {
       const digest = await recordDigest(value)
       return { key: `ret/${digest}`, digest, value }
     }))
-    const checkpoints = await Promise.all(facts.checkpoints.map(async value => {
+    const evidence = await Promise.all(facts.evidence.map(async value => {
       const digest = await recordDigest(value)
-      return { key: `cp/${await recordDigest(value.payload)}`, digest, value }
+      return { key: `ev/${digest}`, digest, value }
     }))
-    return { publicOps, encryptedEnvelopes, casNodes, retentions, checkpoints }
+    return { publicOps, encryptedEnvelopes, casNodes, retentions, evidence }
   }
 
   async remember(facts: SessionFacts): Promise<void> {
     const entries = await this.#digestItems(facts)
-    for (const group of [entries.publicOps, entries.encryptedEnvelopes, entries.casNodes, entries.retentions, entries.checkpoints]) {
+    for (const group of [entries.publicOps, entries.encryptedEnvelopes, entries.casNodes, entries.retentions, entries.evidence]) {
       for (const item of group) this.#known.set(item.key, item.digest)
     }
   }
@@ -56,7 +56,7 @@ export class PeerFactKnowledge {
       encryptedEnvelopes: filter(entries.encryptedEnvelopes),
       casNodes: filter(entries.casNodes),
       retentions: filter(entries.retentions),
-      checkpoints: filter(entries.checkpoints),
+      evidence: filter(entries.evidence),
     }
   }
 }

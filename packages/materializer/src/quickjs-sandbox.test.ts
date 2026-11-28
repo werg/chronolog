@@ -45,12 +45,14 @@ describe('QuickJsSandbox isolation', () => {
           Math.leak = () => 1;
           JSON.leak = true;
           if (globalThis.__chronologHost) globalThis.__chronologHost.leak = true;
-          const t = ctx.topic('t'); if (t) t.mutated = true;
-          return { ok: true, state: seen };
+          const t = ctx.topic('t');
+          let topicFreezeThrew = false;
+          try { if (t) t.mutated = true; } catch (e) { topicFreezeThrew = e instanceof TypeError; }
+          return { ok: true, state: { ...seen, topicFreezeThrew } };
         },
       };
     `)
-    const expected = { calls: 1, globalX: 'undefined', protoPolluted: false, mathPatched: 'undefined', jsonPatched: false, hostTampered: false, topicMutated: false }
+    const expected = { calls: 1, globalX: 'undefined', protoPolluted: false, mathPatched: 'undefined', jsonPatched: false, hostTampered: false, topicMutated: false, topicFreezeThrew: true }
     for (let i = 0; i < 3; i++) {
       expect(await value(sandbox, input({ topics: { t: { a: 1 } } }))).toEqual({ ok: true, state: expected })
     }
@@ -129,7 +131,7 @@ describe('QuickJsSandbox ctx', () => {
     }))
     expect(out).toEqual({ ok: true, state: {
       frozen: true,
-      keys: ['topic', 'query', 'mount', 'mountQuery', 'opOutcome', 'topicLastOpId', 'authorLastOpId', 'config'],
+      keys: ['topic', 'query', 'can', 'reject', 'mount', 'mountQuery', 'opOutcome', 'topicLastOpId', 'authorLastOpId', 'config'],
       sameTopic: true,
       topic: { v: 1 }, missing: null,
       outcome: ['accepted', 'rejected', null],
@@ -149,12 +151,16 @@ describe('QuickJsSandbox ctx', () => {
     expect(await value(sandbox, input({ method: 'onConflict', conflict: { code: 'x' } }))).toEqual({ ok: true, state: { conflict: { code: 'x' }, op: 'op' } })
   })
 
-  it('reports missing methods, missing exports, falsy exports and throwing reducers as before', async () => {
+  it('distinguishes intentional ctx.reject() from uncaught reducer crashes and enforces deepFreeze + strict JSON output', async () => {
     const { sandbox, input } = await setup(`
       export default { reduce() { throw new RangeError('boom') } };
       export const zero = 0;
       export const nothing = null;
       export const undef = undefined;
+      export const rejecter = { reduce(s, tx, ctx) { ctx.reject('insufficient_funds', 'need 50'); } };
+      export const mutator = { reduce(state) { state.nested.x = 99; return { ok: true, state }; } };
+      export const badNaN = { reduce() { return { ok: true, state: { balance: NaN } }; } };
+      export const badMap = { reduce() { return { ok: true, state: { items: new Map([['a', 1]]) } }; } };
     `)
     expect(await sandbox.invoke(input({ method: 'query' }))).toEqual({ ok: false, code: 'vm:missing_method:query' })
     for (const exportName of ['zero', 'nothing', 'undef']) {
@@ -162,13 +168,10 @@ describe('QuickJsSandbox ctx', () => {
     }
     const missingExport = await sandbox.invoke(input({ exportName: 'absent' }))
     expect(missingExport.ok ? null : missingExport.code).toBe('vm:module_load_error')
-    expect(await sandbox.invoke(input())).toMatchObject({ ok: false, code: 'reducer:throw', detail: expect.stringContaining('boom') })
-  })
-
-  it('serializes output through JSON.stringify({ __ok, value }) including toJSON(key)', async () => {
-    const { sandbox, input } = await setup(`
-      export default { reduce() { return { toJSON(key) { return { key } } } } };
-    `)
-    expect(await value(sandbox, input())).toEqual({ key: 'value' })
+    expect(await sandbox.invoke(input())).toMatchObject({ ok: false, code: 'reducer:crash', detail: expect.stringContaining('boom') })
+    expect(await sandbox.invoke(input({ exportName: 'rejecter' }))).toEqual({ ok: true, value: { ok: false, code: 'insufficient_funds', detail: 'need 50' } })
+    expect(await sandbox.invoke(input({ exportName: 'mutator', state: { nested: { x: 1 } } }))).toMatchObject({ ok: false, code: 'reducer:crash' })
+    expect(await sandbox.invoke(input({ exportName: 'badNaN' }))).toMatchObject({ ok: false, code: 'vm:invalid_output', detail: expect.stringContaining('$.state.balance') })
+    expect(await sandbox.invoke(input({ exportName: 'badMap' }))).toMatchObject({ ok: false, code: 'vm:invalid_output', detail: expect.stringContaining('$.state.items') })
   })
 })

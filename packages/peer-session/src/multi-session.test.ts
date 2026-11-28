@@ -71,7 +71,7 @@ function scriptedSession(applicationId: string): MergeableSession & { push(chang
       queue.push({
         kind: 'materialized',
         revision: { digest: '00'.repeat(32), stateRoot: '11'.repeat(32), historyDigest: '22'.repeat(32), view: 'local', orderLength: 1 },
-        revisedProposalIds: [],
+        revisedOpIds: [],
         ...change,
       })
       wake()

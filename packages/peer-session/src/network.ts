@@ -7,7 +7,7 @@ import type {
 import { bytesToHex } from '@chronolog/canonical'
 import { decodeEncryptedEnvelope, decodeSignedOperation, operationIdDigest } from '@chronolog/protocol'
 import { check, signRecord, verifyRecord, type Signed } from '@chronolog/authority'
-import type { FinalityCheckpoint } from '@chronolog/authority'
+import type { AdmissionEvidence } from '@chronolog/authority'
 import type { RetentionEvidence } from './operation.js'
 import { reconcileRanges, type ReconcileRange } from './reconcile.js'
 import { createNetworkContent, type ContentWireMessage } from './network-content.js'
@@ -116,7 +116,7 @@ interface Proof {
 interface WireFacts {
   readonly publicOps: readonly Uint8Array[]
   readonly encryptedEnvelopes: readonly Uint8Array[]
-  readonly checkpoints: readonly FinalityCheckpoint[]
+  readonly evidence: readonly AdmissionEvidence[]
 }
 type Message =
   | { readonly kind: 'hello'; readonly value: Signed<Hello> }
@@ -326,21 +326,21 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     // ---- outgoing facts (batched, size-bounded) ----
     const FACT_BATCH_BYTES = 512 * 1024
     const sendFactBatches = async (facts: WireFacts, requestId = ''): Promise<void> => {
-      const batches: { publicOps: Uint8Array[]; encryptedEnvelopes: Uint8Array[]; checkpoints: FinalityCheckpoint[] }[] = []
-      let current = { publicOps: [] as Uint8Array[], encryptedEnvelopes: [] as Uint8Array[], checkpoints: [] as FinalityCheckpoint[] }, size = 0
+      const batches: { publicOps: Uint8Array[]; encryptedEnvelopes: Uint8Array[]; evidence: AdmissionEvidence[] }[] = []
+      let current = { publicOps: [] as Uint8Array[], encryptedEnvelopes: [] as Uint8Array[], evidence: [] as AdmissionEvidence[] }, size = 0
       const roll = (bytes: number): void => {
-        if (size + bytes > FACT_BATCH_BYTES && size > 0) { batches.push(current); current = { publicOps: [], encryptedEnvelopes: [], checkpoints: [] }; size = 0 }
+        if (size + bytes > FACT_BATCH_BYTES && size > 0) { batches.push(current); current = { publicOps: [], encryptedEnvelopes: [], evidence: [] }; size = 0 }
         size += bytes
       }
       for (const raw of facts.publicOps) { roll(raw.length); current.publicOps.push(raw) }
       for (const raw of facts.encryptedEnvelopes) { if (!privateAllowed()) break; roll(raw.length); current.encryptedEnvelopes.push(raw) }
-      for (const cp of facts.checkpoints) { roll(4096); current.checkpoints.push(cp) }
+      for (const ev of facts.evidence) { roll(4096); current.evidence.push(ev) }
       batches.push(current)
       let sent: Promise<void> = Promise.resolve()
       for (let i = 0; i < batches.length; i++) {
         const batch = batches[i]!, last = i === batches.length - 1
-        if (!last && batch.publicOps.length + batch.encryptedEnvelopes.length + batch.checkpoints.length === 0) continue
-        if (last && requestId === '' && batch.publicOps.length + batch.encryptedEnvelopes.length + batch.checkpoints.length === 0) continue
+        if (!last && batch.publicOps.length + batch.encryptedEnvelopes.length + batch.evidence.length === 0) continue
+        if (last && requestId === '' && batch.publicOps.length + batch.encryptedEnvelopes.length + batch.evidence.length === 0) continue
         sent = post({ kind: 'facts', requestId: last ? requestId : '', facts: batch })
       }
       await sent
@@ -375,7 +375,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     })
 
     // ---- retention receipts (one signature per debounced batch) ----
-    let receiptItems: { proposalId: string }[] = []
+    let receiptItems: { opId: string }[] = []
     let receiptTimer: ReturnType<typeof setTimeout> | undefined
     const flushReceipts = async (): Promise<void> => {
       receiptTimer = undefined
@@ -395,17 +395,17 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     }
     const queueOutOfBandReceipts = (): void => {
       if (signal.aborted) return
-      for (const proposalId of session.unreceiptedProposalIdsByAuthor(peerId, privateAllowed())) {
-        receiptItems.push({ proposalId })
+      for (const opId of session.unreceiptedOpIdsByAuthor(peerId, privateAllowed())) {
+        receiptItems.push({ opId })
       }
       scheduleReceipts()
     }
     const queueReceipts = (facts: WireFacts): void => {
       for (const raw of facts.publicOps) {
-        try { receiptItems.push({ proposalId: bytesToHex(operationIdDigest(decodeSignedOperation(raw).coreBytes)) }) } catch { /* rejected by merge */ }
+        try { receiptItems.push({ opId: bytesToHex(operationIdDigest(decodeSignedOperation(raw).coreBytes)) }) } catch { /* rejected by merge */ }
       }
       for (const raw of facts.encryptedEnvelopes) {
-        try { receiptItems.push({ proposalId: bytesToHex(decodeEncryptedEnvelope(raw).opId) }) } catch { /* ignore */ }
+        try { receiptItems.push({ opId: bytesToHex(decodeEncryptedEnvelope(raw).opId) }) } catch { /* ignore */ }
       }
       scheduleReceipts()
     }
@@ -546,15 +546,15 @@ export async function connectApplicationPeer(session: ApplicationSession, option
             case 'want': {
               check(Array.isArray(message.ids) && message.ids.length <= 100_000, 'PEER_REQUEST_INVALID')
               const allowed = message.scope === 'public' || privateAllowed()
-              void sendFactBatches(allowed ? session.exportFactsById(message.scope, message.ids) : { publicOps: [], encryptedEnvelopes: [], checkpoints: [] }, message.requestId)
+              void sendFactBatches(allowed ? session.exportFactsById(message.scope, message.ids) : { publicOps: [], encryptedEnvelopes: [], evidence: [] }, message.requestId)
               break
             }
             case 'facts': {
               check(typeof message.requestId === 'string' && message.requestId.length <= 128, 'PEER_REQUEST_INVALID')
               const facts = message.facts
               const encryptedEnvelopes = privateAllowed() ? facts.encryptedEnvelopes : []
-              await session.mergeFacts({ publicOps: facts.publicOps, encryptedEnvelopes, casNodes: [], retentions: [], checkpoints: facts.checkpoints }, { source: connectionId })
-              queueReceipts({ publicOps: facts.publicOps, encryptedEnvelopes, checkpoints: [] })
+              await session.mergeFacts({ publicOps: facts.publicOps, encryptedEnvelopes, casNodes: [], retentions: [], evidence: facts.evidence }, { source: connectionId })
+              queueReceipts({ publicOps: facts.publicOps, encryptedEnvelopes, evidence: [] })
               if (message.requestId !== '') {
                 const roundId = wantRequests.get(message.requestId)
                 wantRequests.delete(message.requestId)
@@ -576,13 +576,13 @@ export async function connectApplicationPeer(session: ApplicationSession, option
             }
             case 'cas': {
               const nodes = message.nodes.filter(node => node.partition === 'public' || privateAllowed())
-              if (nodes.length > 0) await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: nodes, retentions: [], checkpoints: [] }, { source: connectionId })
+              if (nodes.length > 0) await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: nodes, retentions: [], evidence: [] }, { source: connectionId })
               const waiter = casRequests.get(message.requestId)
               casRequests.delete(message.requestId); waiter?.resolve()
               break
             }
             case 'receipt': {
-              await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: [], retentions: [message.evidence], checkpoints: [] }, { source: connectionId })
+              await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: [], retentions: [message.evidence], evidence: [] }, { source: connectionId })
               break
             }
             case 'content': {

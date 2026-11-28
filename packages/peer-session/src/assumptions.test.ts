@@ -19,9 +19,9 @@ describe('Universal operation assumptions & ergonomic SQL row guards', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: {
             admins: [alice.identity.publicKey],
             members: [],
@@ -57,7 +57,7 @@ describe('Universal operation assumptions & ergonomic SQL row guards', () => {
       const bobNote = await sBob.command('db:exec', {
         sql: 'INSERT INTO notes (id, body) VALUES (?, ?)',
         params: ['n1', 'confirmed 14:00'],
-      }, { afterOps: [bobClaim.id] })
+      }, { assumptions: { checks: [{ kind: 'op_accepted', opId: bobClaim.id }] } })
       expect((await bobNote.materialized()).outcome).toBe('accepted')
       expect(BigInt(bobNote.inspect().authorTimestampMs ?? '0') >= 2001n).toBe(true)
 
@@ -65,7 +65,7 @@ describe('Universal operation assumptions & ergonomic SQL row guards', () => {
       const bobFallback = await sBob.command('db:exec', {
         sql: 'INSERT INTO bookings (slot, owner) VALUES (?, ?)',
         params: ['14:30', 'bob'],
-      }, { requiresRejected: [bobClaim.id], authorTimestampMs: 2500n })
+      }, { assumptions: { checks: [{ kind: 'op_rejected', opId: bobClaim.id }] }, authorTimestampMs: 2500n })
       expect((await bobFallback.materialized()).outcome).toBe('rejected')
       expect((await bobFallback.materialized()).rejectionCode).toBe('assumption:expected_rejected')
 
@@ -128,9 +128,9 @@ describe('Universal operation assumptions & ergonomic SQL row guards', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: {
             admins: [admin.identity.publicKey],
             members: [],

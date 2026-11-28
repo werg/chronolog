@@ -81,11 +81,11 @@ export {
 } from '@chronolog/protocol'
 export {
   collectControlReferencedCasHashes,
-  extractControlPermissions,
+  extractControlAdmission,
   replayBlindHostControl,
   dryRunReducerUpgrade,
   type BlindHostCasNode,
-  type ControlPermissionsSummary,
+  type ControlAdmissionSummary,
   type ReplayBlindHostOptions,
   type BlindHostControlResult,
   type DryRunReducerUpgradeOptions,

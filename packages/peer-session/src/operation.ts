@@ -3,7 +3,7 @@ import type { Signed } from '@chronolog/authority'
 import type { MaterializedRevision, WaitOptions } from './session-types.js'
 
 export interface MaterializedOperation {
-  readonly proposalId: string
+  readonly opId: string
   readonly revision: MaterializedRevision
   readonly outcome: 'accepted' | 'rejected'
   readonly rejectionCode: string | null
@@ -15,7 +15,7 @@ export interface RetentionStatement {
   readonly applicationId: string
   readonly peer: string
   readonly storageId: string
-  /** Proposal ids retained (any envelope version of an op carries the same signed operation). */
+  /** Operation ids retained (any envelope version of an op carries the same signed operation). */
   readonly items: readonly string[]
 }
 
@@ -25,7 +25,7 @@ export interface OperationInspection {
   readonly applicationId: string
   readonly author: string
   readonly authorTimestampMs: string | null
-  readonly proposalId: string
+  readonly opId: string
   readonly operationId: string
   readonly visibility: OperationVisibility
   readonly stored: boolean
@@ -58,7 +58,4 @@ export interface ApplicationSubmission {
   readonly awaitMaterialized?: boolean
   readonly updates: readonly TopicUpdate[]
   readonly assumptions?: OperationAssumptionsConfig
-  readonly afterOps?: readonly string[]
-  readonly requiresRejected?: readonly string[]
-  readonly onAssumptionFailed?: 'reject' | 'record_conflict'
 }

@@ -12,7 +12,7 @@ const root = resolve(import.meta.dirname, '..');
 const args = process.argv.slice(2);
 const outputFlag = args.indexOf('--output');
 const output = resolve(outputFlag >= 0 ? args[outputFlag + 1] : args.find(value => !value.startsWith('--')) ?? join(root, 'artifacts/authority'));
-const names = ['index', 'codec', 'definition', 'finality'];
+const names = ['index', 'codec', 'definition', 'admission'];
 const authorityRoot = join(root, 'packages/authority');
 const workspace = JSON.parse(await readFile(join(authorityRoot, 'package.json'), 'utf8'));
 const entries = Object.fromEntries(names.map(name => {

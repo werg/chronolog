@@ -15,7 +15,7 @@ export type QueryRows = SqliteQueryResult
 
 export interface ApplicationEvent {
   readonly id: string
-  readonly proposalId: string
+  readonly opId: string
   readonly operationId: string
   readonly author: string
   readonly authorTimestampMs: string
@@ -55,18 +55,12 @@ export interface CommandOptions {
   readonly awaitMaterialized?: boolean
   /** Explicit signed causal and/or state assumptions evaluated deterministically before applying updates. */
   readonly assumptions?: OperationAssumptionsConfig
-  /** Shorthand for op_accepted assumptions (automatically clamps authorTimestampMs past referenced ops). */
-  readonly afterOps?: readonly string[]
-  /** Shorthand for op_rejected assumptions (deterministic fallback / compensating action). */
-  readonly requiresRejected?: readonly string[]
-  /** Behavior when an assumption fails: 'reject' (default) or 'record_conflict'. */
-  readonly onAssumptionFailed?: 'reject' | 'record_conflict'
 }
 
 export interface ApplicationChange {
   readonly kind: 'materialized' | 'finalized' | 'dependency'
   readonly revision: MaterializedRevision
-  readonly revisedProposalIds: readonly string[]
+  readonly revisedOpIds: readonly string[]
   readonly changedTopics?: readonly string[]
   readonly changedTables?: readonly string[]
 }

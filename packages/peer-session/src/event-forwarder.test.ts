@@ -77,7 +77,7 @@ it('rederives effective event sets, retracts late-rejected proposals, exports in
     nonce: enc.nonce,
     ciphertext: enc.ciphertext,
   })
-  await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [envBytes], casNodes: [], retentions: [], checkpoints: [] })
+  await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [envBytes], casNodes: [], retentions: [], evidence: [] })
 
   await expect.poll(() => [...active.values()]).toEqual(['earlier canonical winner'])
   expect(deliveries.some(delivery => delivery.change === 'retract' && delivery.id.startsWith(late.id) && delivery.outcome === 'rejected')).toBe(true)
@@ -132,11 +132,11 @@ it('persists uncertain delivery before callback and retries the same stable even
 
 it('final mode uses verified final reads and none mode explicitly refuses a final exporter', async () => {
   const identity = await createSigningIdentity()
-  const f = await sessionFixture({ identities: [identity], finalityPolicy: { kind: 'signed-frontier', signer: identity.publicKey } })
+  const f = await sessionFixture({ identities: [identity], admissionPolicy: { kind: 'signed-frontier', signer: identity.publicKey } })
   const session = await f.open(0)
   closes.push(() => session.close())
   await (await session.command('say', 'closed', { authorTimestampMs: 1n })).materialized()
-  await session.finality.createCheckpoint({ throughMs: 2n })
+  await session.admission.createCheckpoint({ throughMs: 2n })
 
   const delivered: EventDeliveryProjection<EventProjection>[] = [], abort = new AbortController()
   const running = forwardSessionEvents({

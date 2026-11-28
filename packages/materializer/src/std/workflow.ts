@@ -1,14 +1,6 @@
 export const STD_WORKFLOW_SOURCE = `
 function hasCap(ctx, cap, author) {
-  const checked = ctx.query('$permissions', { check: cap, actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  if (!perms || !Array.isArray(perms.members)) return false;
-  const m = perms.members.find(x => x.publicKey === author);
-  if (!m) return false;
-  if (cap === 'administrator') return m.administrator === true;
-  if (cap === 'writer') return m.writer === true || m.administrator === true;
-  return false;
+  return ctx.can(cap, author);
 }
 
 function normalizeWorkflow(state, config) {
@@ -93,7 +85,7 @@ export const stateMachine = {
       const authorized = roles.some(role => {
         if (role === 'administrator' || role === 'admin') return isAdmin;
         if (role === 'writer') return isWriter;
-        return Boolean(ctx.query('$permissions', { check: 'scope', actor: tx.author, scope: role, atMs: nowMs }));
+        return ctx.can('scope', tx.author, { scope: role, atMs: nowMs });
       });
       if (!authorized) return { ok: false, code: 'workflow:role_required' };
 

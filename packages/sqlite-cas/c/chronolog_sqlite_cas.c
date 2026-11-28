@@ -108,6 +108,10 @@ EM_JS(double, js_chronolog_history_num, (int row, int col), {
   const fn = Module._casHooks && Module._casHooks.historyNum;
   return fn ? fn(row, col) : 0;
 });
+EM_JS(int, js_chronolog_can, (const char* capability, const char* actor), {
+  const fn = Module._casHooks && Module._casHooks.can;
+  return fn ? (fn(UTF8ToString(capability), UTF8ToString(actor)) ? 1 : 0) : 0;
+});
 
 /* Override localtime/localtime_r in WASM libc so SQLite 'localtime' modifier is ALWAYS fixed UTC! */
 struct tm* localtime_r(const time_t* timer, struct tm* result) {
@@ -291,6 +295,13 @@ static void fnChronologTopicQuery(sqlite3_context* ctx, int argc, sqlite3_value*
   const char* inputJson = (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_TEXT)
     ? (const char*)sqlite3_value_text(argv[1]) : "null";
   returnMallocTextOrNull(ctx, topic ? js_chronolog_topic_query(topic, inputJson) : NULL);
+}
+static void fnChronologCan(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  if (argc < 1 || sqlite3_value_type(argv[0]) != SQLITE_TEXT) { sqlite3_result_int(ctx, 0); return; }
+  const char* capability = (const char*)sqlite3_value_text(argv[0]);
+  const char* actor = (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_TEXT)
+    ? (const char*)sqlite3_value_text(argv[1]) : g_actor;
+  sqlite3_result_int(ctx, (capability && actor) ? js_chronolog_can(capability, actor) : 0);
 }
 static void fnDisabledRandom(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
   (void)argc; (void)argv;
@@ -592,6 +603,8 @@ EMSCRIPTEN_KEEPALIVE sqlite3* chronolog_open(void) {
   sqlite3_create_function_v2(db, "chronolog_author_last_op", 1, detFlags, NULL, fnChronologAuthorLastOp, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "chronolog_topic_query", 1, detFlags, NULL, fnChronologTopicQuery, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "chronolog_topic_query", 2, detFlags, NULL, fnChronologTopicQuery, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_can", 1, detFlags, NULL, fnChronologCan, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_can", 2, detFlags, NULL, fnChronologCan, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "random", 0, SQLITE_UTF8, NULL, fnDisabledRandom, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "randomblob", 1, SQLITE_UTF8, NULL, fnDisabledRandom, NULL, NULL, NULL);
   sqlite3_create_module(db, "chronolog_tx", &g_chronolog_vtab_module, (void*)(intptr_t)0);

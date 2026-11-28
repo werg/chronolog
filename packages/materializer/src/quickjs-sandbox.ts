@@ -97,6 +97,7 @@ export interface SqliteIntrospectionHooks {
   readonly opOutcome?: (opId: string) => 'accepted' | 'rejected' | null
   readonly authorLastOpId?: (author: string) => string | null
   readonly topicQueryJson?: (topic: string, inputJson: string) => string | null
+  readonly can?: (capability: string, actor: string) => boolean
   readonly topics?: readonly { readonly topic: string; readonly lastOpId: string | null; readonly stateJson: string }[]
   readonly history?: readonly {
     readonly seq: number
@@ -144,7 +145,7 @@ export interface ReducerInvocationInput {
   readonly topicBindings?: Readonly<Record<string, { readonly module: string; readonly export?: string; readonly config?: JsonValue }>>
   readonly moduleSpecifier: string
   readonly exportName: string
-  readonly method: 'reduce' | 'query' | 'describe' | 'onConflict' | 'derive'
+  readonly method: 'reduce' | 'query' | 'describe' | 'onConflict' | 'derive' | 'admit' | 'authorize' | 'verify'
   readonly state: JsonValue
   readonly payload: JsonValue
   readonly tx?: {
@@ -152,6 +153,8 @@ export interface ReducerInvocationInput {
     readonly author: string
     readonly authorTimestampMs: number
     readonly operationId: string
+    readonly visibility?: 'public' | 'encrypted'
+    readonly updates?: readonly { readonly topic: string; readonly input: JsonValue }[]
   }
   readonly conflict?: AssumptionFailureInfo
   /** Lazy outcome lookup for ops visible to this invocation (never serialized wholesale into the VM). */
@@ -244,9 +247,52 @@ for (const k of ['Intl', 'performance', 'WeakRef', 'FinalizationRegistry']) {
     Object.defineProperty(globalThis, k, { value: undefined, writable: false, configurable: false });
   }
 }
+const __deepFreeze = (val) => {
+  if (val === null || typeof val !== 'object') return val;
+  if (Object.isFrozen(val)) return val;
+  Object.freeze(val);
+  if (Array.isArray(val)) {
+    for (let i = 0; i < val.length; i++) __deepFreeze(val[i]);
+  } else {
+    for (const k of Object.keys(val)) __deepFreeze(val[k]);
+  }
+  return val;
+};
+const __reject = (code, detail) => {
+  const err = new Error(detail !== undefined ? String(detail) : String(code || 'rejected'));
+  err.__chronologReject = true;
+  err.code = typeof code === 'string' && code.length > 0 ? code : 'rejected';
+  if (detail !== undefined && detail !== null) err.detail = String(detail);
+  throw err;
+};
+const __assertDeterministicJson = (val, path) => {
+  if (val === null || val === undefined || typeof val === 'boolean' || typeof val === 'string') return;
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val)) throw new TypeError('INVALID_STATE: Non-finite number at ' + path);
+    return;
+  }
+  if (typeof val !== 'object') {
+    throw new TypeError('INVALID_STATE: Unsupported value (' + typeof val + ') at ' + path);
+  }
+  if (Array.isArray(val)) {
+    for (let i = 0; i < val.length; i++) {
+      if (val[i] === undefined) throw new TypeError('INVALID_STATE: undefined array element at ' + path + '[' + i + ']');
+      __assertDeterministicJson(val[i], path + '[' + i + ']');
+    }
+    return;
+  }
+  const proto = Object.getPrototypeOf(val);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new TypeError('INVALID_STATE: Non-plain object (' + (proto && proto.constructor ? proto.constructor.name : 'Object') + ') at ' + path);
+  }
+  for (const k of Object.keys(val)) {
+    __assertDeterministicJson(val[k], path + '.' + k);
+  }
+};
 [JSON, JSON.parse, JSON.stringify, String, Object.is,
-  (topic, query, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config) => Object.freeze({ topic, query, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config }),
-  (out) => JSON.stringify({ __ok: true, value: out })];
+  (topic, query, can, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config) => Object.freeze({ topic, query, can, reject: __reject, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config: __deepFreeze(config) }),
+  (out) => { __assertDeterministicJson(out, '$'); return JSON.stringify({ __ok: true, value: out }); },
+  __deepFreeze];
 `
 
 /** Carries a VM exception out of a host-side coercion so a host `ctx` method can rethrow it unchanged. */
@@ -986,6 +1032,17 @@ export class QuickJsSandbox {
             topicQueryJson: (topic: string, inputJson: string) => {
               try { return queryTopic(topic, inputJson) } catch { return null }
             },
+            can: (capability: string, actor: string) => {
+              try {
+                const isScoped = capability.startsWith('scope:')
+                const qInput = isScoped
+                  ? { kind: 'can', capability: 'scope', scope: capability.slice(6), actor, atMs: input.tx?.authorTimestampMs ?? 0 }
+                  : { kind: 'can', capability, actor, atMs: input.tx?.authorTimestampMs ?? 0 }
+                return JSON.parse(queryTopic('$admission', JSON.stringify(qInput))) === true
+              } catch {
+                return false
+              }
+            },
             get topics() {
               if (cachedTopicsList === undefined) {
                 const names = Object.keys(input.topics)
@@ -1063,6 +1120,7 @@ export class QuickJsSandbox {
         const objectIsH = intrinsic(4)
         const makeCtxH = intrinsic(5)
         const finishH = intrinsic(6)
+        const deepFreezeH = intrinsic(7)
         /** `JSON.parse(text)` in the VM; the result (or the VM exception) is owned by the caller. */
         const vmParse = (text: string) => {
           const textH = ctx.newString(text)
@@ -1101,7 +1159,10 @@ export class QuickJsSandbox {
           if (cached === undefined) {
             const res = vmParse(JSON.stringify(Object.hasOwn(input.topics, key) ? input.topics[key]! : null))
             if (res.error) throw new VmThrow(res.error)
-            cached = own(res.value)
+            const frozen = ctx.callFunction(deepFreezeH, ctx.undefined, res.value)
+            res.value.dispose()
+            if (frozen.error) throw new VmThrow(frozen.error)
+            cached = own(frozen.value)
             topicCache.set(key, cached)
           }
           return cached
@@ -1115,6 +1176,27 @@ export class QuickJsSandbox {
         ctxMethod('query', (nameH, inputH) => {
           const name = vmString(nameH)
           return vmParse(queryTopic(name, vmStringifyInput(inputH)))
+        })
+        ctxMethod('can', (capH, actorH, extraH) => {
+          const capability = vmString(capH)
+          const actor = actorH === undefined || ctx.typeof(actorH) === 'undefined'
+            ? (input.tx?.author ?? '')
+            : vmString(actorH)
+          const extra = extraH === undefined || ctx.typeof(extraH) === 'undefined'
+            ? {}
+            : (JSON.parse(vmStringifyInput(extraH)) as Record<string, JsonValue> | null) ?? {}
+          const qInput: Record<string, JsonValue> = {
+            kind: 'can',
+            capability,
+            actor,
+            atMs: input.tx?.authorTimestampMs ?? 0,
+            ...extra,
+          }
+          try {
+            return JSON.parse(queryTopic('$admission', JSON.stringify(qInput))) === true ? ctx.true : ctx.false
+          } catch {
+            return ctx.false
+          }
         })
         ctxMethod('mount', (nameH) => {
           const mountsH = readTopicCached('$mounts')
@@ -1193,17 +1275,26 @@ export class QuickJsSandbox {
           const fnRes = ctx.getProp(target, input.method)
           own(fnRes)
           if (ctx.typeof(fnRes) !== 'function') return { kind: 'missing' }
-          const argsJson = input.method === 'reduce' ? [input.state, txJson(input)]
-            : input.method === 'onConflict' ? [input.state, txJson(input), input.conflict ?? null]
-              : input.method === 'query' ? [input.state, input.payload]
-                : input.method === 'derive' ? [input.payload]
-                  : [input.state]
+          const argsJson = input.method === 'reduce' || input.method === 'authorize' ? [input.state, txJson(input)]
+            : input.method === 'verify'
+              ? [
+                  (input.payload !== null && typeof input.payload === 'object' && !Array.isArray(input.payload) ? (input.payload as Record<string, JsonValue>).before ?? null : null),
+                  (input.payload !== null && typeof input.payload === 'object' && !Array.isArray(input.payload) ? (input.payload as Record<string, JsonValue>).after ?? null : null),
+                  txJson(input),
+                ]
+              : input.method === 'onConflict' ? [input.state, txJson(input), input.conflict ?? null]
+                : input.method === 'query' || input.method === 'admit' ? [input.state, input.payload]
+                  : input.method === 'derive' ? [input.payload]
+                    : [input.state]
           const argsRes = vmParse(JSON.stringify(argsJson))
           if (argsRes.error) return { kind: 'error', error: argsRes.error }
           const argsArr = own(argsRes.value)
+          const freezeRes = ctx.callFunction(deepFreezeH, ctx.undefined, argsArr)
+          if (freezeRes.error) return { kind: 'error', error: freezeRes.error }
+          freezeRes.value.dispose()
           const args = argsJson.map((_, i) => own(ctx.getProp(argsArr, i)))
-          // ctx is the third argument for reduce/onConflict/query, second for derive/describe.
-          const ctxIndex = input.method === 'derive' || input.method === 'describe' ? 1 : 2
+          // ctx position: 3 for verify(before, after, tx, ctx), 1 for derive/describe, 2 for reduce/authorize/onConflict/query/admit.
+          const ctxIndex = input.method === 'verify' ? 3 : input.method === 'derive' || input.method === 'describe' ? 1 : 2
           args.splice(ctxIndex, 0, ctxObj)
           const callRes = ctx.callFunction(fnRes, ctx.undefined, ...args)
           if (callRes.error) return { kind: 'error', error: callRes.error }
@@ -1220,8 +1311,25 @@ export class QuickJsSandbox {
           if (missingDep !== null) throw missingDep as Error
           if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
           if (timedOut) throw new OperationalTimeoutError()
+          if (
+            dumped !== null &&
+            typeof dumped === 'object' &&
+            (dumped as { readonly __chronologReject?: unknown }).__chronologReject === true
+          ) {
+            const rej = dumped as { readonly code?: unknown; readonly detail?: unknown }
+            const code = typeof rej.code === 'string' && rej.code.length > 0 ? rej.code : 'rejected'
+            const detail = typeof rej.detail === 'string' && rej.detail.length > 0 ? rej.detail : undefined
+            return {
+              ok: true,
+              value: { ok: false, code, ...(detail === undefined ? {} : { detail }) },
+            }
+          }
           const detail = formatJsError(dumped)
-          const code = /out of memory|memory limit/i.test(detail) ? 'vm:limit' : 'reducer:throw'
+          const code = /out of memory|memory limit/i.test(detail)
+            ? 'vm:limit'
+            : detail.startsWith('INVALID_STATE:')
+              ? 'vm:invalid_output'
+              : 'reducer:crash'
           return { ok: false, code, detail }
         }
         if (missingDep !== null) throw missingDep as Error

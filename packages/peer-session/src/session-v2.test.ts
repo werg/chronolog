@@ -268,16 +268,16 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     await expect(sessA.readView({ view: 'final' })).rejects.toMatchObject({ code: 'FINALITY_UNSUPPORTED' })
 
     await (await sessA.command('set', { key: 'k1', value: 'v1' }, { authorTimestampMs: 10n })).materialized()
-    // Activate signed-frontier finality effective after t=20 (none -> P1 bootstrap!)
-    await (await sessA.scheduleFinality({
+    // Activate signed-frontier admission effective after t=20 (open -> P1 bootstrap!)
+    await (await sessA.admission.schedulePolicy({
       effectiveAfterMs: 20n,
       policy: { kind: 'signed-frontier', signer: devA.identity.publicKey },
       authorTimestampMs: 15n,
     })).materialized()
 
     await (await sessA.command('set', { key: 'k2', value: 'v2' }, { authorTimestampMs: 25n })).materialized()
-    const { checkpoint, snapshot } = await sessA.finality.createCheckpoint({ throughMs: 30n })
-    expect(sessA.finality.status().closedThroughMs).toBe(30n)
+    const { evidence, snapshot } = await sessA.admission.createCheckpoint({ throughMs: 30n })
+    expect(sessA.admission.status().closedThroughMs).toBe(30n)
 
     // Write a suffix op after the checkpoint
     const suffixOp = await sessA.command('set', { key: 'k3', value: 'v3' }, { authorTimestampMs: 40n })
@@ -288,13 +288,13 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     closes.push(() => sessJoiner.close())
 
     // Give joiner the seenOpsRoot CAS node + checkpoint snapshot
-    await sessJoiner.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: (await sessA.exportFacts()).casNodes, retentions: [], checkpoints: [] })
-    await sessJoiner.finality.bootstrapFromCheckpoint(checkpoint, snapshot)
+    await sessJoiner.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: (await sessA.exportFacts()).casNodes, retentions: [], evidence: [] })
+    await sessJoiner.admission.bootstrapFromCheckpoint(evidence, snapshot)
 
     // Now feed ONLY the suffix op envelope
     const allFacts = await sessA.exportFacts()
     const suffixEnv = allFacts.encryptedEnvelopes.at(-1)!
-    await sessJoiner.mergeFacts({ publicOps: [], encryptedEnvelopes: [suffixEnv], casNodes: [], retentions: [], checkpoints: [] })
+    await sessJoiner.mergeFacts({ publicOps: [], encryptedEnvelopes: [suffixEnv], casNodes: [], retentions: [], evidence: [] })
 
     // Checkpoint + suffix produces IDENTICAL stateRoot AND revision.digest to full replay!
     expect(sessJoiner.revision().stateRoot).toBe(sessA.revision().stateRoot)

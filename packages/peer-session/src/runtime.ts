@@ -1,5 +1,4 @@
 import type { LogGenesis } from '@chronolog/protocol'
-import type { BlockchainAnchorVerifier } from '@chronolog/authority'
 import type { QuickJsSandboxOptions } from '@chronolog/materializer'
 import { claimApplicationDevice, type ApplicationDevice } from './device.js'
 import type { ApplicationDefinition } from './definition.js'
@@ -15,7 +14,6 @@ export interface CreateApplicationSessionOptions<D extends ApplicationDefinition
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
   readonly definition?: D
   readonly blindHostMode?: boolean
-  readonly blockchainVerifier?: BlockchainAnchorVerifier
   readonly sqliteWasmModule?: WebAssembly.Module
   readonly sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly sqliteWasmBytes?: Uint8Array

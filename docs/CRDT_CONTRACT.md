@@ -15,7 +15,7 @@ No peer, host, relay, finalizer, transport receipt, or selected branch may assig
 ## 2. Two-Way Public/Encrypted Control Partition
 
 On chains with `privateLog: true`:
-- Control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, `$mounts`, `$builders`) may ONLY be mutated by `visibility: 'public'` operations.
+- Control topics (`$reducers`, `$admission`, `$seals`, `$keys`, `$publications`, `$mounts`, `$builders`) may ONLY be mutated by `visibility: 'public'` operations.
 - Public operations can ONLY read `$*` topics and `public` CAS nodes.
 - Application (non-`$`) topics may ONLY be mutated by `visibility: 'encrypted'` operations (wrapped in `EncryptedOperationEnvelope` under an epoch key).
 - Idempotency deduplication is scoped by `(visibility, author, operationId)`. The consumed-key set is a deterministic function of the ordered history (committed by `historyDigest`) and is committed as a `seenOpsRoot` CAS node whenever state is exported (materialized cache, snapshot bundle, checkpoint bootstrap).
@@ -53,7 +53,7 @@ Checkpoints and snapshots carry `topics`, `seenOpsRoot` and `historyDigest`; res
 
 - Each device holds a persistent Ed25519 signing identity and a persistent X25519 `wrapKey`.
 - `$keys` stores per-epoch `keyCommitment` and HPKE (`DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/AES-256-GCM`) lockboxes per authorized reader.
-- Admitting a fresh device on a chain with rotated epochs atomically updates `$permissions` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history.
+- Admitting a fresh device on a chain with rotated epochs atomically updates `$admission` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history.
 - Encrypted envelopes are reconciled by `encryptedEnvelopeDigest` (not `opId` alone). When an offline device reconnects after an epoch rotation, it re-encrypts its exact original signed operation bytes under the newest epoch while preserving `opId`, `authorTimestampMs`, and signature.
 - Under `finality: none`, membership and key grants are provisional until all earlier operations are known; post-revocation confidentiality applies to epochs rotated after revocation whose ciphertext is not distributed to revoked peers.
 
@@ -69,16 +69,15 @@ Checkpoints and snapshots carry `topics`, `seenOpsRoot` and `historyDigest`; res
   - `mode: 'readonly'` — pure `SELECT` queries and `validateExpr()`.
 - `chronolog/rls` (`applyRls`) validates every user write predicate through SQLite's `mode: 'readonly'` parser (forbidding semicolons, sub-writes, and injection) before wrapping it in `BEFORE INSERT/UPDATE/DELETE` triggers with `RAISE(ABORT, ...)`.
 
-## 7. Optional Time-Scoped Finality (`$finality`)
+## 7. Unified Admission (`$admission`) & Kernel-Enforced Immutability (`$seals`)
 
-`$finality` stores a strictly monotonic schedule `[{ effectiveAfterMs, policy }]`.
-- `policy.kind = 'none'` is a first-class supported mode (zero finality dependencies; finalized-only reads explicitly reject with `FINALITY_UNSUPPORTED`).
-- Supported finalizing policies: `signed-frontier`, `fixed-validator`, and `blockchain-anchor`.
-- Handoff rule at `effectiveAfterMs = T1`:
-  - Outgoing finalizing policy `P0` must seal through `>= T1` before `P1` checkpoints are accepted.
-  - When `P0` is `'none'`, `P1` attests its bootstrap frontier at `>= T1` directly.
-- Finality checkpoints commit to `closedThroughMs`, `includedSetDigest`, `historyDigest`, `stateRoot`, and `inclusions`. Operations with `authorTimestampMs <= closedThroughMs` absent from `includedOpIds` are deterministically excluded.
+`$admission` unifies four concerns in one state-defined module:
+1. **Per-operation fail-closed authorization (`authorize(state, tx, ctx)`):** Invoked automatically by `TopicKernel` before any non-`$admission` topic reducer runs; local topic reducers can only monotonically tighten, never weaken global admission.
+2. **Optional semantic post-conditions (`verify(before, after, tx, ctx)`):** Pure, flat post-execution invariant check over `before`/`after` topic snapshots; failure rolls back the entire atomic multi-topic transaction.
+3. **Consensus-agnostic history admission (`admit(state, { logId, ops, evidence, pinnedFrontier }, ctx)`):** Evaluates time-scoped `schedule` policies (`open`, `signed-frontier`, `threshold-quorum`, `member-quorum`, `optimistic-challenge`, `merkle-anchor`, `pinned-checkpoint`) and locally pinned non-rewinding frontiers (`pinnedFrontier`) identically on full peers and blind hosts. Operations with `authorTimestampMs <= closedThroughMs` absent from `includedOpIds` are deterministically excluded.
+4. **Ephemeral signal authorization (`query('$admission', { kind: 'signals' })`):** Cached per `stateRoot` so membership revocations take effect immediately on `@chronolog/signals` live lanes.
 
-## 8. Ephemeral Signals (`@chronolog/signals` & `$signal_policy`)
-
-Ephemeral live-lane messages (cursors, typing, streaming tokens) stay completely off the durable operation set. `SignalStream` carries optional `stateRoot` and `supersedesStream` anchoring, and `ApplicationSession` caches `$signal_policy` per `stateRoot` so membership revocations take effect immediately.
+`$seals` is a plain-data, kernel-enforced monotonic ratchet table (`{ reducers, paths }`):
+- Existing seals can never be removed or weakened (`append-only` may tighten to `frozen`, never reverse), enforced directly by `TopicKernel` before every commit.
+- `reducers[topic] = true` pins the topic's resolved `(moduleRef, export, config)` (including resolved `$reducers.imports` CAS hashes).
+- `paths[topic][dotPath] = 'frozen' | 'append-only'` locks a JSON subtree forever (auto-sealing `reducers[topic]` by default unless `allowMutableReducer: true` is specified).

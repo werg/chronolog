@@ -19,9 +19,9 @@ describe('Phase 2 standard reducers: crdt, text, ledger, workflow, fs', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: { admins: [alice.identity.publicKey], members: [], openRead: true, openWrite: true, admission: null },
         },
         prefs: { module: 'chronolog/crdt', export: 'lwwMap' },
@@ -97,9 +97,9 @@ describe('Phase 2 standard reducers: crdt, text, ledger, workflow, fs', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: { admins: [admin.identity.publicKey], members: [], openRead: true, openWrite: true, admission: null },
         },
         ledger: { module: 'chronolog/ledger', export: 'doubleEntryLedger' },
@@ -209,9 +209,9 @@ describe('Phase 2 standard reducers: crdt, text, ledger, workflow, fs', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: { admins: [admin1.identity.publicKey, admin2.identity.publicKey], members: [], openRead: true, openWrite: true, admission: null },
         },
         proposals: {

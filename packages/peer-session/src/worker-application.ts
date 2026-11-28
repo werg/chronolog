@@ -1,11 +1,11 @@
 import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
 import type { JsonValue } from '@chronolog/protocol'
 import type { ApplicationEndpointBinding as InlineApplicationEndpointBinding, ApplicationEndpointContext as InlineApplicationEndpointContext } from './owner-types.js'
-import type { ApplicationDescription as InlineApplicationDescription, EquivocationProof, FinalityCheckpoint as InlineFinalityCheckpoint, ScheduledFinalityEntry, VerifiedFinalityV2 } from '@chronolog/authority'
+import type { ApplicationDescription as InlineApplicationDescription, AdmissionDecision, AdmissionEquivocation, AdmissionEvidence as InlineAdmissionEvidence, PinnedFrontier } from '@chronolog/authority'
 import type { SqliteExecOptions, SqliteExecResult, SqliteQueryResult } from '@chronolog/materializer'
 import type { ApplicationPeerDiagnostics as InlineApplicationPeerDiagnostics } from './network.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
-import type { CheckpointBootstrapSnapshot, GuardianMember, PermissionsTopicState, SessionFacts as InlineSessionFacts } from './session.js'
+import type { AdmissionRoster, AdmissionScheduleEntry, CheckpointBootstrapSnapshot, GuardianMember, SessionFacts as InlineSessionFacts, SimulationResult } from './session.js'
 import type { SqlBranchDiff, SqlBranchProposal } from './sql-extensions.js'
 import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from './worker-application-protocol.js'
 import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, SessionStatus, WaitOptions } from './session-types.js'
@@ -144,6 +144,7 @@ export class WorkerApplicationSession {
   async resumeAttachment(): Promise<InlineApplicationEndpointBinding | null> { this.#status = await this.request('attachment.resume', []); this.#attachmentState = 'active'; return this.endpoint ?? null }
   detach(): Promise<void> { return this.close() }
   async submit(input: ApplicationSubmission): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('submit', [input]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
+  simulate(input: ApplicationSubmission): Promise<SimulationResult> { return this.request('simulate', [input]) }
   async command(name: string, input: unknown, options: CommandOptions = {}): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('command', [name, input, options]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
   query(name: string, input: unknown = null): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly value: unknown }> { return this.request('query', [name, input]) }
   topic(name: string): Promise<JsonValue | null> { return this.request('topic', [name]) }
@@ -152,9 +153,8 @@ export class WorkerApplicationSession {
   }
   opOutcome(opId: string): Promise<'accepted' | 'rejected' | null> { return this.request('opOutcome', [opId]) }
   topicLastOpId(topic: string): Promise<string | null> { return this.request('topicLastOpId', [topic]) }
-  permissions(): Promise<PermissionsTopicState> { return this.request('permissions.summary', []) }
-  finalityStatus(opId: string): Promise<'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local'> { return this.request('finality.opStatus', [opId]) }
-  equivocationProofs(): Promise<readonly EquivocationProof[]> { return this.request('finality.equivocationProofs', []) }
+  permissions(): Promise<AdmissionRoster> { return this.request('permissions.summary', []) }
+  admissionStatus(opId: string): Promise<'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local'> { return this.request('admission.opStatus', [opId]) }
 
   async forkSql(topic: string): Promise<WorkerSqlBranch> {
     const opened = await this.request<{ readonly id: string; readonly topic: string; readonly baseRoot: string | null }>('sqlBranch.open', [topic])
@@ -260,10 +260,13 @@ export class WorkerApplicationSession {
   exportFacts(options?: { readonly includePrivateCas?: boolean; readonly includeGenesis?: boolean }): Promise<InlineSessionFacts> { return this.request('facts.export', options === undefined ? [] : [options]) }
   mergeFacts(facts: InlineSessionFacts): Promise<void> { return this.request('facts.merge', [facts]) }
 
-  readonly finality = {
-    status: (): Promise<VerifiedFinalityV2 & { readonly schedule: readonly ScheduledFinalityEntry[] }> => this.request('finality.status', []),
-    createCheckpoint: (options: { readonly throughMs: bigint }): Promise<{ readonly checkpoint: InlineFinalityCheckpoint; readonly snapshot: CheckpointBootstrapSnapshot }> => this.request('finality.createCheckpoint', [options]),
-    submitCheckpoints: (checkpoints: readonly InlineFinalityCheckpoint[]): Promise<void> => this.request('finality.submitCheckpoints', [checkpoints]),
+  readonly admission = {
+    status: (): Promise<AdmissionDecision & { readonly schedule: readonly AdmissionScheduleEntry[]; readonly pinnedFrontier: PinnedFrontier | null }> => this.request('admission.status', []),
+    opStatus: (opId: string): Promise<'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local'> => this.request('admission.opStatus', [opId]),
+    equivocations: (): Promise<readonly AdmissionEquivocation[]> => this.request('admission.equivocations', []),
+    createCheckpoint: (options: { readonly throughMs: bigint }): Promise<{ readonly evidence: InlineAdmissionEvidence; readonly snapshot: CheckpointBootstrapSnapshot }> => this.request('admission.createCheckpoint', [options]),
+    submitEvidence: (evidence: readonly InlineAdmissionEvidence[]): Promise<void> => this.request('admission.submitEvidence', [evidence]),
+    pinFrontier: (frontier: PinnedFrontier | null): Promise<void> => this.request('admission.pinFrontier', [frontier]),
   }
 
   readonly extensions = {

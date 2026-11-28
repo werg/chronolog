@@ -52,25 +52,23 @@ import {
 import {
   check,
   checkedApplicationInputSchema,
+  computeAdmissionScopeId,
   computeIncludedSetDigest,
   decodeRecord,
   encodeRecord,
-  parseFinalitySchedule,
-  policyScopeId,
+  evaluateAdmission,
+  evidenceDigest,
   recordDigest,
-  signFinalityCheckpoint,
+  signAdmissionCheckpoint,
   signRecord,
   validateApplicationDescription,
-  verifyFinalityV2,
   verifyRecord,
+  type AdmissionCheckpointPayload,
+  type AdmissionDecision,
+  type AdmissionEquivocation,
+  type AdmissionEvidence,
   type ApplicationDescription,
-  type BlockchainAnchorVerifier,
-  type FinalityAttestation,
-  type FinalityCheckpoint,
-  type FinalityCheckpointPayload,
-  type FinalityPolicyV2,
-  type ScheduledFinalityEntry,
-  type VerifiedFinalityV2,
+  type PinnedFrontier,
 } from '@chronolog/authority'
 import {
   createBytesStoreDerivationMemo,
@@ -136,7 +134,7 @@ export interface SessionCasNode {
   readonly partition: CasPartition
 }
 
-/** Sync-v3 fact scopes: public = public ops + finality checkpoints; private = encrypted envelopes. */
+/** Sync-v3 fact scopes: public = public ops + admission evidence; private = encrypted envelopes. */
 export type FactScope = 'public' | 'private'
 
 /** Facts added since the last `onFacts` notification, tagged with the link that delivered them. */
@@ -178,7 +176,27 @@ export interface SessionFacts {
   readonly encryptedEnvelopes: readonly Uint8Array[]
   readonly casNodes: readonly SessionCasNode[]
   readonly retentions: readonly RetentionEvidence[]
-  readonly checkpoints: readonly FinalityCheckpoint[]
+  readonly evidence: readonly AdmissionEvidence[]
+}
+
+export interface AdmissionScheduleEntry {
+  readonly effectiveAfterMs: number
+  readonly policy: JsonValue
+}
+
+export interface SealsTopicState {
+  readonly reducers: Readonly<Record<string, true>>
+  readonly paths: Readonly<Record<string, Readonly<Record<string, 'frozen' | 'append-only'>>>>
+}
+
+export interface SimulationResult {
+  readonly ok: boolean
+  readonly outcome: 'accepted' | 'rejected'
+  readonly rejectionCode: string | null
+  readonly rejectionDetail?: string
+  readonly events: readonly ApplicationEvent[]
+  readonly changedTopics: readonly string[]
+  readonly stateRoot: string
 }
 
 export interface MemberRecord {
@@ -216,26 +234,27 @@ export interface RecoveryRequestRecord {
   readonly createdAtMs: number
 }
 
-export interface PermissionsMultisigInfo {
+export interface AdmissionMultisigInfo {
   readonly threshold: number
   readonly signers: readonly string[]
   readonly proposals: Readonly<Record<string, JsonValue>>
 }
 
-export interface PermissionsTopicState {
+export interface AdmissionRoster {
   readonly mode?: 'attested' | 'open' | 'multisig' | 'custom'
   readonly members: readonly MemberRecord[]
   readonly readers?: readonly string[]
   readonly writers?: readonly string[]
   readonly administrators?: readonly string[]
   readonly publishers?: readonly string[]
+  readonly finalizers?: readonly string[]
   readonly openReaders?: boolean
   readonly openWriters?: boolean
   readonly blockedAuthors?: readonly string[]
   readonly admission: { readonly hostKey?: string } | null
   readonly guardians?: GuardiansConfig | null
   readonly recoveryRequests?: Readonly<Record<string, RecoveryRequestRecord>>
-  readonly multisig?: PermissionsMultisigInfo | null
+  readonly multisig?: AdmissionMultisigInfo | null
 }
 
 export interface KeyRingState {
@@ -281,7 +300,6 @@ export interface OpenApplicationSessionOptions<D extends ApplicationDefinition =
   readonly epochKeys?: ReadonlyMap<number, Uint8Array>
   readonly definition?: D
   readonly blindHostMode?: boolean
-  readonly blockchainVerifier?: BlockchainAnchorVerifier
   readonly sqliteWasmModule?: WebAssembly.Module
   readonly sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly materializedSnapshot?: Uint8Array
@@ -316,18 +334,21 @@ interface LocalPendingOp {
   currentEpoch: number
 }
 
-interface EvaluatedPermissionsSummary {
+interface EvaluatedAdmissionRoster {
   readonly mode: 'attested' | 'open' | 'multisig' | 'custom'
   readonly members: readonly MemberRecord[]
   readonly readers: ReadonlySet<string>
   readonly writers: ReadonlySet<string>
   readonly administrators: ReadonlySet<string>
   readonly publishers: ReadonlySet<string>
+  readonly finalizers: ReadonlySet<string>
   readonly openReaders: boolean
   readonly openWriters: boolean
   readonly blockedAuthors: ReadonlySet<string>
   readonly admission: { readonly hostKey?: string } | null
-  readonly multisig: PermissionsMultisigInfo | null
+  readonly guardians: GuardiansConfig | null
+  readonly recoveryRequests: Readonly<Record<string, RecoveryRequestRecord>>
+  readonly multisig: AdmissionMultisigInfo | null
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -355,7 +376,7 @@ function toMaterializedRevision(rev: ReturnType<TopicKernel['revision']>): Mater
 function toApplicationEvent(ev: EmittedKernelEvent): ApplicationEvent {
   return Object.freeze({
     id: `${ev.opId}:${ev.eventOrdinal}`,
-    proposalId: ev.opId,
+    opId: ev.opId,
     operationId: ev.operationId,
     author: ev.author,
     authorTimestampMs: ev.authorTimestampMs.toString(),
@@ -372,8 +393,7 @@ function toApplicationEvent(ev: EmittedKernelEvent): ApplicationEvent {
  * - Pure Merkle-DAG CAS (public/private partitions, explicit links, exact GC)
  * - TopicKernel + QuickJS-NG Import-Map ES Module reducers + lazy chronolog:sqlite
  * - Automatic HPKE $keys unsealing + reconnect rewrapping of offline encrypted ops
- * - Time-scoped $finality verification & checkpoint bootstrap
- * - State-root-cached $signal_policy enforcement
+ * - Unified state-defined $admission (global authorization, history finality, signals, checkpoint pins)
  */
 export class ApplicationSession<D extends ApplicationDefinition = ApplicationDefinition> {
   readonly applicationId: string
@@ -392,7 +412,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #lifetime = new AbortController()
   readonly #release: () => void | Promise<void>
   readonly #blindHostMode: boolean
-  readonly #blockchainVerifier?: BlockchainAnchorVerifier
   readonly #sandboxOptions: QuickJsSandboxOptions
   readonly #sqliteWasmModule?: WebAssembly.Module
   readonly #sqliteWasmLoader?: () => Promise<WebAssembly.Module>
@@ -418,7 +437,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #undecryptedEnvelopes = new Set<string>()
   readonly #localPending = new Map<string, LocalPendingOp>()
   readonly #retentions = new Map<string, Map<string, RetentionEvidence>>()
-  readonly #checkpoints = new FactMap<FinalityCheckpoint>(this.#publicFactIds, (id, source) => this.#recordDelta('public', id, source))
+  readonly #evidence = new FactMap<AdmissionEvidence>(this.#publicFactIds, (id, source) => this.#recordDelta('public', id, source))
   readonly #epochKeys = new Map<number, Uint8Array>()
   readonly #ringKeys = new Map<string, Map<number, Uint8Array>>()
 
@@ -431,19 +450,20 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #materializationError: string | null = null
   #lastLocalRevision: MaterializedRevision
   #lastFinalRevision: MaterializedRevision | null = null
-  #verifiedFinality: VerifiedFinalityV2 = {
+  #pinnedFrontier: PinnedFrontier | null = null
+  #admissionDecision: AdmissionDecision = {
     closedThroughMs: null,
     includedOpIds: new Set(),
     excludedOpIds: new Set(),
     latestCheckpoint: null,
-    verifiedCheckpoints: [],
-    equivocationProofs: [],
+    verifiedEvidence: [],
+    equivocations: [],
   }
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
   #cachedDescription: { stateRoot: string; value: ApplicationDescription } | null = null
   #validationDescription: { readonly key: string; readonly value: ApplicationDescription | null } | null = null
-  #evaluatedPermissions: EvaluatedPermissionsSummary | null = null
-  #lastPermsStateJson = ''
+  #evaluatedRoster: EvaluatedAdmissionRoster | null = null
+  #lastAdmissionHash = ''
   #pendingMaterializedCache: KernelMaterializedCache | null = null
   #pendingSnapshotBundle: {
     readonly cache: KernelMaterializedCache
@@ -486,7 +506,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#prefix = `v2/${this.logId}`
     this.#release = options.release
     this.#blindHostMode = options.blindHostMode ?? false
-    if (options.blockchainVerifier !== undefined) this.#blockchainVerifier = options.blockchainVerifier
     if (options.sqliteWasmModule !== undefined) this.#sqliteWasmModule = options.sqliteWasmModule
     if (options.sqliteWasmLoader !== undefined) this.#sqliteWasmLoader = options.sqliteWasmLoader
     if (options.materializedSnapshot !== undefined) this.#pendingEncryptedSnapshot = options.materializedSnapshot.slice()
@@ -632,9 +651,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const keyState = this.#computeKeyState()
     const pk = this.identity.publicKey
     const isAdmin = this.isAdministrator(pk)
-    const isPub = this.#evaluatedPermissions !== null
-      ? this.#evaluatedPermissions.publishers.has(pk)
-      : this.member(pk)?.publisher === true
+    const isPub = this.#evaluatedRoster !== null && this.#evaluatedRoster.publishers.has(pk)
     const canAuthorControl = !this.#closed && !this.#blindHostMode && (isAdmin || isPub)
     const canAuthorData = !this.#closed && !this.#blindHostMode && this.isWriter(pk) && (keyState === 'public' || keyState === 'ready')
     const canAuthor = canAuthorData || canAuthorControl
@@ -654,28 +671,41 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
   }
 
-  permissions(): PermissionsTopicState {
-    if (this.#evaluatedPermissions !== null) {
-      const p = this.#evaluatedPermissions
+  permissions(): AdmissionRoster {
+    const p = this.#evaluatedRoster
+    if (p === null) {
       return {
-        mode: p.mode,
-        members: p.members,
-        readers: p.openReaders ? ['*'] : [...p.readers].sort(),
-        writers: p.openWriters ? ['*'] : [...p.writers].sort(),
-        administrators: [...p.administrators].sort(),
-        publishers: [...p.publishers].sort(),
-        openReaders: p.openReaders,
-        openWriters: p.openWriters,
-        blockedAuthors: [...p.blockedAuthors].sort(),
-        admission: p.admission,
-        multisig: p.multisig,
+        members: [],
+        readers: [],
+        writers: [],
+        administrators: [],
+        publishers: [],
+        finalizers: [],
+        openReaders: false,
+        openWriters: false,
+        blockedAuthors: [],
+        admission: null,
+        guardians: null,
+        recoveryRequests: {},
+        multisig: null,
       }
     }
-    const raw = this.#kernel.topic('$permissions') as PermissionsTopicState | null
-    if (raw === null || typeof raw !== 'object' || !Array.isArray(raw.members)) {
-      return { members: [], openReaders: false, openWriters: false, blockedAuthors: [], admission: null, multisig: null }
+    return {
+      mode: p.mode,
+      members: p.members,
+      readers: p.openReaders ? ['*'] : [...p.readers].sort(),
+      writers: p.openWriters ? ['*'] : [...p.writers].sort(),
+      administrators: [...p.administrators].sort(),
+      publishers: [...p.publishers].sort(),
+      finalizers: [...p.finalizers].sort(),
+      openReaders: p.openReaders,
+      openWriters: p.openWriters,
+      blockedAuthors: [...p.blockedAuthors].sort(),
+      admission: p.admission,
+      guardians: p.guardians,
+      recoveryRequests: p.recoveryRequests,
+      multisig: p.multisig,
     }
-    return raw
   }
 
   member(publicKey: string): MemberRecord | null {
@@ -683,59 +713,96 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   isBlockedAuthor(publicKey: string): boolean {
-    return this.#evaluatedPermissions !== null && this.#evaluatedPermissions.blockedAuthors.has(publicKey)
+    return this.#evaluatedRoster !== null && this.#evaluatedRoster.blockedAuthors.has(publicKey)
   }
 
   isMember(publicKey: string): boolean {
-    if (this.#evaluatedPermissions !== null) {
-      if (this.#evaluatedPermissions.openWriters || this.#evaluatedPermissions.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
-      return this.#evaluatedPermissions.members.some(m => m.publicKey === publicKey) ||
-        this.#evaluatedPermissions.readers.has(publicKey) ||
-        this.#evaluatedPermissions.writers.has(publicKey) ||
-        this.#evaluatedPermissions.administrators.has(publicKey)
-    }
-    return this.member(publicKey) !== null
+    if (this.#evaluatedRoster === null) return false
+    if (this.#evaluatedRoster.openWriters || this.#evaluatedRoster.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
+    return this.#evaluatedRoster.members.some(m => m.publicKey === publicKey) ||
+      this.#evaluatedRoster.readers.has(publicKey) ||
+      this.#evaluatedRoster.writers.has(publicKey) ||
+      this.#evaluatedRoster.administrators.has(publicKey)
   }
 
   isReader(publicKey: string): boolean {
     if (!this.genesis.privateLog) return true
-    if (this.#evaluatedPermissions !== null) {
-      if (this.#evaluatedPermissions.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
-      return this.#evaluatedPermissions.readers.has(publicKey)
-    }
-    return this.member(publicKey)?.reader === true
+    if (this.#evaluatedRoster === null) return false
+    if (this.#evaluatedRoster.openReaders) return /^[0-9a-f]{64}$/u.test(publicKey)
+    return this.#evaluatedRoster.readers.has(publicKey)
   }
 
   isWriter(publicKey: string): boolean {
-    if (this.#evaluatedPermissions !== null) {
-      if (this.#evaluatedPermissions.blockedAuthors.has(publicKey)) return false
-      if (this.#evaluatedPermissions.openWriters) return /^[0-9a-f]{64}$/u.test(publicKey)
-      return this.#evaluatedPermissions.writers.has(publicKey) || this.#evaluatedPermissions.administrators.has(publicKey)
-    }
-    return this.member(publicKey)?.writer === true || this.member(publicKey)?.administrator === true
+    if (this.#evaluatedRoster === null) return false
+    if (this.#evaluatedRoster.blockedAuthors.has(publicKey)) return false
+    if (this.#evaluatedRoster.openWriters) return /^[0-9a-f]{64}$/u.test(publicKey)
+    return this.#evaluatedRoster.writers.has(publicKey) || this.#evaluatedRoster.administrators.has(publicKey)
   }
 
   isAdministrator(publicKey: string): boolean {
-    if (this.#evaluatedPermissions !== null) {
-      return this.#evaluatedPermissions.administrators.has(publicKey)
-    }
-    return this.member(publicKey)?.administrator === true
+    return this.#evaluatedRoster !== null && this.#evaluatedRoster.administrators.has(publicKey)
   }
 
-  /** Query an arbitrary capability (standard or custom) against the chain's `$permissions` reducer. */
-  async checkPermission(capability: string, actor = this.identity.publicKey): Promise<boolean> {
-    const res = await this.#kernel.query('$permissions', { check: capability, actor }).catch(() => null)
-    if (typeof res === 'boolean') return res
-    if (capability === 'reader') return this.isReader(actor)
-    if (capability === 'writer') return this.isWriter(actor)
-    if (capability === 'administrator') return this.isAdministrator(actor)
-    if (capability === 'publisher') {
-      return this.#evaluatedPermissions !== null
-        ? this.#evaluatedPermissions.publishers.has(actor) || this.#evaluatedPermissions.administrators.has(actor)
-        : this.member(actor)?.publisher === true || this.member(actor)?.administrator === true
+  /** Query any standard or custom capability (including `scope:<name>`) against the log's `$admission` reducer. */
+  async can(capability: string, actor = this.identity.publicKey): Promise<boolean> {
+    const query = capability.startsWith('scope:')
+      ? { kind: 'can', capability: 'scope', scope: capability.slice(6), actor }
+      : { kind: 'can', capability, actor }
+    const res = await this.#kernel.query('$admission', query).catch(() => null)
+    return res === true
+  }
+
+  /** Read the log's kernel-enforced monotonic `$seals` table (locked reducers and frozen/append-only JSON paths). */
+  seals(): SealsTopicState {
+    const raw = this.#kernel.topic('$seals') as Partial<SealsTopicState> | null
+    const reducers: Record<string, true> = {}
+    const paths: Record<string, Record<string, 'frozen' | 'append-only'>> = {}
+    if (raw !== null && typeof raw === 'object') {
+      if (raw.reducers && typeof raw.reducers === 'object') {
+        for (const [k, v] of Object.entries(raw.reducers)) {
+          if (v === true) reducers[k] = true
+        }
+      }
+      if (raw.paths && typeof raw.paths === 'object') {
+        for (const [t, rules] of Object.entries(raw.paths)) {
+          if (!rules || typeof rules !== 'object') continue
+          const clean: Record<string, 'frozen' | 'append-only'> = {}
+          for (const [p, mode] of Object.entries(rules)) {
+            if (mode === 'frozen' || mode === 'append-only') clean[p] = mode
+          }
+          if (Object.keys(clean).length > 0) paths[t] = clean
+        }
+      }
     }
-    if (capability === 'member') return this.isMember(actor)
-    return false
+    return { reducers, paths }
+  }
+
+  /** Irreversibly add reducer hash locks and/or JSON path locks to `$seals`. */
+  async seal(options: {
+    readonly reducers?: readonly string[]
+    readonly paths?: readonly {
+      readonly topic: string
+      readonly path: string
+      readonly mode?: 'frozen' | 'append-only'
+      readonly allowMutableReducer?: boolean
+    }[]
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  }): Promise<ApplicationOperation> {
+    return this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$seals',
+        input: {
+          action: 'seal',
+          ...(options.reducers === undefined ? {} : { reducers: [...options.reducers] }),
+          ...(options.paths === undefined ? {} : { paths: options.paths as unknown as JsonValue }),
+        },
+      }],
+    })
   }
 
   keysState(): KeysTopicState {
@@ -1150,10 +1217,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return !this.#kernelHasSqlite
   }
 
-  async #refreshPermissionsCache(kernel: TopicKernel = this.#kernel): Promise<void> {
-    const rawPerms = kernel.topic('$permissions')
-    const rawJson = JSON.stringify(rawPerms)
-    if (this.#evaluatedPermissions !== null && rawJson === this.#lastPermsStateJson) {
+  async #refreshAdmissionCache(kernel: TopicKernel = this.#kernel): Promise<void> {
+    const admHash = `${kernel.topicHash('$admission') ?? ''}:${kernel.topicHash('$reducers') ?? ''}`
+    if (this.#evaluatedRoster !== null && admHash === this.#lastAdmissionHash) {
       return
     }
     const parseStringList = (val: unknown): { readonly keys: Set<string>; readonly open: boolean } => {
@@ -1173,25 +1239,26 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
 
     try {
-      const summary = await kernel.query('$permissions', { summary: true })
-      if (
-        summary !== null &&
-        typeof summary === 'object' &&
-        !Array.isArray(summary) &&
-        Array.isArray((summary as Record<string, unknown>).administrators) &&
-        Array.isArray((summary as Record<string, unknown>).readers)
-      ) {
-        const s = summary as Record<string, unknown>
+      const roster = await kernel.query('$admission', { kind: 'roster' })
+      if (roster !== null && typeof roster === 'object' && !Array.isArray(roster)) {
+        const s = roster as Record<string, unknown>
         const readers = parseStringList(s.readers)
         const writers = parseStringList(s.writers)
         const admins = parseStringList(s.administrators)
         const pubs = parseStringList(s.publishers)
+        const fins = parseStringList(s.finalizers)
         const blocked = parseStringList(s.blockedAuthors)
         const admission = (s.admission !== null && typeof s.admission === 'object' && !Array.isArray(s.admission))
           ? s.admission as { readonly hostKey?: string }
           : null
+        const guardians = (s.guardians !== null && typeof s.guardians === 'object' && !Array.isArray(s.guardians))
+          ? s.guardians as GuardiansConfig
+          : null
+        const recoveryRequests = (s.recoveryRequests !== null && typeof s.recoveryRequests === 'object' && !Array.isArray(s.recoveryRequests))
+          ? s.recoveryRequests as Record<string, RecoveryRequestRecord>
+          : {}
         const msRaw = s.multisig
-        const multisig: PermissionsMultisigInfo | null =
+        const multisig: AdmissionMultisigInfo | null =
           msRaw !== null && typeof msRaw === 'object' && !Array.isArray(msRaw) &&
           typeof (msRaw as { threshold?: unknown }).threshold === 'number' &&
           Array.isArray((msRaw as { signers?: unknown }).signers)
@@ -1203,83 +1270,34 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             : null
         const openReaders = s.openReaders === true || readers.open
         const openWriters = s.openWriters === true || writers.open
-        const mode: EvaluatedPermissionsSummary['mode'] =
+        const mode: EvaluatedAdmissionRoster['mode'] =
           s.mode === 'attested' || s.mode === 'open' || s.mode === 'multisig'
             ? s.mode
             : multisig !== null ? 'multisig' : (openReaders || openWriters) ? 'open' : admission !== null ? 'attested' : 'custom'
-        this.#evaluatedPermissions = {
+        this.#evaluatedRoster = {
           mode,
           members: parseMembers(s.members),
           readers: readers.keys,
           writers: writers.keys,
           administrators: admins.keys,
           publishers: pubs.keys,
+          finalizers: fins.keys,
           openReaders,
           openWriters,
           blockedAuthors: blocked.keys,
           admission,
+          guardians,
+          recoveryRequests,
           multisig,
         }
-        return
-      }
-
-      const [rRaw, wRaw, aRaw, pRaw, mRaw, admRaw, blkRaw] = await Promise.all([
-        kernel.query('$permissions', { list: 'readers' }).catch(() => null),
-        kernel.query('$permissions', { list: 'writers' }).catch(() => null),
-        kernel.query('$permissions', { list: 'administrators' }).catch(() => null),
-        kernel.query('$permissions', { list: 'publishers' }).catch(() => null),
-        kernel.query('$permissions', { list: 'members' }).catch(() => null),
-        kernel.query('$permissions', { admission: true }).catch(() => null),
-        kernel.query('$permissions', { list: 'blockedAuthors' }).catch(() => null),
-      ])
-      if (Array.isArray(rRaw) || Array.isArray(wRaw) || Array.isArray(aRaw)) {
-        const readers = parseStringList(rRaw)
-        const writers = parseStringList(wRaw)
-        const admins = parseStringList(aRaw)
-        const pubs = parseStringList(pRaw)
-        const blocked = parseStringList(blkRaw)
-        const admission = (admRaw !== null && typeof admRaw === 'object' && !Array.isArray(admRaw))
-          ? admRaw as { readonly hostKey?: string }
-          : null
-        this.#evaluatedPermissions = {
-          mode: (readers.open || writers.open) ? 'open' : admission !== null ? 'attested' : 'custom',
-          members: parseMembers(mRaw),
-          readers: readers.keys,
-          writers: writers.keys,
-          administrators: admins.keys,
-          publishers: pubs.keys,
-          openReaders: readers.open,
-          openWriters: writers.open,
-          blockedAuthors: blocked.keys,
-          admission,
-          multisig: null,
-        }
+        this.#lastAdmissionHash = admHash
         return
       }
     } catch {
-      // Fall through to legacy raw topic inspection
+      // Fail closed if $admission cannot be evaluated
     }
-
-    const raw = kernel.topic('$permissions') as PermissionsTopicState | null
-    if (raw !== null && typeof raw === 'object' && Array.isArray(raw.members)) {
-      const members = parseMembers(raw.members)
-      this.#evaluatedPermissions = {
-        mode: raw.admission ? 'attested' : 'custom',
-        members,
-        readers: new Set(members.filter(m => m.reader).map(m => m.publicKey)),
-        writers: new Set(members.filter(m => m.writer || m.administrator).map(m => m.publicKey)),
-        administrators: new Set(members.filter(m => m.administrator).map(m => m.publicKey)),
-        publishers: new Set(members.filter(m => m.publisher || m.administrator).map(m => m.publicKey)),
-        openReaders: false,
-        openWriters: false,
-        blockedAuthors: new Set(),
-        admission: raw.admission ?? null,
-        multisig: null,
-      }
-    } else {
-      this.#evaluatedPermissions = null
-    }
-    this.#lastPermsStateJson = JSON.stringify(kernel.topic('$permissions'))
+    this.#evaluatedRoster = null
+    this.#lastAdmissionHash = admHash
   }
 
   async #ingestSingleStoreEntry(entry: BytesStoreEntry): Promise<boolean> {
@@ -1355,14 +1373,22 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const ev = decodeRecord<RetentionEvidence>(entry.value)
         if (Array.isArray(ev.payload.items) && this.#indexRetention(ev)) return true
       } catch { /* ignore */ }
-    } else if (rest.startsWith('checkpoint/')) {
-      const key = rest.slice('checkpoint/'.length)
-      if (this.#checkpoints.has(key)) return false
+    } else if (rest.startsWith('evidence/')) {
+      const key = rest.slice('evidence/'.length)
+      if (this.#evidence.has(key)) return false
       try {
-        const cp = decodeRecord<FinalityCheckpoint>(entry.value)
-        const computedKey = await recordDigest(cp)
-        if (!this.#checkpoints.has(computedKey)) {
-          this.#checkpoints.set(computedKey, cp)
+        const ev = decodeRecord<AdmissionEvidence>(entry.value)
+        const computedKey = await evidenceDigest(ev)
+        if (!this.#evidence.has(computedKey)) {
+          this.#evidence.set(computedKey, ev)
+          return true
+        }
+      } catch { /* ignore */ }
+    } else if (rest === 'pinned-frontier') {
+      try {
+        const pf = decodeRecord<PinnedFrontier>(entry.value)
+        if (pf && typeof pf.closedThroughMs === 'bigint' && typeof pf.stateRoot === 'string' && typeof pf.historyDigest === 'string' && Array.isArray(pf.includedOpIds)) {
+          this.#pinnedFrontier = pf
           return true
         }
       } catch { /* ignore */ }
@@ -1652,17 +1678,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         // so this.#kernel never loses private ops or suffix snapshots mid-rematerialization.
         controlKernel = this.#controlKernel
         await controlKernel.materialize(publicInputs)
-        await this.#refreshPermissionsCache(controlKernel)
+        await this.#refreshAdmissionCache(controlKernel)
         await this.#unsealAvailableEpochKeys(controlKernel)
         await this.#decryptPendingEnvelopes()
         rewrapped = await this.#rewrapPendingLocalOps(controlKernel)
         allByOpId = this.#collectDecryptedKernelInputs()
       } else {
         // Public log or blind host: only public ops exist in the local kernel.
-        // If finality checkpoints exist, probe $finality on an isolated kernel so this.#kernel
-        // never transiently exposes excluded operations.
+        // If admission evidence or a pinned frontier exists, probe $admission on an isolated kernel
+        // so this.#kernel never transiently exposes excluded operations.
         allByOpId = this.#collectDecryptedKernelInputs()
-        if (this.#checkpoints.size > 0) {
+        if (this.#evidence.size > 0 || this.#pinnedFrontier !== null) {
           await this.#ensureSqliteIfNeeded()
           controlKernel = new TopicKernel({
             genesis: this.genesisBytes,
@@ -1678,27 +1704,27 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
       }
 
-      const schedule = parseFinalitySchedule(controlKernel.topic('$finality'))
-      this.#verifiedFinality = await verifyFinalityV2({
+      this.#admissionDecision = await evaluateAdmission({
         logId: this.logId,
-        schedule,
-        checkpoints: [...this.#checkpoints.values()],
-        knownOps: [...allByOpId.entries()].map(([opId, input]) => ({
+        ops: [...allByOpId.entries()].map(([opId, input]) => ({
           opId,
+          author: bytesToHex(input.core.author),
           authorTimestampMs: input.core.authorTimestampMs,
+          visibility: input.core.visibility,
         })),
-        predicateVerifier: controlKernel.createFinalityPredicateVerifier(),
-        ...(this.#blockchainVerifier === undefined ? {} : { blockchainVerifier: this.#blockchainVerifier }),
+        evidence: [...this.#evidence.values()],
+        pinnedFrontier: this.#pinnedFrontier,
+        evaluator: controlKernel.createAdmissionEvaluator(),
       })
 
       const eligibleLocal: KernelOperationInput[] = []
       for (const [opId, input] of allByOpId) {
-        if (this.#verifiedFinality.excludedOpIds.has(opId)) continue
+        if (this.#admissionDecision.excludedOpIds.has(opId)) continue
         eligibleLocal.push(input)
       }
 
       const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'), controlKernel.topic('$mounts'))
-      // The isolated $finality probe kernel is not needed past this point.
+      // The isolated $admission probe kernel is not needed past this point.
       ephemeralControl?.dispose()
       if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
         this.#kernel.dispose()
@@ -1791,7 +1817,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         this.#finalKernel?.dispose()
         this.#finalKernel = null
       }
-      await this.#refreshPermissionsCache(this.#kernel)
+      await this.#refreshAdmissionCache(this.#kernel)
       this.#lastLocalRevision = toMaterializedRevision(localResult.revision)
 
       // Debounce local materialized cache persistence (off the critical write path; flushed on close).
@@ -1803,7 +1829,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         this.#scheduleCachePersist()
       }
 
-      if (this.#verifiedFinality.closedThroughMs !== null) {
+      if (this.#admissionDecision.closedThroughMs !== null) {
         this.#finalKernel ??= new TopicKernel({
           genesis: this.genesisBytes,
           cas: this.cas,
@@ -1813,7 +1839,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         })
         const finalInputs: KernelOperationInput[] = []
         for (const [opId, input] of allByOpId) {
-          if (this.#verifiedFinality.includedOpIds.has(opId)) finalInputs.push(input)
+          if (this.#admissionDecision.includedOpIds.has(opId)) finalInputs.push(input)
         }
         await this.#finalKernel.materialize(finalInputs)
         this.#lastFinalRevision = toMaterializedRevision(this.#finalKernel.revision('final'))
@@ -1880,7 +1906,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         this.#emitChange({
           kind: localResult.pendingDependencies.length > 0 ? 'dependency' : 'materialized',
           revision: this.#lastLocalRevision,
-          revisedProposalIds: revised,
+          revisedOpIds: revised,
           ...(changedTopics === undefined ? {} : { changedTopics }),
           ...(changedTables === undefined ? {} : { changedTables }),
         })
@@ -1889,7 +1915,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         this.#emitChange({
           kind: 'finalized',
           revision: this.#lastFinalRevision,
-          revisedProposalIds: [],
+          revisedOpIds: [],
         })
       }
       this.#emitStatus()
@@ -1947,12 +1973,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
       }
 
-      const combinedChecks: OperationAssumption[] = [
-        ...(input.assumptions?.checks ?? []),
-        ...(input.afterOps ?? []).map(opId => ({ kind: 'op_accepted' as const, opId })),
-        ...(input.requiresRejected ?? []).map(opId => ({ kind: 'op_rejected' as const, opId })),
-      ]
-      const onFailed = input.assumptions?.onFailed ?? input.onAssumptionFailed
+      const combinedChecks: OperationAssumption[] = [...(input.assumptions?.checks ?? [])]
+      const onFailed = input.assumptions?.onFailed
       const assumptions: OperationAssumptionsConfig | undefined = combinedChecks.length > 0
         ? normalizeAssumptionsConfig({
             checks: combinedChecks,
@@ -2066,6 +2088,62 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       await this.#flushPendingMaterialization()
     }
     return op
+  }
+
+  /**
+   * Ephemerally dry-run an operation against the current materialized state without signing,
+   * persisting, emitting facts, or mutating kernel/CAS state.
+   */
+  async simulate(input: ApplicationSubmission): Promise<SimulationResult> {
+    await this.#flushPendingMaterialization()
+    check(Array.isArray(input.updates) && input.updates.length > 0, 'OPERATION_UPDATES_REQUIRED')
+    const updatesList: readonly TopicUpdate[] = input.updates
+    const allControl = updatesList.every(u => isControlTopic(u.topic))
+    const anyControl = updatesList.some(u => isControlTopic(u.topic))
+    check(!anyControl || allControl, 'OPERATION_CROSS_PARTITION_FORBIDDEN')
+
+    const visibility: OperationVisibility = input.visibility ?? (
+      this.genesis.privateLog
+        ? (allControl ? 'public' : 'encrypted')
+        : 'public'
+    )
+    if (this.genesis.privateLog) {
+      if (allControl) check(visibility === 'public', 'CONTROL_OP_MUST_BE_PUBLIC')
+      else check(visibility === 'encrypted', 'PRIVATE_OP_MUST_BE_ENCRYPTED')
+    }
+
+    const combinedChecks: OperationAssumption[] = [...(input.assumptions?.checks ?? [])]
+    const onFailed = input.assumptions?.onFailed
+    const assumptions: OperationAssumptionsConfig | undefined = combinedChecks.length > 0
+      ? normalizeAssumptionsConfig({
+          checks: combinedChecks,
+          ...(onFailed === undefined ? {} : { onFailed }),
+        })
+      : undefined
+
+    const core: OperationCore = {
+      version: 1,
+      logId: hexToBytes(this.logId),
+      author: hexToBytes(this.identity.publicKey),
+      operationId: input.operationId ?? `sim:${crypto.randomUUID()}`,
+      authorTimestampMs: input.authorTimestampMs ?? BigInt(Date.now()),
+      nonce: crypto.getRandomValues(new Uint8Array(16)),
+      visibility,
+      updates: updatesList.map(u => ({ topic: u.topic, input: normalizeJsonValue(u.input) })),
+      ...(assumptions === undefined ? {} : { assumptions }),
+    }
+    const signed = await signOperationCore(core, this.device.identity.privateKey)
+    const opIdBytes = operationIdDigest(signed.coreBytes)
+    const res = await this.#kernel.simulate({ opId: opIdBytes, core, verified: true })
+    return {
+      ok: res.ok,
+      outcome: res.outcome,
+      rejectionCode: res.rejectionCode,
+      ...(res.rejectionDetail === undefined ? {} : { rejectionDetail: res.rejectionDetail }),
+      events: res.events.map(toApplicationEvent),
+      changedTopics: res.changedTopics,
+      stateRoot: res.stateRoot,
+    }
   }
 
   /** Execute a named command (via local ApplicationDefinition if present, else direct topic dispatch). */
@@ -2186,6 +2264,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const multiTopic = Object.keys(raw).filter(t => !isControlTopic(t)).length > 1
 
     for (const [topic, entry] of Object.entries(raw)) {
+      if (isControlTopic(topic)) continue
       if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
       const obj = entry as Record<string, unknown>
       const prefix = multiTopic ? `${topic}.` : ''
@@ -2226,9 +2305,25 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return description
   }
 
-  #hasActiveFinalityPolicy(): boolean {
-    const schedule = parseFinalitySchedule(this.#kernel.topic('$finality'))
-    return schedule.some(entry => entry.policy.kind !== 'none')
+  #admissionSchedule(): readonly AdmissionScheduleEntry[] {
+    const raw = this.#kernel.topic('$admission') as { readonly schedule?: unknown } | null
+    if (raw !== null && typeof raw === 'object' && Array.isArray(raw.schedule) && raw.schedule.length > 0) {
+      return raw.schedule.filter(
+        (entry): entry is AdmissionScheduleEntry =>
+          entry !== null && typeof entry === 'object' &&
+          typeof (entry as { effectiveAfterMs?: unknown }).effectiveAfterMs === 'number' &&
+          (entry as { policy?: unknown }).policy !== undefined,
+      )
+    }
+    return [{ effectiveAfterMs: -1, policy: { kind: 'open' } }]
+  }
+
+  #hasActiveAdmissionPolicy(): boolean {
+    if (this.#pinnedFrontier !== null) return true
+    return this.#admissionSchedule().some(entry => {
+      const p = entry.policy as { readonly kind?: unknown } | null
+      return p !== null && typeof p === 'object' && p.kind !== 'open'
+    })
   }
 
   opOutcome(opId: string): 'accepted' | 'rejected' | null {
@@ -2244,24 +2339,20 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   /**
-   * Plain-language finality lifecycle status for UI badges (Pending -> Confirmed -> Needs attention):
-   * - 'equivocated': notary/witness equivocation detected (fraud proof available via equivocationProofs())
-   * - 'finalized': op is included in a verified $finality checkpoint
+   * Plain-language admission lifecycle status for UI badges (Pending -> Confirmed -> Needs attention):
+   * - 'equivocated': witness/notary equivocation detected (see admission.equivocations())
+   * - 'finalized': op is included in a verified $admission checkpoint or pinned frontier
    * - 'excluded': closed-time frontier passed op's timestamp without including it
    * - 'synced': op has retention evidence from at least one peer/host
-   * - 'local': authored/stored locally, awaiting sync or finality
+   * - 'local': authored/stored locally, awaiting sync or admission checkpoint
    */
-  finalityStatus(opId: string): 'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local' {
-    if (this.#verifiedFinality.equivocationProofs.length > 0) return 'equivocated'
-    if (this.#verifiedFinality.includedOpIds.has(opId)) return 'finalized'
-    if (this.#verifiedFinality.excludedOpIds.has(opId)) return 'excluded'
+  admissionStatus(opId: string): 'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local' {
+    if (this.#admissionDecision.equivocations.length > 0) return 'equivocated'
+    if (this.#admissionDecision.includedOpIds.has(opId)) return 'finalized'
+    if (this.#admissionDecision.excludedOpIds.has(opId)) return 'excluded'
     const ret = this.#retentions.get(opId)
     if (ret !== undefined && ret.size > 0) return 'synced'
     return 'local'
-  }
-
-  equivocationProofs() {
-    return this.#verifiedFinality.equivocationProofs
   }
 
   /**
@@ -2319,7 +2410,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<ApplicationReadView> {
     await this.#flushPendingMaterialization()
     const viewKind = options.view ?? 'local'
-    if (viewKind === 'final' && !this.#hasActiveFinalityPolicy()) {
+    if (viewKind === 'final' && !this.#hasActiveAdmissionPolicy()) {
       throw Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' })
     }
     const kernel = viewKind === 'final' ? this.#finalKernel : this.#kernel
@@ -2366,7 +2457,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   readEvents(options: ApplicationEventOptions & { readonly view?: 'local' | 'final' } = {}): ApplicationEventBatch {
     const viewKind = options.view ?? 'local'
-    if (viewKind === 'final' && !this.#hasActiveFinalityPolicy()) {
+    if (viewKind === 'final' && !this.#hasActiveAdmissionPolicy()) {
       throw Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' })
     }
     const kernel = viewKind === 'final' ? this.#finalKernel : this.#kernel
@@ -2415,7 +2506,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     const updates: TopicUpdate[] = [
       {
-        topic: '$permissions',
+        topic: '$admission',
         input: {
           action: 'setMember',
           member: memberPayload,
@@ -2567,7 +2658,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
    * - Splits a fresh 32-byte recoveryKey into N Shamir shares (threshold M).
    * - Encrypts all retained epoch + compartment keys inside a recovery vault under recoveryKey.
    * - HPKE-seals each Shamir share strictly to its guardian's wrapKey (guardians cannot read app data).
-   * - Atomically updates $permissions.guardians and $keys.recovery.
+   * - Atomically updates $admission.guardians and $keys.recovery.
    */
   async setupSocialRecovery(options: {
     readonly guardians: readonly GuardianMember[]
@@ -2578,7 +2669,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     check(options.guardians.length > 0, 'GUARDIANS_REQUIRED')
     check(Number.isSafeInteger(options.threshold) && options.threshold >= 1 && options.threshold <= options.guardians.length, 'INVALID_GUARDIAN_THRESHOLD')
     const updates: TopicUpdate[] = [{
-      topic: '$permissions',
+      topic: '$admission',
       input: {
         action: 'setGuardians',
         guardians: {
@@ -2657,7 +2748,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
-        topic: '$permissions',
+        topic: '$admission',
         input: {
           action: 'requestRecovery',
           requestId,
@@ -2676,14 +2767,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     requestId: string,
     options: { readonly operationId?: string; readonly authorTimestampMs?: bigint } = {},
   ): Promise<ApplicationOperation> {
-    const permInfo = (await this.#kernel.query('$permissions', { guardians: true })) as {
+    const admInfo = (await this.#kernel.query('$admission', { kind: 'guardians' })) as {
       readonly recoveryRequests?: Readonly<Record<string, RecoveryRequestRecord>>
     }
-    const req = permInfo?.recoveryRequests?.[requestId]
+    const req = admInfo?.recoveryRequests?.[requestId]
     check(req !== undefined && req.status === 'pending', 'RECOVERY_REQUEST_NOT_FOUND')
 
     const updates: TopicUpdate[] = [{
-      topic: '$permissions',
+      topic: '$admission',
       input: { action: 'approveRecovery', requestId },
     }]
 
@@ -2734,10 +2825,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async completeSocialRecovery(): Promise<{ readonly restoredEpochs: number; readonly restoredRings: number }> {
     return this.#serial(async () => {
       if (!this.genesis.privateLog) return { restoredEpochs: 0, restoredRings: 0 }
-      const permInfo = (await this.#kernel.query('$permissions', { guardians: true })) as {
+      const admInfo = (await this.#kernel.query('$admission', { kind: 'guardians' })) as {
         readonly guardians?: GuardiansConfig | null
       }
-      const threshold = permInfo?.guardians?.threshold ?? 1
+      const threshold = admInfo?.guardians?.threshold ?? 1
       const rec = (await this.#kernel.query('$keys', { recoveryFor: this.identity.publicKey })) as unknown as {
         readonly vault: { readonly nonce: string; readonly ciphertext: string } | null
         readonly shares: Readonly<Record<string, { readonly index: number; readonly box: EpochKeyBox }>>
@@ -2793,7 +2884,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly authorTimestampMs?: bigint
   } = {}): Promise<ApplicationOperation> {
     const updates: TopicUpdate[] = [
-      { topic: '$permissions', input: { action: 'removeMember', publicKey } },
+      { topic: '$admission', input: { action: 'removeMember', publicKey } },
     ]
     if (this.genesis.privateLog && options.rotateEpoch !== false) {
       const nextEpoch = this.keysState().currentEpoch + 1
@@ -2896,9 +2987,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
   }
 
-  async scheduleFinality(options: {
+  async scheduleAdmissionPolicy(options: {
     readonly effectiveAfterMs: bigint | number
-    readonly policy: FinalityPolicyV2
+    readonly policy: JsonValue
     readonly operationId?: string
     readonly authorTimestampMs?: bigint
   }): Promise<ApplicationOperation> {
@@ -2908,11 +2999,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
       ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
       updates: [{
-        topic: '$finality',
+        topic: '$admission',
         input: {
           action: 'schedulePolicy',
           effectiveAfterMs: Number(options.effectiveAfterMs),
-          policy: options.policy as unknown as JsonValue,
+          policy: options.policy,
         },
       }],
     })
@@ -2950,55 +3041,112 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
   }
 
-  // ---- Finality operations ----
+  // ---- Admission & checkpoint operations ----
 
-  readonly finality = {
-    status: (): VerifiedFinalityV2 & { readonly schedule: readonly ScheduledFinalityEntry[] } => ({
-      ...this.#verifiedFinality,
-      schedule: parseFinalitySchedule(this.#kernel.topic('$finality')),
+  readonly admission = {
+    status: (): AdmissionDecision & {
+      readonly schedule: readonly AdmissionScheduleEntry[]
+      readonly pinnedFrontier: PinnedFrontier | null
+    } => ({
+      ...this.#admissionDecision,
+      schedule: this.#admissionSchedule(),
+      pinnedFrontier: this.#pinnedFrontier,
     }),
+
+    opStatus: (opId: string): 'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local' =>
+      this.admissionStatus(opId),
+
+    equivocations: (): readonly AdmissionEquivocation[] => this.#admissionDecision.equivocations,
+
+    schedulePolicy: (options: {
+      readonly effectiveAfterMs: bigint | number
+      readonly policy: JsonValue
+      readonly operationId?: string
+      readonly authorTimestampMs?: bigint
+    }): Promise<ApplicationOperation> => this.scheduleAdmissionPolicy(options),
+
+    pinCheckpoint: (options: {
+      readonly closedThroughMs: bigint | number
+      readonly stateRoot: string
+      readonly historyDigest: string
+      readonly includedOpIds: readonly string[]
+      readonly operationId?: string
+      readonly authorTimestampMs?: bigint
+    }): Promise<ApplicationOperation> => this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$admission',
+        input: {
+          action: 'pinCheckpoint',
+          closedThroughMs: Number(options.closedThroughMs),
+          stateRoot: options.stateRoot,
+          historyDigest: options.historyDigest,
+          includedOpIds: [...options.includedOpIds],
+        },
+      }],
+    }),
+
+    pinFrontier: async (frontier: PinnedFrontier | null): Promise<void> => {
+      await this.#serial(async () => {
+        this.#pinnedFrontier = frontier
+        if (frontier === null) {
+          await this.#store.delete?.(`${this.#prefix}/pinned-frontier`)
+        } else {
+          await this.#store.put(`${this.#prefix}/pinned-frontier`, encodeRecord(frontier), { durability: 'strict' })
+        }
+        await this.#rematerialize()
+      })
+    },
 
     createCheckpoint: async (options: {
       readonly throughMs: bigint
-      readonly attestation?: FinalityAttestation | ((payload: FinalityCheckpointPayload) => FinalityAttestation | Promise<FinalityAttestation>)
+      readonly kind?: string
+      readonly scopeId?: string
+      readonly data?: JsonValue | ((payload: AdmissionCheckpointPayload) => JsonValue | Promise<JsonValue>)
     }): Promise<{
-      readonly checkpoint: FinalityCheckpoint
+      readonly evidence: AdmissionEvidence
       readonly snapshot: CheckpointBootstrapSnapshot
     }> => {
       return this.#serial(async () => {
-        const schedule = parseFinalitySchedule(this.#kernel.topic('$finality'))
-        const scopeEntries = await Promise.all(schedule.map(async entry => ({
+        const schedule = this.#admissionSchedule()
+        const scopeEntries = schedule.map(entry => ({
           entry,
-          scopeId: await policyScopeId(this.logId, entry),
-        })))
+          scopeId: computeAdmissionScopeId(this.logId, entry.effectiveAfterMs, entry.policy),
+        }))
         const closedByScope = new Map<string, bigint>()
-        for (const cp of this.#verifiedFinality.verifiedCheckpoints) {
-          const prev = closedByScope.get(cp.payload.policyScopeId)
-          if (prev === undefined || cp.payload.closedThroughMs > prev) {
-            closedByScope.set(cp.payload.policyScopeId, cp.payload.closedThroughMs)
-          }
+        for (const ev of this.#admissionDecision.verifiedEvidence) {
+          const p = ev.payload as Partial<AdmissionCheckpointPayload> | null
+          if (!p || typeof p !== 'object' || typeof p.scopeId !== 'string') continue
+          const closed = typeof p.closedThroughMs === 'bigint' ? p.closedThroughMs : BigInt(Number(p.closedThroughMs ?? 0))
+          const prev = closedByScope.get(p.scopeId)
+          if (prev === undefined || closed > prev) closedByScope.set(p.scopeId, closed)
         }
         let activeIdx = 0
         for (let i = 0; i < scopeEntries.length; i++) {
           const cur = scopeEntries[i]!
-          if (cur.entry.effectiveAfterMs > options.throughMs) break
+          if (BigInt(cur.entry.effectiveAfterMs) > options.throughMs) break
           if (i > 0) {
             const prev = scopeEntries[i - 1]!
-            if (prev.entry.policy.kind !== 'none') {
+            const prevKind = (prev.entry.policy as { readonly kind?: string } | null)?.kind
+            if (prevKind !== 'open') {
               const prevClosed = closedByScope.get(prev.scopeId)
-              if (prevClosed === undefined || prevClosed < cur.entry.effectiveAfterMs) break
+              if (prevClosed === undefined || prevClosed < BigInt(cur.entry.effectiveAfterMs)) break
             }
           }
           activeIdx = i
         }
-        const active = scopeEntries[activeIdx]!.entry
-        check(active.policy.kind !== 'none', 'FINALITY_NOT_ACTIVE')
-        const scopeId = scopeEntries[activeIdx]!.scopeId
+        const active = scopeEntries[activeIdx]!
+        const activeKind = (active.entry.policy as { readonly kind?: string } | null)?.kind
+        check(options.scopeId !== undefined || activeKind !== 'open', 'ADMISSION_CHECKPOINT_POLICY_NOT_ACTIVE')
+        const scopeId = options.scopeId ?? active.scopeId
 
         const all = this.#collectDecryptedKernelInputs()
         const included: KernelOperationInput[] = []
         for (const [opId, input] of all) {
-          if (this.#verifiedFinality.excludedOpIds.has(opId)) continue
+          if (this.#admissionDecision.excludedOpIds.has(opId)) continue
           if (input.core.authorTimestampMs <= options.throughMs) included.push(input)
         }
         included.sort((a, b) => compareOperationOrder(
@@ -3027,60 +3175,72 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           authorTimestampMs: i.core.authorTimestampMs,
           author: bytesToHex(i.core.author),
         }))
-        const payload: FinalityCheckpointPayload = {
+        const payload: AdmissionCheckpointPayload = {
           logId: this.logId,
-          policyScopeId: scopeId,
+          scopeId,
           closedThroughMs: options.throughMs,
           includedSetDigest: computeIncludedSetDigest(inclusions.map(i => i.opId)),
           historyDigest: snap.historyDigest,
           stateRoot: snap.stateRoot,
           inclusions,
         }
-        const attestation: FinalityAttestation = options.attestation === undefined
-          ? { kind: 'signatures', signatures: [await signFinalityCheckpoint(payload, this.device.identity)] }
-          : typeof options.attestation === 'function'
-            ? await options.attestation(payload)
-            : options.attestation
-        const checkpoint: FinalityCheckpoint = {
+        const data: JsonValue = options.data === undefined
+          ? { signatures: [await signAdmissionCheckpoint(payload, this.device.identity)] }
+          : typeof options.data === 'function'
+            ? await options.data(payload)
+            : options.data
+        const evidence: AdmissionEvidence = {
+          kind: options.kind ?? 'checkpoint',
           payload,
-          attestation,
+          data,
         }
 
-        const key = await recordDigest(checkpoint)
-        this.#checkpoints.set(key, checkpoint)
-        await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(checkpoint))
+        const key = await evidenceDigest(evidence)
+        this.#evidence.set(key, evidence)
+        await this.#store.put(`${this.#prefix}/evidence/${key}`, encodeRecord(evidence))
         await this.#rematerialize()
         this.#emitFacts()
-        return { checkpoint, snapshot: snap }
+        return { evidence, snapshot: snap }
       })
     },
 
-    submitCheckpoints: async (checkpoints: readonly FinalityCheckpoint[]): Promise<void> => {
+    submitEvidence: async (evidence: readonly AdmissionEvidence[]): Promise<void> => {
       await this.mergeFacts({
         publicOps: [],
         encryptedEnvelopes: [],
         casNodes: [],
         retentions: [],
-        checkpoints,
+        evidence,
       })
     },
 
     bootstrapFromCheckpoint: async (
-      checkpoint: FinalityCheckpoint,
+      evidence: AdmissionEvidence,
       snapshot: CheckpointBootstrapSnapshot,
     ): Promise<void> => {
       await this.#serial(async () => {
-        check(checkpoint.payload.logId === this.logId, 'CHECKPOINT_CHAIN_MISMATCH')
-        check(checkpoint.payload.stateRoot === snapshot.stateRoot && checkpoint.payload.historyDigest === snapshot.historyDigest, 'CHECKPOINT_SNAPSHOT_MISMATCH')
-        const key = await recordDigest(checkpoint)
-        this.#checkpoints.set(key, checkpoint)
-        await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(checkpoint))
+        const payload = evidence.payload as AdmissionCheckpointPayload
+        check(payload !== null && typeof payload === 'object' && payload.logId === this.logId, 'CHECKPOINT_CHAIN_MISMATCH')
+        check(payload.stateRoot === snapshot.stateRoot && payload.historyDigest === snapshot.historyDigest, 'CHECKPOINT_SNAPSHOT_MISMATCH')
+        const key = await evidenceDigest(evidence)
+        this.#evidence.set(key, evidence)
+        const frontier: PinnedFrontier = {
+          closedThroughMs: typeof payload.closedThroughMs === 'bigint' ? payload.closedThroughMs : BigInt(Number(payload.closedThroughMs)),
+          stateRoot: payload.stateRoot,
+          historyDigest: payload.historyDigest,
+          includedOpIds: payload.inclusions.map(i => i.opId),
+        }
+        this.#pinnedFrontier = frontier
+        await writeBytesMany(this.#store, [
+          { key: `${this.#prefix}/evidence/${key}`, value: encodeRecord(evidence) },
+          { key: `${this.#prefix}/pinned-frontier`, value: encodeRecord(frontier) },
+        ], { durability: 'strict' })
         await this.#kernel.bootstrapFromCheckpoint(snapshot)
         if (this.#controlKernel !== null) {
           await this.#controlKernel.bootstrapFromCheckpoint(snapshot)
         }
         this.#lastLocalRevision = toMaterializedRevision(this.#kernel.revision('local'))
-        this.#emitChange({ kind: 'finalized', revision: this.#lastLocalRevision, revisedProposalIds: [] })
+        this.#emitChange({ kind: 'finalized', revision: this.#lastLocalRevision, revisedOpIds: [] })
         this.#emitStatus()
       })
     },
@@ -3134,7 +3294,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     const outcome = this.#kernel.outcomeOf(opIdHex)
     const materialized: MaterializedOperation | null = outcome === undefined ? null : {
-      proposalId: opIdHex,
+      opId: opIdHex,
       revision: this.#lastLocalRevision,
       outcome: outcome.outcome,
       rejectionCode: outcome.rejectionCode,
@@ -3153,15 +3313,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       applicationId: this.applicationId,
       author: core === null ? '' : bytesToHex(core.author),
       authorTimestampMs: core === null ? null : core.authorTimestampMs.toString(),
-      proposalId: opIdHex,
+      opId: opIdHex,
       operationId: core === null ? idOrOperationId : core.operationId,
       visibility: core === null ? 'encrypted' : core.visibility,
       stored: core !== null,
       pending,
       materialized,
       retained,
-      finalized: this.#verifiedFinality.includedOpIds.has(opIdHex),
-      excluded: this.#verifiedFinality.excludedOpIds.has(opIdHex),
+      finalized: this.#admissionDecision.includedOpIds.has(opIdHex),
+      excluded: this.#admissionDecision.excludedOpIds.has(opIdHex),
     }
   }
 
@@ -3170,7 +3330,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     fact: 'materialized' | 'retained' | 'finalized',
     options: WaitOptions = {},
   ): Promise<OperationInspection> {
-    if (fact === 'finalized' && !this.#hasActiveFinalityPolicy()) {
+    if (fact === 'finalized' && !this.#hasActiveAdmissionPolicy()) {
       throw Object.assign(new Error('FINALITY_UNSUPPORTED'), { code: 'FINALITY_UNSUPPORTED' })
     }
     const checkDone = (): OperationInspection | null => {
@@ -3214,7 +3374,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly operations = {
     get: (idOrOperationId: string): ApplicationOperation | null => {
       const info = this.inspectOperation(idOrOperationId)
-      return info.stored ? new ApplicationOperation(info.proposalId, info.operationId, this) : null
+      return info.stored ? new ApplicationOperation(info.opId, info.operationId, this) : null
     },
     retry: async (idOrOperationId: string): Promise<ApplicationOperation> => {
       const existing = this.operations.get(idOrOperationId)
@@ -3226,19 +3386,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   // ---- Retention ----
 
-  async retain(proposalId: string, subject: { readonly author: string; readonly envelopeDigest: string }): Promise<RetentionEvidence> {
-    const [evidence] = await this.retainMany([{ proposalId, author: subject.author, envelopeDigest: subject.envelopeDigest }])
+  async retain(opId: string, subject: { readonly author: string; readonly envelopeDigest: string }): Promise<RetentionEvidence> {
+    const [evidence] = await this.retainMany([{ opId, author: subject.author, envelopeDigest: subject.envelopeDigest }])
     return evidence!
   }
 
-  /** Sign and persist a batch of retention receipts in ONE batched store write + ONE fact emission. */
-  /** Index a (batch) retention receipt under every proposal it covers; true if anything was new. */
+  /** Index a (batch) retention receipt under every op it covers; true if anything was new. */
   #indexRetention(ev: RetentionEvidence): boolean {
     let added = false
-    for (const proposalId of ev.payload.items) {
-      if (typeof proposalId !== 'string') continue
-      let byPeer = this.#retentions.get(proposalId)
-      if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(proposalId, byPeer) }
+    for (const opId of ev.payload.items) {
+      if (typeof opId !== 'string') continue
+      let byPeer = this.#retentions.get(opId)
+      if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(opId, byPeer) }
       if (!byPeer.has(ev.signer)) { byPeer.set(ev.signer, ev); added = true }
     }
     return added
@@ -3249,35 +3408,35 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
    * signature, store write and gossip fact per operation.
    */
   async retainMany(
-    items: readonly { readonly proposalId: string; readonly author?: string; readonly envelopeDigest?: string }[],
+    items: readonly { readonly opId: string; readonly author?: string; readonly envelopeDigest?: string }[],
   ): Promise<readonly RetentionEvidence[]> {
     if (items.length === 0) return []
-    const fresh = [...new Set(items.map(item => item.proposalId))]
-      .filter(proposalId => this.#retentions.get(proposalId)?.get(this.identity.publicKey) === undefined)
-    if (fresh.length === 0) return items.map(item => this.#retentions.get(item.proposalId)!.get(this.identity.publicKey)!)
+    const fresh = [...new Set(items.map(item => item.opId))]
+      .filter(opId => this.#retentions.get(opId)?.get(this.identity.publicKey) === undefined)
+    if (fresh.length === 0) return items.map(item => this.#retentions.get(item.opId)!.get(this.identity.publicKey)!)
     const evidence = await signRecord('operation-retention', {
       applicationId: this.applicationId,
       peer: this.identity.publicKey,
       storageId: this.device.storageId,
       items: fresh,
     }, this.device.identity)
-    for (const proposalId of fresh) {
-      let byPeer = this.#retentions.get(proposalId)
-      if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(proposalId, byPeer) }
+    for (const opId of fresh) {
+      let byPeer = this.#retentions.get(opId)
+      if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(opId, byPeer) }
       byPeer.set(this.identity.publicKey, evidence)
     }
     await this.#store.put(`${this.#prefix}/retention/${await recordDigest(evidence.payload)}`, encodeRecord(evidence), { durability: 'relaxed' })
     this.#emitFacts()
-    return items.map(item => this.#retentions.get(item.proposalId)!.get(this.identity.publicKey)!)
+    return items.map(item => this.#retentions.get(item.opId)!.get(this.identity.publicKey)!)
   }
 
   /**
-   * Return `proposalId`s authored by `authorPublicKey` that this replica holds durably
+   * Return `opId`s authored by `authorPublicKey` that this replica holds durably
    * (public ops and/or encrypted envelopes) and has not yet signed its own retention receipt for.
    * Used after P2P sync reconciliation to attest operations received out-of-band (e.g. host mailbox)
    * without re-signing or resending receipts on unchanged reconnects.
    */
-  unreceiptedProposalIdsByAuthor(authorPublicKey: string, includePrivate: boolean): string[] {
+  unreceiptedOpIdsByAuthor(authorPublicKey: string, includePrivate: boolean): string[] {
     const self = this.identity.publicKey
     const ids: string[] = []
     for (const [opId, op] of this.#publicOps) {
@@ -3418,7 +3577,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       encryptedEnvelopes: [...this.#encryptedEnvelopes.values()].map(v => v.raw.slice()),
       casNodes,
       retentions,
-      checkpoints: [...this.#checkpoints.values()],
+      evidence: [...this.#evidence.values()],
     }
   }
 
@@ -3431,7 +3590,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   exportFactsById(scope: FactScope, ids: readonly string[]): SessionFacts {
     // Emit in canonical order (author timestamp first) so a receiver merging batch by batch appends
     // at its tip instead of replaying a suffix per batch. Undecryptable envelopes go last.
-    const ops: { ts: bigint; raw: Uint8Array }[] = [], checkpoints: FinalityCheckpoint[] = []
+    const ops: { ts: bigint; raw: Uint8Array }[] = [], evidence: AdmissionEvidence[] = []
     const LAST = 1n << 62n
     for (const id of ids) {
       if (scope === 'private') {
@@ -3441,12 +3600,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
       const op = this.#publicOps.get(id)
       if (op !== undefined) { ops.push({ ts: op.core.authorTimestampMs, raw: op.raw }); continue }
-      const cp = this.#checkpoints.get(id)
-      if (cp !== undefined) checkpoints.push(cp)
+      const ev = this.#evidence.get(id)
+      if (ev !== undefined) evidence.push(ev)
     }
     ops.sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)
     const raws = ops.map(op => op.raw)
-    return { publicOps: scope === 'public' ? raws : [], encryptedEnvelopes: scope === 'private' ? raws : [], casNodes: [], retentions: [], checkpoints }
+    return { publicOps: scope === 'public' ? raws : [], encryptedEnvelopes: scope === 'private' ? raws : [], casNodes: [], retentions: [], evidence }
   }
 
   /** CAS nodes by hash for an on-demand peer pull; walks explicit CasNode.links when subgraph=true. */
@@ -3710,7 +3869,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async exportPublicControlFacts(): Promise<{
     readonly publicOps: readonly Uint8Array[]
     readonly casNodes: readonly SessionCasNode[]
-    readonly checkpoints: readonly FinalityCheckpoint[]
+    readonly evidence: readonly AdmissionEvidence[]
   }> {
     const casNodes: SessionCasNode[] = []
     const standard = standardModuleHashes()
@@ -3722,7 +3881,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return {
       publicOps: [...this.#publicOps.values()].map(v => v.raw.slice()),
       casNodes,
-      checkpoints: [...this.#checkpoints.values()],
+      evidence: [...this.#evidence.values()],
     }
   }
 
@@ -3785,7 +3944,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       for (const ev of facts.retentions ?? []) {
         if (ev.payload.applicationId !== this.applicationId || !Array.isArray(ev.payload.items)) continue
         // Verify once per batch receipt, and only if it says something new.
-        if (ev.payload.items.every((proposalId: string) => this.#retentions.get(proposalId)?.has(ev.signer) === true)) continue
+        if (ev.payload.items.every((opId: string) => this.#retentions.get(opId)?.has(ev.signer) === true)) continue
         await verifyRecord('operation-retention', ev, ev.signer)
         if (this.#indexRetention(ev)) {
           storeBatch.push({ key: `${this.#prefix}/retention/${await recordDigest(ev.payload)}`, value: encodeRecord(ev) })
@@ -3793,12 +3952,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
       }
 
-      for (const cp of facts.checkpoints ?? []) {
-        if (cp.payload.logId !== this.logId) continue
-        const key = await recordDigest(cp)
-        if (!this.#checkpoints.has(key)) {
-          this.#checkpoints.setFrom(key, cp, source)
-          storeBatch.push({ key: `${this.#prefix}/checkpoint/${key}`, value: encodeRecord(cp) })
+      for (const ev of facts.evidence ?? []) {
+        if (ev === null || typeof ev !== 'object' || typeof ev.kind !== 'string') continue
+        const payloadLogId = (ev.payload as { readonly logId?: unknown } | null)?.logId
+        if (typeof payloadLogId === 'string' && payloadLogId !== this.logId) continue
+        const key = await evidenceDigest(ev)
+        if (!this.#evidence.has(key)) {
+          this.#evidence.setFrom(key, ev, source)
+          storeBatch.push({ key: `${this.#prefix}/evidence/${key}`, value: encodeRecord(ev) })
           materializedChanged = true
           factsChanged = true
         }

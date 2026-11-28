@@ -5,8 +5,8 @@ This guide walks through how operations flow from local authoring through replic
 ## 1. Genesis & Chain Identity
 
 Use `createLogGenesis()` from `@chronolog/peer-session`:
-- Pins the 5 standard modules (`chronolog/permissions`, `chronolog/keys`, `chronolog/finality`, `chronolog/publications`, `chronolog/rls`) and your application ES Modules into public CAS (`cas:sha256-...`).
-- Configures `$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, and your app topics.
+- Pins the standard audited modules (`chronolog/admission`, `chronolog/seals`, `chronolog/reducer`, `chronolog/keys`, `chronolog/publications`, `chronolog/rls`, `chronolog/sql`, etc.) and your application ES Modules into public CAS (`cas:sha256-...`).
+- Configures `$reducers`, `$admission`, `$seals`, `$keys`, `$publications`, and your app topics.
 - Produces canonical `genesisBytes`, deterministic `logId`, `casNodes`, and (for private chains) an initial `epoch0Key`.
 
 ## 2. Local Durable Authoring
@@ -30,6 +30,6 @@ Because late earlier operations can revise SQL rows, topic states, and emitted e
 
 ## 5. Checkpoint Bootstrap
 
-When a finalizing policy is active in `$finality`:
-- Authorized finalizers call `session.finality.createCheckpoint({ throughMs })`, producing a signed `FinalityCheckpoint` committing to `includedSetDigest`, `stateRoot`, and `historyDigest`, plus a `CheckpointBootstrapSnapshot` (`{ topics, seenOpsRoot, historyDigest, stateRoot }`).
-- A new replica calls `session.finality.bootstrapFromCheckpoint(checkpoint, snapshot)` and replays only suffix operations after `closedThroughMs`, arriving at the exact same `stateRoot` and `revision.digest` as a full replay from genesis.
+When a finalizing policy is active in `$admission`:
+- Authorized signers call `session.admission.createCheckpoint({ throughMs })`, producing an `AdmissionEvidence` record committing to `includedSetDigest`, `stateRoot`, and `historyDigest`, plus a `CheckpointBootstrapSnapshot` (`{ topics, seenOpsRoot, historyDigest, stateRoot }`).
+- A new replica calls `session.admission.bootstrapFromCheckpoint(evidence, snapshot)` (which also pins a non-rewinding `PinnedFrontier`) and replays only suffix operations after `closedThroughMs`, arriving at the exact same `stateRoot` and `revision.digest` as a full replay from genesis.

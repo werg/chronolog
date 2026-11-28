@@ -7,7 +7,7 @@
     ".": "./src/index.ts",
     "./codec": "./src/codec.ts",
     "./definition": "./src/definition.ts",
-    "./finality": "./src/finality-v2.ts"
+    "./admission": "./src/admission.ts"
   },
   "dependencies": {
     "@chronolog/canonical": "workspace:*",

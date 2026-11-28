@@ -2,11 +2,7 @@ export const STD_FS_SOURCE = `
 function hasWriter(ctx, author) {
   const cfg = ctx.config && typeof ctx.config === 'object' ? ctx.config : {};
   if (cfg.allowPublicWrite === true) return true;
-  const checked = ctx.query('$permissions', { check: 'writer', actor: author });
-  if (typeof checked === 'boolean') return checked;
-  const perms = ctx.topic('$permissions');
-  if (!perms || !Array.isArray(perms.members)) return false;
-  return perms.members.some(m => m.publicKey === author && (m.writer === true || m.administrator === true));
+  return ctx.can('writer', author);
 }
 
 function normalizePath(raw) {

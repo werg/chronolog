@@ -218,9 +218,9 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: { admins: [pubAdmin.identity.publicKey], members: [], openRead: true, openWrite: true, admission: null },
         },
         board: { module: 'chronolog/crdt', export: 'lwwMap' },
@@ -231,7 +231,7 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
     try {
       await (await sPubAdmin.submit({
         visibility: 'public',
-        updates: [{ topic: '$permissions', input: { action: 'setAntiSpam', antiSpam: { requireVouch: true } } }],
+        updates: [{ topic: '$admission', input: { action: 'setAntiSpam', antiSpam: { requireVouch: true } } }],
         authorTimestampMs: 1000n,
       })).materialized()
 
@@ -242,7 +242,7 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       // Admin vouches for newcomer -> subsequent post succeeds!
       await (await sPubAdmin.submit({
         visibility: 'public',
-        updates: [{ topic: '$permissions', input: { action: 'vouchAuthor', publicKey: newcomer.identity.publicKey } }],
+        updates: [{ topic: '$admission', input: { action: 'vouchAuthor', publicKey: newcomer.identity.publicKey } }],
         authorTimestampMs: 2500n,
       })).materialized()
       await sNewcomer.mergeFacts(await sPubAdmin.exportFacts())

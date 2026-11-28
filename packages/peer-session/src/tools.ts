@@ -72,7 +72,7 @@ export function createScopedApplicationTools(
         applicationId: state.applicationId,
         author: state.author,
         operationId: state.operationId,
-        proposalId: state.proposalId,
+        opId: state.opId,
       },
     }
   }

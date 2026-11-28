@@ -254,6 +254,142 @@ function extractRequiredCasHashes(value: JsonValue, out: Set<string>, key?: stri
   }
 }
 
+interface NormalizedSeals {
+  readonly reducers: Readonly<Record<string, true>>
+  readonly paths: Readonly<Record<string, Readonly<Record<string, 'frozen' | 'append-only'>>>>
+}
+
+function normalizeSealsState(raw: JsonValue | undefined): NormalizedSeals {
+  const reducers: Record<string, true> = {}
+  const paths: Record<string, Record<string, 'frozen' | 'append-only'>> = {}
+  if (raw !== null && raw !== undefined && typeof raw === 'object' && !Array.isArray(raw)) {
+    const obj = raw as Readonly<Record<string, JsonValue>>
+    if (obj.reducers && typeof obj.reducers === 'object' && !Array.isArray(obj.reducers)) {
+      for (const [k, v] of Object.entries(obj.reducers)) {
+        if (v === true && k.length > 0) reducers[k] = true
+      }
+    }
+    if (obj.paths && typeof obj.paths === 'object' && !Array.isArray(obj.paths)) {
+      for (const [topic, rules] of Object.entries(obj.paths)) {
+        if (!rules || typeof rules !== 'object' || Array.isArray(rules)) continue
+        const clean: Record<string, 'frozen' | 'append-only'> = {}
+        for (const [p, mode] of Object.entries(rules)) {
+          if (p.length > 0 && (mode === 'frozen' || mode === 'append-only')) clean[p] = mode
+        }
+        if (Object.keys(clean).length > 0) paths[topic] = clean
+      }
+    }
+  }
+  return { reducers, paths }
+}
+
+function checkSealsMonotonicity(beforeRaw: JsonValue | undefined, afterRaw: JsonValue | undefined): { readonly ok: true } | { readonly ok: false; readonly code: string; readonly detail: string } {
+  const before = normalizeSealsState(beforeRaw)
+  const after = normalizeSealsState(afterRaw)
+  for (const topic of Object.keys(before.reducers)) {
+    if (after.reducers[topic] !== true) {
+      return { ok: false, code: 'seal:cannot_weaken', detail: `reducer:${topic}` }
+    }
+  }
+  for (const [topic, rules] of Object.entries(before.paths)) {
+    const afterRules = after.paths[topic]
+    for (const [path, mode] of Object.entries(rules)) {
+      const nextMode = afterRules?.[path]
+      if (nextMode === undefined || (mode === 'frozen' && nextMode !== 'frozen')) {
+        return { ok: false, code: 'seal:cannot_weaken', detail: `${topic}.${path}` }
+      }
+    }
+  }
+  return { ok: true }
+}
+
+function canonicalValueTag(val: JsonValue | undefined): string {
+  if (val === undefined) return 'U'
+  return `V:${bytesToHex(encodeCanonicalJsonCbor(val))}`
+}
+
+function readTopicPath(root: JsonValue | undefined, path: string): JsonValue | undefined {
+  if (path === '*' || path === '') return root
+  let cur: JsonValue | undefined = root
+  for (const seg of path.split('.')) {
+    if (cur === null || cur === undefined || typeof cur !== 'object' || Array.isArray(cur)) return undefined
+    const rec = cur as Readonly<Record<string, JsonValue>>
+    if (!Object.hasOwn(rec, seg)) return undefined
+    cur = rec[seg]
+  }
+  return cur
+}
+
+function resolveEffectiveBindingTag(reducersRaw: JsonValue | undefined, topic: string): string {
+  if (reducersRaw === undefined) return 'NONE'
+  let cfg: ReducersConfig
+  try { cfg = assertValidReducersConfig(reducersRaw) } catch { return 'INVALID' }
+  const b = cfg.topics[topic]
+  if (b === undefined) return 'UNBOUND'
+  const resolvedModule = b.module.startsWith('cas:sha256-') ? b.module : (cfg.imports[b.module] ?? b.module)
+  return canonicalValueTag({
+    module: resolvedModule,
+    export: b.export ?? 'default',
+    config: b.config ?? null,
+  })
+}
+
+function checkSealsEnforced(
+  beforeSealsRaw: JsonValue | undefined,
+  beforeTopics: Readonly<Record<string, JsonValue>>,
+  afterTopics: Readonly<Record<string, JsonValue>>,
+): { readonly ok: true } | { readonly ok: false; readonly code: string; readonly detail: string } {
+  const seals = normalizeSealsState(beforeSealsRaw)
+  const lockedReducers = Object.keys(seals.reducers)
+  if (lockedReducers.length > 0 && beforeTopics.$reducers !== afterTopics.$reducers) {
+    for (const topic of lockedReducers) {
+      if (resolveEffectiveBindingTag(beforeTopics.$reducers, topic) !== resolveEffectiveBindingTag(afterTopics.$reducers, topic)) {
+        return { ok: false, code: 'seal:reducer_locked', detail: topic }
+      }
+    }
+  }
+  for (const [topic, rules] of Object.entries(seals.paths)) {
+    if (beforeTopics[topic] === afterTopics[topic]) continue
+    for (const [path, mode] of Object.entries(rules)) {
+      const bVal = readTopicPath(beforeTopics[topic], path)
+      const aVal = readTopicPath(afterTopics[topic], path)
+      if (mode === 'frozen') {
+        if (canonicalValueTag(bVal) !== canonicalValueTag(aVal)) {
+          return { ok: false, code: 'seal:path_frozen', detail: `${topic}.${path}` }
+        }
+      } else {
+        // append-only
+        if (bVal === undefined || bVal === null) continue
+        if (Array.isArray(bVal)) {
+          if (!Array.isArray(aVal) || aVal.length < bVal.length) {
+            return { ok: false, code: 'seal:path_append_only', detail: `${topic}.${path}` }
+          }
+          const bArr = bVal as readonly JsonValue[]
+          const aArr = aVal as readonly JsonValue[]
+          for (let i = 0; i < bArr.length; i++) {
+            if (canonicalValueTag(bArr[i]) !== canonicalValueTag(aArr[i])) {
+              return { ok: false, code: 'seal:path_append_only', detail: `${topic}.${path}[${i}]` }
+            }
+          }
+        } else if (typeof bVal === 'object') {
+          if (aVal === null || aVal === undefined || typeof aVal !== 'object' || Array.isArray(aVal)) {
+            return { ok: false, code: 'seal:path_append_only', detail: `${topic}.${path}` }
+          }
+          const aObj = aVal as Readonly<Record<string, JsonValue>>
+          for (const [k, v] of Object.entries(bVal)) {
+            if (!Object.hasOwn(aObj, k) || canonicalValueTag(v) !== canonicalValueTag(aObj[k])) {
+              return { ok: false, code: 'seal:path_append_only', detail: `${topic}.${path}.${k}` }
+            }
+          }
+        } else if (canonicalValueTag(bVal) !== canonicalValueTag(aVal)) {
+          return { ok: false, code: 'seal:path_append_only', detail: `${topic}.${path}` }
+        }
+      }
+    }
+  }
+  return { ok: true }
+}
+
 /**
  * Chronolog v2 Topic Kernel & Suffix-Replay Engine.
  * - Flat timestamp-ordered operation set: (authorTimestampMs, author, opId)
@@ -304,6 +440,8 @@ export class TopicKernel {
   #describeCache = new Map<string, JsonValue | undefined>()
   /** query() results keyed by the exact state they can observe (see #queryScope). */
   #queryCache = new Map<string, JsonValue>()
+  /** Memoize whether a resolved $admission binding exports `verify` so logs without verify pay zero overhead. */
+  #admissionHasVerify = new Map<string, boolean>()
 
   constructor(options: TopicKernelOptions) {
     this.genesisBytes = options.genesis instanceof Uint8Array
@@ -618,10 +756,6 @@ export class TopicKernel {
     this.#publicAuthorLastOpIds = new Map(Object.entries(cache.publicAuthorLastOpIds ?? {}))
     for (const o of this.#outcomes) {
       this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
-      if (o.outcome === 'accepted') {
-        if (cache.authorLastOpIds === undefined) this.#authorLastOpIds.set(o.author, o.opId)
-        if (cache.publicAuthorLastOpIds === undefined && o.visibility === 'public') this.#publicAuthorLastOpIds.set(o.author, o.opId)
-      }
     }
     this.#frontierOpIds = new Set(cache.frontierOpIds)
     this.#frontierOrderLength = cache.frontierOpIds.length
@@ -1145,6 +1279,77 @@ export class TopicKernel {
     const visibleTopicLastOpsForReduce = buildVisibleTopicLastOpIds()
     const visibleAuthorLastOpsForReduce = buildVisibleAuthorLastOpIds()
 
+    // Global fail-closed $admission.authorize(state, tx, ctx) gate (monotonic attenuation:
+    // topic reducers can only tighten, never weaken global admission decisions).
+    if (core.updates.some(u => u.topic !== '$admission')) {
+      let authReducersConfig: ReducersConfig
+      try {
+        authReducersConfig = assertValidReducersConfig(workingTopics.$reducers)
+      } catch (err) {
+        return makeRejected('reducers_config_invalid', err instanceof Error ? err.message : String(err))
+      }
+      const admissionBinding = authReducersConfig.topics.$admission
+      if (admissionBinding !== undefined) {
+        let authRes
+        try {
+          authRes = await this.sandbox.invoke({
+            imports: authReducersConfig.imports,
+            builtins: authReducersConfig.runtime.builtins,
+            topicBindings: authReducersConfig.topics,
+            moduleSpecifier: admissionBinding.module,
+            exportName: admissionBinding.export ?? 'default',
+            method: 'authorize',
+            state: Object.hasOwn(workingTopics, '$admission') ? workingTopics.$admission! : null,
+            payload: null,
+            tx: {
+              opId: opIdHex,
+              author: authorHex,
+              authorTimestampMs: Number(core.authorTimestampMs),
+              operationId: core.operationId,
+              visibility: core.visibility,
+              updates: core.updates,
+            },
+            opOutcome: visibleOutcome,
+            topicLastOpIds: visibleTopicLastOpsForReduce,
+            authorLastOpIds: visibleAuthorLastOpsForReduce,
+            txVisibility: core.visibility,
+            topics: filterPublicTopics(workingTopics),
+            topicHash,
+            ...(admissionBinding.config === undefined ? {} : { config: admissionBinding.config }),
+            cas: this.cas,
+            casPartition: 'public',
+            readOnly: true,
+            maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
+            ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
+          })
+        } catch (err) {
+          if (err instanceof MissingDependencyError) {
+            return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
+          }
+          throw err
+        }
+        if (authRes.ok) {
+          if (authRes.value === false) {
+            work.seen.add(dedupKey, true)
+            return makeRejected('admission_denied')
+          }
+          if (authRes.value !== null && typeof authRes.value === 'object' && !Array.isArray(authRes.value)) {
+            const authObj = authRes.value as Readonly<Record<string, JsonValue>>
+            if (authObj.ok === false) {
+              work.seen.add(dedupKey, true)
+              return makeRejected(
+                typeof authObj.code === 'string' && authObj.code.length > 0 ? authObj.code : 'admission_denied',
+                typeof authObj.detail === 'string' ? authObj.detail : undefined,
+              )
+            }
+          }
+        } else if (authRes.code !== 'vm:missing_method:authorize') {
+          work.seen.add(dedupKey, true)
+          return makeRejected(authRes.code, authRes.detail)
+        }
+      }
+    }
+
     for (const update of core.updates) {
       let reducersConfig: ReducersConfig
       try {
@@ -1260,6 +1465,97 @@ export class TopicKernel {
                 operationId: core.operationId,
                 authorTimestampMs: core.authorTimestampMs,
               })
+            }
+          }
+        }
+      }
+    }
+
+    // Kernel-enforced monotonic immutability controller ($seals):
+    // 1. Existing seals can NEVER be removed or weakened (even if $seals reducer were modified).
+    const sealMono = checkSealsMonotonicity(work.topics.$seals, workingTopics.$seals)
+    if (!sealMono.ok) {
+      work.seen.add(dedupKey, true)
+      return makeRejected(sealMono.code, sealMono.detail)
+    }
+    // 2. Enforce all active reducer hash locks and frozen/append-only JSON path locks.
+    const sealCheck = checkSealsEnforced(work.topics.$seals, work.topics, workingTopics)
+    if (!sealCheck.ok) {
+      work.seen.add(dedupKey, true)
+      return makeRejected(sealCheck.code, sealCheck.detail)
+    }
+
+    // 3. Optional flat semantic post-condition hook: $admission.verify(before, after, tx, ctx).
+    //    Skipped in O(1) when the resolved $admission module does not export `verify`.
+    {
+      let postReducersConfig: ReducersConfig | null = null
+      try { postReducersConfig = assertValidReducersConfig(workingTopics.$reducers) } catch { /* ignore */ }
+      const admBinding = postReducersConfig?.topics.$admission
+      if (postReducersConfig !== null && admBinding !== undefined) {
+        const verifyCacheKey = resolveEffectiveBindingTag(workingTopics.$reducers, '$admission')
+        if (this.#admissionHasVerify.get(verifyCacheKey) !== false) {
+          const isPublicOnly = this.genesis.privateLog && core.visibility === 'public'
+          const visibleBefore = isPublicOnly ? filterPublicTopics(work.topics) : work.topics
+          const visibleAfter = isPublicOnly ? filterPublicTopics(workingTopics) : workingTopics
+          let verifyRes
+          try {
+            verifyRes = await this.sandbox.invoke({
+              imports: postReducersConfig.imports,
+              builtins: postReducersConfig.runtime.builtins,
+              topicBindings: postReducersConfig.topics,
+              moduleSpecifier: admBinding.module,
+              exportName: admBinding.export ?? 'default',
+              method: 'verify',
+              state: Object.hasOwn(visibleAfter, '$admission') ? visibleAfter.$admission! : null,
+              payload: { before: visibleBefore, after: visibleAfter },
+              tx: {
+                opId: opIdHex,
+                author: authorHex,
+                authorTimestampMs: Number(core.authorTimestampMs),
+                operationId: core.operationId,
+                visibility: core.visibility,
+                updates: core.updates,
+              },
+              opOutcome: visibleOutcome,
+              topicLastOpIds: visibleTopicLastOpsForReduce,
+              authorLastOpIds: visibleAuthorLastOpsForReduce,
+              txVisibility: core.visibility,
+              topics: visibleAfter,
+              topicHash,
+              ...(admBinding.config === undefined ? {} : { config: admBinding.config }),
+              cas: this.cas,
+              casPartition: isPublicOnly ? 'public' : casPartition,
+              readOnly: true,
+              maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
+              ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
+            })
+          } catch (err) {
+            if (err instanceof MissingDependencyError) {
+              return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
+            }
+            throw err
+          }
+          if (!verifyRes.ok && verifyRes.code === 'vm:missing_method:verify') {
+            this.#admissionHasVerify.set(verifyCacheKey, false)
+          } else {
+            this.#admissionHasVerify.set(verifyCacheKey, true)
+            if (!verifyRes.ok) {
+              work.seen.add(dedupKey, true)
+              return makeRejected(verifyRes.code, verifyRes.detail)
+            }
+            if (verifyRes.value === false) {
+              work.seen.add(dedupKey, true)
+              return makeRejected('verify:rejected')
+            }
+            if (verifyRes.value !== null && typeof verifyRes.value === 'object' && !Array.isArray(verifyRes.value)) {
+              const vObj = verifyRes.value as Readonly<Record<string, JsonValue>>
+              if (vObj.ok === false) {
+                work.seen.add(dedupKey, true)
+                return makeRejected(
+                  typeof vObj.code === 'string' && vObj.code.length > 0 ? vObj.code : 'verify:rejected',
+                  typeof vObj.detail === 'string' ? vObj.detail : undefined,
+                )
+              }
             }
           }
         }
@@ -1534,15 +1830,76 @@ export class TopicKernel {
   }
 
   /**
-   * Create a deterministic `FinalityPredicateVerifier` that evaluates `$finality` policies
-   * with `kind: 'predicate'` by running the hash-pinned ES Module / `chronolog-pkg/v1` /
-   * pure-WASM module declared in `$reducers` against the public control state and checkpoint
-   * evidence. Runs identically on browsers, Node agents, and blind Cloudflare Worker hosts.
+   * Simulate an operation against the current materialized state without mutating
+   * persisted CAS, kernel state, or outcomes (ephemeral dry-run).
    */
-  createFinalityPredicateVerifier(): (
-    policy: { readonly kind: 'predicate'; readonly module: string; readonly export?: string; readonly config?: JsonValue },
-    checkpoint: unknown,
-  ) => Promise<boolean> {
+  async simulate(entry: KernelOperationInput): Promise<{
+    readonly ok: boolean
+    readonly outcome: 'accepted' | 'rejected'
+    readonly rejectionCode: string | null
+    readonly rejectionDetail?: string
+    readonly events: readonly EmittedKernelEvent[]
+    readonly changedTopics: readonly string[]
+    readonly stateRoot: string
+  }> {
+    if (this.#logsDirty) throw new Error('KERNEL_REPLAY_IN_PROGRESS')
+    const work: KernelMutableState = {
+      topics: { ...this.#topics },
+      topicHashes: new Map(this.#topicHashes),
+      seen: this.#seen.clone(this.#committedSeenLength),
+      outcomes: this.#outcomeLog.clone(this.#outcomes.length),
+      topicLastOpIds: new Map(this.#topicLastOpIds),
+      authorLastOpIds: new Map(this.#authorLastOpIds),
+      publicAuthorLastOpIds: new Map(this.#publicAuthorLastOpIds),
+      historyDigest: this.#historyDigest,
+      stateRoot: this.#stateRoot,
+    }
+    const opIdHex = bytesToHex(entry.opId)
+    const authorHex = bytesToHex(entry.core.author)
+    this.cas.beginBatch()
+    try {
+      const step = await this.#applyOne(work, entry, opIdHex, authorHex)
+      if (step.kind === 'missing') {
+        throw new MissingDependencyError(step.dependency.split('/')[1] ?? step.dependency, 'cas')
+      }
+      const changedTopics: string[] = []
+      for (const [name, hash] of work.topicHashes) {
+        if (this.#topicHashes.get(name) !== hash) changedTopics.push(name)
+      }
+      changedTopics.sort()
+      return {
+        ok: step.outcome.outcome === 'accepted',
+        outcome: step.outcome.outcome,
+        rejectionCode: step.outcome.rejectionCode,
+        ...(step.outcome.rejectionDetail === undefined ? {} : { rejectionDetail: step.outcome.rejectionDetail }),
+        events: step.outcome.events,
+        changedTopics,
+        stateRoot: work.stateRoot,
+      }
+    } finally {
+      this.cas.rollbackBatch()
+    }
+  }
+
+  /**
+   * Create a deterministic `AdmissionEvaluator` that invokes the log's state-defined
+   * `$admission.admit(state, { logId, ops, evidence, pinnedFrontier }, ctx)` function
+   * against public control state and available external evidence. Runs identically on
+   * browsers, Node agents, and blind Cloudflare Worker hosts.
+   */
+  createAdmissionEvaluator(): (input: {
+    readonly logId: string
+    readonly ops: readonly { readonly opId: string; readonly author: string; readonly authorTimestampMs: bigint; readonly visibility: 'public' | 'encrypted' }[]
+    readonly evidence: readonly unknown[]
+    readonly pinnedFrontier?: { readonly closedThroughMs: bigint; readonly stateRoot: string; readonly historyDigest: string; readonly includedOpIds: readonly string[] } | null
+  }) => Promise<{
+    readonly closedThroughMs?: number | string | bigint | null
+    readonly includedOpIds?: readonly string[]
+    readonly excludedOpIds?: readonly string[]
+    readonly verifiedEvidenceIndices?: readonly number[]
+    readonly latestCheckpointIndex?: number | null
+    readonly equivocations?: readonly { readonly signer: string; readonly scopeId?: string; readonly reason: string; readonly detail?: string }[]
+  } | null> {
     const toJsonSafe = (value: unknown, depth = 0): JsonValue => {
       if (depth > 16 || value === null || value === undefined) return null
       if (typeof value === 'boolean' || typeof value === 'string') return value
@@ -1559,63 +1916,52 @@ export class TopicKernel {
       }
       return null
     }
-    return async (policy, checkpoint): Promise<boolean> => {
+    return async (input) => {
       let reducersConfig: ReducersConfig
-      try { reducersConfig = assertValidReducersConfig(this.#topics.$reducers) } catch { return false }
+      try { reducersConfig = assertValidReducersConfig(this.#topics.$reducers) } catch { return null }
+      const binding = reducersConfig.topics.$admission
+      if (binding === undefined) return null
       const visibleControlTopics = filterPublicTopics(this.#topics)
-      const payload: JsonValue = {
-        policy: toJsonSafe(policy),
-        checkpoint: toJsonSafe(checkpoint),
-      }
+      const payload = toJsonSafe(input)
       try {
         const res = await this.sandbox.invoke({
           imports: reducersConfig.imports,
           builtins: reducersConfig.runtime.builtins,
           topicBindings: reducersConfig.topics,
-          moduleSpecifier: policy.module,
-          exportName: policy.export ?? 'default',
-          method: 'query',
-          state: visibleControlTopics.$finality ?? null,
+          moduleSpecifier: binding.module,
+          exportName: binding.export ?? 'default',
+          method: 'admit',
+          state: visibleControlTopics.$admission ?? null,
           payload,
           topics: visibleControlTopics,
-          ...(policy.config === undefined ? {} : { config: policy.config }),
+          ...(binding.config === undefined ? {} : { config: binding.config }),
           cas: this.cas,
           casPartition: 'public',
           readOnly: true,
           maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
           ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
         })
-        if (!res.ok) return false
-        if (res.value === true) return true
-        if (res.value !== null && typeof res.value === 'object' && !Array.isArray(res.value)) {
-          return (res.value as Readonly<Record<string, JsonValue>>).admitted === true
+        if (!res.ok || res.value === null || typeof res.value !== 'object' || Array.isArray(res.value)) return null
+        return res.value as {
+          readonly closedThroughMs?: number | string | bigint | null
+          readonly includedOpIds?: readonly string[]
+          readonly excludedOpIds?: readonly string[]
+          readonly verifiedEvidenceIndices?: readonly number[]
+          readonly latestCheckpointIndex?: number | null
+          readonly equivocations?: readonly { readonly signer: string; readonly scopeId?: string; readonly reason: string; readonly detail?: string }[]
         }
-        return false
       } catch {
-        return false
+        return null
       }
     }
   }
 
-  /** Evaluate signal authorization policy for the current stateRoot (cached by caller per stateRoot). */
+  /** Evaluate signal authorization policy from `$admission` for the current stateRoot. */
   async signalPolicy(): Promise<{ readonly rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] }> {
-    const reducersConfig = assertValidReducersConfig(this.#topics.$reducers)
-    if (reducersConfig.topics.$signal_policy !== undefined) {
-      const val = await this.query('$signal_policy', null)
-      if (val !== null && typeof val === 'object' && !Array.isArray(val) && Array.isArray((val as Readonly<Record<string, JsonValue>>).rules)) {
-        return val as { readonly rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] }
-      }
+    const val = await this.query('$admission', { kind: 'signals' }).catch(() => null)
+    if (val !== null && typeof val === 'object' && !Array.isArray(val) && Array.isArray((val as Readonly<Record<string, JsonValue>>).rules)) {
+      return val as { readonly rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] }
     }
-    const queriedReaders = await this.query('$permissions', { list: 'readers' }).catch(() => null)
-    if (Array.isArray(queriedReaders) && queriedReaders.every(x => typeof x === 'string')) {
-      return {
-        rules: [{ topicPattern: '*', allowedAuthors: queriedReaders, maxTtlMs: 30_000, allowRelay: true }],
-      }
-    }
-    const perms = this.#topics.$permissions as { readonly members?: readonly { readonly publicKey: string; readonly reader?: boolean }[] } | undefined
-    const readers = (perms?.members ?? []).filter(m => m.reader).map(m => m.publicKey)
-    return {
-      rules: [{ topicPattern: '*', allowedAuthors: readers, maxTtlMs: 30_000, allowRelay: true }],
-    }
+    return { rules: [] }
   }
 }

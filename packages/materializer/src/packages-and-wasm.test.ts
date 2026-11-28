@@ -292,12 +292,13 @@ describe('Scoped chronolog-pkg/v1, capability attenuation, fuel, WASM, derivatio
       limits: { ...DEFAULT_GENESIS_LIMITS, maxFuel: 40 },
       salt: new Uint8Array(16).fill(2),
       initialTopics: {
-        $permissions: { members: [{ publicKey: pubHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: false }], admission: null },
+        $admission: { members: [{ publicKey: pubHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: false }], admission: null },
         $reducers: {
           runtime: DEFAULT_RUNTIME_MANIFEST as unknown as JsonValue,
           imports: { ...stdImports, '@app/calc': v1.ref, '@app/spin': spin.ref },
           topics: {
-            $reducers: { module: 'chronolog/permissions', export: 'adminOnlyReducers' },
+            $admission: { module: 'chronolog/admission', export: 'attestedAdmission' },
+            $reducers: { module: 'chronolog/admission', export: 'adminOnlyReducers' },
             calc: { module: '@app/calc' },
             spin: { module: '@app/spin' },
           },
@@ -465,7 +466,7 @@ describe('Scoped chronolog-pkg/v1, capability attenuation, fuel, WASM, derivatio
       limits: DEFAULT_GENESIS_LIMITS,
       salt: new Uint8Array(16).fill(4),
       initialTopics: {
-        $permissions: {
+        $admission: {
           members: [
             { publicKey: bytesToHex(admin.publicKeyBytes), reader: true, writer: true, administrator: true, publisher: true, finalizer: false },
             { publicKey: bytesToHex(nonAdmin.publicKeyBytes), reader: true, writer: true, administrator: false, publisher: false, finalizer: false },

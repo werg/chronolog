@@ -19,9 +19,9 @@ describe('Chronolog v2 ergonomics & platform upgrades', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: {
             admins: [admin.identity.publicKey],
             members: [],
@@ -88,9 +88,9 @@ describe('Chronolog v2 ergonomics & platform upgrades', () => {
       },
       privateLog: false,
       topics: {
-        $permissions: {
-          module: 'chronolog/permissions',
-          export: 'openMembers',
+        $admission: {
+          module: 'chronolog/admission',
+          export: 'openAdmission',
           initialState: {
             admins: [admin.identity.publicKey],
             members: [],
@@ -117,7 +117,7 @@ describe('Chronolog v2 ergonomics & platform upgrades', () => {
       const blk = await sAdmin.submit({
         visibility: 'public',
         operationId: 'block-1',
-        updates: [{ topic: '$permissions', input: { action: 'blockAuthor', publicKey: spammer.identity.publicKey, reason: 'spam' } }],
+        updates: [{ topic: '$admission', input: { action: 'blockAuthor', publicKey: spammer.identity.publicKey, reason: 'spam' } }],
       })
       expect((await blk.materialized()).outcome).toBe('accepted')
       expect(sAdmin.permissions().blockedAuthors).toEqual([spammer.identity.publicKey])
@@ -138,7 +138,7 @@ describe('Chronolog v2 ergonomics & platform upgrades', () => {
       const unblk = await sAdmin.submit({
         visibility: 'public',
         operationId: 'unblock-1',
-        updates: [{ topic: '$permissions', input: { action: 'unblockAuthor', publicKey: spammer.identity.publicKey } }],
+        updates: [{ topic: '$admission', input: { action: 'unblockAuthor', publicKey: spammer.identity.publicKey } }],
       })
       expect((await unblk.materialized()).outcome).toBe('accepted')
       expect(sAdmin.isBlockedAuthor(spammer.identity.publicKey)).toBe(false)

@@ -25,7 +25,7 @@ export interface WasmCallHostContext {
 
 export interface WasmReducerInvocationInput {
   readonly wasmHash: string
-  readonly method: 'reduce' | 'query' | 'describe' | 'onConflict'
+  readonly method: 'reduce' | 'query' | 'describe' | 'onConflict' | 'admit' | 'authorize' | 'verify'
   readonly state: JsonValue
   readonly payload: JsonValue
   readonly tx?: {

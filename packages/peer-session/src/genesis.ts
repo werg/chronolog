@@ -19,7 +19,6 @@ import {
   type RuntimeManifest,
   type TopicBinding,
 } from '@chronolog/protocol'
-import type { ScheduledFinalityEntry } from '@chronolog/authority'
 import { STANDARD_MODULE_SOURCES } from '@chronolog/materializer/std-modules'
 
 export interface EpochKeyBox {
@@ -73,6 +72,8 @@ export interface LogMemberSeed {
   readonly wrapKey?: string
   readonly label?: string
   readonly subject?: string
+  readonly scopes?: readonly string[]
+  readonly expiresAtMs?: number
   readonly reader?: boolean
   readonly writer?: boolean
   readonly administrator?: boolean
@@ -126,13 +127,26 @@ export interface CreateLogGenesisOptions {
   readonly builders?: BuildersSeed
   /** Application topics to register in `$reducers.topics` alongside standard `$*` control topics. */
   readonly topics?: Readonly<Record<string, LogTopicSeed>>
-  /** Optional host public key for `chronolog/permissions` Ed25519 admission attestations. */
+  /** Optional host public key for `chronolog/admission` Ed25519 admission attestations. */
   readonly hostPublicKey?: string
-  /** Optional full initial `$permissions.admission` policy object (overrides `hostPublicKey` default). */
+  /** Optional full initial `$admission.admission` policy object (overrides `hostPublicKey` default). */
   readonly admission?: JsonValue | null
-  /** Initial `$finality` schedule (defaults to `finality: none`). */
-  readonly finalitySchedule?: readonly ScheduledFinalityEntry[]
+  /** Initial `$admission.schedule` history-admission schedule (defaults to open CRDT `{ kind: 'open' }`). */
+  readonly admissionSchedule?: readonly { readonly effectiveAfterMs: bigint | number; readonly policy: JsonValue }[]
+  /** Optional initial `$admission.signals` policy (`{ rules: [...] }`). */
   readonly signalPolicy?: JsonValue
+  /** Optional initial `$admission.topicAccess` map (explicit public-write or scoped topic rules). */
+  readonly topicAccess?: Readonly<Record<string, { readonly allowPublicWrite?: boolean; readonly requiredCapability?: string; readonly requiredScope?: string }>>
+  /** Optional initial kernel-enforced monotonic `$seals` (reducer hash pins + frozen/append-only JSON paths). */
+  readonly seals?: {
+    readonly reducers?: readonly string[]
+    readonly paths?: readonly {
+      readonly topic: string
+      readonly path: string
+      readonly mode?: 'frozen' | 'append-only'
+      readonly allowMutableReducer?: boolean
+    }[]
+  }
   readonly runtime?: RuntimeManifest
   readonly limits?: GenesisLimits
   readonly salt?: Uint8Array
@@ -204,11 +218,10 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
   }
 
   const topicBindings: Record<string, TopicBinding> = {
-    $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' },
+    $admission: { module: 'chronolog/admission', export: 'attestedAdmission' },
+    $seals: { module: 'chronolog/seals', export: 'monotonicSeals' },
     $keys: { module: 'chronolog/keys', export: 'hpkeEpochs' },
-    $finality: { module: 'chronolog/finality', export: 'scheduledFinality' },
     $publications: { module: 'chronolog/publications', export: 'signedReleases' },
-    $signal_policy: { module: 'chronolog/permissions', export: 'defaultSignalPolicy' },
   }
   if (options.enableMounts === true || options.builders?.requireMountApproval != null) {
     topicBindings.$mounts = { module: 'chronolog/mounts', export: 'verifiedMounts' }
@@ -219,7 +232,7 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
   if (options.frozenReducers !== true) {
     topicBindings.$reducers = options.builders !== undefined
       ? { module: 'chronolog/builders', export: 'attestedReducers' }
-      : { module: 'chronolog/permissions', export: 'adminOnlyReducers' }
+      : { module: 'chronolog/admission', export: 'adminOnlyReducers' }
   }
 
   const allMembers = [options.creator, ...(options.members ?? [])]
@@ -230,6 +243,8 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
       ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
       ...(m.label ? { label: m.label } : {}),
       ...(m.subject ? { subject: m.subject } : {}),
+      ...(m.scopes && m.scopes.length > 0 ? { scopes: [...m.scopes] } : {}),
+      ...(m.expiresAtMs !== undefined ? { expiresAtMs: m.expiresAtMs } : {}),
       reader: m.reader ?? true,
       writer: m.writer ?? true,
       administrator: m.administrator ?? (m.publicKey === options.creator.publicKey),
@@ -239,7 +254,7 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
   }
   const members = [...memberByKey.values()].sort((a, b) => a.publicKey.localeCompare(b.publicKey))
 
-  const schedule = (options.finalitySchedule ?? [{ effectiveAfterMs: -1n, policy: { kind: 'none' } }]).map(entry => ({
+  const schedule = (options.admissionSchedule ?? [{ effectiveAfterMs: -1, policy: { kind: 'open' } }]).map(entry => ({
     effectiveAfterMs: Number(entry.effectiveAfterMs),
     policy: entry.policy,
   }))
@@ -248,15 +263,34 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     ? options.admission
     : (options.hostPublicKey ? { hostKey: options.hostPublicKey } : null)
 
+  const sealReducers: Record<string, true> = {}
+  const sealPaths: Record<string, Record<string, 'frozen' | 'append-only'>> = {}
+  for (const r of options.seals?.reducers ?? []) {
+    if (typeof r === 'string' && r.length > 0 && r !== '$seals') sealReducers[r] = true
+  }
+  for (const p of options.seals?.paths ?? []) {
+    if (typeof p.topic !== 'string' || p.topic.length === 0 || p.topic === '$seals') continue
+    if (typeof p.path !== 'string' || p.path.length === 0) continue
+    const mode: 'frozen' | 'append-only' = p.mode === 'append-only' ? 'append-only' : 'frozen'
+    const existing = sealPaths[p.topic] ?? (sealPaths[p.topic] = {})
+    existing[p.path] = mode
+    if (p.allowMutableReducer !== true) sealReducers[p.topic] = true
+  }
+
   const initialTopics: Record<string, JsonValue> = {
-    $permissions: {
+    $admission: {
       members: members as unknown as JsonValue,
       admission: admissionPolicy,
+      schedule,
+      ...(options.signalPolicy === undefined ? {} : { signals: options.signalPolicy }),
+      ...(options.topicAccess === undefined ? {} : { topicAccess: options.topicAccess as unknown as JsonValue }),
+    },
+    $seals: {
+      reducers: sealReducers,
+      paths: sealPaths,
     },
     $keys: { currentEpoch: -1, epochs: {} },
-    $finality: { schedule },
     $publications: { revision: 0, current: null, history: [] },
-    ...(options.signalPolicy === undefined ? {} : { $signal_policy: options.signalPolicy }),
   }
   if (options.enableMounts === true || options.builders?.requireMountApproval != null) {
     initialTopics.$mounts = { mounts: {} }

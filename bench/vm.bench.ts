@@ -14,7 +14,7 @@ import { performance } from 'node:perf_hooks'
 import { MemoryBytesStore, ContentAddressedStore } from '@chronolog/records'
 import { utf8 } from '@chronolog/canonical'
 import { QuickJsSandbox, loadQuickJsModule, CRYPTO_BUILTIN_ID, type ReducerInvocationInput } from '../packages/materializer/src/quickjs-sandbox.js'
-import { STD_PERMISSIONS_SOURCE } from '../packages/materializer/src/std-modules.js'
+import { STD_ADMISSION_SOURCE } from '../packages/materializer/src/std-modules.js'
 import { createSqliteCasDriver, SQLITE_CAS_BUILTIN_ID } from '../packages/sqlite-cas/src/index.js'
 
 const argNum = (name: string, fallback: number): number => { const i = process.argv.indexOf(`--${name}`); return i >= 0 ? Number(process.argv[i + 1]) || fallback : fallback }
@@ -33,7 +33,7 @@ export default {
 }`
 const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
 const hash = await cas.put(utf8(SOURCE), [], 'private')
-const permHash = await cas.put(utf8(STD_PERMISSIONS_SOURCE), [], 'public')
+const permHash = await cas.put(utf8(STD_ADMISSION_SOURCE), [], 'public')
 const sqlHash = await cas.put(utf8(SQL_SOURCE), [], 'private')
 
 type Case = readonly [label: string, run: () => unknown]
@@ -62,9 +62,9 @@ const kvInput: ReducerInvocationInput = {
   method: 'reduce', state: {}, payload: { key: 'a', value: 1 },
 }
 const permInput: ReducerInvocationInput = {
-  ...base, imports: { 'chronolog/permissions': `cas:sha256-${permHash}` }, moduleSpecifier: 'chronolog/permissions',
-  exportName: 'attestedMembers', builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID }, method: 'query', state: null,
-  payload: { kind: 'members' }, casPartition: 'public', readOnly: true,
+  ...base, imports: { 'chronolog/admission': `cas:sha256-${permHash}` }, moduleSpecifier: 'chronolog/admission',
+  exportName: 'attestedAdmission', builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID }, method: 'query', state: null,
+  payload: { kind: 'roster' }, casPartition: 'public', readOnly: true,
 }
 const sqlInput: ReducerInvocationInput = {
   ...kvInput, imports: { 'app/sql': `cas:sha256-${sqlHash}` }, moduleSpecifier: 'app/sql',
@@ -82,7 +82,7 @@ const rt = qjs.newRuntime()
 rt.setMemoryLimit(64 * 1024 * 1024)
 rt.setMaxStackSize(512 * 1024)
 rt.setInterruptHandler(() => false)
-rt.setModuleLoader((name: string) => name === 'perm' ? STD_PERMISSIONS_SOURCE
+rt.setModuleLoader((name: string) => name === 'perm' ? STD_ADMISSION_SOURCE
   : name === 'chronolog:crypto' ? 'export function sha256() {} export function verifyEd25519() {} export function canonicalJson() {}'
     : SOURCE)
 // quickjs-emscripten DefaultIntrinsics minus Date (what QuickJsSandbox uses).

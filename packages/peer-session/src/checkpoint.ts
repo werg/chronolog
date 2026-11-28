@@ -59,7 +59,6 @@ export interface RestoredCheckpoint {
 const MAGIC = new Uint8Array([0x43, 0x4c, 0x43, 0x50, 0x01]) // "CLCP\x01"
 const SALT_BYTES = 16
 const IV_BYTES = 12
-const LEGACY_PBKDF2_ITERATIONS = 100_000
 const PBKDF2_ITERATIONS = 600_000
 const KDF_HEADER_BYTES = 5 // algorithm (1 = PBKDF2-SHA256), iterations (uint32 BE)
 const encoder = new TextEncoder()
@@ -197,7 +196,7 @@ export async function exportDeviceCheckpoint(store: BytesStore, options: ExportC
   const aad = checkpointAad(kdfHeader)
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext))
 
-  // Wire layout: MAGIC(5) | FLAGS(1: 0=legacy, 1=raw, 2=parameterized KDF)
+  // Wire layout: MAGIC(5) | FLAGS(1: 1=raw, 2=parameterized KDF)
   // | optional KDF(5) | SALT(16) | IV(12) | CIPHERTEXT+TAG
   const out = new Uint8Array(MAGIC.length + 1 + kdfHeader.length + SALT_BYTES + IV_BYTES + ciphertext.byteLength)
   let offset = 0
@@ -239,8 +238,8 @@ export async function restoreDeviceCheckpoint(
   }
   let offset = MAGIC.length
   const flags = encryptedBytes[offset++]!
-  if (flags !== 0 && flags !== 1 && flags !== 2) throw fail('CHECKPOINT_CORRUPT', 'Unrecognized checkpoint flags.')
-  let iterations = LEGACY_PBKDF2_ITERATIONS
+  if (flags !== 1 && flags !== 2) throw fail('CHECKPOINT_CORRUPT', 'Unrecognized checkpoint flags.')
+  let iterations = PBKDF2_ITERATIONS
   const kdfHeader = flags === 2 ? encryptedBytes.slice(offset, offset + KDF_HEADER_BYTES) : new Uint8Array()
   if (flags === 2) {
     if (encryptedBytes.length <= headerLength + KDF_HEADER_BYTES + 16 || kdfHeader[0] !== 1) throw fail('CHECKPOINT_CORRUPT', 'Unsupported checkpoint KDF.')

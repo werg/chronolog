@@ -45,8 +45,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const counterV1Hash = await cas.put(utf8(`
       export default {
         reduce(state, tx, ctx) {
-          const perms = ctx.topic('$permissions');
-          if (!perms.members.some(m => m.publicKey === tx.author && m.writer)) return { ok: false, code: 'unauthorized' };
+          if (!ctx.can('writer')) return { ok: false, code: 'unauthorized' };
           const cur = typeof state === 'number' ? state : 0;
           return { ok: true, state: cur + tx.payload.delta, events: [{ topic: 'counter.changed', payload: { value: cur + tx.payload.delta } }] };
         },
@@ -57,8 +56,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const counterV2Hash = await cas.put(utf8(`
       export default {
         reduce(state, tx, ctx) {
-          const perms = ctx.topic('$permissions');
-          if (!perms.members.some(m => m.publicKey === tx.author && m.writer)) return { ok: false, code: 'unauthorized' };
+          if (!ctx.can('writer')) return { ok: false, code: 'unauthorized' };
           const cur = typeof state === 'number' ? state : 0;
           return { ok: true, state: cur + tx.payload.delta * 10 };
         },
@@ -79,11 +77,11 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID, 'chronolog:cas': CAS_BUILTIN_ID } },
           imports: { ...stdImports, '@app/counter': `cas:sha256-${counterV1Hash}` },
           topics: {
-            $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' },
+            $admission: { module: 'chronolog/admission', export: 'attestedAdmission' },
             counter: { module: '@app/counter' },
           },
         },
-        $permissions: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }] },
+        $admission: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }] },
         counter: 0,
       },
       limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
@@ -106,12 +104,12 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         $reducers: {
           ...(frozenGenesis.initialTopics.$reducers as Record<string, unknown>),
           topics: {
-            $reducers: { module: 'chronolog/permissions', export: 'adminOnlyReducers' },
-            $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' },
+            $reducers: { module: 'chronolog/admission', export: 'adminOnlyReducers' },
+            $admission: { module: 'chronolog/admission', export: 'attestedAdmission' },
             counter: { module: '@app/counter' },
           },
         },
-        $permissions: {
+        $admission: {
           members: [
             { publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true },
             { publicKey: bobHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
@@ -253,13 +251,13 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID, 'chronolog:cas': CAS_BUILTIN_ID } },
           imports: { ...stdFull, '@app/priv': `cas:sha256-${privHash}` },
           topics: {
-            $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' },
+            $admission: { module: 'chronolog/admission', export: 'attestedAdmission' },
             $keys: { module: 'chronolog/keys', export: 'hpkeEpochs' },
             $publications: { module: 'chronolog/publications', export: 'signedReleases' },
             priv: { module: '@app/priv' },
           },
         },
-        $permissions: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }] },
+        $admission: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }] },
         $keys: { currentEpoch: -1, epochs: {} },
         $publications: { revision: 0, current: null, history: [] },
         priv: 0,
@@ -275,11 +273,11 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const encOp = makeOp(full.logId, admin.publicKeyBytes, 'shared-id', 10n, 'encrypted', [{ topic: 'priv', input: null }], 1)
     // 2. Later public op reuses operationId="shared-id" (cross-partition collision must NOT suppress public op!)
     const pubGrant = makeOp(full.logId, admin.publicKeyBytes, 'shared-id', 20n, 'public', [
-      { topic: '$permissions', input: { action: 'setMember', member: { publicKey: userHex, reader: true, writer: true, administrator: false, publisher: true, finalizer: false } } },
+      { topic: '$admission', input: { action: 'setMember', member: { publicKey: userHex, reader: true, writer: true, administrator: false, publisher: true, finalizer: false } } },
     ], 2)
-    // 3. Adversarial encrypted op trying to mutate $permissions (must reject on full replica!)
+    // 3. Adversarial encrypted op trying to mutate $admission (must reject on full replica!)
     const badEncControl = makeOp(full.logId, admin.publicKeyBytes, 'bad-enc', 30n, 'encrypted', [
-      { topic: '$permissions', input: { action: 'removeMember', publicKey: userHex } },
+      { topic: '$admission', input: { action: 'removeMember', publicKey: userHex } },
     ], 3)
     // 4. Adversarial public op trying to mutate private topic (must reject on both!)
     const badPubPriv = makeOp(full.logId, admin.publicKeyBytes, 'bad-pub', 40n, 'public', [
@@ -299,7 +297,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     expect(full.topic('priv')).toBe(1)
 
     // Blind host and full replica MUST derive identical control topics!
-    expect(blind.topic('$permissions')).toEqual(full.topic('$permissions'))
+    expect(blind.topic('$admission')).toEqual(full.topic('$admission'))
     expect(blind.topic('$publications')).toEqual(full.topic('$publications'))
     expect((blind.topic('$publications') as { revision: number }).revision).toBe(1)
   })
@@ -383,7 +381,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     expect(fast.revision('local').digest).toBe(full.revision('local').digest)
   })
 
-  it('verifies Ed25519 HostAttestation synchronously inside $permissions via chronolog:crypto', async () => {
+  it('verifies Ed25519 HostAttestation synchronously inside $admission via chronolog:crypto', async () => {
     const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
     const stdImports = await seedStandardModules(cas)
     const admin = await generateEd25519KeyPair()
@@ -400,9 +398,9 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         $reducers: {
           runtime: { js: QUICKJS_RUNTIME_ID, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } },
           imports: stdImports,
-          topics: { $permissions: { module: 'chronolog/permissions', export: 'attestedMembers' } },
+          topics: { $admission: { module: 'chronolog/admission', export: 'attestedAdmission' } },
         },
-        $permissions: {
+        $admission: {
           members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }],
           admission: { hostKey: hostHex },
         },
@@ -417,7 +415,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
 
     const kernel = new TopicKernel({ genesis, cas })
     const opGood = makeOp(kernel.logId, admin.publicKeyBytes, 'admit-1', 10n, 'public', [{
-      topic: '$permissions',
+      topic: '$admission',
       input: {
         action: 'setMember',
         member: { publicKey: newcomerHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
@@ -426,10 +424,10 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     }])
     const res = await kernel.materialize([opGood])
     expect(res.outcomes[0]!.outcome).toBe('accepted')
-    expect(await kernel.query('$permissions', { publicKey: newcomerHex })).toMatchObject({ publicKey: newcomerHex, writer: true })
+    expect(await kernel.query('$admission', { publicKey: newcomerHex })).toMatchObject({ publicKey: newcomerHex, writer: true })
   })
 
-  it('enforces public-only partition on ctx.query() and supports multisigMembers + openMembers without hardcoded state shape', async () => {
+  it('enforces public-only partition on ctx.query() and supports multisigAdmission + openAdmission without hardcoded state shape', async () => {
     const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
     const stdImports = await seedStandardModules(cas)
     const s1 = await generateEd25519KeyPair()
@@ -446,7 +444,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
       export default {
         reduce(state, tx, ctx) {
           const leaked = ctx.query('secret', { ping: true });
-          const isAdmin = ctx.query('$permissions', { check: 'administrator', actor: tx.author });
+          const isAdmin = ctx.can('administrator');
           return { ok: true, state: { leaked, isAdmin } };
         },
       };
@@ -472,13 +470,13 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
             'app/secret': `cas:sha256-${secretHash}`,
           },
           topics: {
-            $permissions: { module: 'chronolog/permissions', export: 'multisigMembers' },
-            $reducers: { module: 'chronolog/permissions', export: 'adminOnlyReducers' },
-            $signal_policy: { module: 'app/probe' },
+            $admission: { module: 'chronolog/admission', export: 'multisigAdmission' },
+            $reducers: { module: 'chronolog/admission', export: 'adminOnlyReducers' },
+            $mounts: { module: 'app/probe' },
             secret: { module: 'app/secret' },
           },
         },
-        $permissions: {
+        $admission: {
           threshold: 2,
           signers: [s1Hex, s2Hex, s3Hex],
           members: {},
@@ -494,35 +492,35 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const blind = new TopicKernel({ genesis, cas, blindHostMode: true })
 
     // 1. Public control op probing 'secret' via ctx.query() MUST see null (identical on full & blind host)
-    const opProbe = makeOp(full.logId, s1.publicKeyBytes, 'probe-1', 10n, 'public', [{ topic: '$signal_policy', input: {} }])
+    const opProbe = makeOp(full.logId, s1.publicKeyBytes, 'probe-1', 10n, 'public', [{ topic: '$mounts', input: {} }])
     // 2. Multisig 2-of-3 proposal to admit guest
     const opPropose = makeOp(full.logId, s1.publicKeyBytes, 'ms-prop-1', 20n, 'public', [{
-      topic: '$permissions',
+      topic: '$admission',
       input: {
         action: 'propose',
-        proposalId: 'admit-guest',
+        id: 'admit-guest',
         kind: 'setMember',
         member: { publicKey: guestHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
       },
     }])
     // 3. Second signer approves -> executes atomically!
     const opApprove = makeOp(full.logId, s2.publicKeyBytes, 'ms-app-1', 30n, 'public', [{
-      topic: '$permissions',
-      input: { action: 'approve', proposalId: 'admit-guest' },
+      topic: '$admission',
+      input: { action: 'approve', id: 'admit-guest' },
     }])
 
     await full.materialize([opProbe, opPropose])
-    expect(full.topic('$signal_policy')).toEqual({ leaked: null, isAdmin: true })
+    expect(full.topic('$mounts')).toEqual({ leaked: null, isAdmin: true })
     // Not admitted after 1 approval (threshold = 2)
-    expect(await full.query('$permissions', { check: 'writer', actor: guestHex })).toBe(false)
+    expect(await full.query('$admission', { kind: 'can', capability: 'writer', actor: guestHex })).toBe(false)
 
     await full.materialize([opProbe, opPropose, opApprove])
     await blind.materialize([opProbe, opPropose, opApprove])
 
-    expect(await full.query('$permissions', { check: 'writer', actor: guestHex })).toBe(true)
-    expect(await blind.query('$permissions', { check: 'writer', actor: guestHex })).toBe(true)
-    expect(await full.query('$permissions', { admission: true })).toBeNull()
-    expect(full.topic('$signal_policy')).toEqual(blind.topic('$signal_policy'))
-    expect(full.topic('$permissions')).toEqual(blind.topic('$permissions'))
+    expect(await full.query('$admission', { kind: 'can', capability: 'writer', actor: guestHex })).toBe(true)
+    expect(await blind.query('$admission', { kind: 'can', capability: 'writer', actor: guestHex })).toBe(true)
+    expect((await full.query('$admission', { kind: 'roster' }) as { admission: unknown }).admission).toBeNull()
+    expect(full.topic('$mounts')).toEqual(blind.topic('$mounts'))
+    expect(full.topic('$admission')).toEqual(blind.topic('$admission'))
   })
 })
