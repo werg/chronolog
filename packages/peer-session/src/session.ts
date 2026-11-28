@@ -1622,6 +1622,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
       let controlKernel: TopicKernel
       let rewrapped = false
+      let ephemeralControl: TopicKernel | null = null
       let allByOpId: Map<string, KernelOperationInput>
 
       if (this.#controlKernel !== null) {
@@ -1648,6 +1649,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             ...this.#sandboxOptions,
             ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
           })
+          ephemeralControl = controlKernel
           await controlKernel.materialize(publicInputs)
         } else {
           controlKernel = this.#kernel
@@ -1673,8 +1675,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'), controlKernel.topic('$mounts'))
+      // The isolated $finality probe kernel is not needed past this point.
+      ephemeralControl?.dispose()
       if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
-        this.#kernel.sandbox.dispose()
+        this.#kernel.dispose()
         const nextKernel = new TopicKernel({
           genesis: this.genesisBytes,
           cas: this.cas,
@@ -1684,7 +1688,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         })
         this.#kernel = nextKernel
         this.#kernelHasSqlite = true
-        this.#finalKernel?.sandbox.dispose()
+        this.#finalKernel?.dispose()
         this.#finalKernel = null
       }
 
@@ -1705,7 +1709,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const bundle = this.#pendingSnapshotBundle
         this.#pendingSnapshotBundle = null
         if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(bundle.cache.topics.$reducers) && this.#sqliteDriver !== undefined) {
-          this.#kernel.sandbox.dispose()
+          this.#kernel.dispose()
           this.#kernel = new TopicKernel({
             genesis: this.genesisBytes,
             cas: this.cas,
@@ -1714,7 +1718,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             sqliteDriver: this.#sqliteDriver,
           })
           this.#kernelHasSqlite = true
-          this.#finalKernel?.sandbox.dispose()
+          this.#finalKernel?.dispose()
           this.#finalKernel = null
         }
         // Try exact prefix restore first if all ops are local; otherwise bootstrap at the snapshot frontier!
@@ -1739,7 +1743,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const cached = this.#pendingMaterializedCache
         this.#pendingMaterializedCache = null
         if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(cached.topics.$reducers) && this.#sqliteDriver !== undefined) {
-          this.#kernel.sandbox.dispose()
+          this.#kernel.dispose()
           this.#kernel = new TopicKernel({
             genesis: this.genesisBytes,
             cas: this.cas,
@@ -1748,7 +1752,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             sqliteDriver: this.#sqliteDriver,
           })
           this.#kernelHasSqlite = true
-          this.#finalKernel?.sandbox.dispose()
+          this.#finalKernel?.dispose()
           this.#finalKernel = null
         }
         const restored = await this.#kernel.restoreMaterializedCache(cached, eligibleLocal)
@@ -1773,10 +1777,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           sqliteDriver: this.#sqliteDriver,
         })
         localResult = await nextKernel.materialize(eligibleLocal)
-        this.#kernel.sandbox.dispose()
+        this.#kernel.dispose()
         this.#kernel = nextKernel
         this.#kernelHasSqlite = true
-        this.#finalKernel?.sandbox.dispose()
+        this.#finalKernel?.dispose()
         this.#finalKernel = null
       }
       await this.#refreshPermissionsCache(this.#kernel)
@@ -2963,9 +2967,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ...this.#sandboxOptions,
           ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
         })
-        await tempKernel.materialize(included)
-        await tempKernel.commitSeenOpsRoot()
-        const snap = tempKernel.snapshot()
+        let snap: ReturnType<TopicKernel['snapshot']>
+        try {
+          await tempKernel.materialize(included)
+          await tempKernel.commitSeenOpsRoot()
+          snap = tempKernel.snapshot()
+        } finally {
+          tempKernel.dispose()
+        }
 
         const inclusions = included.map(i => ({
           opId: bytesToHex(i.opId),
@@ -3749,9 +3758,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       this.#closed = true
       this.#lifetime.abort(new Error('SESSION_CLOSED'))
       this.#emitStatus()
-      this.#kernel.sandbox.dispose()
-      this.#controlKernel?.sandbox.dispose()
-      this.#finalKernel?.sandbox.dispose()
+      this.#kernel.dispose()
+      this.#controlKernel?.dispose()
+      this.#finalKernel?.dispose()
       await this.content.close()
       await this.#release()
     })()

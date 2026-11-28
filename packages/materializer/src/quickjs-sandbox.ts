@@ -204,12 +204,23 @@ if (typeof Intl !== 'undefined') {
 `
 
 let defaultQuickJsPromise: Promise<QuickJSWASMModule> | null = null
+/**
+ * One QuickJS WASM instance per compiled module (e.g. a Cloudflare Worker's static import), shared by
+ * every sandbox. Each invocation still gets a fresh context, so sharing the instance cannot leak state;
+ * it removes a per-kernel instantiation and its 16 MiB initial heap.
+ */
+const sharedQuickJs = new WeakMap<WebAssembly.Module, Promise<QuickJSWASMModule>>()
 
 export async function loadQuickJsModule(wasmModule?: WebAssembly.Module): Promise<QuickJSWASMModule> {
   const syncBase = baseVariant as unknown as QuickJSSyncVariant
   if (wasmModule !== undefined) {
-    const variant = newVariant(syncBase, { wasmModule })
-    return newQuickJSWASMModuleFromVariant(variant)
+    let shared = sharedQuickJs.get(wasmModule)
+    if (shared === undefined) {
+      shared = newQuickJSWASMModuleFromVariant(newVariant(syncBase, { wasmModule }))
+      sharedQuickJs.set(wasmModule, shared)
+      shared.catch(() => sharedQuickJs.delete(wasmModule))
+    }
+    return shared
   }
   if (defaultQuickJsPromise === null) {
     defaultQuickJsPromise = newQuickJSWASMModuleFromVariant(syncBase).catch(err => {
@@ -263,7 +274,13 @@ export class QuickJsSandbox {
     return this.#wasmSandbox
   }
 
+  #disposed = false
+
+  get disposed(): boolean { return this.#disposed }
+
+  /** Release pooled runtimes and caches. Idempotent; later invocations throw SANDBOX_DISPOSED. */
   dispose(): void {
+    this.#disposed = true
     for (let i = 0; i < this.#runtimePool.length; i++) {
       try { this.#runtimePool[i]?.dispose() } catch { /* ignore */ }
       this.#runtimePool[i] = undefined
@@ -316,6 +333,7 @@ export class QuickJsSandbox {
    * JS/hybrid packages to a fresh isolated QuickJSContext with 2-arg scoped resolution.
    */
   async invoke(input: ReducerInvocationInput): Promise<ReducerInvocationResult> {
+    if (this.#disposed) throw new Error('SANDBOX_DISPOSED')
     const readPartition: CasPartition | 'any' = input.casPartition === 'public' ? 'public' : 'any'
     const maxFuel = input.maxFuel ?? DEFAULT_MAX_FUEL
 

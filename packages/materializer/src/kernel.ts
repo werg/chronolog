@@ -401,6 +401,26 @@ export class TopicKernel {
     return this.#seenRootCache.root
   }
 
+  #disposed = false
+
+  get disposed(): boolean { return this.#disposed }
+
+  /**
+   * Release this kernel's VM runtimes, snapshots, logs and caches. Idempotent. Committed revision
+   * fields stay readable; materialize/query/describe throw SANDBOX_DISPOSED afterwards.
+   */
+  dispose(): void {
+    if (this.#disposed) return
+    this.#disposed = true
+    this.sandbox.dispose()
+    this.#snapshots.clear()
+    this.#queryCache.clear()
+    this.#describeCache.clear()
+    this.#seen.clear()
+    this.#outcomeLog.clear()
+    this.#logsDirty = true
+  }
+
   /** Durably persist the committed idempotency set node and return its root (call before exporting state). */
   async commitSeenOpsRoot(): Promise<string> {
     const partition: CasPartition = this.genesis.privateLog && this.blindHostMode ? 'public' : 'private'
@@ -751,6 +771,7 @@ export class TopicKernel {
   }
 
   async materialize__impl(inputs: readonly KernelOperationInput[]): Promise<KernelMaterializeResult> {
+    if (this.#disposed) throw new Error('SANDBOX_DISPOSED')
     // Filter for blindHostMode and logId, sort strictly by canonical comparator
     const eligible: KernelOperationInput[] = []
     const seenIds = new Set<string>()

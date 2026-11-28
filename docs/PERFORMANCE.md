@@ -48,6 +48,16 @@ lazy `ctx.topic()` / `ctx.opOutcome()` host calls instead of serializing all sta
 positional snapshots (shallow copies), and query/describe caches keyed by the exact state they
 observe. Session rematerialize reuses stable kernel inputs and diffs only the replayed suffix.
 
+## Kernel lifetime
+
+`TopicKernel.dispose()` releases the kernel's QuickJS runtimes, snapshots, logs and caches; it is
+idempotent, keeps the committed revision and topics readable, and makes later
+`materialize`/`query`/`describe` calls throw `SANDBOX_DISPOSED`. Hosts that build a kernel per
+request (blind control replay) should dispose it when done. Sandboxes given a precompiled
+`wasmModule` share one QuickJS WASM instance per module instead of instantiating one (16 MiB initial
+heap) per kernel; isolation is unchanged because every call still runs in a fresh context.
+`ApplicationSession` disposes swapped-out, ephemeral and closed kernels itself.
+
 ## Baseline vs sync v3 (2026-11-28, loaded 16-core machine, wall times noisy)
 
 | N=400 | KV baseline | KV v3 | SQL baseline | SQL v3 |
