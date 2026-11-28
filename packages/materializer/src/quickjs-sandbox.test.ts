@@ -64,14 +64,18 @@ describe('QuickJsSandbox isolation', () => {
           try { Math.random(); } catch (e) { random = e.message; }
           return { ok: true, state: {
             date: typeof Date, dateOwn: Object.getOwnPropertyDescriptor(globalThis, 'Date'),
-            intl: typeof Intl, performance: typeof performance, random,
+            intl: typeof Intl, performance: typeof performance,
+            weakRef: typeof WeakRef, finalizationRegistry: typeof FinalizationRegistry,
+            bigInt: String(BigInt(42) + 1n), random,
           } };
         },
       };
     `)
     expect(await value(sandbox, input())).toEqual({ ok: true, state: {
       date: 'undefined', dateOwn: { writable: false, enumerable: false, configurable: false },
-      intl: 'undefined', performance: 'undefined', random: 'NONDETERMINISTIC_MATH_RANDOM',
+      intl: 'undefined', performance: 'undefined',
+      weakRef: 'undefined', finalizationRegistry: 'undefined',
+      bigInt: '43', random: 'NONDETERMINISTIC_MATH_RANDOM',
     } })
   })
 

@@ -1,5 +1,4 @@
 import {
-  DefaultIntrinsics,
   newQuickJSWASMModuleFromVariant,
   newVariant,
   type QuickJSHandle,
@@ -205,8 +204,10 @@ export function openDb(dbRoot = null) {
 const DETERMINISM_PRELUDE = `
 Object.defineProperty(globalThis, 'Date', { value: undefined, writable: false, configurable: false });
 Object.defineProperty(Math, 'random', { value: () => { throw new Error('NONDETERMINISTIC_MATH_RANDOM'); }, writable: false, configurable: false });
-if (typeof Intl !== 'undefined') {
-  Object.defineProperty(globalThis, 'Intl', { value: undefined, writable: false, configurable: false });
+for (const k of ['Intl', 'performance', 'WeakRef', 'FinalizationRegistry']) {
+  if (typeof globalThis[k] !== 'undefined') {
+    Object.defineProperty(globalThis, k, { value: undefined, writable: false, configurable: false });
+  }
 }
 [JSON, JSON.parse, JSON.stringify, String, Object.is,
   (topic, query, mount, mountQuery, opOutcome, topicLastOpId, config) => Object.freeze({ topic, query, mount, mountQuery, opOutcome, topicLastOpId, config }),
@@ -246,12 +247,12 @@ function txJson(input: ReducerInvocationInput): JsonValue {
 }
 
 /**
- * Reducer contexts are created without the Date intrinsic: the prelude removes `Date` anyway, and in
- * quickjs-ng that intrinsic also installs the wall-clock `performance` global (`performance.now()`),
- * which the prelude did not strip. Skipping it is both cheaper (~10% of context creation) and closes
- * that non-determinism hole. All other default intrinsics are kept.
+ * Note: `@jitl/quickjs-ng-wasmfile-release-sync@0.32.0` omits `BigInt` whenever custom `intrinsics`
+ * flags are passed to `runtime.newContext(...)` (because `QTS_NewContext` switches to `JS_NewContextRaw`
+ * without `JS_AddIntrinsicBigInt`). We therefore use `runtime.newContext()` so deterministic `BigInt`
+ * remains available to reducers, and lock out `Date`, `performance`, `Intl`, `WeakRef`, and
+ * `FinalizationRegistry` in `DETERMINISM_PRELUDE`.
  */
-const CONTEXT_OPTIONS = { intrinsics: { ...DefaultIntrinsics, Date: false } } as const
 
 let defaultQuickJsPromise: Promise<QuickJSWASMModule> | null = null
 /**
@@ -672,7 +673,7 @@ export class QuickJsSandbox {
         },
       )
       perfCount('vm.newContext')
-      const ctx = runtime.newContext(CONTEXT_OPTIONS)
+      const ctx = runtime.newContext()
       const owned: QuickJSHandle[] = []
       const own = (h: QuickJSHandle): QuickJSHandle => { owned.push(h); return h }
       try {
