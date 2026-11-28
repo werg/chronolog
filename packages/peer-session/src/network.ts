@@ -584,7 +584,9 @@ export async function connectApplicationPeer(session: ApplicationSession, option
               // that would trigger our own check), so verify membership here as that ack would.
               if (session.genesis.privateLog) verifyMember()
               if (snapshotScopeAllowed()) {
-                try { bytes = await session.exportMaterializedSnapshot() } catch { bytes = null }
+                // Only serve a frontier-only P2P snapshot when the log has enough ops to beat
+                // direct replay; tiny logs replay faster, use less bandwidth, and preserve events.
+                try { bytes = await session.exportMaterializedSnapshot({ minOps: 16 }) } catch { bytes = null }
                 if (bytes !== null && bytes.length > SNAPSHOT_MAX_BYTES) bytes = null
               }
               void post({ kind: 'snapshot', requestId: message.requestId, bytes })

@@ -3252,14 +3252,16 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
    * On private logs it is AEAD-encrypted under the current epoch key, so blind hosts can cache it
    * and peers can serve it without exposing plaintext.
    */
-  async exportMaterializedSnapshot(options: { readonly includeReachableCas?: boolean } = {}): Promise<Uint8Array | null> {
+  async exportMaterializedSnapshot(options: { readonly includeReachableCas?: boolean; readonly minOps?: number } = {}): Promise<Uint8Array | null> {
     await this.#flushPendingMaterialization()
     return this.#serial(() => this.#exportSnapshotNow(options))
   }
 
-  async #exportSnapshotNow(options: { readonly includeReachableCas?: boolean }): Promise<Uint8Array | null> {
+  async #exportSnapshotNow(options: { readonly includeReachableCas?: boolean; readonly minOps?: number }): Promise<Uint8Array | null> {
+    const totalOps = this.#kernel.materializedOutcomes.length + this.#kernel.frontierOrderLength
+    const minOps = options.minOps ?? 1
     if (
-      (this.#kernel.materializedOutcomes.length === 0 && this.#kernel.frontierOrderLength === 0) ||
+      totalOps < minOps ||
       this.#kernel.pendingDependencies.length > 0
     ) {
       return null

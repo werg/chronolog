@@ -148,4 +148,22 @@ describe('cold open and snapshot bootstrap', () => {
       await Promise.all([sessA.close(), sessB.close()])
     }
   })
+
+  it('skips P2P snapshot bootstrap for tiny logs (<16 ops) so replay is faster and preserves events', async () => {
+    const { a, b, open } = await fixture(true)
+    const sessA = await open(new MemoryBytesStore(), a)
+    await author(sessA, 0, 3)
+    const sessB = await open(new MemoryBytesStore(), b)
+    try {
+      resetPerfCounters()
+      const [la, lb] = await link(sessA, sessB)
+      await Promise.all([la.synchronize(), lb.synchronize()])
+      await until(() => sessB.revision().digest === sessA.revision().digest)
+      expect(perfCounters()['wire.send.snapshot'] ?? 0).toBe(1) // null snapshot reply
+      expect(sessB.readEvents({ limit: 32 }).events).toHaveLength(3)
+      await Promise.all([la.close(), lb.close()])
+    } finally {
+      await Promise.all([sessA.close(), sessB.close()])
+    }
+  })
 })
