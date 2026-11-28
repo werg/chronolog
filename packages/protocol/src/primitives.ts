@@ -9,6 +9,7 @@ export const DOMAINS = {
   celldApplicationInvitation: 'chronolog/celld/application-invitation/v1',
   celldWorkspacePublication: 'chronolog/celld/workspace-publication/v1',
   publication: 'chronolog/publication/v1',
+  materializedSnapshot: 'chronolog/materialized-snapshot/v3',
 } as const
 
 export type ProtocolDomain = (typeof DOMAINS)[keyof typeof DOMAINS]

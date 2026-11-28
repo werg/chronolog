@@ -1,6 +1,8 @@
 import { perfTimeAsync } from '@chronolog/canonical'
 import {
   bytesToHex,
+  decodeCanonicalCbor,
+  DEFAULT_DECODE_LIMITS,
   encodeCanonicalCbor,
   hashDomainSync,
   type CborValue,
@@ -24,6 +26,8 @@ import {
   type ReducersConfig,
 } from '@chronolog/protocol'
 import type { CasPartition, ContentAddressedStore } from '@chronolog/records'
+import type { EmittedKernelEvent, KernelMaterializedCache, KernelOperationOutcome } from './materialized-cache.js'
+export type { EmittedKernelEvent, KernelMaterializedCache, KernelOperationOutcome } from './materialized-cache.js'
 import {
   MissingDependencyError,
   QuickJsSandbox,
@@ -35,29 +39,6 @@ export interface KernelOperationInput {
   readonly core: OperationCore
   /** Caller already verified opId === operationIdDigest(core); skips O(N) CBOR+SHA-256 re-verification on every materialize(). */
   readonly verified?: boolean
-}
-
-export interface EmittedKernelEvent {
-  readonly opId: string
-  readonly eventOrdinal: number
-  readonly topic: string
-  readonly payload: JsonValue
-  readonly author: string
-  readonly operationId: string
-  readonly authorTimestampMs: bigint
-}
-
-export interface KernelOperationOutcome {
-  readonly opId: string
-  readonly author: string
-  readonly operationId: string
-  readonly authorTimestampMs: bigint
-  readonly visibility: OperationVisibility
-  readonly outcome: 'accepted' | 'rejected'
-  readonly rejectionCode: string | null
-  readonly rejectionDetail?: string
-  readonly conflictRecorded?: boolean
-  readonly events: readonly EmittedKernelEvent[]
 }
 
 export interface KernelRevision {
@@ -85,18 +66,6 @@ export interface KernelSnapshot {
   readonly historyDigest: string
   readonly stateRoot: string
   readonly orderLength: number
-}
-
-export interface KernelMaterializedCache {
-  readonly v: 1
-  readonly logId: string
-  readonly blindHostMode: boolean
-  readonly topics: Readonly<Record<string, JsonValue>>
-  readonly seenOpsRoot: string
-  readonly historyDigest: string
-  readonly stateRoot: string
-  readonly orderOpIds: readonly string[]
-  readonly outcomes: readonly KernelOperationOutcome[]
 }
 
 /** Append-only keyed log that can be truncated back to an earlier length (O(removed)). */
@@ -525,36 +494,62 @@ export class TopicKernel {
     return this.#cacheRestores
   }
 
-  /** Export a self-verifying materialized cache snapshot for instant cold-open or suffix catch-up. */
-  exportMaterializedCache(): KernelMaterializedCache {
+  /**
+   * Export the committed state for instant cold open (local cache) or snapshot bootstrap.
+   * `suffix: false` omits the replayable suffix (order ids, outcomes and events) and folds it
+   * into the frontier, giving a bundle whose size is O(state + op count x 32 bytes).
+   * Outcome/event objects are immutable and shared, not cloned.
+   */
+  exportMaterializedCache(options: { readonly suffix?: boolean } = {}): KernelMaterializedCache {
+    const orderOpIds = this.#order.map(item => metaOf(item).opIdHex)
+    const includeSuffix = options.suffix !== false
+    let maxTs = this.#frontierMaxTimestampMs
+    if (!includeSuffix) for (const o of this.#outcomes) if (o.authorTimestampMs > maxTs) maxTs = o.authorTimestampMs
     return {
-      v: 1,
+      v: 2,
       logId: this.logIdHex,
       blindHostMode: this.blindHostMode,
-      topics: structuredClone(this.#topics),
+      topics: this.#topics,
       seenOpsRoot: this.seenOpsRoot,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
-      orderOpIds: this.#order.map(item => bytesToHex(item.opId)),
-      outcomes: this.#outcomes.map(o => ({
-        opId: o.opId,
-        author: o.author,
-        operationId: o.operationId,
-        authorTimestampMs: o.authorTimestampMs,
-        visibility: o.visibility,
-        outcome: o.outcome,
-        rejectionCode: o.rejectionCode,
-        ...(o.rejectionDetail === undefined ? {} : { rejectionDetail: o.rejectionDetail }),
-        events: o.events.map((e: EmittedKernelEvent) => ({
-          opId: e.opId,
-          eventOrdinal: e.eventOrdinal,
-          topic: e.topic,
-          payload: structuredClone(e.payload),
-          author: e.author,
-          operationId: e.operationId,
-          authorTimestampMs: e.authorTimestampMs,
-        })),
-      })),
+      frontierOpIds: includeSuffix ? [...this.#frontierOpIds] : [...this.#frontierOpIds, ...orderOpIds],
+      frontierMaxTimestampMs: maxTs,
+      orderOpIds: includeSuffix ? orderOpIds : [],
+      outcomes: includeSuffix ? this.#outcomes : [],
+      topicLastOpIds: Object.fromEntries(this.#topicLastOpIds),
+    }
+  }
+
+  /** Validate cache state against local CAS and decode its idempotency set (null on any miss). */
+  async #loadCacheBase(cache: KernelMaterializedCache): Promise<string[] | null> {
+    if (
+      cache.v !== 2 ||
+      cache.logId !== this.logIdHex ||
+      cache.blindHostMode !== this.blindHostMode ||
+      !Array.isArray(cache.orderOpIds) ||
+      !Array.isArray(cache.frontierOpIds) ||
+      !Array.isArray(cache.outcomes) ||
+      cache.orderOpIds.length !== cache.outcomes.length
+    ) {
+      return null
+    }
+    if (computeStateRoot(cache.topics) !== cache.stateRoot) return null
+    const seenNode = await this.cas.get(cache.seenOpsRoot, 'any')
+    if (seenNode === null) return null
+    const neededCas = new Set<string>()
+    extractRequiredCasHashes(cache.topics, neededCas)
+    for (const hash of neededCas) {
+      if (!this.cas.hasSync(hash, 'any') && await this.cas.get(hash, 'any') === null) return null
+    }
+    try {
+      // The seen node is content-addressed (its hash was checked when it entered CAS), so a plain
+      // decode suffices; no canonical re-encode round trip.
+      const raw = decodeCanonicalCbor(seenNode.bytes, DEFAULT_DECODE_LIMITS)
+      if (!Array.isArray(raw)) return null
+      return raw.filter((v): v is string => typeof v === 'string')
+    } catch {
+      return null
     }
   }
 
@@ -562,109 +557,58 @@ export class TopicKernel {
    * Restore materialized state directly from a previously exported cache if:
    * - logId, blindHostMode, and recomputed stateRoot match exactly,
    * - seenOpsRoot and every CAS node hash referenced by topics exist locally, and
-   * - cache.orderOpIds is an exact prefix of canonically sorted `inputs`.
-   * Returns true on cache hit (exact or suffix-catchup prefix), false on miss.
+   * - every suffix op id in cache.orderOpIds is present in `inputs` (in canonical order).
+   * O(N) id lookups; no re-sort. Inputs not in the cache are applied by the next materialize().
+   * Returns true on cache hit, false on miss.
    */
   async restoreMaterializedCache(
     cache: KernelMaterializedCache,
     inputs: readonly KernelOperationInput[],
   ): Promise<boolean> {
-    if (
-      cache.v !== 1 ||
-      cache.logId !== this.logIdHex ||
-      cache.blindHostMode !== this.blindHostMode ||
-      !Array.isArray(cache.orderOpIds) ||
-      !Array.isArray(cache.outcomes) ||
-      cache.orderOpIds.length === 0 ||
-      cache.orderOpIds.length !== cache.outcomes.length
-    ) {
-      return false
-    }
-    if (computeStateRoot(cache.topics) !== cache.stateRoot) {
-      return false
-    }
-    const seenNode = await this.cas.get(cache.seenOpsRoot, 'any')
-    if (seenNode === null) return false
-    const neededCas = new Set<string>()
-    extractRequiredCasHashes(cache.topics, neededCas)
-    for (const hash of neededCas) {
-      if (!this.cas.hasSync(hash, 'any') && await this.cas.get(hash, 'any') === null) {
-        return false
-      }
-    }
-    let decodedSeen: string[]
-    try {
-      const { assertCanonicalCbor, DEFAULT_DECODE_LIMITS } = await import('@chronolog/canonical')
-      const raw = normalizeJsonValue(JSON.parse(JSON.stringify(assertCanonicalCbor(seenNode.bytes, DEFAULT_DECODE_LIMITS))))
-      if (!Array.isArray(raw)) return false
-      decodedSeen = raw.filter((v): v is string => typeof v === 'string')
-    } catch {
-      return false
-    }
+    if (cache.orderOpIds === undefined || (cache.orderOpIds.length === 0 && (cache.frontierOpIds?.length ?? 0) === 0)) return false
+    const decodedSeen = await this.#loadCacheBase(cache)
+    if (decodedSeen === null) return false
 
-    const eligible: KernelOperationInput[] = []
-    const seenIds = new Set<string>()
+    const byId = new Map<string, KernelOperationInput>()
     for (const item of inputs) {
-      if (bytesToHex(item.core.logId) !== this.logIdHex) continue
+      const meta = metaOf(item)
+      if (meta.logIdHex !== this.logIdHex) continue
       if (this.blindHostMode && this.genesis.privateLog && item.core.visibility !== 'public') continue
-      const opIdHex = bytesToHex(item.opId)
-      if (seenIds.has(opIdHex)) continue
-      seenIds.add(opIdHex)
-      eligible.push(item)
+      byId.set(meta.opIdHex, item)
     }
-    eligible.sort((a, b) => compareOperationOrder(
-      { authorTimestampMs: a.core.authorTimestampMs, author: a.core.author, opId: a.opId },
-      { authorTimestampMs: b.core.authorTimestampMs, author: b.core.author, opId: b.opId },
-    ))
-
     const prefixLen = cache.orderOpIds.length
-    if (prefixLen > eligible.length) return false
+    const order: KernelOperationInput[] = new Array<KernelOperationInput>(prefixLen)
     for (let i = 0; i < prefixLen; i++) {
-      if (bytesToHex(eligible[i]!.opId) !== cache.orderOpIds[i]) return false
+      const item = byId.get(cache.orderOpIds[i]!)
+      if (item === undefined) return false
+      if (i > 0) {
+        const prev = order[i - 1]!
+        if (compareOperationOrder(
+          { authorTimestampMs: prev.core.authorTimestampMs, author: prev.core.author, opId: prev.opId },
+          { authorTimestampMs: item.core.authorTimestampMs, author: item.core.author, opId: item.opId },
+        ) >= 0) return false
+      }
+      order[i] = item
     }
 
-    this.#order = eligible.slice(0, prefixLen)
-    const cachedOutcomes: readonly KernelOperationOutcome[] = cache.outcomes
-    this.#outcomes = cachedOutcomes.map((o: KernelOperationOutcome) => ({
-      opId: o.opId,
-      author: o.author,
-      operationId: o.operationId,
-      authorTimestampMs: BigInt(o.authorTimestampMs),
-      visibility: o.visibility,
-      outcome: o.outcome,
-      rejectionCode: o.rejectionCode,
-      ...(o.rejectionDetail === undefined ? {} : { rejectionDetail: o.rejectionDetail }),
-      events: o.events.map((e: EmittedKernelEvent) => ({
-        opId: e.opId,
-        eventOrdinal: e.eventOrdinal,
-        topic: e.topic,
-        payload: structuredClone(e.payload),
-        author: e.author,
-        operationId: e.operationId,
-        authorTimestampMs: BigInt(e.authorTimestampMs),
-      })),
-    }))
+    this.#order = order
+    this.#outcomes = cache.outcomes.slice()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
     this.#topicHashes = computeTopicHashes(this.#topics)
     this.#resetLogs(decodedSeen)
     this.#seenRootCache = { length: this.#committedSeenLength, root: cache.seenOpsRoot }
-    this.#topicLastOpIds = new Map()
-    for (let i = 0; i < this.#outcomes.length; i++) {
-      const o = this.#outcomes[i]!
-      const entry = this.#order[i]!
-      this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
-      if (o.outcome === 'accepted') {
-        for (const u of entry.core.updates) {
-          this.#topicLastOpIds.set(u.topic, o.opId)
-        }
-      }
-    }
+    this.#topicLastOpIds = new Map(Object.entries(cache.topicLastOpIds ?? {}))
+    for (const o of this.#outcomes) this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
+    this.#frontierOpIds = new Set(cache.frontierOpIds)
+    this.#frontierOrderLength = cache.frontierOpIds.length
+    this.#frontierMaxTimestampMs = BigInt(cache.frontierMaxTimestampMs ?? 0n)
     this.#historyDigest = cache.historyDigest
     this.#stateRoot = cache.stateRoot
     this.#pendingDependencies.clear()
     this.#skippedOpIds.clear()
     this.#snapshots.clear()
-    this.#snapshots.set(0, this.#genesisSnapshot)
+    // With a frontier the genesis snapshot is not a valid rewind base: the base is the frontier.
+    if (this.#frontierOrderLength === 0) this.#snapshots.set(0, this.#genesisSnapshot)
     this.#snapshots.set(prefixLen, this.#captureSnapshot(prefixLen))
     this.#cacheRestores++
     return true
@@ -709,51 +653,27 @@ export class TopicKernel {
   }
 
   /**
-   * Bootstrap kernel state directly from a host-cached encrypted Snapshot Bundle WITHOUT requiring
-   * all historical operations to be downloaded first. Subsequent materialize(suffixInputs) skips
-   * any op already covered by `frontierOpIds` and applies only new tail operations.
+   * Bootstrap kernel state from a verified snapshot WITHOUT the historical operations: every op in
+   * the cache (frontier and suffix) becomes frontier, so materialize(inputs) skips those ops and
+   * applies only operations that are new. Trust: the caller has verified the snapshot's signer.
    */
-  async restoreSnapshotFrontier(snapshot: {
-    readonly topics: Readonly<Record<string, JsonValue>>
-    readonly seenOpsRoot: string
-    readonly historyDigest: string
-    readonly stateRoot: string
-    readonly orderOpIds: readonly string[]
-    readonly maxAuthorTimestampMs?: bigint | string | number
-  }): Promise<boolean> {
-    if (computeStateRoot(snapshot.topics) !== snapshot.stateRoot) {
-      return false
-    }
-    const seenNode = await this.cas.get(snapshot.seenOpsRoot, 'any')
-    if (seenNode === null) return false
-    const neededCas = new Set<string>()
-    extractRequiredCasHashes(snapshot.topics, neededCas)
-    for (const hash of neededCas) {
-      if (!this.cas.hasSync(hash, 'any') && await this.cas.get(hash, 'any') === null) {
-        return false
-      }
-    }
-    let decodedSeen: string[]
-    try {
-      const { assertCanonicalCbor, DEFAULT_DECODE_LIMITS } = await import('@chronolog/canonical')
-      const raw = normalizeJsonValue(JSON.parse(JSON.stringify(assertCanonicalCbor(seenNode.bytes, DEFAULT_DECODE_LIMITS))))
-      if (!Array.isArray(raw)) return false
-      decodedSeen = raw.filter((v): v is string => typeof v === 'string')
-    } catch {
-      return false
-    }
+  async restoreSnapshotFrontier(cache: KernelMaterializedCache): Promise<boolean> {
+    const decodedSeen = await this.#loadCacheBase(cache)
+    if (decodedSeen === null) return false
+    let maxTs = BigInt(cache.frontierMaxTimestampMs ?? 0n)
+    for (const o of cache.outcomes) if (o.authorTimestampMs > maxTs) maxTs = o.authorTimestampMs
     this.#order = []
     this.#outcomes = []
-    this.#topicLastOpIds.clear()
-    this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(snapshot.topics)) : structuredClone(snapshot.topics)
+    this.#topicLastOpIds = new Map(Object.entries(cache.topicLastOpIds ?? {}))
+    this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
     this.#topicHashes = computeTopicHashes(this.#topics)
     this.#resetLogs(decodedSeen)
-    this.#seenRootCache = { length: this.#committedSeenLength, root: snapshot.seenOpsRoot }
-    this.#historyDigest = snapshot.historyDigest
-    this.#stateRoot = snapshot.stateRoot
-    this.#frontierOpIds = new Set(snapshot.orderOpIds)
-    this.#frontierOrderLength = snapshot.orderOpIds.length
-    this.#frontierMaxTimestampMs = snapshot.maxAuthorTimestampMs !== undefined ? BigInt(snapshot.maxAuthorTimestampMs) : 0n
+    this.#seenRootCache = { length: this.#committedSeenLength, root: cache.seenOpsRoot }
+    this.#historyDigest = cache.historyDigest
+    this.#stateRoot = cache.stateRoot
+    this.#frontierOpIds = new Set([...cache.frontierOpIds, ...cache.orderOpIds])
+    this.#frontierOrderLength = this.#frontierOpIds.size
+    this.#frontierMaxTimestampMs = maxTs
     this.#pendingDependencies.clear()
     this.#skippedOpIds.clear()
     this.#snapshots.clear()
@@ -820,7 +740,16 @@ export class TopicKernel {
     for (const idx of this.#snapshots.keys()) {
       if (idx <= diff && idx > snapIndex) snapIndex = idx
     }
-    const snap = this.#snapshots.get(snapIndex)!
+    const snapshotAt = this.#snapshots.get(snapIndex)
+    // A frontier (snapshot bootstrap) cannot be rewound: an op that would sort before ops folded
+    // into it, or a rewind below the restored suffix base, needs a full replay by the caller.
+    if (snapshotAt === undefined) throw new Error('KERNEL_FRONTIER_REWIND')
+    if (this.#frontierOrderLength > 0) {
+      for (let i = diff; i < eligible.length; i++) {
+        if (eligible[i]!.core.authorTimestampMs <= this.#frontierMaxTimestampMs) throw new Error('KERNEL_FRONTIER_REWIND')
+      }
+    }
+    const snap = snapshotAt
     // Rewind the live logs to the snapshot (O(rewound ops)); topic values are immutable so the
     // working topic record is a shallow copy.
     this.#seen.truncate(snap.seenLength)
@@ -1395,7 +1324,8 @@ export class TopicKernel {
     for (const idx of this.#snapshots.keys()) {
       if (idx <= targetLen && idx > snapIndex) snapIndex = idx
     }
-    const snap = this.#snapshots.get(snapIndex)!
+    const snap = this.#snapshots.get(snapIndex)
+    if (snap === undefined) throw new Error('TIME_TRAVEL_BEFORE_FRONTIER')
     if (this.#logsDirty) throw new Error('KERNEL_REPLAY_IN_PROGRESS')
     const work: KernelMutableState = {
       topics: { ...snap.topics },

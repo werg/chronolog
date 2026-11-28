@@ -1,9 +1,9 @@
 import { useDeviceStore } from './checkpoint-lifecycle.js'
-import type { BytesStore } from '@chronolog/records'
+import { readBytesMany, type BytesStore } from '@chronolog/records'
 import { createSigningIdentity, type SigningIdentity } from '@chronolog/authority'
 import { assertCanonicalCbor, encodeCanonicalCbor, exportEd25519PrivateKey, hexToBytes, importEd25519PrivateKey, importEd25519PublicKey } from '@chronolog/protocol'
 import { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
-import { assertDeviceNotRetired } from './checkpoint.js'
+import { assertDeviceNotRetired, DEVICE_RETIRED_KEY } from './checkpoint.js'
 
 export interface DeviceWrapKey {
   readonly publicKey: string
@@ -33,6 +33,9 @@ const DEVICE_BINDING = 'peer-session/device-binding/v1'
 const STORAGE_BINDING = 'peer-session/storage-binding/v1'
 const STORAGE_OPENED = 'peer-session/storage-opened/v1'
 const claimed = new WeakSet<ApplicationDevice>()
+/** Signing keys whose sign/verify self-test already passed in this process. */
+const selfTested = new WeakSet<CryptoKey>()
+const selfTestedStored = new Set<string>()
 
 /** Explicit setup can create once. Resume never replaces a missing or inconsistent signer. */
 export async function openApplicationDevice(options: {
@@ -47,10 +50,17 @@ export async function openApplicationDevice(options: {
 }): Promise<ApplicationDevice> {
   const releaseOpening = useDeviceStore(options.store)
   try {
-    await assertDeviceNotRetired(options.store)
+    // One batched read for the retirement fence, signer, binding and wrap key (one IDB transaction).
+    const [retired, rawInitial, bindingInitial, wrapInitial] = await readBytesMany(options.store, [DEVICE_RETIRED_KEY, DEVICE_KEY, DEVICE_BINDING, DEVICE_WRAP_KEY])
+    if (retired !== null) await assertDeviceNotRetired(options.store)
     const managedSigner = options.managedSigner && { ...options.managedSigner }
-    if (managedSigner) await verifyDeviceSigner(managedSigner)
-    let raw = await options.store.get(DEVICE_KEY), binding = await options.store.get(DEVICE_BINDING)
+    // The sign/verify self-test runs once per key per process, not on every activation.
+    if (managedSigner && !selfTested.has(managedSigner.privateKey)) {
+      await verifyDeviceSigner(managedSigner)
+      selfTested.add(managedSigner.privateKey)
+    }
+    let raw = rawInitial ?? null, binding = bindingInitial ?? null
+    let wrapRawInitial = wrapInitial ?? null
     if (raw === null && binding !== null) raw = await options.store.get(DEVICE_KEY)
     let identity: SigningIdentity, storageId: string
     if (raw === null) {
@@ -71,7 +81,8 @@ export async function openApplicationDevice(options: {
       }
       if (options.store.initialize !== undefined) await options.store.initialize(entries)
       else for (const entry of entries) await options.store.put(entry.key, entry.value)
-      raw = await options.store.get(DEVICE_KEY); binding = await options.store.get(DEVICE_BINDING)
+      const reread = await readBytesMany(options.store, [DEVICE_KEY, DEVICE_BINDING, DEVICE_WRAP_KEY])
+      raw = reread[0] ?? null; binding = reread[1] ?? null; wrapRawInitial = reread[2] ?? null
       if (raw === null) throw new Error(binding === null ? 'APPLICATION_DEVICE_NOT_FOUND' : 'APPLICATION_DEVICE_KEYS_MISSING')
     }
     {
@@ -84,7 +95,10 @@ export async function openApplicationDevice(options: {
       } else if (value[0] === 1n && value.length === 4 && value[2] instanceof Uint8Array && validStorageId(value[3])) {
         if (managedSigner !== undefined) throw new Error('APPLICATION_DEVICE_STORAGE_MODE_MISMATCH')
         identity = { publicKey: value[1], privateKey: await importEd25519PrivateKey(value[2]) }; storageId = value[3]
-        await verifyDeviceSigner(identity)
+        // Trust shortcut: the stored key pair was self-tested when this device created it; a
+        // resumed device only checks it once per process run.
+        const testKey = `${storageId}:${identity.publicKey}`
+        if (!selfTestedStored.has(testKey)) { await verifyDeviceSigner(identity); selfTestedStored.add(testKey) }
       } else throw new Error('APPLICATION_DEVICE_INVALID')
       if (binding === null || !sameBytes(binding, encodeCanonicalCbor([identity.publicKey, storageId]))) throw new Error('APPLICATION_DEVICE_BINDING_INVALID')
     }
@@ -95,7 +109,7 @@ export async function openApplicationDevice(options: {
       if (!/^[0-9a-f]{64}$/u.test(options.managedWrapKey.publicKey)) throw new Error('APPLICATION_DEVICE_WRAP_KEY_INVALID')
       wrapKey = Object.freeze({ ...options.managedWrapKey })
     } else {
-      let wrapRaw = await options.store.get(DEVICE_WRAP_KEY)
+      let wrapRaw = wrapRawInitial
       if (wrapRaw === null) {
         const pair = await createWrapKeyPair()
         const encoded = encodeCanonicalCbor([1n, pair.publicKey, pair.privateKey])
@@ -130,7 +144,7 @@ export async function openApplicationDevice(options: {
           try {
             if (closed) throw new Error('APPLICATION_DEVICE_CLOSED')
             const expected = encodeCanonicalCbor([identity.publicKey, storageId])
-            const opened = await options.store.get(STORAGE_OPENED), retained = await acquired.store.get(STORAGE_BINDING)
+            const [opened, retained] = await Promise.all([options.store.get(STORAGE_OPENED), acquired.store.get(STORAGE_BINDING)])
             if (opened !== null && !sameBytes(opened, expected) || retained !== null && !sameBytes(retained, expected)) {
               throw new Error('APPLICATION_DATA_STORAGE_BINDING_INVALID')
             }

@@ -209,7 +209,7 @@ export class IndexedDbBytesStore implements BytesStore {
             failure = new Error('INDEXEDDB_VALUE_CORRUPT'); return
           }
           entries.push({ key, value: raw }); bytes += raw.length
-          if (entries.length < 128 && bytes < 2 * 1024 * 1024) cursor.continue()
+          if (entries.length < 1024 && bytes < 8 * 1024 * 1024) cursor.continue()
         }
         return () => { if (failure !== undefined) throw failure; return entries }
       }))
@@ -241,7 +241,7 @@ export class IndexedDbBytesStore implements BytesStore {
               failure = new Error('INDEXEDDB_VALUE_CORRUPT'); return
             }
             entries.push({ key, value: raw }); bytes += raw.length
-            if (entries.length < 128 && bytes < 2 * 1024 * 1024) cursor.continue()
+            if (entries.length < 1024 && bytes < 8 * 1024 * 1024) cursor.continue()
           }
           return () => { if (failure !== undefined) throw failure; return entries }
         })

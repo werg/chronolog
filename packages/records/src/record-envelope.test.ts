@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import { encodeCanonicalCbor, sha256 } from '@chronolog/canonical'
 import { decodeRecordValue, encodeRecordValue, MAX_RECORD_ENVELOPE_BYTES } from './record-envelope.js'
 
 describe('shared durable record envelope', () => {
@@ -12,13 +11,16 @@ describe('shared durable record envelope', () => {
       expect(await decodeRecordValue('segment/1', raw, 'RECORD_CORRUPT')).toEqual(bytes)
     }
   })
-  it('rejects key, version, digest and canonical-envelope corruption', async () => {
-    const data = Uint8Array.of(1, 2), digest = await sha256(data)
+  it('rejects key, version, checksum and truncation corruption', async () => {
+    const data = Uint8Array.of(1, 2)
+    const good = await encodeRecordValue('key', data)
+    const wrongVersion = good.slice(); wrongVersion[0] = 1
+    const wrongChecksum = good.slice(); wrongChecksum[good.length - 1] = wrongChecksum[good.length - 1]! ^ 0xff
     const invalid = [
-      encodeCanonicalCbor([2n, 'key', data, digest]),
-      encodeCanonicalCbor([1n, 'another-key', data, digest]),
-      encodeCanonicalCbor([1n, 'key', data, new Uint8Array(32)]),
-      encodeCanonicalCbor([1n, 'key', data]),
+      wrongVersion,
+      await encodeRecordValue('another-key', data),
+      wrongChecksum,
+      good.slice(0, 6),
       new Uint8Array(),
       Uint8Array.of(0xff),
     ]

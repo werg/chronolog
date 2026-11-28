@@ -40,7 +40,7 @@ function open(handle, { path, options }) {
     insert: db.prepare('INSERT INTO stored_bytes (key,value) VALUES (?,?)'),
     remove: db.prepare('DELETE FROM stored_bytes WHERE key = ?'),
     count: db.prepare('SELECT count(*) AS count FROM stored_bytes'),
-    page: db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key LIMIT 64'),
+    page: db.prepare('SELECT key,value FROM stored_bytes WHERE key > ? ORDER BY key LIMIT 1024'),
   }
   stores.set(handle, store)
   return store
@@ -82,9 +82,10 @@ function run(store, method, args) {
   }
   if (method === 'page') {
     const value = []; let bytes = 0
-    for (const row of store.page.all(args.after)) {
+    // Large pages: one worker round trip per ~1024 entries / 4 MiB instead of per 64 entries.
+    for (const row of store.page.iterate(args.after)) {
       value.push({ key: row.key, value: row.value }); bytes += row.value.length
-      if (value.length >= 64 || bytes >= 1024 * 1024) break
+      if (value.length >= 1024 || bytes >= 4 * 1024 * 1024) break
     }
     return value
   }
