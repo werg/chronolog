@@ -2,7 +2,7 @@
  * Micro-benchmark: cost breakdown of one QuickJS reducer invocation. `pnpm tsx bench/vm.bench.ts`
  *
  * Part 1 times `QuickJsSandbox.invoke` end to end for a trivial KV reducer, the 600-line standard
- * `chronolog/permissions` module (query path) and a SQL reducer (`chronolog:sqlite` builtin).
+ * `chronolog/admission` module (query path) and a SQL reducer (`chronolog:sqlite` builtin).
  * Part 2 times the raw QuickJS primitives one invocation is built from, so the fixed cost can be
  * attributed (context creation with/without the Date intrinsic, prelude eval, per-function compile
  * cost, host function creation, FFI calls, module load, std-module compile).
@@ -73,7 +73,7 @@ const sqlInput: ReducerInvocationInput = {
 const sandbox = new QuickJsSandbox({ sqliteDriver: await createSqliteCasDriver() })
 await measure('QuickJsSandbox.invoke', [
   ['invoke kv reduce', () => sandbox.invoke(kvInput)],
-  ['invoke permissions query (600-line std module)', () => sandbox.invoke(permInput)],
+  ['invoke admission roster query (std module)', () => sandbox.invoke(permInput)],
   ['invoke sql reduce (fresh db)', () => sandbox.invoke(sqlInput)],
 ])
 
@@ -110,6 +110,6 @@ await measure('Raw QuickJS primitives (each includes a fresh context unless note
   ['+ 8 host newFunction', inFresh(ctx => { for (let i = 0; i < 8; i++) ctx.newFunction('f', () => ctx.undefined).dispose() })],
   ['+ 8 getProp(global, name)', inFresh(ctx => { for (let i = 0; i < 8; i++) ctx.getProp(ctx.global, 'JSON').dispose() })],
   ['+ module import of kv reducer', inFresh(ctx => evalDispose(ctx, `import m from 'kv'; export default m;`, true))],
-  ['+ module import of permissions std module', inFresh(ctx => evalDispose(ctx, `import { attestedMembers } from 'perm'; export default attestedMembers;`, true))],
+  ['+ module import of admission std module', inFresh(ctx => evalDispose(ctx, `import { attestedAdmission } from 'perm'; export default attestedAdmission;`, true))],
 ])
 rt.dispose()

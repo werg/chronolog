@@ -347,7 +347,9 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
 
     // Revoke member: signal policy cache invalidates immediately on stateRoot change
     await (await admin.removeMember(devMember.identity.publicKey, { authorTimestampMs: 30n })).materialized()
-    await member.signals.send('cursor', { x: 99 })
+    await member.signals.send('cursor', { x: 99 }).catch((err: unknown) => {
+      if (!(err instanceof Error) || err.message !== 'SIGNAL_UNAUTHORIZED') throw err
+    })
     await new Promise(r => setTimeout(r, 50))
     expect(received).toEqual([{ x: 42 }])
 

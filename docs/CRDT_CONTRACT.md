@@ -20,7 +20,7 @@ On chains with `privateLog: true`:
 - Application (non-`$`) topics may ONLY be mutated by `visibility: 'encrypted'` operations (wrapped in `EncryptedOperationEnvelope` under an epoch key).
 - Idempotency deduplication is scoped by `(visibility, author, operationId)`. The consumed-key set is a deterministic function of the ordered history (committed by `historyDigest`) and is committed as a `seenOpsRoot` CAS node whenever state is exported (materialized cache, snapshot bundle, checkpoint bootstrap).
 
-**Guarantee:** A blind host (`blindHostMode: true`) that holds zero decryption keys and replays only public operations derives bit-for-bit identical `$*` control topic state to every full replica, even under adversarial cross-partition `(author, operationId)` collisions.
+**Guarantee:** A blind host (`blindHostMode: true`) with the same public facts and history policy inputs as a full replica derives identical control topics. Idempotency is partition-scoped, and history policy receives only the public operation references on private logs. The resulting time closure applies to decrypted operations on the replicas that hold them.
 
 ## 3. Hash-Pinned Packages, Scoped Import Maps & Pure WASM (`$reducers`)
 
@@ -30,7 +30,7 @@ On chains with `privateLog: true`:
 - `topics`: map of topic names to `{ module, export?, config? }` (accepting either an import alias or a direct `cas:sha256-<64-hex>` reference).
 
 Execution invariants:
-- Fresh `QuickJSContext` per `reduce()`, `query()`, `describe()`, `authorize()`, `verify()`, `admit()`, `onConflict()`, and `derive()` invocation (zero cross-call state leakage) with deep-frozen inputs (`state`, `tx`, `ctx.config`, `ctx.topic()`).
+- Fresh `QuickJSContext` per `reduce()`, `query()`, `describe()`, `authorize()`, `verify()`, `admit()`, `onConflict()`, and `derive()` invocation with deep-frozen inputs (`state`, `tx`, `ctx.config`, `ctx.topic()`). `ctx.logId` is the log ID for log-bound calls and `null` for standalone derivations. Nested topic queries run against the invocation's visible working state, including earlier updates of the same transaction.
 - Non-deterministic globals (`Date`, `performance`, `Math.random`, `Intl`, `WeakRef`, `FinalizationRegistry`) are stripped in the determinism prelude (while preserving `BigInt`), and deterministic fuel metering (`limits.maxFuel`) rejects runaway loops uniformly as `vm:fuel_exhausted`.
 - `chronolog-pkg/v1` packages enforce scoped dependency resolution (eliminating diamond conflicts), package-local `./`/`../` relative imports, and per-package `builtins` capability attenuation.
 - Pure WASM reducers (`runtime: 'wasm-pure'`, `chronolog-wasm/v1` ABI) and `chronolog:wasm` libraries reject non-`chronolog` host imports and cache compiled `WebAssembly.Module` instances per `cas:sha256-...` hash.
@@ -77,7 +77,7 @@ Checkpoints and snapshots carry `topics`, `seenOpsRoot` and `historyDigest`; res
 `$admission` unifies four concerns in one state-defined module:
 1. **Per-operation fail-closed authorization (`authorize(state, tx, ctx)`):** Invoked automatically by `TopicKernel` before any non-`$admission` topic reducer runs; local topic reducers can only monotonically tighten, never weaken global admission.
 2. **Optional semantic post-conditions (`verify(before, after, tx, ctx)`):** Pure, flat post-execution invariant check over `before`/`after` topic snapshots; failure rolls back the entire atomic multi-topic transaction.
-3. **Consensus-agnostic history admission (`admit(state, { logId, ops, evidence, pinnedFrontier }, ctx)`):** Evaluates time-scoped `schedule` policies (`open`, `signed-frontier`, `threshold-quorum`, `member-quorum`, `optimistic-challenge`, `merkle-anchor`, `pinned-checkpoint`) and locally pinned non-rewinding frontiers (`pinnedFrontier`) identically on full peers and blind hosts. Operations with `authorTimestampMs <= closedThroughMs` absent from `includedOpIds` are deterministically excluded.
+3. **Consensus-agnostic history admission (`admit(state, { logId, ops, evidence, pinnedFrontier }, ctx)`):** Evaluates time-scoped `schedule` policies (`open`, `signed-frontier`, `threshold-quorum`, `member-quorum`, `optimistic-challenge`, `merkle-anchor`, `pinned-checkpoint`). Operations with `authorTimestampMs <= closedThroughMs` absent from `includedOpIds` are deterministically excluded. A locally pinned frontier fixes the included set through its closed time, including when subsequent evidence advances that time. For private logs, evidence shared with blind hosts is public. Use an open history for workflows that cannot disclose checkpoint inclusions.
 4. **Ephemeral signal authorization (`query('$admission', { kind: 'signals' })`):** Cached per `stateRoot` so membership revocations take effect immediately on `@chronolog/signals` live lanes.
 
 `$seals` is a plain-data, kernel-enforced monotonic ratchet table (`{ reducers, paths }`):

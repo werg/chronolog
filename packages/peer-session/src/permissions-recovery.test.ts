@@ -442,7 +442,7 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
     }
   })
 
-  it('supports mixed X-Wing + X25519 epoch admission, O(log N) Key-Tagged TreeKEM, Private Vaults, and SQL write-time RLS crypto helpers', async () => {
+  it('supports mixed X-Wing + X25519 epoch admission, Key-Tagged TreeKEM, Private Vaults, and SQL write-time RLS crypto helpers', async () => {
     const admin = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const alice = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const bob = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
@@ -531,7 +531,7 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
         await (await sAdmin.admitMember({ publicKey: p.identity.publicKey, wrapKey: p.wrapKey.publicKey, pqWrapKey: p.pqWrapKey!.publicKey })).materialized()
       }
 
-      // 2. Sub-linear O(log N) Key-Tagged TreeKEM rotation over 9 members
+      // 2. Key-Tagged TreeKEM rotation over 9 members (fresh tree: one box per other member + self-box)
       const tree1 = await sAdmin.rotateTreeEpoch()
       expect((await tree1.operation.materialized()).outcome).toBe('accepted')
       expect(tree1.epoch).toBe(1)
@@ -558,12 +558,17 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       expect(needs.needsRotation).toBe(true)
       expect(needs.staleMembers).toContain(extraPeers[4]!.identity.publicKey)
 
-      // Sub-linear healing TreeKEM rotation excludes extraPeers[4] in O(log N) boxes!
+      // Healing TreeKEM rotation excludes extraPeers[4]. The updater seals each fresh path seed to the
+      // resolution of its copath, which covers every other active leaf at most once, plus one self-box:
+      // copathBoxes <= active members. It reaches log2(leafCount) + 1 only once internal nodes are
+      // populated; right after the fresh epoch-1 tree (only the updater's path is non-blank) the
+      // resolutions are still leaves, so this rotation is exactly that worst case.
       const tree2 = await sAdmin.rotateTreeEpoch()
       expect((await tree2.operation.materialized()).outcome).toBe('accepted')
       expect(tree2.epoch).toBe(2)
-      console.log("COPATH", tree1.copathBoxes, tree2.copathBoxes)
-      expect(tree2.copathBoxes).toBeLessThanOrEqual(8)
+      const activeAfterRemoval = 1 + 3 + extraPeers.length - 1
+      expect(tree1.copathBoxes).toBeLessThanOrEqual(activeAfterRemoval + 1)
+      expect(tree2.copathBoxes).toBeLessThanOrEqual(activeAfterRemoval)
       expect((await sAdmin.keysNeedsRotation()).needsRotation).toBe(false)
 
       const facts2 = await sAdmin.exportFacts()

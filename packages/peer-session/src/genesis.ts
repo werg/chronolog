@@ -183,7 +183,8 @@ export interface CreateLogGenesisOptions {
   /** Optional initial on-log `$keys.policy` (minSuite, paddingBucketBytes, hideEnvelopeAuthor, rotateOnRemove, maxOpsPerEpoch). */
   readonly keysPolicy?: KeysPolicy
   readonly runtime?: RuntimeManifest
-  readonly limits?: GenesisLimits
+  /** Genesis limits; omitted fields take `DEFAULT_GENESIS_LIMITS`. */
+  readonly limits?: Partial<GenesisLimits>
   readonly salt?: Uint8Array
   readonly epoch0Key?: Uint8Array
 }
@@ -368,7 +369,7 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     version: 1,
     privateLog,
     initialTopics,
-    limits: options.limits ?? DEFAULT_GENESIS_LIMITS,
+    limits: { ...DEFAULT_GENESIS_LIMITS, ...options.limits },
     salt,
   }
   const genesisBytes = encodeLogGenesis(genesis)

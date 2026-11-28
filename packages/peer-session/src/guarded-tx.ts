@@ -1,8 +1,9 @@
-import type {
-  JsonValue,
-  OperationAssumption,
-  OperationAssumptionsConfig,
-  TopicUpdate,
+import {
+  isControlTopic,
+  type JsonValue,
+  type OperationAssumption,
+  type OperationAssumptionsConfig,
+  type TopicUpdate,
 } from '@chronolog/protocol'
 import type { ApplicationOperation } from './operation.js'
 import type { ApplicationSession } from './session.js'
@@ -126,6 +127,8 @@ export function createGuardedTx(session: ApplicationSession, options: GuardedTxO
   const defaultSqlTopic = options.defaultSqlTopic ?? 'sql'
   const defaultOnFailed = options.onFailed ?? 'reject'
   const kernelChecks: OperationAssumption[] = []
+  /** `requireOwnHistory` checks: re-resolved at submit against the view of the op's partition and ring. */
+  const ownHistory = new Map<number, string>()
   const sqlPreByTopic = new Map<string, GuardedSqlPrecondition[]>()
   const sqlPostByTopic = new Map<string, GuardedSqlPrecondition[]>()
 
@@ -219,6 +222,7 @@ export function createGuardedTx(session: ApplicationSession, options: GuardedTxO
     requireOwnHistory(author) {
       const target = author ?? session.identity.publicKey
       const lastOpId = session.authorLastOpId(target)
+      ownHistory.set(kernelChecks.length, target)
       kernelChecks.push({
         kind: 'author_last_op',
         ...(author === undefined ? {} : { author: target }),
@@ -285,7 +289,22 @@ export function createGuardedTx(session: ApplicationSession, options: GuardedTxO
           },
         }
       })
-      const assumptions = tx.assumptions({ onFailed })
+      let assumptions = tx.assumptions({ onFailed })
+      if (assumptions !== undefined && ownHistory.size > 0) {
+        // The kernel evaluates `author_last_op` in the op's own view: public ops see only public
+        // history; encrypted ops on a private log see their ring's ops plus public ones.
+        const visibility = input.visibility ?? (session.genesis.privateLog && !mergedUpdates.every(u => isControlTopic(u.topic)) ? 'encrypted' : 'public')
+        const topicRings = session.keysState().topicRings ?? {}
+        const ring = topicRings[mergedUpdates[0]?.topic ?? ''] ?? 'default'
+        const view = visibility === 'public' && session.genesis.privateLog ? { publicOnly: true } : { ring }
+        assumptions = {
+          ...assumptions,
+          checks: assumptions.checks.map((check, i) => {
+            const target = ownHistory.get(i)
+            return target === undefined || check.kind !== 'author_last_op' ? check : { ...check, lastOpId: session.authorLastOpId(target, view) }
+          }),
+        }
+      }
       return session.submit({
         updates: mergedUpdates,
         awaitMaterialized: input.awaitMaterialized ?? true,

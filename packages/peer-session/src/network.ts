@@ -521,11 +521,17 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     const initialSync = new Promise<void>(resolve => { markReady = resolve })
     void initialSync.catch(() => undefined)
     const runInitialSync = async (): Promise<void> => {
+      // Cold open: dependencies already known locally (e.g. TreeKEM nodes of a restored `$keys`)
+      // are requested before the first round instead of waiting for new facts.
+      await pullMissingCas()
       if (!session.genesis.privateLog) await requestSnapshot()
       await runRound('public')
       verifyMember()
       if (session.genesis.privateLog) await requestSnapshot()
       await runRound('private')
+      // Reconciliation is complete: a snapshot adopted provisionally that replay still cannot
+      // confirm is dropped in favour of replaying the full history now held.
+      await session.settleProvisionalSnapshot()
       queueOutOfBandReceipts()
       void post({ kind: 'ready' })
       markReady()

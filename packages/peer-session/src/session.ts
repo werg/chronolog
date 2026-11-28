@@ -2835,8 +2835,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return this.#kernel.topicLastOpId(topic)
   }
 
-  authorLastOpId(author?: string): string | null {
-    return this.#kernel.authorLastOpId(author ?? this.identity.publicKey)
+  /**
+   * Last accepted op of `author` (default: this identity) as an op authored now would observe it in
+   * an `author_last_op` assumption: `publicOnly` for a public op on a private log, else the view of
+   * an encrypted op of `ring` (default 'default').
+   */
+  authorLastOpId(author?: string, options: { readonly publicOnly?: boolean; readonly ring?: string } = {}): string | null {
+    return this.#kernel.authorLastOpId(author ?? this.identity.publicKey, options)
   }
 
   /**
