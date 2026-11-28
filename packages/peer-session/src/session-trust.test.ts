@@ -190,6 +190,36 @@ describe('control plane (B7)', () => {
     expect(blind.topics.$admission).toEqual(sessA.topic('$admission'))
     expect(blind.roster.members.map(m => m.publicKey)).not.toContain(y.identity.publicKey)
   })
+
+  it('exposes the seenOpsRoot and normalized $admission schedule a blind notary signs checkpoints with', async () => {
+    const { a, open, created } = await fixture(false)
+    const sessA = await open(new MemoryBytesStore(), a)
+    const x = await member()
+    await sessA.admitMember({ publicKey: x.identity.publicKey, authorTimestampMs: 10n })
+    const scheduled = await sessA.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      authorTimestampMs: 20n,
+      updates: [{ topic: '$admission', input: { action: 'schedulePolicy', effectiveAfterMs: 30, policy: { kind: 'signed-frontier', signer: a.identity.publicKey } } }],
+    })
+    expect((await scheduled.materialized()).outcome).toBe('accepted')
+    const facts = await sessA.exportPublicControlFacts()
+    const blind = await replayBlindHostControl({
+      genesis: created.genesis,
+      publicOps: facts.publicOps.map(raw => {
+        const signed = decodeSignedOperation(raw)
+        return { opId: operationIdDigest(signed.coreBytes), core: decodeOperationCore(signed.coreBytes), verified: true }
+      }),
+      publicCasNodes: facts.casNodes.map(n => ({ hash: n.hash, bytes: n.bytes })),
+    })
+    expect(blind.admissionSchedule).toEqual(await sessA.query('$admission', { kind: 'schedule' }).then(r => r.value))
+    expect(blind.admissionSchedule.map(e => e.effectiveAfterMs)).toEqual([-1, 30])
+    expect(blind.admissionSchedule[1]!.policy).toEqual({ kind: 'signed-frontier', signer: a.identity.publicKey })
+    // The replica's own checkpoint over the same (all-public) history commits the same idempotency root.
+    const { evidence } = await sessA.admission.createCheckpoint({ throughMs: 40n })
+    expect(blind.seenOpsRoot).toMatch(/^[0-9a-f]{64}$/u)
+    expect(blind.seenOpsRoot).toBe((evidence.payload as { readonly seenOpsRoot: string }).seenOpsRoot)
+  })
 })
 
 describe('commitment-bound keys', () => {

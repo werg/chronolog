@@ -213,6 +213,24 @@ export interface BlindHostControlResult {
   readonly referencedCasHashes: ReadonlySet<string>
   /** Per-ring per-epoch Ed25519 mailbox verification keys from `$keys` (`{ default: { '0': hex }, ... }`). */
   readonly mailboxVerifyKeys: Readonly<Record<string, Readonly<Record<string, string>>>>
+  /**
+   * Committed idempotency-set root of the replayed public history, as a blind host puts it in
+   * `AdmissionCheckpointPayload.seenOpsRoot` when it signs a checkpoint. On a public log it equals a
+   * full replica's root over the same ops; on a private log it covers public ops only (a decrypting
+   * replica's root also holds the encrypted keys).
+   */
+  readonly seenOpsRoot: string
+  /**
+   * Normalized `$admission` history schedule (`query('$admission', { kind: 'schedule' })`), sorted
+   * by `effectiveAfterMs`; empty when the log's `$admission` does not answer that query.
+   */
+  readonly admissionSchedule: readonly BlindHostScheduleEntry[]
+}
+
+/** One entry of the normalized `$admission` history schedule. */
+export interface BlindHostScheduleEntry {
+  readonly effectiveAfterMs: number
+  readonly policy: JsonValue
 }
 
 /**
@@ -294,9 +312,24 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
       }
     } catch { /* custom $keys without mailboxKeys query */ }
 
+    let admissionSchedule: BlindHostScheduleEntry[] = []
+    try {
+      const q = await kernel.query('$admission', { kind: 'schedule' })
+      if (Array.isArray(q)) {
+        admissionSchedule = q
+          .filter((e): e is Record<string, JsonValue> => e !== null && typeof e === 'object' && !Array.isArray(e))
+          .filter(e => typeof e.effectiveAfterMs === 'number' && Number.isSafeInteger(e.effectiveAfterMs))
+          .map(e => ({ effectiveAfterMs: e.effectiveAfterMs as number, policy: e.policy ?? null }))
+          .sort((a, b) => a.effectiveAfterMs - b.effectiveAfterMs)
+      }
+    } catch { /* custom $admission without schedule query */ }
+    const seenOpsRoot = await kernel.commitSeenOpsRoot()
+
     return {
       stateRoot: snap.stateRoot,
       historyDigest: snap.historyDigest,
+      seenOpsRoot,
+      admissionSchedule,
       topics: snap.topics,
       outcomes: result.outcomes,
       pendingDependencies: result.pendingDependencies,
