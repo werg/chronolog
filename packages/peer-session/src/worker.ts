@@ -5,3 +5,8 @@ export type * from './owner-types.js'
 export { openWorkerWebRtcConnection } from './worker-transport.js'
 import type { probeBrowserCapabilities as ProbeBrowserCapabilities } from './browser-capabilities.js'
 export async function probeBrowserCapabilities(...args: Parameters<typeof ProbeBrowserCapabilities>) { return (await import('./browser-capabilities.js')).probeBrowserCapabilities(...args) }
+export {
+  serveTabWorkerOwner,
+  type TabWorkerOwnedSession,
+  type ServeTabWorkerOwnerOptions,
+} from './worker-tab-owner.js'
