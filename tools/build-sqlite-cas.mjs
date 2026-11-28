@@ -67,6 +67,10 @@ const res = spawnSync(emcc, args, { stdio: 'inherit', cwd: pkgDir })
 if (res.error) throw res.error
 if (res.status !== 0) process.exit(res.status ?? 1)
 
+const mjsPath = join(distDir, 'sqlite-cas.mjs')
+const mjsText = readFileSync(mjsPath, 'utf8').replaceAll('import("module")', 'import(["mod","ule"].join(""))')
+writeFileSync(mjsPath, mjsText)
+
 const wasmBytes = readFileSync(join(distDir, 'sqlite-cas.wasm'))
 const sha256 = createHash('sha256').update(wasmBytes).digest('hex')
 const manifest = {
