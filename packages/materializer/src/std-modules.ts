@@ -1122,6 +1122,7 @@ export const signedReleases = {
         timestampMs: tx.authorTimestampMs,
         entry: target.entry,
         files: target.files,
+        ...(typeof target.treeRoot === 'string' ? { treeRoot: target.treeRoot } : {}),
         rollbackOf: target.revision,
       };
       const history = hist.concat([release]).slice(-128);
@@ -1138,6 +1139,9 @@ export const signedReleases = {
     if (input.expectedRevision !== undefined && input.expectedRevision !== cur.revision) {
       return { ok: false, code: 'publication_revision_conflict' };
     }
+    if (input.treeRoot !== undefined && (typeof input.treeRoot !== 'string' || !/^cas:sha256-[0-9a-f]{64}$/.test(input.treeRoot))) {
+      return { ok: false, code: 'invalid_publication_tree_root' };
+    }
     const files = [];
     const seenPaths = new Set();
     for (const f of input.files) {
@@ -1149,7 +1153,15 @@ export const signedReleases = {
     }
     if (!files.some(f => f.path === input.entry)) return { ok: false, code: 'publication_entry_missing' };
     const revision = cur.revision + 1;
-    const release = { revision, opId: tx.opId, author: tx.author, timestampMs: tx.authorTimestampMs, entry: input.entry, files };
+    const release = {
+      revision,
+      opId: tx.opId,
+      author: tx.author,
+      timestampMs: tx.authorTimestampMs,
+      entry: input.entry,
+      files,
+      ...(typeof input.treeRoot === 'string' ? { treeRoot: input.treeRoot } : {}),
+    };
     const history = (Array.isArray(cur.history) ? cur.history : []).concat([release]).slice(-128);
     return {
       ok: true,
