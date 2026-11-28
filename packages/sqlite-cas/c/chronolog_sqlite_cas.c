@@ -33,6 +33,81 @@ EM_JS(double, js_cas_filesize, (), {
 EM_JS(int, js_ddl_authorize, (int action, const char* arg1, const char* arg2), {
   return Module._casHooks.ddlAuthorize(action, arg1 ? UTF8ToString(arg1) : "", arg2 ? UTF8ToString(arg2) : "");
 });
+EM_JS(char*, js_chronolog_topic_json, (const char* name), {
+  const fn = Module._casHooks && Module._casHooks.topicJson;
+  const res = fn ? fn(UTF8ToString(name)) : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(char*, js_chronolog_topic_last_op, (const char* name), {
+  const fn = Module._casHooks && Module._casHooks.topicLastOpId;
+  const res = fn ? fn(UTF8ToString(name)) : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(char*, js_chronolog_op_outcome, (const char* opId), {
+  const fn = Module._casHooks && Module._casHooks.opOutcome;
+  const res = fn ? fn(UTF8ToString(opId)) : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(char*, js_chronolog_author_last_op, (const char* author), {
+  const fn = Module._casHooks && Module._casHooks.authorLastOpId;
+  const res = fn ? fn(UTF8ToString(author)) : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(char*, js_chronolog_topic_query, (const char* topic, const char* inputJson), {
+  const fn = Module._casHooks && Module._casHooks.topicQueryJson;
+  const res = fn ? fn(UTF8ToString(topic), inputJson ? UTF8ToString(inputJson) : "null") : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(int, js_chronolog_topics_count, (), {
+  const fn = Module._casHooks && Module._casHooks.topicsCount;
+  return fn ? fn() : 0;
+});
+EM_JS(char*, js_chronolog_topics_col, (int row, int col), {
+  const fn = Module._casHooks && Module._casHooks.topicsCol;
+  const res = fn ? fn(row, col) : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(int, js_chronolog_history_count, (), {
+  const fn = Module._casHooks && Module._casHooks.historyCount;
+  return fn ? fn() : 0;
+});
+EM_JS(char*, js_chronolog_history_col, (int row, int col), {
+  const fn = Module._casHooks && Module._casHooks.historyCol;
+  const res = fn ? fn(row, col) : null;
+  if (res === null || res === undefined) return 0;
+  const len = lengthBytesUTF8(res) + 1;
+  const ptr = _malloc(len);
+  stringToUTF8(res, ptr, len);
+  return ptr;
+});
+EM_JS(double, js_chronolog_history_num, (int row, int col), {
+  const fn = Module._casHooks && Module._casHooks.historyNum;
+  return fn ? fn(row, col) : 0;
+});
 
 /* Override localtime/localtime_r in WASM libc so SQLite 'localtime' modifier is ALWAYS fixed UTC! */
 struct tm* localtime_r(const time_t* timer, struct tm* result) {
@@ -45,7 +120,10 @@ struct tm* localtime(const time_t* timer) {
 /* Kernel-bound execution context (never set from JS reducer arguments) */
 static char g_actor[65] = "0000000000000000000000000000000000000000000000000000000000000000";
 static char g_op_id[65] = "0000000000000000000000000000000000000000000000000000000000000000";
+static char g_operation_id[257] = "";
+static char g_visibility[17] = "";
 static sqlite3_int64 g_op_time_ms = 0;
+static int g_is_readonly_open = 0;
 static int g_auth_mode = 0; /* 0 = admin, 1 = user, 2 = readonly */
 
 /* ── Minimal CAS VFS ──────────────────────────────────────────────────────── */
@@ -159,6 +237,10 @@ static sqlite3_vfs g_cas_vfs = {
 
 /* ── Deterministic SQL functions ──────────────────────────────────────────── */
 
+static void returnMallocTextOrNull(sqlite3_context* ctx, char* ptr) {
+  if (!ptr) { sqlite3_result_null(ctx); return; }
+  sqlite3_result_text(ctx, ptr, -1, free);
+}
 static void fnActor(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
   (void)argc; (void)argv;
   sqlite3_result_text(ctx, g_actor, 64, SQLITE_TRANSIENT);
@@ -171,10 +253,164 @@ static void fnOpTime(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
   (void)argc; (void)argv;
   sqlite3_result_int64(ctx, g_op_time_ms);
 }
+static void fnOperationId(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  (void)argc; (void)argv;
+  if (g_operation_id[0] == '\0') { sqlite3_result_null(ctx); return; }
+  sqlite3_result_text(ctx, g_operation_id, -1, SQLITE_TRANSIENT);
+}
+static void fnTxVisibility(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  (void)argc; (void)argv;
+  if (g_visibility[0] == '\0') { sqlite3_result_null(ctx); return; }
+  sqlite3_result_text(ctx, g_visibility, -1, SQLITE_TRANSIENT);
+}
+static void fnChronologTopic(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  if (argc != 1 || sqlite3_value_type(argv[0]) != SQLITE_TEXT) { sqlite3_result_null(ctx); return; }
+  const char* name = (const char*)sqlite3_value_text(argv[0]);
+  returnMallocTextOrNull(ctx, name ? js_chronolog_topic_json(name) : NULL);
+}
+static void fnChronologTopicLastOp(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  if (argc != 1 || sqlite3_value_type(argv[0]) != SQLITE_TEXT) { sqlite3_result_null(ctx); return; }
+  const char* name = (const char*)sqlite3_value_text(argv[0]);
+  returnMallocTextOrNull(ctx, name ? js_chronolog_topic_last_op(name) : NULL);
+}
+static void fnChronologOp(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  if (argc != 1 || sqlite3_value_type(argv[0]) != SQLITE_TEXT) { sqlite3_result_null(ctx); return; }
+  const char* id = (const char*)sqlite3_value_text(argv[0]);
+  returnMallocTextOrNull(ctx, id ? js_chronolog_op_outcome(id) : NULL);
+}
+static void fnChronologAuthorLastOp(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  const char* author = g_actor;
+  if (argc == 1 && sqlite3_value_type(argv[0]) == SQLITE_TEXT) {
+    author = (const char*)sqlite3_value_text(argv[0]);
+  }
+  returnMallocTextOrNull(ctx, author ? js_chronolog_author_last_op(author) : NULL);
+}
+static void fnChronologTopicQuery(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  if (argc < 1 || sqlite3_value_type(argv[0]) != SQLITE_TEXT) { sqlite3_result_null(ctx); return; }
+  const char* topic = (const char*)sqlite3_value_text(argv[0]);
+  const char* inputJson = (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_TEXT)
+    ? (const char*)sqlite3_value_text(argv[1]) : "null";
+  returnMallocTextOrNull(ctx, topic ? js_chronolog_topic_query(topic, inputJson) : NULL);
+}
 static void fnDisabledRandom(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
   (void)argc; (void)argv;
   sqlite3_result_error(ctx, "NONDETERMINISTIC_SQL_RANDOM_DISABLED", -1);
 }
+
+/* ── Eponymous Read-Only Virtual Tables (chronolog_tx, chronolog_topics, chronolog_history) ── */
+
+typedef struct {
+  sqlite3_vtab base;
+  int kind; /* 0 = tx, 1 = topics, 2 = history */
+} ChronologVtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  int kind;
+  int row;
+  int count;
+} ChronologCursor;
+
+static int cvConnect(sqlite3* db, void* pAux, int argc, const char* const* argv, sqlite3_vtab** ppVtab, char** pzErr) {
+  (void)argc; (void)argv; (void)pzErr;
+  int kind = (int)(intptr_t)pAux;
+  const char* schema =
+    kind == 0 ? "CREATE TABLE x(op_id TEXT, author TEXT, author_timestamp_ms INTEGER, operation_id TEXT, visibility TEXT)" :
+    kind == 1 ? "CREATE TABLE x(topic TEXT, last_op_id TEXT, state_json TEXT)" :
+                "CREATE TABLE x(seq INTEGER, op_id TEXT, author TEXT, operation_id TEXT, author_timestamp_ms INTEGER, visibility TEXT, outcome TEXT, rejection_code TEXT)";
+  int rc = sqlite3_declare_vtab(db, schema);
+  if (rc != SQLITE_OK) return rc;
+  ChronologVtab* vt = (ChronologVtab*)sqlite3_malloc(sizeof(ChronologVtab));
+  if (!vt) return SQLITE_NOMEM;
+  memset(vt, 0, sizeof(ChronologVtab));
+  vt->kind = kind;
+  *ppVtab = &vt->base;
+  return SQLITE_OK;
+}
+static int cvDisconnect(sqlite3_vtab* pVtab) { sqlite3_free(pVtab); return SQLITE_OK; }
+static int cvBestIndex(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
+  (void)pVtab;
+  pInfo->estimatedCost = 10.0;
+  pInfo->estimatedRows = 10;
+  return SQLITE_OK;
+}
+static int cvOpen(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor) {
+  ChronologVtab* vt = (ChronologVtab*)pVtab;
+  ChronologCursor* cur = (ChronologCursor*)sqlite3_malloc(sizeof(ChronologCursor));
+  if (!cur) return SQLITE_NOMEM;
+  memset(cur, 0, sizeof(ChronologCursor));
+  cur->kind = vt->kind;
+  *ppCursor = &cur->base;
+  return SQLITE_OK;
+}
+static int cvClose(sqlite3_vtab_cursor* pCur) { sqlite3_free(pCur); return SQLITE_OK; }
+static int cvFilter(sqlite3_vtab_cursor* pCur, int idxNum, const char* idxStr, int argc, sqlite3_value** argv) {
+  (void)idxNum; (void)idxStr; (void)argc; (void)argv;
+  ChronologCursor* cur = (ChronologCursor*)pCur;
+  cur->row = 0;
+  if (cur->kind == 0) {
+    cur->count = 1;
+  } else if (cur->kind == 1) {
+    cur->count = js_chronolog_topics_count();
+  } else {
+    if (!g_is_readonly_open) {
+      pCur->pVtab->zErrMsg = sqlite3_mprintf("CHRONOLOG_HISTORY_QUERY_ONLY: use chronolog_op(op_id) or chronolog_author_last_op(author) inside reduce()");
+      return SQLITE_ERROR;
+    }
+    cur->count = js_chronolog_history_count();
+  }
+  return SQLITE_OK;
+}
+static int cvNext(sqlite3_vtab_cursor* pCur) { ((ChronologCursor*)pCur)->row++; return SQLITE_OK; }
+static int cvEof(sqlite3_vtab_cursor* pCur) {
+  ChronologCursor* cur = (ChronologCursor*)pCur;
+  return cur->row >= cur->count ? 1 : 0;
+}
+static int cvRowid(sqlite3_vtab_cursor* pCur, sqlite3_int64* pRowid) {
+  *pRowid = ((ChronologCursor*)pCur)->row + 1;
+  return SQLITE_OK;
+}
+static int cvColumn(sqlite3_vtab_cursor* pCur, sqlite3_context* ctx, int col) {
+  ChronologCursor* cur = (ChronologCursor*)pCur;
+  if (cur->kind == 0) {
+    if (col == 0) sqlite3_result_text(ctx, g_op_id, 64, SQLITE_TRANSIENT);
+    else if (col == 1) sqlite3_result_text(ctx, g_actor, 64, SQLITE_TRANSIENT);
+    else if (col == 2) sqlite3_result_int64(ctx, g_op_time_ms);
+    else if (col == 3) { if (g_operation_id[0]) sqlite3_result_text(ctx, g_operation_id, -1, SQLITE_TRANSIENT); else sqlite3_result_null(ctx); }
+    else if (col == 4) { if (g_visibility[0]) sqlite3_result_text(ctx, g_visibility, -1, SQLITE_TRANSIENT); else sqlite3_result_null(ctx); }
+    else sqlite3_result_null(ctx);
+    return SQLITE_OK;
+  }
+  if (cur->kind == 1) {
+    returnMallocTextOrNull(ctx, js_chronolog_topics_col(cur->row, col));
+    return SQLITE_OK;
+  }
+  /* kind == 2: history(seq, op_id, author, operation_id, author_timestamp_ms, visibility, outcome, rejection_code) */
+  if (col == 0 || col == 4) {
+    sqlite3_result_int64(ctx, (sqlite3_int64)js_chronolog_history_num(cur->row, col));
+  } else {
+    returnMallocTextOrNull(ctx, js_chronolog_history_col(cur->row, col));
+  }
+  return SQLITE_OK;
+}
+
+static sqlite3_module g_chronolog_vtab_module = {
+  0,
+  NULL,         /* xCreate = NULL -> eponymous-only, cannot be CREATE VIRTUAL TABLE'd */
+  cvConnect,
+  cvBestIndex,
+  cvDisconnect,
+  NULL,         /* xDestroy */
+  cvOpen,
+  cvClose,
+  cvFilter,
+  cvNext,
+  cvEof,
+  cvColumn,
+  cvRowid,
+  NULL,         /* xUpdate = NULL -> strictly read-only! */
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+};
 
 /* ── Three-mode authorizer ────────────────────────────────────────────────── */
 
@@ -184,7 +420,7 @@ static int startsWithNoCase(const char* s, const char* prefix) {
 }
 
 static int isReservedTable(const char* name) {
-  return startsWithNoCase(name, "_rls_") || startsWithNoCase(name, "sqlite_");
+  return startsWithNoCase(name, "_rls_") || startsWithNoCase(name, "sqlite_") || startsWithNoCase(name, "chronolog_");
 }
 
 static int isAllowedVtab(const char* mod) {
@@ -307,6 +543,22 @@ EMSCRIPTEN_KEEPALIVE void chronolog_set_context(const char* actor, const char* o
   g_op_time_ms = (sqlite3_int64)opTimeMs;
 }
 
+EMSCRIPTEN_KEEPALIVE void chronolog_set_tx_meta(const char* operationId, const char* visibility, int isReadOnly) {
+  if (operationId && operationId[0]) {
+    strncpy(g_operation_id, operationId, sizeof(g_operation_id) - 1);
+    g_operation_id[sizeof(g_operation_id) - 1] = '\0';
+  } else {
+    g_operation_id[0] = '\0';
+  }
+  if (visibility && visibility[0]) {
+    strncpy(g_visibility, visibility, sizeof(g_visibility) - 1);
+    g_visibility[sizeof(g_visibility) - 1] = '\0';
+  } else {
+    g_visibility[0] = '\0';
+  }
+  g_is_readonly_open = isReadOnly ? 1 : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE void chronolog_set_mode(int mode) {
   g_auth_mode = mode;
 }
@@ -326,13 +578,25 @@ EMSCRIPTEN_KEEPALIVE sqlite3* chronolog_open(void) {
   sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DDL, 0, &applied);
   sqlite3_extended_result_codes(db, 1);
 
-  /* Register deterministic kernel-bound functions and disable random() */
+  /* Register deterministic kernel-bound functions, read-only introspection vtabs, and disable random() */
   int detFlags = SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS;
   sqlite3_create_function_v2(db, "actor", 0, detFlags, NULL, fnActor, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "op_id", 0, detFlags, NULL, fnOpId, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "op_time", 0, detFlags, NULL, fnOpTime, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "operation_id", 0, detFlags, NULL, fnOperationId, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "tx_visibility", 0, detFlags, NULL, fnTxVisibility, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_topic", 1, detFlags, NULL, fnChronologTopic, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_topic_last_op", 1, detFlags, NULL, fnChronologTopicLastOp, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_op", 1, detFlags, NULL, fnChronologOp, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_author_last_op", 0, detFlags, NULL, fnChronologAuthorLastOp, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_author_last_op", 1, detFlags, NULL, fnChronologAuthorLastOp, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_topic_query", 1, detFlags, NULL, fnChronologTopicQuery, NULL, NULL, NULL);
+  sqlite3_create_function_v2(db, "chronolog_topic_query", 2, detFlags, NULL, fnChronologTopicQuery, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "random", 0, SQLITE_UTF8, NULL, fnDisabledRandom, NULL, NULL, NULL);
   sqlite3_create_function_v2(db, "randomblob", 1, SQLITE_UTF8, NULL, fnDisabledRandom, NULL, NULL, NULL);
+  sqlite3_create_module(db, "chronolog_tx", &g_chronolog_vtab_module, (void*)(intptr_t)0);
+  sqlite3_create_module(db, "chronolog_topics", &g_chronolog_vtab_module, (void*)(intptr_t)1);
+  sqlite3_create_module(db, "chronolog_history", &g_chronolog_vtab_module, (void*)(intptr_t)2);
 
   /* Configure deterministic in-memory journal & fixed 4 KiB page size BEFORE installing authorizer */
   g_auth_mode = 0;

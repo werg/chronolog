@@ -89,6 +89,27 @@ export interface SqliteDbHandle {
   close(): void
 }
 
+export interface SqliteIntrospectionHooks {
+  readonly operationId?: string
+  readonly visibility?: 'public' | 'encrypted'
+  readonly topicJson?: (name: string) => string | null
+  readonly topicLastOpId?: (name: string) => string | null
+  readonly opOutcome?: (opId: string) => 'accepted' | 'rejected' | null
+  readonly authorLastOpId?: (author: string) => string | null
+  readonly topicQueryJson?: (topic: string, inputJson: string) => string | null
+  readonly topics?: readonly { readonly topic: string; readonly lastOpId: string | null; readonly stateJson: string }[]
+  readonly history?: readonly {
+    readonly seq: number
+    readonly opId: string
+    readonly author: string
+    readonly operationId: string
+    readonly authorTimestampMs: number
+    readonly visibility: 'public' | 'encrypted'
+    readonly outcome: 'accepted' | 'rejected'
+    readonly rejectionCode: string | null
+  }[]
+}
+
 export interface SqliteBuiltinDriver {
   readonly builtinId: string
   openDb(options: {
@@ -100,6 +121,7 @@ export interface SqliteBuiltinDriver {
     readonly opTimeMs: bigint
     readonly readOnly: boolean
     readonly onMissingCas: (hash: string) => never
+    readonly introspection?: SqliteIntrospectionHooks
   }): SqliteDbHandle
 }
 
@@ -136,6 +158,19 @@ export interface ReducerInvocationInput {
   readonly opOutcome?: (opId: string) => 'accepted' | 'rejected' | null
   readonly opOutcomes?: Readonly<Record<string, 'accepted' | 'rejected'>>
   readonly topicLastOpIds?: Readonly<Record<string, string>>
+  readonly authorLastOpIds?: Readonly<Record<string, string>>
+  readonly txVisibility?: 'public' | 'encrypted'
+  /** Optional materialized history rows exposed read-only in SQL `chronolog_history` (query() only). */
+  readonly historyRows?: readonly {
+    readonly seq: number
+    readonly opId: string
+    readonly author: string
+    readonly operationId: string
+    readonly authorTimestampMs: number
+    readonly visibility: 'public' | 'encrypted'
+    readonly outcome: 'accepted' | 'rejected'
+    readonly rejectionCode: string | null
+  }[]
   /** Visible topic states; read lazily by `ctx.topic()` / `ctx.query()` through host calls. */
   readonly topics: Readonly<Record<string, JsonValue>>
   /** Optional precomputed content hash of a visible topic state (memoization key for nested queries). */
@@ -210,7 +245,7 @@ for (const k of ['Intl', 'performance', 'WeakRef', 'FinalizationRegistry']) {
   }
 }
 [JSON, JSON.parse, JSON.stringify, String, Object.is,
-  (topic, query, mount, mountQuery, opOutcome, topicLastOpId, config) => Object.freeze({ topic, query, mount, mountQuery, opOutcome, topicLastOpId, config }),
+  (topic, query, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config) => Object.freeze({ topic, query, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config }),
   (out) => JSON.stringify({ __ok: true, value: out })];
 `
 
@@ -925,6 +960,49 @@ export class QuickJsSandbox {
 
         if (this.#sqliteDriver !== undefined) {
           const driver = this.#sqliteDriver
+          let cachedTopicsList: readonly { readonly topic: string; readonly lastOpId: string | null; readonly stateJson: string }[] | undefined
+          const introspection: SqliteIntrospectionHooks = {
+            ...(input.tx?.operationId === undefined ? {} : { operationId: input.tx.operationId }),
+            ...(input.txVisibility === undefined ? {} : { visibility: input.txVisibility }),
+            topicJson: (name: string) => {
+              if (readPartition === 'public' && !isControlTopic(name)) return null
+              if (!Object.hasOwn(input.topics, name)) return null
+              return JSON.stringify(input.topics[name] ?? null)
+            },
+            topicLastOpId: (name: string) => {
+              if (readPartition === 'public' && !isControlTopic(name)) return null
+              const ids = input.topicLastOpIds
+              return ids !== undefined && Object.hasOwn(ids, name) ? ids[name]! : null
+            },
+            opOutcome: (opId: string) => {
+              if (input.opOutcome !== undefined) return input.opOutcome(opId)
+              if (input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, opId)) return input.opOutcomes[opId]!
+              return null
+            },
+            authorLastOpId: (author: string) => {
+              const ids = input.authorLastOpIds
+              return ids !== undefined && Object.hasOwn(ids, author) ? ids[author]! : null
+            },
+            topicQueryJson: (topic: string, inputJson: string) => {
+              try { return queryTopic(topic, inputJson) } catch { return null }
+            },
+            get topics() {
+              if (cachedTopicsList === undefined) {
+                const names = Object.keys(input.topics)
+                  .filter(name => readPartition !== 'public' || isControlTopic(name))
+                  .sort()
+                cachedTopicsList = names.map(name => ({
+                  topic: name,
+                  lastOpId: input.topicLastOpIds !== undefined && Object.hasOwn(input.topicLastOpIds, name)
+                    ? input.topicLastOpIds[name]!
+                    : null,
+                  stateJson: JSON.stringify(input.topics[name] ?? null),
+                }))
+              }
+              return cachedTopicsList
+            },
+            ...(input.readOnly && input.historyRows !== undefined ? { history: input.historyRows } : {}),
+          }
           bindFn('sqlOpen', (rootH) => {
             const rawRoot = ctx.dump(rootH) as unknown
             const dbRoot = typeof rawRoot === 'string' ? rawRoot : null
@@ -937,6 +1015,7 @@ export class QuickJsSandbox {
               opTimeMs: BigInt(input.tx?.authorTimestampMs ?? 0),
               readOnly: input.readOnly,
               onMissingCas: (hash) => tripMissing(hash, 'sqlite'),
+              introspection,
             })
             const id = nextDbId++
             openDbs.set(id, db)
@@ -1063,6 +1142,13 @@ export class QuickJsSandbox {
           const key = vmString(nameH)
           const ids = input.topicLastOpIds
           return ids !== undefined && Object.hasOwn(ids, key) ? ctx.newString(ids[key]!) : ctx.null
+        })
+        ctxMethod('authorLastOpId', (authorH) => {
+          const key = authorH === undefined || ctx.typeof(authorH) === 'undefined'
+            ? (input.tx?.author ?? '')
+            : vmString(authorH)
+          const ids = input.authorLastOpIds
+          return key.length > 0 && ids !== undefined && Object.hasOwn(ids, key) ? ctx.newString(ids[key]!) : ctx.null
         })
         const configRes = vmParse(JSON.stringify(input.config ?? null))
         if (configRes.error) { configRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }

@@ -5,10 +5,11 @@ import type {
   SqliteDdlAllowlist,
   SqliteExecOptions,
   SqliteExecResult,
+  SqliteIntrospectionHooks,
   SqliteQueryResult,
 } from '@chronolog/materializer'
 
-export const SQLITE_CAS_BUILTIN_ID = 'sqlite-cas@1#sha256-bbc4674a5dd1d11962a8227ce5f1118e2e6ed7d00163ea92f1f35781caf46936'
+export const SQLITE_CAS_BUILTIN_ID = 'sqlite-cas@1#sha256-4b2ef04a5c2f285d7df273e3187665d17ade145075f9f5b4816ec1bab0a0b241'
 import type { JsonValue } from '@chronolog/protocol'
 import { MerklePageFile } from './merkle-pages.js'
 
@@ -45,6 +46,7 @@ interface EmscriptenSqliteModule {
   _free(ptr: number): void
   _chronolog_init(): number
   _chronolog_set_context(actorPtr: number, opIdPtr: number, opTimeMs: number): void
+  _chronolog_set_tx_meta(operationIdPtr: number, visibilityPtr: number, isReadOnly: number): void
   _chronolog_set_mode(mode: number): void
   _chronolog_open(): number
   _chronolog_close(db: number): number
@@ -74,6 +76,16 @@ interface EmscriptenSqliteModule {
     truncate(size: number): number
     filesize(): number
     ddlAuthorize(action: number, arg1: string, arg2: string): number
+    topicJson?(name: string): string | null
+    topicLastOpId?(name: string): string | null
+    opOutcome?(opId: string): string | null
+    authorLastOpId?(author: string): string | null
+    topicQueryJson?(topic: string, inputJson: string): string | null
+    topicsCount?(): number
+    topicsCol?(row: number, col: number): string | null
+    historyCount?(): number
+    historyCol?(row: number, col: number): string | null
+    historyNum?(row: number, col: number): number
   }
 }
 
@@ -121,6 +133,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
     const factory = createSqliteCasWasm as (moduleArg?: Record<string, unknown>) => Promise<EmscriptenSqliteModule>
     const mod = await factory(wasmConfig)
     let activeFile: MerklePageFile | null = null
+    let activeIntrospection: SqliteIntrospectionHooks | undefined
     let missingCasError: Error | null = null
     let activeDdl: {
       allow: SqliteDdlAllowlist
@@ -193,6 +206,53 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
         }
         return 0
       },
+      topicJson(name) {
+        return activeIntrospection?.topicJson?.(name) ?? null
+      },
+      topicLastOpId(name) {
+        return activeIntrospection?.topicLastOpId?.(name) ?? null
+      },
+      opOutcome(opId) {
+        return activeIntrospection?.opOutcome?.(opId) ?? null
+      },
+      authorLastOpId(author) {
+        return activeIntrospection?.authorLastOpId?.(author) ?? null
+      },
+      topicQueryJson(topic, inputJson) {
+        return activeIntrospection?.topicQueryJson?.(topic, inputJson) ?? null
+      },
+      topicsCount() {
+        return activeIntrospection?.topics?.length ?? 0
+      },
+      topicsCol(row, col) {
+        const item = activeIntrospection?.topics?.[row]
+        if (item === undefined) return null
+        if (col === 0) return item.topic
+        if (col === 1) return item.lastOpId
+        if (col === 2) return item.stateJson
+        return null
+      },
+      historyCount() {
+        return activeIntrospection?.history?.length ?? 0
+      },
+      historyCol(row, col) {
+        const item = activeIntrospection?.history?.[row]
+        if (item === undefined) return null
+        if (col === 1) return item.opId
+        if (col === 2) return item.author
+        if (col === 3) return item.operationId
+        if (col === 5) return item.visibility
+        if (col === 6) return item.outcome
+        if (col === 7) return item.rejectionCode
+        return null
+      },
+      historyNum(row, col) {
+        const item = activeIntrospection?.history?.[row]
+        if (item === undefined) return 0
+        if (col === 0) return item.seq
+        if (col === 4) return item.authorTimestampMs
+        return 0
+      },
     }
 
     const initRc = mod._chronolog_init()
@@ -263,11 +323,17 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
           onMissingCas: openOpts.onMissingCas,
         })
         activeFile = pageFile
+        activeIntrospection = openOpts.introspection
 
         const setContext = (): void => {
           withCString(mod, openOpts.actor, actorPtr => {
             withCString(mod, openOpts.opId, opIdPtr => {
               mod._chronolog_set_context(actorPtr, opIdPtr, Number(openOpts.opTimeMs))
+            })
+          })
+          withCString(mod, openOpts.introspection?.operationId ?? '', opNamePtr => {
+            withCString(mod, openOpts.introspection?.visibility ?? '', visPtr => {
+              mod._chronolog_set_tx_meta(opNamePtr, visPtr, openOpts.readOnly ? 1 : 0)
             })
           })
         }
@@ -281,6 +347,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
         const ensureOpen = (): void => {
           if (closed) throw new Error('SQLITE_HANDLE_CLOSED')
           activeFile = pageFile
+          activeIntrospection = openOpts.introspection
           setContext()
         }
 
@@ -412,7 +479,10 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
               mod._chronolog_close(db)
               closed = true
             }
-            if (activeFile === pageFile) activeFile = null
+            if (activeFile === pageFile) {
+              activeFile = null
+              activeIntrospection = undefined
+            }
           },
         }
       },

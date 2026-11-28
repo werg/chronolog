@@ -13,6 +13,15 @@ import { STD_FS_SOURCE } from './std/fs.js'
 import { STD_MOUNTS_SOURCE } from './std/mounts.js'
 import { STD_BUILDERS_SOURCE } from './std/builders.js'
 import { STD_REGISTRY_SOURCE } from './std/registry.js'
+import {
+  STD_FINALITY_PREDICATES_SOURCE,
+  STD_GUARDS_SOURCE,
+  STD_QUOTAS_SOURCE,
+  STD_QUEUE_SOURCE,
+  STD_VOTES_SOURCE,
+  STD_SCHEMA_SOURCE,
+  STD_AUDIT_SOURCE,
+} from './std-stdlib-extra.js'
 
 export {
   STD_CRDT_SOURCE,
@@ -23,6 +32,13 @@ export {
   STD_MOUNTS_SOURCE,
   STD_BUILDERS_SOURCE,
   STD_REGISTRY_SOURCE,
+  STD_FINALITY_PREDICATES_SOURCE,
+  STD_GUARDS_SOURCE,
+  STD_QUOTAS_SOURCE,
+  STD_QUEUE_SOURCE,
+  STD_VOTES_SOURCE,
+  STD_SCHEMA_SOURCE,
+  STD_AUDIT_SOURCE,
 }
 
 export const STD_PERMISSIONS_SOURCE = `
@@ -1049,6 +1065,10 @@ function validPolicy(policy) {
   if (policy.kind === 'blockchain-anchor') {
     return typeof policy.chain === 'string' && policy.chain.length > 0 && typeof policy.anchorId === 'string' && policy.anchorId.length > 0;
   }
+  if (policy.kind === 'predicate') {
+    return typeof policy.module === 'string' && policy.module.length > 0 &&
+      (policy.export === undefined || (typeof policy.export === 'string' && policy.export.length > 0));
+  }
   return false;
 }
 
@@ -1277,6 +1297,11 @@ export function stampRowOp(db, tables, options = {}) {
       'CREATE TRIGGER "' + updName + '" AFTER UPDATE ON ' + qTable +
       ' WHEN NEW._last_op_id IS NOT op_id() BEGIN UPDATE ' + qTable +
       ' SET ' + setClause + ' WHERE rowid = NEW.rowid; END',
+      [],
+      { mode: 'admin' },
+    );
+    db.exec(
+      'UPDATE ' + qTable + ' SET ' + setClause + ' WHERE _last_op_id IS NULL',
       [],
       { mode: 'admin' },
     );
@@ -2317,6 +2342,13 @@ export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.
   'chronolog/mounts': STD_MOUNTS_SOURCE,
   'chronolog/builders': STD_BUILDERS_SOURCE,
   'chronolog/registry': STD_REGISTRY_SOURCE,
+  'chronolog/finality-predicates': STD_FINALITY_PREDICATES_SOURCE,
+  'chronolog/guards': STD_GUARDS_SOURCE,
+  'chronolog/quotas': STD_QUOTAS_SOURCE,
+  'chronolog/queue': STD_QUEUE_SOURCE,
+  'chronolog/votes': STD_VOTES_SOURCE,
+  'chronolog/schema': STD_SCHEMA_SOURCE,
+  'chronolog/audit': STD_AUDIT_SOURCE,
 })
 
 export const STANDARD_MODULE_BUILTINS: Readonly<Record<string, readonly ChronologBuiltinName[]>> = Object.freeze({
@@ -2335,6 +2367,13 @@ export const STANDARD_MODULE_BUILTINS: Readonly<Record<string, readonly Chronolo
   'chronolog/mounts': ['chronolog:crypto'],
   'chronolog/builders': ['chronolog:crypto'],
   'chronolog/registry': ['chronolog:sqlite', 'chronolog:crypto'],
+  'chronolog/finality-predicates': ['chronolog:crypto'],
+  'chronolog/guards': [],
+  'chronolog/quotas': [],
+  'chronolog/queue': [],
+  'chronolog/votes': [],
+  'chronolog/schema': [],
+  'chronolog/audit': ['chronolog:crypto'],
 })
 
 export const STANDARD_MODULE_IMPORTS: Readonly<Record<string, string>> = Object.freeze(

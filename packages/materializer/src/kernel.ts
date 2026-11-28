@@ -62,6 +62,8 @@ export interface KernelSnapshot {
   readonly topics: Readonly<Record<string, JsonValue>>
   readonly topicHashes: ReadonlyMap<string, string>
   readonly topicLastOpIds: ReadonlyMap<string, string>
+  readonly authorLastOpIds: ReadonlyMap<string, string>
+  readonly publicAuthorLastOpIds: ReadonlyMap<string, string>
   readonly seenLength: number
   readonly historyDigest: string
   readonly stateRoot: string
@@ -110,6 +112,8 @@ interface KernelMutableState {
   seen: AppendLog<true>
   outcomes: AppendLog<RecordedOpOutcome>
   topicLastOpIds: Map<string, string>
+  authorLastOpIds: Map<string, string>
+  publicAuthorLastOpIds: Map<string, string>
   historyDigest: string
   stateRoot: string
 }
@@ -282,6 +286,8 @@ export class TopicKernel {
   /** Set when a materialize threw mid-replay: the live logs no longer match committed state. */
   #logsDirty = false
   #topicLastOpIds = new Map<string, string>()
+  #authorLastOpIds = new Map<string, string>()
+  #publicAuthorLastOpIds = new Map<string, string>()
   #historyDigest: string = ZERO_HASH
   #stateRoot: string
   #pendingDependencies = new Set<string>()
@@ -327,6 +333,8 @@ export class TopicKernel {
       topics: { ...state.topics },
       topicHashes: new Map(state.topicHashes),
       topicLastOpIds: new Map(state.topicLastOpIds),
+      authorLastOpIds: new Map(state.authorLastOpIds),
+      publicAuthorLastOpIds: new Map(state.publicAuthorLastOpIds),
       seenLength: state.seen.length,
       historyDigest: state.historyDigest,
       stateRoot: state.stateRoot,
@@ -339,6 +347,8 @@ export class TopicKernel {
       topics: { ...this.#topics },
       topicHashes: new Map(this.#topicHashes),
       topicLastOpIds: new Map(this.#topicLastOpIds),
+      authorLastOpIds: new Map(this.#authorLastOpIds),
+      publicAuthorLastOpIds: new Map(this.#publicAuthorLastOpIds),
       seenLength: this.#committedSeenLength,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
@@ -437,6 +447,10 @@ export class TopicKernel {
     return this.#topicLastOpIds.get(topic) ?? null
   }
 
+  authorLastOpId(author: string, options: { readonly publicOnly?: boolean } = {}): string | null {
+    return (options.publicOnly === true ? this.#publicAuthorLastOpIds : this.#authorLastOpIds).get(author) ?? null
+  }
+
   get outcomes(): readonly KernelOperationOutcome[] {
     return this.#outcomes.slice()
   }
@@ -518,6 +532,8 @@ export class TopicKernel {
       orderOpIds: includeSuffix ? orderOpIds : [],
       outcomes: includeSuffix ? this.#outcomes : [],
       topicLastOpIds: Object.fromEntries(this.#topicLastOpIds),
+      authorLastOpIds: Object.fromEntries(this.#authorLastOpIds),
+      publicAuthorLastOpIds: Object.fromEntries(this.#publicAuthorLastOpIds),
     }
   }
 
@@ -598,7 +614,15 @@ export class TopicKernel {
     this.#resetLogs(decodedSeen)
     this.#seenRootCache = { length: this.#committedSeenLength, root: cache.seenOpsRoot }
     this.#topicLastOpIds = new Map(Object.entries(cache.topicLastOpIds ?? {}))
-    for (const o of this.#outcomes) this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
+    this.#authorLastOpIds = new Map(Object.entries(cache.authorLastOpIds ?? {}))
+    this.#publicAuthorLastOpIds = new Map(Object.entries(cache.publicAuthorLastOpIds ?? {}))
+    for (const o of this.#outcomes) {
+      this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
+      if (o.outcome === 'accepted') {
+        if (cache.authorLastOpIds === undefined) this.#authorLastOpIds.set(o.author, o.opId)
+        if (cache.publicAuthorLastOpIds === undefined && o.visibility === 'public') this.#publicAuthorLastOpIds.set(o.author, o.opId)
+      }
+    }
     this.#frontierOpIds = new Set(cache.frontierOpIds)
     this.#frontierOrderLength = cache.frontierOpIds.length
     this.#frontierMaxTimestampMs = BigInt(cache.frontierMaxTimestampMs ?? 0n)
@@ -640,6 +664,8 @@ export class TopicKernel {
     this.#order = []
     this.#outcomes = []
     this.#topicLastOpIds.clear()
+    this.#authorLastOpIds.clear()
+    this.#publicAuthorLastOpIds.clear()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(checkpoint.topics)) : structuredClone(checkpoint.topics)
     this.#topicHashes = computeTopicHashes(this.#topics)
     this.#resetLogs(decodedSeen)
@@ -665,6 +691,8 @@ export class TopicKernel {
     this.#order = []
     this.#outcomes = []
     this.#topicLastOpIds = new Map(Object.entries(cache.topicLastOpIds ?? {}))
+    this.#authorLastOpIds = new Map(Object.entries(cache.authorLastOpIds ?? {}))
+    this.#publicAuthorLastOpIds = new Map(Object.entries(cache.publicAuthorLastOpIds ?? {}))
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
     this.#topicHashes = computeTopicHashes(this.#topics)
     this.#resetLogs(decodedSeen)
@@ -761,6 +789,8 @@ export class TopicKernel {
       seen: this.#seen,
       outcomes: this.#outcomeLog,
       topicLastOpIds: new Map(snap.topicLastOpIds),
+      authorLastOpIds: new Map(snap.authorLastOpIds),
+      publicAuthorLastOpIds: new Map(snap.publicAuthorLastOpIds),
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
     }
@@ -810,6 +840,8 @@ export class TopicKernel {
       this.#topics = work.topics
       this.#topicHashes = work.topicHashes
       this.#topicLastOpIds = work.topicLastOpIds
+      this.#authorLastOpIds = work.authorLastOpIds
+      this.#publicAuthorLastOpIds = work.publicAuthorLastOpIds
       this.#historyDigest = work.historyDigest
       this.#stateRoot = work.stateRoot
       this.#order = nextOrder
@@ -906,10 +938,16 @@ export class TopicKernel {
       return out
     }
 
+    const buildVisibleAuthorLastOpIds = (): Record<string, string> => {
+      const source = isPublicOnPrivate ? work.publicAuthorLastOpIds : work.authorLastOpIds
+      return Object.fromEntries(source)
+    }
+
     // Evaluate signed operation-level assumptions before applying topic updates
     if (core.assumptions !== undefined && core.assumptions.checks.length > 0) {
       const visibleTopicsForAssumptions = isPublicOnPrivate ? filterPublicTopics(work.topics) : work.topics
       const visibleTopicLastOps = buildVisibleTopicLastOpIds()
+      const visibleAuthorLastOps = buildVisibleAuthorLastOpIds()
       let failure: { readonly code: string; readonly detail?: string; readonly checkIndex: number } | null = null
 
       for (let i = 0; i < core.assumptions.checks.length; i++) {
@@ -932,6 +970,19 @@ export class TopicKernel {
           }
           if (st !== 'rejected') {
             failure = { code: 'assumption:expected_rejected', detail: `Expected op ${chk.opId} to be rejected`, checkIndex: i }
+            break
+          }
+        } else if (chk.kind === 'op_present') {
+          const st = visibleOutcome(chk.opId)
+          if (st === null) {
+            failure = { code: 'assumption:missing_op', detail: `Required op ${chk.opId} not present`, checkIndex: i }
+            break
+          }
+        } else if (chk.kind === 'author_last_op') {
+          const targetAuthor = chk.author ?? authorHex
+          const actual = Object.hasOwn(visibleAuthorLastOps, targetAuthor) ? visibleAuthorLastOps[targetAuthor]! : null
+          if (actual !== chk.lastOpId) {
+            failure = { code: 'assumption:author_history_mismatch', detail: `Author ${targetAuthor} lastOpId expected ${String(chk.lastOpId)}, got ${String(actual)}`, checkIndex: i }
             break
           }
         } else if (chk.kind === 'topic_revision') {
@@ -1092,6 +1143,7 @@ export class TopicKernel {
     const emitted: EmittedKernelEvent[] = []
     let ordinal = 0
     const visibleTopicLastOpsForReduce = buildVisibleTopicLastOpIds()
+    const visibleAuthorLastOpsForReduce = buildVisibleAuthorLastOpIds()
 
     for (const update of core.updates) {
       let reducersConfig: ReducersConfig
@@ -1133,6 +1185,8 @@ export class TopicKernel {
           },
           opOutcome: visibleOutcome,
           topicLastOpIds: visibleTopicLastOpsForReduce,
+          authorLastOpIds: visibleAuthorLastOpsForReduce,
+          txVisibility: core.visibility,
           topics: visibleTopics,
           topicHash,
           ...(binding.config === undefined ? {} : { config: binding.config }),
@@ -1220,6 +1274,10 @@ export class TopicKernel {
     for (const u of core.updates) {
       work.topicLastOpIds.set(u.topic, opIdHex)
     }
+    work.authorLastOpIds.set(authorHex, opIdHex)
+    if (core.visibility === 'public') {
+      work.publicAuthorLastOpIds.set(authorHex, opIdHex)
+    }
     work.stateRoot = stateRootFromHashes(work.topicHashes)
     work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'accepted', null, emitted)
 
@@ -1257,10 +1315,41 @@ export class TopicKernel {
     const binding = reducersConfig.topics[topic]
     const state = Object.hasOwn(sourceTopics, topic) ? sourceTopics[topic]! : null
     if (binding === undefined) return structuredClone(state)
-    const casPartition: CasPartition = (this.genesis.privateLog && isControlTopic(topic)) ? 'public' : 'private'
-    const visibleTopics = (this.genesis.privateLog && isControlTopic(topic))
+    const isPublicOnly = this.genesis.privateLog && isControlTopic(topic)
+    const casPartition: CasPartition = isPublicOnly ? 'public' : 'private'
+    const visibleTopics = isPublicOnly
       ? filterPublicTopics(sourceTopics)
       : sourceTopics
+    const visibleTopicLastOps: Record<string, string> = {}
+    for (const [tName, lastId] of this.#topicLastOpIds) {
+      if (isPublicOnly && !isControlTopic(tName)) continue
+      visibleTopicLastOps[tName] = lastId
+    }
+    const visibleAuthorLastOps = Object.fromEntries(isPublicOnly ? this.#publicAuthorLastOpIds : this.#authorLastOpIds)
+    const visibleOpOutcome = (opId: string): 'accepted' | 'rejected' | null => {
+      const committed = this.#outcomes.length
+      if (!this.#logsDirty) {
+        const hit = this.#outcomeLog.getBefore(opId, committed)
+        if (hit !== undefined) return (isPublicOnly && hit.visibility !== 'public') ? null : hit.outcome
+      }
+      for (let i = committed - 1; i >= 0; i--) {
+        const o = this.#outcomes[i]!
+        if (o.opId === opId) return (isPublicOnly && o.visibility !== 'public') ? null : o.outcome
+      }
+      return null
+    }
+    const historyRows = this.#outcomes
+      .filter(o => !isPublicOnly || o.visibility === 'public')
+      .map((o, idx) => ({
+        seq: this.#frontierOrderLength + idx,
+        opId: o.opId,
+        author: o.author,
+        operationId: o.operationId,
+        authorTimestampMs: Number(o.authorTimestampMs),
+        visibility: o.visibility,
+        outcome: o.outcome,
+        rejectionCode: o.rejectionCode,
+      }))
     const res = await this.sandbox.invoke({
       imports: reducersConfig.imports,
       builtins: reducersConfig.runtime.builtins,
@@ -1270,6 +1359,10 @@ export class TopicKernel {
       method: 'query',
       state,
       payload: normalizedInput,
+      opOutcome: visibleOpOutcome,
+      topicLastOpIds: visibleTopicLastOps,
+      authorLastOpIds: visibleAuthorLastOps,
+      historyRows,
       topics: visibleTopics,
       ...(topicsOverride === undefined ? { topicHash: (name: string) => this.#topicHashes.get(name) } : {}),
       ...(binding.config === undefined ? {} : { config: binding.config }),
@@ -1333,6 +1426,8 @@ export class TopicKernel {
       seen: this.#seen.clone(snap.seenLength),
       outcomes: this.#outcomeLog.clone(snapIndex),
       topicLastOpIds: new Map(snap.topicLastOpIds),
+      authorLastOpIds: new Map(snap.authorLastOpIds),
+      publicAuthorLastOpIds: new Map(snap.publicAuthorLastOpIds),
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
     }
@@ -1436,6 +1531,70 @@ export class TopicKernel {
       return scope
     }
     return this.#stateRoot
+  }
+
+  /**
+   * Create a deterministic `FinalityPredicateVerifier` that evaluates `$finality` policies
+   * with `kind: 'predicate'` by running the hash-pinned ES Module / `chronolog-pkg/v1` /
+   * pure-WASM module declared in `$reducers` against the public control state and checkpoint
+   * evidence. Runs identically on browsers, Node agents, and blind Cloudflare Worker hosts.
+   */
+  createFinalityPredicateVerifier(): (
+    policy: { readonly kind: 'predicate'; readonly module: string; readonly export?: string; readonly config?: JsonValue },
+    checkpoint: unknown,
+  ) => Promise<boolean> {
+    const toJsonSafe = (value: unknown, depth = 0): JsonValue => {
+      if (depth > 16 || value === null || value === undefined) return null
+      if (typeof value === 'boolean' || typeof value === 'string') return value
+      if (typeof value === 'number') return Number.isFinite(value) ? value : String(value)
+      if (typeof value === 'bigint') return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(Number.MIN_SAFE_INTEGER) ? Number(value) : value.toString()
+      if (value instanceof Uint8Array) return bytesToHex(value)
+      if (Array.isArray(value)) return value.map(item => toJsonSafe(item, depth + 1))
+      if (typeof value === 'object') {
+        const out: Record<string, JsonValue> = {}
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          if (v !== undefined) out[k] = toJsonSafe(v, depth + 1)
+        }
+        return out
+      }
+      return null
+    }
+    return async (policy, checkpoint): Promise<boolean> => {
+      let reducersConfig: ReducersConfig
+      try { reducersConfig = assertValidReducersConfig(this.#topics.$reducers) } catch { return false }
+      const visibleControlTopics = filterPublicTopics(this.#topics)
+      const payload: JsonValue = {
+        policy: toJsonSafe(policy),
+        checkpoint: toJsonSafe(checkpoint),
+      }
+      try {
+        const res = await this.sandbox.invoke({
+          imports: reducersConfig.imports,
+          builtins: reducersConfig.runtime.builtins,
+          topicBindings: reducersConfig.topics,
+          moduleSpecifier: policy.module,
+          exportName: policy.export ?? 'default',
+          method: 'query',
+          state: visibleControlTopics.$finality ?? null,
+          payload,
+          topics: visibleControlTopics,
+          ...(policy.config === undefined ? {} : { config: policy.config }),
+          cas: this.cas,
+          casPartition: 'public',
+          readOnly: true,
+          maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
+          ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
+        })
+        if (!res.ok) return false
+        if (res.value === true) return true
+        if (res.value !== null && typeof res.value === 'object' && !Array.isArray(res.value)) {
+          return (res.value as Readonly<Record<string, JsonValue>>).admitted === true
+        }
+        return false
+      } catch {
+        return false
+      }
+    }
   }
 
   /** Evaluate signal authorization policy for the current stateRoot (cached by caller per stateRoot). */

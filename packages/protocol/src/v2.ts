@@ -127,7 +127,9 @@ export interface TopicUpdate {
 export type OperationAssumption =
   | { readonly kind: 'op_accepted'; readonly opId: string }
   | { readonly kind: 'op_rejected'; readonly opId: string }
+  | { readonly kind: 'op_present'; readonly opId: string }
   | { readonly kind: 'topic_revision'; readonly topic: string; readonly lastOpId: string | null }
+  | { readonly kind: 'author_last_op'; readonly author?: string; readonly lastOpId: string | null }
   | { readonly kind: 'query_match'; readonly topic: string; readonly query: JsonValue; readonly expect: JsonValue }
 
 export interface OperationAssumptionsConfig {
@@ -418,7 +420,7 @@ export function normalizeAssumptionsConfig(raw: unknown): OperationAssumptionsCo
   const checks: OperationAssumption[] = obj.checks.map((item): OperationAssumption => {
     protocolInvariant(item !== null && typeof item === 'object' && !Array.isArray(item), 'SCHEMA_INVALID', 'Invalid assumption check')
     const rec = item as Record<string, unknown>
-    if (rec.kind === 'op_accepted' || rec.kind === 'op_rejected') {
+    if (rec.kind === 'op_accepted' || rec.kind === 'op_rejected' || rec.kind === 'op_present') {
       protocolInvariant(typeof rec.opId === 'string' && HEX32.test(rec.opId), 'SCHEMA_INVALID', 'Invalid assumption opId')
       return { kind: rec.kind, opId: rec.opId }
     }
@@ -427,6 +429,17 @@ export function normalizeAssumptionsConfig(raw: unknown): OperationAssumptionsCo
       assertValidTopicName(rec.topic)
       protocolInvariant(rec.lastOpId === null || (typeof rec.lastOpId === 'string' && HEX32.test(rec.lastOpId)), 'SCHEMA_INVALID', 'Invalid assumption lastOpId')
       return { kind: 'topic_revision', topic: rec.topic, lastOpId: rec.lastOpId }
+    }
+    if (rec.kind === 'author_last_op') {
+      if (rec.author !== undefined) {
+        protocolInvariant(typeof rec.author === 'string' && HEX32.test(rec.author), 'SCHEMA_INVALID', 'Invalid assumption author')
+      }
+      protocolInvariant(rec.lastOpId === null || (typeof rec.lastOpId === 'string' && HEX32.test(rec.lastOpId)), 'SCHEMA_INVALID', 'Invalid assumption lastOpId')
+      return {
+        kind: 'author_last_op',
+        ...(rec.author === undefined ? {} : { author: rec.author }),
+        lastOpId: rec.lastOpId,
+      }
     }
     if (rec.kind === 'query_match') {
       protocolInvariant(typeof rec.topic === 'string', 'SCHEMA_INVALID', 'Invalid assumption topic')
@@ -674,7 +687,7 @@ export const DEFAULT_RUNTIME_MANIFEST: RuntimeManifest = Object.freeze({
   builtins: Object.freeze({
     'chronolog:crypto': 'crypto@1',
     'chronolog:cas': 'cas@1',
-    'chronolog:sqlite': 'sqlite-cas@1#sha256-bbc4674a5dd1d11962a8227ce5f1118e2e6ed7d00163ea92f1f35781caf46936',
+    'chronolog:sqlite': 'sqlite-cas@1#sha256-4b2ef04a5c2f285d7df273e3187665d17ade145075f9f5b4816ec1bab0a0b241',
     'chronolog:wasm': 'wasm@1',
   }),
 })

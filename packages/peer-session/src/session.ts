@@ -65,6 +65,7 @@ import {
   verifyRecord,
   type ApplicationDescription,
   type BlockchainAnchorVerifier,
+  type FinalityAttestation,
   type FinalityCheckpoint,
   type FinalityCheckpointPayload,
   type FinalityPolicyV2,
@@ -1359,7 +1360,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       if (this.#checkpoints.has(key)) return false
       try {
         const cp = decodeRecord<FinalityCheckpoint>(entry.value)
-        const computedKey = await recordDigest(cp.payload)
+        const computedKey = await recordDigest(cp)
         if (!this.#checkpoints.has(computedKey)) {
           this.#checkpoints.set(computedKey, cp)
           return true
@@ -1686,6 +1687,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           opId,
           authorTimestampMs: input.core.authorTimestampMs,
         })),
+        predicateVerifier: controlKernel.createFinalityPredicateVerifier(),
         ...(this.#blockchainVerifier === undefined ? {} : { blockchainVerifier: this.#blockchainVerifier }),
       })
 
@@ -1962,8 +1964,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       if (assumptions !== undefined) {
         const referencedOpIds = new Set<string>()
         for (const chk of assumptions.checks) {
-          if (chk.kind === 'op_accepted' || chk.kind === 'op_rejected') referencedOpIds.add(chk.opId)
-          else if (chk.kind === 'topic_revision' && chk.lastOpId !== null) referencedOpIds.add(chk.lastOpId)
+          if (chk.kind === 'op_accepted' || chk.kind === 'op_rejected' || chk.kind === 'op_present') referencedOpIds.add(chk.opId)
+          else if ((chk.kind === 'topic_revision' || chk.kind === 'author_last_op') && chk.lastOpId !== null) referencedOpIds.add(chk.lastOpId)
         }
         for (const refId of referencedOpIds) {
           const pub = this.#publicOps.get(refId)
@@ -2235,6 +2237,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   topicLastOpId(topic: string): string | null {
     return this.#kernel.topicLastOpId(topic)
+  }
+
+  authorLastOpId(author?: string): string | null {
+    return this.#kernel.authorLastOpId(author ?? this.identity.publicKey)
   }
 
   /**
@@ -2952,18 +2958,42 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       schedule: parseFinalitySchedule(this.#kernel.topic('$finality')),
     }),
 
-    createCheckpoint: async (options: { readonly throughMs: bigint }): Promise<{
+    createCheckpoint: async (options: {
+      readonly throughMs: bigint
+      readonly attestation?: FinalityAttestation | ((payload: FinalityCheckpointPayload) => FinalityAttestation | Promise<FinalityAttestation>)
+    }): Promise<{
       readonly checkpoint: FinalityCheckpoint
       readonly snapshot: CheckpointBootstrapSnapshot
     }> => {
       return this.#serial(async () => {
         const schedule = parseFinalitySchedule(this.#kernel.topic('$finality'))
-        let active: ScheduledFinalityEntry = schedule[0]!
-        for (const entry of schedule) {
-          if (entry.effectiveAfterMs <= options.throughMs) active = entry
+        const scopeEntries = await Promise.all(schedule.map(async entry => ({
+          entry,
+          scopeId: await policyScopeId(this.logId, entry),
+        })))
+        const closedByScope = new Map<string, bigint>()
+        for (const cp of this.#verifiedFinality.verifiedCheckpoints) {
+          const prev = closedByScope.get(cp.payload.policyScopeId)
+          if (prev === undefined || cp.payload.closedThroughMs > prev) {
+            closedByScope.set(cp.payload.policyScopeId, cp.payload.closedThroughMs)
+          }
         }
+        let activeIdx = 0
+        for (let i = 0; i < scopeEntries.length; i++) {
+          const cur = scopeEntries[i]!
+          if (cur.entry.effectiveAfterMs > options.throughMs) break
+          if (i > 0) {
+            const prev = scopeEntries[i - 1]!
+            if (prev.entry.policy.kind !== 'none') {
+              const prevClosed = closedByScope.get(prev.scopeId)
+              if (prevClosed === undefined || prevClosed < cur.entry.effectiveAfterMs) break
+            }
+          }
+          activeIdx = i
+        }
+        const active = scopeEntries[activeIdx]!.entry
         check(active.policy.kind !== 'none', 'FINALITY_NOT_ACTIVE')
-        const scopeId = await policyScopeId(this.logId, active)
+        const scopeId = scopeEntries[activeIdx]!.scopeId
 
         const all = this.#collectDecryptedKernelInputs()
         const included: KernelOperationInput[] = []
@@ -3006,13 +3036,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           stateRoot: snap.stateRoot,
           inclusions,
         }
-        const sig = await signFinalityCheckpoint(payload, this.device.identity)
+        const attestation: FinalityAttestation = options.attestation === undefined
+          ? { kind: 'signatures', signatures: [await signFinalityCheckpoint(payload, this.device.identity)] }
+          : typeof options.attestation === 'function'
+            ? await options.attestation(payload)
+            : options.attestation
         const checkpoint: FinalityCheckpoint = {
           payload,
-          attestation: { kind: 'signatures', signatures: [sig] },
+          attestation,
         }
 
-        const key = await recordDigest(payload)
+        const key = await recordDigest(checkpoint)
         this.#checkpoints.set(key, checkpoint)
         await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(checkpoint))
         await this.#rematerialize()
@@ -3038,7 +3072,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       await this.#serial(async () => {
         check(checkpoint.payload.logId === this.logId, 'CHECKPOINT_CHAIN_MISMATCH')
         check(checkpoint.payload.stateRoot === snapshot.stateRoot && checkpoint.payload.historyDigest === snapshot.historyDigest, 'CHECKPOINT_SNAPSHOT_MISMATCH')
-        const key = await recordDigest(checkpoint.payload)
+        const key = await recordDigest(checkpoint)
         this.#checkpoints.set(key, checkpoint)
         await this.#store.put(`${this.#prefix}/checkpoint/${key}`, encodeRecord(checkpoint))
         await this.#kernel.bootstrapFromCheckpoint(snapshot)
@@ -3761,7 +3795,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
       for (const cp of facts.checkpoints ?? []) {
         if (cp.payload.logId !== this.logId) continue
-        const key = await recordDigest(cp.payload)
+        const key = await recordDigest(cp)
         if (!this.#checkpoints.has(key)) {
           this.#checkpoints.setFrom(key, cp, source)
           storeBatch.push({ key: `${this.#prefix}/checkpoint/${key}`, value: encodeRecord(cp) })

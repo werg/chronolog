@@ -1,5 +1,5 @@
 import { bytesToHex, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
-import { canonicalEventPayload, type EventPayload } from '@chronolog/protocol'
+import { canonicalEventPayload, type EventPayload, type JsonValue } from '@chronolog/protocol'
 import { check, hex, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from './codec.js'
 
 export type FinalityPolicyV2 =
@@ -7,6 +7,7 @@ export type FinalityPolicyV2 =
   | { readonly kind: 'signed-frontier'; readonly signer: string }
   | { readonly kind: 'fixed-validator'; readonly validators: readonly string[]; readonly threshold: number }
   | { readonly kind: 'blockchain-anchor'; readonly chain: string; readonly anchorId: string }
+  | { readonly kind: 'predicate'; readonly module: string; readonly export?: string; readonly config?: JsonValue }
 
 export interface ScheduledFinalityEntry {
   readonly effectiveAfterMs: bigint
@@ -32,6 +33,7 @@ export interface FinalityCheckpointPayload {
 export type FinalityAttestation =
   | { readonly kind: 'signatures'; readonly signatures: readonly Signed<FinalityCheckpointPayload>[] }
   | { readonly kind: 'blockchain'; readonly blockHeight: number; readonly blockTimestampMs: bigint; readonly proofBytes: string }
+  | { readonly kind: 'evidence'; readonly data: JsonValue }
 
 export interface FinalityCheckpoint {
   readonly payload: FinalityCheckpointPayload
@@ -40,6 +42,11 @@ export interface FinalityCheckpoint {
 
 export type BlockchainAnchorVerifier = (
   policy: Extract<FinalityPolicyV2, { readonly kind: 'blockchain-anchor' }>,
+  checkpoint: FinalityCheckpoint,
+) => boolean | Promise<boolean>
+
+export type FinalityPredicateVerifier = (
+  policy: Extract<FinalityPolicyV2, { readonly kind: 'predicate' }>,
   checkpoint: FinalityCheckpoint,
 ) => boolean | Promise<boolean>
 
@@ -102,8 +109,13 @@ async function verifyAttestationForPolicy(
   policy: FinalityPolicyV2,
   checkpoint: FinalityCheckpoint,
   blockchainVerifier?: BlockchainAnchorVerifier,
+  predicateVerifier?: FinalityPredicateVerifier,
 ): Promise<boolean> {
   if (policy.kind === 'none') return false
+  if (policy.kind === 'predicate') {
+    if (predicateVerifier === undefined) return false
+    return await predicateVerifier(policy, checkpoint)
+  }
   if (policy.kind === 'blockchain-anchor') {
     if (checkpoint.attestation.kind !== 'blockchain' || blockchainVerifier === undefined) return false
     return await blockchainVerifier(policy, checkpoint)
@@ -137,6 +149,7 @@ export async function verifyFinalityV2(options: {
   readonly checkpoints: readonly FinalityCheckpoint[]
   readonly knownOps?: readonly { readonly opId: string; readonly authorTimestampMs: bigint }[]
   readonly blockchainVerifier?: BlockchainAnchorVerifier
+  readonly predicateVerifier?: FinalityPredicateVerifier
 }): Promise<VerifiedFinalityV2> {
   hex(options.logId)
   const scopeEntries = await Promise.all(
@@ -179,7 +192,7 @@ export async function verifyFinalityV2(options: {
       // When prev.entry.policy.kind === 'none', P_i itself attests its bootstrap frontier at >= T1.
     }
 
-    const ok = await verifyAttestationForPolicy(scope.entry.policy, cp, options.blockchainVerifier)
+    const ok = await verifyAttestationForPolicy(scope.entry.policy, cp, options.blockchainVerifier, options.predicateVerifier)
     if (!ok) continue
 
     for (const inc of p.inclusions) {

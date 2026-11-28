@@ -298,6 +298,7 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
       schedule,
       checkpoints: options.checkpoints ?? [],
       knownOps: opList,
+      predicateVerifier: kernel.createFinalityPredicateVerifier(),
       ...(options.anchorVerifier === undefined ? {} : { blockchainVerifier: options.anchorVerifier }),
     })
 

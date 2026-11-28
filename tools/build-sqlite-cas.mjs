@@ -16,7 +16,7 @@ const emcc = join(emsdk, 'upstream/emscripten/emcc')
 
 const exportedFunctions = [
   '_malloc', '_free',
-  '_chronolog_init', '_chronolog_set_context', '_chronolog_set_mode',
+  '_chronolog_init', '_chronolog_set_context', '_chronolog_set_tx_meta', '_chronolog_set_mode',
   '_chronolog_open', '_chronolog_close', '_chronolog_errmsg',
   '_chronolog_changes', '_chronolog_last_insert_rowid', '_chronolog_reset_rowid',
   '_chronolog_prepare', '_chronolog_step', '_chronolog_finalize',

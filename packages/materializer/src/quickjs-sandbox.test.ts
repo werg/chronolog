@@ -129,7 +129,7 @@ describe('QuickJsSandbox ctx', () => {
     }))
     expect(out).toEqual({ ok: true, state: {
       frozen: true,
-      keys: ['topic', 'query', 'mount', 'mountQuery', 'opOutcome', 'topicLastOpId', 'config'],
+      keys: ['topic', 'query', 'mount', 'mountQuery', 'opOutcome', 'topicLastOpId', 'authorLastOpId', 'config'],
       sameTopic: true,
       topic: { v: 1 }, missing: null,
       outcome: ['accepted', 'rejected', null],

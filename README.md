@@ -77,8 +77,8 @@ Chronolog treats builds and compilation the same way it treats state transitions
 Because rollback-and-replay applies to any deterministic reducer over CAS, a full relational database becomes a standard topic reducer (`chronolog/sql`) rather than a bespoke replication protocol:
 
 - **Merkle-paged SQLite + FTS5 + `sqlite-vec` in WebAssembly:** Stock SQLite compiled to static `sqlite-cas.wasm` over a 4 KiB Merkle-paged VFS. Each commit flushes only dirty 4 KiB pages into CAS and returns a 32-byte `dbRoot` hash. Rewinding across `CREATE TABLE`, `ALTER TABLE`, indexes, and triggers is an O(1) pointer swap.
-- **Deterministic SQL profile:** `random()`/`randomblob()` are disabled; `datetime('now')` and `localtime` resolve to UTC `op_time()`; and the host kernel binds `actor()`, `op_id()`, and `op_time()` directly into SQLite.
-- **Declarative optimistic concurrency:** Every `chronolog/sql` transaction supports read-only `preconditions` and `postconditions`, plus operation-level causal assumptions (`afterOps`, `requiresRejected`):
+- **Deterministic SQL profile & read-only Chronolog introspection:** `random()`/`randomblob()` are disabled; `datetime('now')` and `localtime` resolve to UTC `op_time()`; and the host kernel binds `actor()`, `op_id()`, `operation_id()`, `op_time()`, `tx_visibility()`, `chronolog_topic(name)`, `chronolog_topic_last_op(name)`, `chronolog_op(op_id)`, `chronolog_author_last_op([author])`, and `chronolog_topic_query(topic, input_json)` alongside three eponymous read-only virtual tables (`chronolog_tx`, `chronolog_topics`, and query-only `chronolog_history`).
+- **Declarative optimistic concurrency & scoped read-set tracking (`createGuardedTx`):** Every `chronolog/sql` transaction supports read-only `preconditions` (`based_on_row`, `row_matches`, arbitrary SQL) and `postconditions`, plus kernel-level causal assumptions (`afterOps`, `requiresRejected`, `op_present`, `author_last_op`, `topic_revision`, `query_match`). Clients can use `createGuardedTx(session)` (`readRow`, `readSql`, `readQuery`, `requireOwnHistory`, `requireTopicUnchanged`, `addSqlPostcondition`) to automatically compile only the reads performed for a write into signed OCC preconditions without phantom conflicts from UI views:
 
 ```json
 {
@@ -109,7 +109,7 @@ Because rollback-and-replay applies to any deterministic reducer over CAS, a ful
 - **Strict Public/Encrypted Partition & Reusable Blind Host (`@chronolog/peer-session/kernel`):** On `privateLog: true`, `$*` control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, `$mounts`, `$builders`) are mutated ONLY by `public` ops (which can read only `$*` topics and `public` CAS). Application topics are mutated ONLY by `encrypted` ops. Untrusted edge servers (such as Cloudflare Workers) call `replayBlindHostControl()` (`TopicKernel({ blindHostMode: true })`) with zero decryption keys and derive bit-for-bit identical control state and reachable public CAS sets (`collectControlReferencedCasHashes`).
 - **End-to-End Encryption & Offline Reconnect Rewrapping (`$keys`):** Persistent Ed25519 signing + X25519 wrapping identities; HPKE (`DHKEM(X25519)/HKDF-SHA256/AES-256-GCM`) epoch lockboxes. Reconnecting offline peers re-encrypt their exact original signed operation bytes under the newest epoch—preserving original `opId`, `authorTimestampMs`, and signature.
 - **Pluggable Authority (`$permissions`):** `attestedMembers` (host-attested admission + guardian M-of-N recovery), `multisigMembers` (zero-host M-of-N governance), `openMembers` (public logs with blocking/vouching), or custom reducers.
-- **Consensus-Agnostic, Time-Scoped Finality (`$finality`):** Ordering is always canonical via `(authorTimestampMs, author, opId)`. Logs default to `finality: none` (pure CRDT) and can monotonically schedule `signed-frontier`, `fixed-validator`, or `blockchain-anchor` checkpoints at any point in time, with checkpoint-plus-suffix bootstrap producing the exact same `stateRoot` and `revision.digest`.
+- **Consensus-Agnostic, Programmable Time-Scoped Finality (`$finality`):** Ordering is always canonical via `(authorTimestampMs, author, opId)`. Logs default to `finality: none` (pure CRDT) and can monotonically schedule `signed-frontier`, `fixed-validator`, `blockchain-anchor`, or state-defined **`predicate`** policies (`{ kind: 'predicate', module, export?, config? }`) evaluated deterministically in QuickJS-NG/WASM across full peers and blind hosts (`replayBlindHostControl`) against verifiable `evidence` attestations (weighted quorums, optimistic challenge windows, external Merkle anchors, or custom admission rules). Checkpoint-plus-suffix bootstrap produces the exact same `stateRoot` and `revision.digest`.
 - **Reactive Views, Event Forwarding & Ephemeral Signals:** `createLiveView` (coherent snapshots with topic/SQL-table invalidation), `forwardSessionEvents` (with explicit retraction callbacks on suffix rewind), `createViewStore` (local drafts), and `@chronolog/signals` (signed bounded ephemeral live lane governed by `$signal_policy`).
 
 ---
@@ -122,13 +122,20 @@ Chronolog pins a suite of audited ES Modules into public CAS at genesis:
 | --- | --- | --- |
 | **Control Plane** | `chronolog/permissions` | `attestedMembers`, `multisigMembers`, `openMembers`, `adminOnlyReducers`, and `defaultSignalPolicy`. |
 | | `chronolog/keys` | HPKE epoch key lockboxes, epoch rotation, and historical epoch grants. |
-| | `chronolog/finality` | Time-scoped finality schedule (`none`, `signed-frontier`, `fixed-validator`, `blockchain-anchor`). |
+| | `chronolog/finality` | Time-scoped finality schedule (`none`, `signed-frontier`, `fixed-validator`, `blockchain-anchor`, `predicate`). |
+| | `chronolog/finality-predicates` | Programmable admission predicates (`signedFrontierPredicate`, `thresholdQuorumPredicate`, `optimisticChallengePredicate`, `merkleAnchorPredicate`). |
 | | `chronolog/publications` | Signed static application releases referencing public CAS hashes and `chronolog-tree/v1` `treeRoot`. |
 | | `chronolog/mounts` | `verifiedMounts` — Ed25519-signed snapshots of external Chronolog logs queryable via `ctx.mountQuery()`. |
 | | `chronolog/builders` | `attestedBuilders` & `attestedReducers` — M-of-N builder/auditor governance for derivations and reducer upgrades. |
 | **Relational SQL** | `chronolog/sql` | First-class SQLite-CAS topic reducer with migrations, preconditions/postconditions, write RLS, and user-owned DDL. |
-| | `chronolog/rls` | Static `readonly` validation and trigger generation (`applyRls`) for row-level write policies. |
+| | `chronolog/rls` | Static `readonly` validation and trigger generation (`applyRls`, `stampRowOp`, `enableAuditLog`) for row-level write policies. |
 | | `chronolog/sqlite-helpers` | Helpers (`defineSqlReducer`, `withDb`, `rowsToObjects`) for custom SQLite-backed reducers. |
+| **Guards & Patterns** | `chronolog/guards` | Composable JS & SQL pre/post condition helpers (`guardReducer`, `requireAuthorChain`, `requireTopicVersion`, `sqlBasedOnRow`, `sqlRequireAuthorLastOp`). |
+| | `chronolog/quotas` | Deterministic per-author token-bucket rate limits & quotas driven by `tx.authorTimestampMs`. |
+| | `chronolog/queue` | Deterministic job queue with time-based leases, retries, and dead-letter handling. |
+| | `chronolog/votes` | Weighted voting, quorum polls, and timelocked decision tallies. |
+| | `chronolog/schema` | Lightweight deterministic JSON schema validation (`validate`) and versioned `migrateState`. |
+| | `chronolog/audit` | Hash-chained tamper-evident audit log reducer with chain integrity verification. |
 | **Data Structures** | `chronolog/crdt` | Out-of-order-safe LWW maps, sets, and counters. |
 | | `chronolog/text` | RGA collaborative text editing with stable character identifiers. |
 | | `chronolog/ledger` | Double-entry accounts, holds, and allowances. |
