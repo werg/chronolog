@@ -166,4 +166,25 @@ describe('cold open and snapshot bootstrap', () => {
       await Promise.all([sessA.close(), sessB.close()])
     }
   })
+
+  it('attests retention over P2P for peer-authored ops previously synced out-of-band (e.g. host mailbox)', async () => {
+    const { a, b, open } = await fixture(true)
+    const sessA = await open(new MemoryBytesStore(), a)
+    const op = await sessA.command('set', { key: 'k0', value: 42 }, { operationId: 'mailbox-op-1' })
+    expect((await op.materialized()).outcome).toBe('accepted')
+    const exported = await sessA.exportFacts()
+    const sessB = await open(new MemoryBytesStore(), b)
+    try {
+      // Simulate host mailbox delivery before P2P connects
+      await sessB.mergeFacts(exported)
+      expect((await sessB.query('kv', { key: 'k0' })).value).toBe(42)
+      const [la, lb] = await link(sessA, sessB)
+      await Promise.all([la.synchronize(), lb.synchronize()])
+      await until(() => sessA.inspectOperation('mailbox-op-1').retained.some(r => r.signer === b.identity.publicKey))
+      expect(sessA.inspectOperation('mailbox-op-1').retained.some(r => r.signer === b.identity.publicKey)).toBe(true)
+      await Promise.all([la.close(), lb.close()])
+    } finally {
+      await Promise.all([sessA.close(), sessB.close()])
+    }
+  })
 })

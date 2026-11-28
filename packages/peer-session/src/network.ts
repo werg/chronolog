@@ -363,12 +363,15 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       } finally { liveFlush = undefined }
     })()
     stopFacts = session.onFacts((delta: FactsDelta) => {
+      let hasOutOfBand = false
       for (const item of delta.items) {
         if (item.source === connectionId) continue
+        if (item.source === undefined) hasOutOfBand = true
         if (item.scope === 'private' && !privateAllowed()) continue
         livePending.push({ scope: item.scope, id: item.id })
       }
       if (livePending.length > 0) void flushLive().catch(() => close())
+      if (hasOutOfBand && memberVerified) queueOutOfBandReceipts()
     })
 
     // ---- retention receipts (one signature per debounced batch) ----
@@ -378,9 +381,24 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       receiptTimer = undefined
       const items = receiptItems; receiptItems = []
       if (items.length === 0 || signal.aborted) return
-      const evidence = await session.retainMany(items)
-      const own = evidence.find(ev => ev.signer === self)
-      if (own !== undefined) void post({ kind: 'receipt', evidence: own })
+      for (let i = 0; i < items.length; i += 1024) {
+        const chunk = items.slice(i, i + 1024)
+        const evidence = await session.retainMany(chunk)
+        const own = evidence.find(ev => ev.signer === self)
+        if (own !== undefined) void post({ kind: 'receipt', evidence: own })
+      }
+    }
+    const scheduleReceipts = (): void => {
+      if (receiptItems.length > 0 && receiptTimer === undefined) {
+        receiptTimer = setTimeout(() => { void flushReceipts().catch(() => undefined) }, 25)
+      }
+    }
+    const queueOutOfBandReceipts = (): void => {
+      if (signal.aborted) return
+      for (const proposalId of session.unreceiptedProposalIdsByAuthor(peerId, privateAllowed())) {
+        receiptItems.push({ proposalId })
+      }
+      scheduleReceipts()
     }
     const queueReceipts = (facts: WireFacts): void => {
       for (const raw of facts.publicOps) {
@@ -389,9 +407,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       for (const raw of facts.encryptedEnvelopes) {
         try { receiptItems.push({ proposalId: bytesToHex(decodeEncryptedEnvelope(raw).opId) }) } catch { /* ignore */ }
       }
-      if (receiptItems.length > 0 && receiptTimer === undefined) {
-        receiptTimer = setTimeout(() => { void flushReceipts().catch(() => undefined) }, 25)
-      }
+      scheduleReceipts()
     }
 
     // ---- on-demand CAS pull (modules, packages, reducer-read nodes, SQLite pages); derived CAS is never pushed ----
@@ -490,6 +506,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       verifyMember()
       if (session.genesis.privateLog) await requestSnapshot()
       await runRound('private')
+      queueOutOfBandReceipts()
       void post({ kind: 'ready' })
       markReady()
     }
@@ -519,6 +536,8 @@ export async function connectApplicationPeer(session: ApplicationSession, option
                 verifyMember()
                 // Posted before the ack, so the peer serves it before starting the private round.
                 if (session.genesis.privateLog) void requestSnapshot()
+              } else if (message.scope === 'private') {
+                queueOutOfBandReceipts()
               }
               void post({ kind: 'ack', requestId: message.round })
               break

@@ -3237,6 +3237,31 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return items.map(item => this.#retentions.get(item.proposalId)!.get(this.identity.publicKey)!)
   }
 
+  /**
+   * Return `proposalId`s authored by `authorPublicKey` that this replica holds durably
+   * (public ops and/or encrypted envelopes) and has not yet signed its own retention receipt for.
+   * Used after P2P sync reconciliation to attest operations received out-of-band (e.g. host mailbox)
+   * without re-signing or resending receipts on unchanged reconnects.
+   */
+  unreceiptedProposalIdsByAuthor(authorPublicKey: string, includePrivate: boolean): string[] {
+    const self = this.identity.publicKey
+    const ids: string[] = []
+    for (const [opId, op] of this.#publicOps) {
+      if (bytesToHex(op.core.author) === authorPublicKey && this.#retentions.get(opId)?.get(self) === undefined) {
+        ids.push(opId)
+      }
+    }
+    if (includePrivate) {
+      for (const env of this.#encryptedEnvelopes.values()) {
+        if (bytesToHex(env.envelope.author) === authorPublicKey) {
+          const opId = bytesToHex(env.envelope.opId)
+          if (this.#retentions.get(opId)?.get(self) === undefined) ids.push(opId)
+        }
+      }
+    }
+    return ids
+  }
+
 
   // ---- Facts export & merge (P2P + blind host sync) ----
 
