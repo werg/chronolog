@@ -11,6 +11,7 @@ import {
   reconcileRanges,
   type ReconcileRange,
 } from './reconcile.js'
+export { FactIdSet } from './reconcile.js'
 import { normalizeVerifiedCasNode, type MirrorCasNode } from './cas-mirror.js'
 
 const HEX32 = /^[0-9a-f]{64}$/u
