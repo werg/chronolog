@@ -4,8 +4,8 @@ import type {
   InBandSignalingHandle, InBandSignalingOptions, PeerMediaController,
   PeerStreamsController, RtcSignalMessage, WebRtcSession,
 } from '@chronolog/transport-webrtc'
-import { bytesToHex, sha256Sync } from '@chronolog/canonical'
-import { decodeEncryptedEnvelope, decodeOperationCore, decodeSignedOperation, encryptedEnvelopeDigest, operationIdDigest } from '@chronolog/protocol'
+import { bytesToHex } from '@chronolog/canonical'
+import { decodeEncryptedEnvelope, decodeSignedOperation, operationIdDigest } from '@chronolog/protocol'
 import { check, signRecord, verifyRecord, type Signed } from '@chronolog/authority'
 import type { FinalityCheckpoint } from '@chronolog/authority'
 import type { RetentionEvidence } from './operation.js'
@@ -361,7 +361,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     })
 
     // ---- retention receipts (one signature per debounced batch) ----
-    let receiptItems: { proposalId: string; author: string; envelopeDigest: string }[] = []
+    let receiptItems: { proposalId: string }[] = []
     let receiptTimer: ReturnType<typeof setTimeout> | undefined
     const flushReceipts = async (): Promise<void> => {
       receiptTimer = undefined
@@ -373,27 +373,17 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     }
     const queueReceipts = (facts: WireFacts): void => {
       for (const raw of facts.publicOps) {
-        try {
-          const signed = decodeSignedOperation(raw)
-          receiptItems.push({
-            proposalId: bytesToHex(operationIdDigest(signed.coreBytes)),
-            author: bytesToHex(decodeOperationCore(signed.coreBytes).author),
-            envelopeDigest: bytesToHex(sha256Sync(raw)),
-          })
-        } catch { /* invalid facts were rejected by merge */ }
+        try { receiptItems.push({ proposalId: bytesToHex(operationIdDigest(decodeSignedOperation(raw).coreBytes)) }) } catch { /* rejected by merge */ }
       }
       for (const raw of facts.encryptedEnvelopes) {
-        try {
-          const env = decodeEncryptedEnvelope(raw)
-          receiptItems.push({ proposalId: bytesToHex(env.opId), author: bytesToHex(env.author), envelopeDigest: bytesToHex(encryptedEnvelopeDigest(raw)) })
-        } catch { /* ignore */ }
+        try { receiptItems.push({ proposalId: bytesToHex(decodeEncryptedEnvelope(raw).opId) }) } catch { /* ignore */ }
       }
       if (receiptItems.length > 0 && receiptTimer === undefined) {
         receiptTimer = setTimeout(() => { void flushReceipts().catch(() => undefined) }, 25)
       }
     }
 
-    // ---- on-demand CAS pull (modules, reducer-read nodes, SQLite pages); derived CAS is never pushed ----
+    // ---- on-demand CAS pull (modules, packages, reducer-read nodes, SQLite pages); derived CAS is never pushed ----
     const casRequests = new Map<string, { resolve(): void; reject(error: unknown): void }>()
     const requestedCas = new Set<string>()
     const pullMissingCas = async (): Promise<void> => {
@@ -470,7 +460,6 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       void post({ kind: 'ready' })
       markReady()
     }
-
     let contentTail: Promise<void> = Promise.resolve()
     void (async () => {
       try {

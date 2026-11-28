@@ -18,7 +18,7 @@ Use `createLogGenesis()` from `@chronolog/peer-session`:
 
 ## 3. Replication & Reconnect Rewrapping
 
-Peers exchange `SessionFacts` (`publicOps`, `encryptedEnvelopes`, `casNodes`, `retentions`, `checkpoints`) over authenticated `ApplicationSecureChannel` connections (WebRTC or WebSocket) or via `exportFacts()` / `mergeFacts()`:
+Peers exchange facts over authenticated `ApplicationSecureChannel` connections (WebRTC or WebSocket) with the sync-v3 protocol described in [Performance](PERFORMANCE.md) (range-fingerprint reconciliation, live push, on-demand CAS pull), or transport-agnostically via `exportFacts()` / `mergeFacts()`:
 - Encrypted envelopes are tracked by `encryptedEnvelopeDigest`, never by `opId` alone.
 - If Peer B authored offline at epoch `0` while Peer A rotated to epoch `1`, Peer B unseals epoch `1` from `$keys` upon reconnecting, automatically re-encrypts its exact original signed bytes under epoch `1`, and syncs the new envelope digest so all peers converge with identical `opId` and `stateRoot`.
 

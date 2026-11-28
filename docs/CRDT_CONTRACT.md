@@ -18,7 +18,7 @@ On chains with `privateLog: true`:
 - Control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, `$mounts`, `$builders`) may ONLY be mutated by `visibility: 'public'` operations.
 - Public operations can ONLY read `$*` topics and `public` CAS nodes.
 - Application (non-`$`) topics may ONLY be mutated by `visibility: 'encrypted'` operations (wrapped in `EncryptedOperationEnvelope` under an epoch key).
-- Idempotency deduplication is scoped by `(visibility, author, operationId)` and authenticated in `seenOpsRoot` (stored in CAS).
+- Idempotency deduplication is scoped by `(visibility, author, operationId)`. The consumed-key set is a deterministic function of the ordered history (committed by `historyDigest`) and is committed as a `seenOpsRoot` CAS node whenever state is exported (materialized cache, snapshot bundle, checkpoint bootstrap).
 
 **Guarantee:** A blind host (`blindHostMode: true`) that holds zero decryption keys and replays only public operations derives bit-for-bit identical `$*` control topic state to every full replica, even under adversarial cross-partition `(author, operationId)` collisions.
 
@@ -42,11 +42,12 @@ Execution invariants:
 ## 4. State Root, Rolling History Digest & Revision Identity
 
 After each operation:
-- `stateRoot = hashDomain('state', cbor({ seenOpsRoot, topics }))`
+- `topicHash(t) = hashDomain('topic', canonicalCbor(topics[t]))`, recomputed only for topics the operation changed
+- `stateRoot = hashDomain('state', cbor({ [topic]: topicHash }))` (state domain `chronolog/state/v3`)
 - `historyDigest = hashDomain('history', cbor([prevHistoryDigest, opId, outcome, rejectionCode, canonicalEvents]))`
 - `revision.digest = hashDomain('revision', cbor([historyDigest, stateRoot, view, policyContextDigest]))`
 
-Committing to `seenOpsRoot` and `historyDigest` ensures that checkpoint bootstrap plus suffix replay produces the exact same `stateRoot` AND `revision.digest` as a cold replay from genesis.
+Checkpoints and snapshots carry `topics`, `seenOpsRoot` and `historyDigest`; restoring them and replaying the suffix produces the exact same `stateRoot` AND `revision.digest` as a cold replay from genesis. Per-operation cost is O(changed state), not O(history): no per-op seen-set node, no whole-state clone, no whole-map state hash.
 
 ## 5. Keys, Rotation & Reconnect Rewrapping (`$keys`)
 

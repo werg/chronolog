@@ -1,0 +1,72 @@
+[
+  {
+    "reducer": "sql",
+    "n": 100,
+    "privateLog": true,
+    "submit": {
+      "totalMs": 2830.738484,
+      "firstDecileMsPerOp": 33.5143019,
+      "lastDecileMsPerOp": 27.865259099999957,
+      "counters": {}
+    },
+    "reopen": {
+      "ms": 106.74212899999975,
+      "counters": {}
+    },
+    "coldSync": {
+      "ms": 1515.4664750000002,
+      "bytesAtoB": 4456384,
+      "bytesBtoA": 700603,
+      "framesAtoB": 94,
+      "framesBtoA": 18,
+      "counters": {}
+    },
+    "liveLatency": {
+      "medianMs": 62.53991700000006,
+      "maxMs": 77.07729000000018,
+      "bytesPerOpAtoB": 45509.65,
+      "counters": {}
+    },
+    "reconnect": {
+      "ms": 2286.804486,
+      "bytesAtoB": 5544266,
+      "bytesBtoA": 5495761,
+      "counters": {}
+    }
+  },
+  {
+    "reducer": "sql",
+    "n": 400,
+    "privateLog": true,
+    "submit": {
+      "totalMs": 10570.996959999999,
+      "firstDecileMsPerOp": 24.575482274999878,
+      "lastDecileMsPerOp": 28.806829649999692,
+      "counters": {}
+    },
+    "reopen": {
+      "ms": 348.9434419999998,
+      "counters": {}
+    },
+    "coldSync": {
+      "ms": 9002.667511,
+      "bytesAtoB": 28193496,
+      "bytesBtoA": 700603,
+      "framesAtoB": 577,
+      "framesBtoA": 18,
+      "counters": {}
+    },
+    "liveLatency": {
+      "medianMs": 253.62419899999804,
+      "maxMs": 342.9608350000017,
+      "bytesPerOpAtoB": 116075.2,
+      "counters": {}
+    },
+    "reconnect": {
+      "ms": 18634.534691,
+      "bytesAtoB": 30793710,
+      "bytesBtoA": 30794391,
+      "counters": {}
+    }
+  }
+]

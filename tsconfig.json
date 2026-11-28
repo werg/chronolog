@@ -7,6 +7,7 @@
     "packages/**/*.ts",
     "test/**/*.ts",
     "tools/**/*.ts",
+    "bench/**/*.ts",
     "vitest.config.ts"
   ]
 }

@@ -132,11 +132,14 @@ export interface ReducerInvocationInput {
     readonly operationId: string
   }
   readonly conflict?: AssumptionFailureInfo
+  /** Lazy outcome lookup for ops visible to this invocation (never serialized wholesale into the VM). */
   readonly opOutcome?: (opId: string) => 'accepted' | 'rejected' | null
   readonly opOutcomes?: Readonly<Record<string, 'accepted' | 'rejected'>>
   readonly topicLastOpIds?: Readonly<Record<string, string>>
+  /** Visible topic states; read lazily by `ctx.topic()` / `ctx.query()` through host calls. */
   readonly topics: Readonly<Record<string, JsonValue>>
-  readonly topicHash?: (name: string) => string | undefined
+  /** Optional precomputed content hash of a visible topic state (memoization key for nested queries). */
+  readonly topicHash?: (topic: string) => string | undefined
   readonly config?: JsonValue
   readonly cas: ContentAddressedStore
   readonly casPartition: CasPartition
@@ -477,7 +480,7 @@ export class QuickJsSandbox {
                   : input.method === 'derive'
                     ? 'fn(env.payload, ctx)'
                     : 'fn(env.state, ctx)'
-            return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const ctx = Object.freeze({ topic(name) { return Object.prototype.hasOwnProperty.call(env.topics, name) ? env.topics[name] : null; }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, mount(name) { const m = env.topics.$mounts; return m && typeof m === 'object' && m.mounts && Object.prototype.hasOwnProperty.call(m.mounts, String(name)) ? m.mounts[String(name)] : null; }, mountQuery(name, topic, input = null) { return JSON.parse(globalThis.__chronologHost.queryMount(String(name), String(topic), JSON.stringify(input === undefined ? null : input))); }, opOutcome(opId) { return JSON.parse(globalThis.__chronologHost.opOutcome(String(opId))); }, topicLastOpId(name) { const key = String(name); return env.topicLastOpIds && Object.prototype.hasOwnProperty.call(env.topicLastOpIds, key) ? env.topicLastOpIds[key] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${callExpr}; return JSON.stringify({ __ok: true, value: out }); };`
+            return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const topicCache = new Map(); const readTopicCached = (name) => { const key = String(name); if (!topicCache.has(key)) topicCache.set(key, JSON.parse(globalThis.__chronologHost.readTopic(key))); return topicCache.get(key); }; const ctx = Object.freeze({ topic(name) { return readTopicCached(name); }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, mount(name) { const m = readTopicCached('$mounts'); return m && typeof m === 'object' && m.mounts && Object.prototype.hasOwnProperty.call(m.mounts, String(name)) ? m.mounts[String(name)] : null; }, mountQuery(name, topic, input = null) { return JSON.parse(globalThis.__chronologHost.queryMount(String(name), String(topic), JSON.stringify(input === undefined ? null : input))); }, opOutcome(opId) { return JSON.parse(globalThis.__chronologHost.opOutcome(String(opId))); }, topicLastOpId(name) { const key = String(name); return env.topicLastOpIds && Object.prototype.hasOwnProperty.call(env.topicLastOpIds, key) ? env.topicLastOpIds[key] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${callExpr}; return JSON.stringify({ __ok: true, value: out }); };`
           }
           if (moduleName.startsWith('pkg:')) {
             const rest = moduleName.slice(4)
@@ -578,7 +581,6 @@ export class QuickJsSandbox {
             try {
               const inspected = this.#inspectCasModuleSync(pkgHash, input.cas, readPartition, h => tripMissing(h, 'module'))
               if (inspected.kind === 'package') {
-                // Exact specifier match in pkg.dependencies first (supports 'chronolog/rls' or '@scope/pkg/sub')
                 const exactDep = inspected.pkg.dependencies[requestedName]
                 if (exactDep !== undefined) {
                   return resolveCasTargetToCanonical(exactDep, '.')
@@ -608,7 +610,6 @@ export class QuickJsSandbox {
           return { error: new Error(`MODULE_NOT_FOUND:${requestedName}`) }
         },
       )
-
       perfCount('vm.newContext')
       const ctx = runtime.newContext()
       try {
@@ -626,6 +627,20 @@ export class QuickJsSandbox {
           ctx.setProp(hostObj, name, handle)
           handle.dispose()
         }
+
+        bindFn('readTopic', (topicH) => {
+          const topicName = ctx.getString(topicH)
+          return ctx.newString(JSON.stringify(Object.hasOwn(input.topics, topicName) ? input.topics[topicName]! : null))
+        })
+
+        bindFn('opOutcome', (opIdH) => {
+          const key = ctx.getString(opIdH)
+          if (input.opOutcome !== undefined) {
+            return ctx.newString(JSON.stringify(input.opOutcome(key)))
+          }
+          const val = input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, key) ? input.opOutcomes[key]! : null
+          return ctx.newString(JSON.stringify(val))
+        })
 
         bindFn('queryTopic', (topicH, inputJsonH) => {
           if (depth >= 4) throw new Error('TOPIC_QUERY_DEPTH_EXCEEDED')
@@ -765,15 +780,6 @@ export class QuickJsSandbox {
             throw new Error(`MOUNT_QUERY_FAILED:${nestedRes.code}:${nestedRes.detail ?? ''}`)
           }
           return ctx.newString(JSON.stringify(nestedRes.value))
-        })
-
-        bindFn('opOutcome', (opIdH) => {
-          const key = ctx.getString(opIdH)
-          if (input.opOutcome !== undefined) {
-            return ctx.newString(JSON.stringify(input.opOutcome(key)))
-          }
-          const val = input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, key) ? input.opOutcomes[key]! : null
-          return ctx.newString(JSON.stringify(val))
         })
 
         bindFn('sha256', (dataHandle) => {
@@ -919,7 +925,6 @@ export class QuickJsSandbox {
           tx: input.tx === undefined ? null : { ...input.tx, payload: input.payload },
           conflict: input.conflict ?? null,
           topicLastOpIds: input.topicLastOpIds ?? {},
-          topics: input.topics,
           config: input.config ?? null,
         })
         const envHandle = ctx.newString(envJson)

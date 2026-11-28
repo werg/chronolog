@@ -15,7 +15,8 @@ export interface RetentionStatement {
   readonly applicationId: string
   readonly peer: string
   readonly storageId: string
-  readonly items: readonly { readonly proposalId: string; readonly author: string; readonly envelopeDigest: string }[]
+  /** Proposal ids retained (any envelope version of an op carries the same signed operation). */
+  readonly items: readonly string[]
 }
 
 export type RetentionEvidence = Signed<RetentionStatement>

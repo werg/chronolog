@@ -37,7 +37,7 @@ export default {
 `
 
 const SQL_REDUCER = `
-import { open as openDb } from 'chronolog:sqlite';
+import { openDb } from 'chronolog:sqlite';
 export default {
   reduce(state, tx) {
     const db = openDb(state);
@@ -88,9 +88,19 @@ async function until(predicate: () => Promise<boolean> | boolean, timeoutMs = 60
 
 const debug = (...args: unknown[]): void => { if (process.env.BENCH_DEBUG) console.error('[bench]', ...args) }
 
+type Counters = Record<string, number>
+interface ScenarioResult {
+  reducer: string; n: number; privateLog: boolean
+  submit: { totalMs: number; firstDecileMsPerOp: number; lastDecileMsPerOp: number; counters: Counters }
+  reopen: { ms: number; counters: Counters }
+  coldSync: { ms: number; bytesAtoB: number; bytesBtoA: number; framesAtoB: number; framesBtoA: number; counters: Counters }
+  liveLatency: { medianMs: number; maxMs: number; bytesPerOpAtoB: number; counters: Counters }
+  reconnect: { ms: number; bytesAtoB: number; bytesBtoA: number; counters: Counters }
+}
+
 function median(values: number[]): number { const s = [...values].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]! }
 
-async function scenario(reducer: string, n: number) {
+async function scenario(reducer: string, n: number): Promise<ScenarioResult> {
   const [a, b] = await Promise.all([member(), member()])
   const created = await createLogGenesis({
     creator: { publicKey: a.identity.publicKey, wrapKey: a.wrap.publicKey, reader: true, writer: true, administrator: true },
@@ -105,7 +115,7 @@ async function scenario(reducer: string, n: number) {
     device: await openApplicationDevice({ store, create: true, managedSigner: m.identity, managedWrapKey: m.wrap }),
     genesis: created.genesisBytes, casNodes: created.casNodes, ...(epochKeys === undefined ? {} : { epochKeys }),
   })
-  const result: Record<string, unknown> = { reducer, n, privateLog }
+  const result = { reducer, n, privateLog } as ScenarioResult
 
   // submit
   let sessA = await open(storeA, a)
@@ -115,7 +125,8 @@ async function scenario(reducer: string, n: number) {
   for (let i = 0; i < n; i++) {
     const t = performance.now()
     const op = await sessA.command('set', { key: `k${i % 50}`, value: i }, { authorTimestampMs: BigInt(1_000 + i) })
-    await op.materialized()
+    const materialized = await op.materialized()
+    if (materialized.outcome !== 'accepted') throw new Error(`bench op rejected: ${materialized.rejectionCode ?? ''} ${materialized.rejectionDetail ?? ''}`)
     perOp.push(performance.now() - t)
   }
   const decile = Math.max(1, Math.floor(n / 10))
@@ -162,7 +173,10 @@ async function scenario(reducer: string, n: number) {
     const op = await sessA.command('set', { key: 'live', value: i }, { authorTimestampMs: BigInt(10_000_000 + i) })
     await op.materialized()
     const target = sessA.revision().digest
-    await until(() => sessB.revision().digest === target)
+    await until(() => sessB.revision().digest === target, Number(process.env.BENCH_LIVE_TIMEOUT ?? 600_000)).catch((error: unknown) => {
+      debug('live stall', i, { a: sessA.revision(), b: sessB.revision(), aStatus: sessA.status, bStatus: sessB.status })
+      throw error
+    })
     lat.push(performance.now() - t)
   }
   result.liveLatency = { medianMs: median(lat), maxMs: Math.max(...lat), bytesPerOpAtoB: (meterA.bytes - liveMeter.bytes) / 20, counters: perfCounters() }
@@ -186,7 +200,7 @@ async function scenario(reducer: string, n: number) {
   return result
 }
 
-function fmt(r: Record<string, any>): string {
+function fmt(r: ScenarioResult): string {
   const kb = (x: number) => `${(x / 1024).toFixed(1)}KiB`
   return [
     `${r.reducer} N=${r.n}`,
@@ -198,10 +212,10 @@ function fmt(r: Record<string, any>): string {
   ].join(' | ')
 }
 
-const results = []
+const results: ScenarioResult[] = []
 for (const reducer of reducers) for (const n of sizes) {
   const r = await scenario(reducer, n)
   results.push(r)
   console.log(fmt(r))
 }
-if (jsonOut !== undefined) await writeFile(jsonOut, JSON.stringify(results, (_k, v) => typeof v === 'bigint' ? v.toString() : v, 2))
+if (jsonOut !== undefined) await writeFile(jsonOut, JSON.stringify(results, (_k, v: unknown) => typeof v === 'bigint' ? v.toString() : v, 2))

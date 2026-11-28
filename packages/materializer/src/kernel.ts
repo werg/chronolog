@@ -111,6 +111,11 @@ class AppendLog<V> {
     const entry = this.#map.get(key)
     return entry !== undefined && entry.pos < limit && this.keys[entry.pos] === key ? entry.value : undefined
   }
+  /** Position of `key` if present below `limit`. */
+  positionBefore(key: string, limit: number): number | undefined {
+    const entry = this.#map.get(key)
+    return entry !== undefined && entry.pos < limit && this.keys[entry.pos] === key ? entry.pos : undefined
+  }
   add(key: string, value: V): void {
     if (this.#map.has(key)) return
     this.#map.set(key, { value, pos: this.keys.length }); this.keys.push(key)
@@ -143,6 +148,8 @@ interface KernelMutableState {
 export interface KernelMaterializeResult {
   readonly revision: KernelRevision
   readonly outcomes: readonly KernelOperationOutcome[]
+  /** Outcomes before this index are unchanged (same objects) since the previous materialize. */
+  readonly replayedFrom?: number
   readonly pendingDependencies: readonly string[]
   readonly skippedOpIds: readonly string[]
 }
@@ -157,6 +164,19 @@ export interface TopicKernelOptions extends QuickJsSandboxOptions {
 }
 
 const ZERO_HASH = '0'.repeat(64)
+
+/** Per-input memo: hex op id and whether this input object already passed id/log validation. */
+const inputMeta = new WeakMap<KernelOperationInput, { readonly opIdHex: string; readonly logIdHex: string }>()
+function metaOf(item: KernelOperationInput): { readonly opIdHex: string; readonly logIdHex: string } {
+  let meta = inputMeta.get(item)
+  if (meta === undefined) {
+    const opIdHex = bytesToHex(item.opId)
+    if (item.verified !== true && bytesToHex(operationIdDigest(item.core)) !== opIdHex) throw new Error('KERNEL_OP_ID_MISMATCH')
+    meta = { opIdHex, logIdHex: bytesToHex(item.core.logId) }
+    inputMeta.set(item, meta)
+  }
+  return meta
+}
 
 function seenOpKey(visibility: OperationVisibility, authorHex: string, operationId: string): string {
   return `${visibility}:${authorHex}:${operationId}`
@@ -430,6 +450,20 @@ export class TopicKernel {
 
   get outcomes(): readonly KernelOperationOutcome[] {
     return this.#outcomes.slice()
+  }
+
+  /** Committed outcome for one op in O(1) (falls back to a scan mid-replay). */
+  outcomeOf(opId: string): KernelOperationOutcome | undefined {
+    if (!this.#logsDirty) {
+      const pos = this.#outcomeLog.positionBefore(opId, this.#outcomes.length)
+      if (pos !== undefined && this.#outcomes[pos]?.opId === opId) return this.#outcomes[pos]
+    }
+    return this.#outcomes.find(o => o.opId === opId)
+  }
+
+  /** Committed outcome list without copying (replaced, never mutated, on each commit). */
+  get materializedOutcomes(): readonly KernelOperationOutcome[] {
+    return this.#outcomes
   }
 
   get pendingDependencies(): readonly string[] {
@@ -721,13 +755,11 @@ export class TopicKernel {
     const eligible: KernelOperationInput[] = []
     const seenIds = new Set<string>()
     for (const item of inputs) {
-      if (bytesToHex(item.core.logId) !== this.logIdHex) continue
+      const meta = metaOf(item)
+      if (meta.logIdHex !== this.logIdHex) continue
       if (this.blindHostMode && this.genesis.privateLog && item.core.visibility !== 'public') continue
-      const opIdHex = bytesToHex(item.opId)
+      const opIdHex = meta.opIdHex
       if (this.#frontierOpIds.has(opIdHex)) continue
-      if (item.verified !== true && bytesToHex(operationIdDigest(item.core)) !== opIdHex) {
-        throw new Error('KERNEL_OP_ID_MISMATCH')
-      }
       if (seenIds.has(opIdHex)) continue
       seenIds.add(opIdHex)
       eligible.push(item)
@@ -740,14 +772,16 @@ export class TopicKernel {
     // Find first divergence point from current materialized prefix
     let diff = 0
     while (diff < this.#order.length && diff < eligible.length) {
-      if (bytesToHex(this.#order[diff]!.opId) !== bytesToHex(eligible[diff]!.opId)) break
+      const prev = this.#order[diff]!, next = eligible[diff]!
+      if (prev !== next && metaOf(prev).opIdHex !== metaOf(next).opIdHex) break
       diff++
     }
     // Fast path: identical eligible set and no pending dependencies — nothing to re-evaluate
     if (diff === eligible.length && this.#order.length === eligible.length && this.#pendingDependencies.size === 0) {
       return {
         revision: this.revision('local'),
-        outcomes: this.#outcomes.slice(),
+        outcomes: this.#outcomes,
+        replayedFrom: this.#outcomes.length,
         pendingDependencies: this.pendingDependencies,
         skippedOpIds: [...this.#skippedOpIds],
       }
@@ -843,7 +877,9 @@ export class TopicKernel {
 
     return {
       revision: this.revision('local'),
-      outcomes: this.#outcomes.slice(),
+      // Committed outcome arrays are never mutated in place, so callers may hold this reference.
+      outcomes: this.#outcomes,
+      replayedFrom: Math.min(snapIndex, this.#outcomes.length),
       pendingDependencies: this.pendingDependencies,
       skippedOpIds: [...this.#skippedOpIds],
     }
