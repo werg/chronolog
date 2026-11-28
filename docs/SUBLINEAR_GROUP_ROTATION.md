@@ -68,20 +68,27 @@ When an admin removes member at leaf $\ell$:
 
 Every remaining member holds the private seed for at least one node in the copath resolution, decrypts the single box for their ancestor, hashes up to `rootSeed`, and obtains `epochKey` in $O(\log N)$ symmetric operations.
 
-### 3.3 Handling Concurrent Leaderless Operations (The CRDT Insight)
+### 3.3 Chronolog-Style Undo-Do-Redo for TreeKEM: Key-Tagged TreeKEM (No Delivery Service, No Fork State Machine)
 
-How do we avoid MLS's "reject concurrent commit" problem when Admin A removes Carol while offline and Admin B concurrently removes Dave?
+Standard MLS breaks under undo-do-redo because:
+1. `epochKey(n)` is cryptographically chained from `epochKey(n-1)`'s linear transcript hash, and
+2. Each commit's copath boxes assume exact tree-version parity, so if a concurrent Commit B ($t = 90$) arrives after Commit A ($t = 100$), other replicas cannot "re-encrypt" A's path secret $S_A$ to B's new public keys without knowing $S_A$.
 
-1. **Deterministic Winner + Automatic Healing (Phase 1 — Simple, Zero Key-Split):**
-   - `$keys` maintains strict monotonic `epoch === currentEpoch + 1` (same invariant as `hpkeEpochs`).
-   - If Admin A's removal sorts first at `(tsA, A, opA)`, it advances `currentEpoch` to `e + 1` excluding Carol.
-   - Admin B's concurrent removal op at `(tsB, B, opB)` had `epoch: e + 1` — its `$admission` `removeMember(Dave)` update **still succeeds** (if split into a separate op or via `onConflict`), while the stale `$keys` rotation is rejected with `epoch_sequence_invalid`.
-   - Any online admin sees `removedMembers` contains Dave after `epoch = e + 1` (via a deterministic `$keys` health query: `{ kind: 'staleMembers' }`) and automatically emits a single `O(log N)` healing rotation for `e + 2` excluding both Carol and Dave!
-   - Meanwhile, `$admission.authorize()` already blocks Dave from writing immediately upon `removeMember(Dave)` materializing.
+**Key-Tagged TreeKEM** eliminates that conflict completely and makes sub-linear group rotation converge cleanly under pure Chronolog undo-do-redo:
 
-2. **Causal Multi-Epoch Merge / DCGKA (Phase 2 — Optional True Concurrent Rotations):**
-   - Follow Kleppmann et al. (DCGKA / Causal-TreeKEM): allow concurrent updates to publish independent update-secret nodes keyed by `(opId)` into a DAG of tree deltas, and derive the combined epoch secret by HKDF-combining the causally maximal concurrent update secrets in canonical `(authorTimestampMs, author, opId)` order.
-   - Because Chronolog already has a canonical total order over all ops, every replica computes the exact same merged tree without a central Delivery Service.
+1. **Decouple epoch roots (no linear transcript chain):**
+   Each epoch derives `epochKey` from a fresh random `rootSeed` (not chained from the previous epoch's secret). A late-arriving epoch commit never invalidates decryption of another epoch, and new devices can cleanly receive only `[minEpoch..current]`.
+2. **LWW-per-node public ratchet tree over CAS:**
+   Each leaf `(memberPk, wrapKey / pqWrapKey)` and each internal node `(nodePubKey, updatedAtMs, opId)` merges via Last-Write-Wins under Chronolog's exact `(authorTimestampMs, author, opId)` total order. Every replica and blind host converges bit-for-bit on the same public ratchet tree via standard undo-do-redo replay.
+3. **Tag every HPKE copath box by `targetPubKeyHash` (not fragile tree slot version):**
+   Each copath lockbox is indexed by `H(targetNodePubKey)` rather than assuming a single linear tree version. Devices retain a small rolling window of their recent node private keys (pruned once the epoch is retired). When Commit B arrives out-of-order and updates overlapping nodes, every remaining member who held `targetNodePubKey` **still decrypts Commit A's box in $O(1)$** during undo-do-redo!
+4. **Deterministic `needsRotation` healing + reconnect rewrapping:**
+   If Commit B removed Carol while Alice (offline) encrypted Commit A against a tree that still included Carol (which no crypto can retroactively undo once sent), undo-do-redo replay deterministically flags `needsRotation: true` in `$keys` because the latest epoch's tree still contains a leaf for a member removed in `$admission`. The first online admin emits **one $O(\log N)$ healing commit** excluding both Carol and Dave, and offline peers automatically rewrap any pending ops under the healed epoch (preserving `opId`, `authorTimestampMs`, and signature).
+
+> **Why this beats both vanilla MLS and DCGKA for Chronolog:**
+> - Unlike vanilla MLS, it requires **no central Delivery Service** and never forks into an unrecoverable group state.
+> - Unlike DCGKA, it requires **no complex pairwise causal ratchet state machine** and scales at $O(\log N)$ per removal with hybrid PQ `X-Wing` (`xwingPublicKeyFromSeed` deterministically derives internal node keys from 32-byte seeds).
+> - Optional Phase 2: for ultra-high-churn groups, concurrent disjoint commits can additionally combine their root seeds deterministically in canonical `(authorTimestampMs, author, opId)` order.
 
 ### 3.4 Member Addition & Historical Backfill
 
