@@ -1,0 +1,17 @@
+{
+  "name": "@chronolog/pack",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@chronolog/canonical": "workspace:*",
+    "@chronolog/materializer": "workspace:*",
+    "@chronolog/peer-session": "workspace:*",
+    "@chronolog/protocol": "workspace:*",
+    "@chronolog/records": "workspace:*",
+    "esbuild": "0.28.2"
+  }
+}

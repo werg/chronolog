@@ -1,5 +1,5 @@
-import { bytesToHex, sha256 } from '@chronolog/canonical'
 import { check, encodeRecord } from '@chronolog/authority'
+import { computeCasHash } from '@chronolog/records'
 import {
   assertContentManifest, assertContentReference, assertContentRetention, CONTENT_CHUNK_BYTES,
   MAX_BLOB_BYTES, MAX_BLOB_CHUNKS, MAX_CONTENT_CHUNKS, MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, MAX_CONTENT_MANIFEST_BYTES,
@@ -145,7 +145,7 @@ export function createNetworkContent(options: {
       check(response.type === 'chunk-response', 'CONTENT_RESPONSE_INVALID')
       if (response.bytes === null) return null
       const bytes = decoded(response.bytes), manifest = await local.manifest(reference, input), expected = manifest?.chunks[index]
-      check(expected !== undefined && bytes.length === expected.bytes && bytesToHex(await sha256(bytes)) === expected.hash, 'CONTENT_CHUNK_INVALID')
+      check(expected !== undefined && bytes.length === expected.bytes && computeCasHash(bytes, []) === expected.hash, 'CONTENT_CHUNK_INVALID')
       allowed(); input.signal?.throwIfAborted(); return bytes
     },
     async retained(reference, input = {}) {

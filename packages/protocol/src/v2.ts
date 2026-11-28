@@ -20,6 +20,8 @@ export const CONTROL_TOPICS = Object.freeze([
   '$finality',
   '$publications',
   '$signal_policy',
+  '$mounts',
+  '$builders',
 ] as const)
 
 const CONTROL_TOPIC_SET = new Set<string>(CONTROL_TOPICS)
@@ -104,6 +106,8 @@ export interface GenesisLimits {
   readonly maxMemoryBytes: number
   readonly maxTopicStateBytes: number
   readonly maxUpdatesPerOp: number
+  /** Deterministic fuel (QuickJS interrupt ticks / WASM fuel units) per reducer call. */
+  readonly maxFuel?: number
 }
 
 export interface LogGenesis {
@@ -301,7 +305,11 @@ export function assertValidReducersConfig(value: unknown): ReducersConfig {
     assertValidTopicName(topicName)
     protocolInvariant(rawBinding !== null && typeof rawBinding === 'object' && !Array.isArray(rawBinding), 'SCHEMA_INVALID', `Invalid topic binding: ${topicName}`)
     const b = rawBinding as Record<string, JsonValue>
-    protocolInvariant(typeof b.module === 'string' && Object.hasOwn(imports, b.module), 'SCHEMA_INVALID', `Topic ${topicName} references unknown import`)
+    protocolInvariant(
+      typeof b.module === 'string' && (Object.hasOwn(imports, b.module) || /^cas:sha256-[0-9a-f]{64}$/u.test(b.module)),
+      'SCHEMA_INVALID',
+      `Topic ${topicName} references unknown import`,
+    )
     if (b.export !== undefined) protocolInvariant(typeof b.export === 'string' && b.export.length > 0 && b.export.length <= 128, 'SCHEMA_INVALID', `Invalid export for ${topicName}`)
     topics[topicName] = {
       module: b.module,
@@ -319,6 +327,9 @@ export function encodeLogGenesis(genesis: LogGenesis): Uint8Array {
   for (const n of [genesis.limits.maxMemoryBytes, genesis.limits.maxTopicStateBytes, genesis.limits.maxUpdatesPerOp]) {
     protocolInvariant(Number.isSafeInteger(n) && n > 0, 'SCHEMA_INVALID', 'Invalid genesis limits')
   }
+  if (genesis.limits.maxFuel !== undefined) {
+    protocolInvariant(Number.isSafeInteger(genesis.limits.maxFuel) && genesis.limits.maxFuel > 0, 'SCHEMA_INVALID', 'Invalid genesis maxFuel')
+  }
   protocolInvariant(Object.hasOwn(genesis.initialTopics, '$reducers'), 'SCHEMA_INVALID', 'Genesis must include $reducers topic')
   assertValidReducersConfig(genesis.initialTopics.$reducers)
   const topicsMap = new Map<CborMapKey, CborValue>()
@@ -329,15 +340,19 @@ export function encodeLogGenesis(genesis: LogGenesis): Uint8Array {
     protocolInvariant(encodedTopic.length <= genesis.limits.maxTopicStateBytes, 'SCHEMA_INVALID', `Initial topic ${key} exceeds maxTopicStateBytes`)
     topicsMap.set(key, jsonToCbor(val))
   }
+  const limitsCbor = new Map<CborMapKey, CborValue>([
+    [0n, BigInt(genesis.limits.maxMemoryBytes)],
+    [1n, BigInt(genesis.limits.maxTopicStateBytes)],
+    [2n, BigInt(genesis.limits.maxUpdatesPerOp)],
+  ])
+  if (genesis.limits.maxFuel !== undefined) {
+    limitsCbor.set(3n, BigInt(genesis.limits.maxFuel))
+  }
   const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
     [1n, genesis.privateLog],
     [2n, topicsMap],
-    [3n, new Map<CborMapKey, CborValue>([
-      [0n, BigInt(genesis.limits.maxMemoryBytes)],
-      [1n, BigInt(genesis.limits.maxTopicStateBytes)],
-      [2n, BigInt(genesis.limits.maxUpdatesPerOp)],
-    ])],
+    [3n, limitsCbor],
     [4n, genesis.salt],
   ])
   return encodeCanonicalCbor(map)
@@ -359,12 +374,14 @@ export function decodeLogGenesis(bytes: Uint8Array): LogGenesis {
     initialTopics[k] = cborToJson(v)
   }
   const limitsRaw = map.get(3n)
-  protocolInvariant(limitsRaw instanceof Map && limitsRaw.size === 3, 'SCHEMA_INVALID', 'Invalid genesis limits')
+  protocolInvariant(limitsRaw instanceof Map && (limitsRaw.size === 3 || (limitsRaw.size === 4 && limitsRaw.has(3n))), 'SCHEMA_INVALID', 'Invalid genesis limits')
   const limitsMap = limitsRaw as ReadonlyMap<CborMapKey, CborValue>
   const num = (v: CborValue | undefined): number => {
     protocolInvariant(typeof v === 'bigint' && v > 0n && v <= BigInt(Number.MAX_SAFE_INTEGER), 'SCHEMA_INVALID', 'Invalid limit')
     return Number(v)
   }
+  const rawMaxFuel = limitsMap.get(3n)
+  const maxFuel = rawMaxFuel === undefined ? undefined : num(rawMaxFuel)
   const salt = map.get(4n)
   protocolInvariant(salt instanceof Uint8Array && salt.length >= 16 && salt.length <= 64, 'SCHEMA_INVALID', 'Invalid genesis salt')
   const genesis: LogGenesis = {
@@ -375,6 +392,7 @@ export function decodeLogGenesis(bytes: Uint8Array): LogGenesis {
       maxMemoryBytes: num(limitsMap.get(0n)),
       maxTopicStateBytes: num(limitsMap.get(1n)),
       maxUpdatesPerOp: num(limitsMap.get(2n)),
+      ...(maxFuel === undefined ? {} : { maxFuel }),
     },
     salt: salt.slice(),
   }
@@ -626,6 +644,7 @@ export const DEFAULT_RUNTIME_MANIFEST: RuntimeManifest = Object.freeze({
     'chronolog:crypto': 'crypto@1',
     'chronolog:cas': 'cas@1',
     'chronolog:sqlite': 'sqlite-cas@1#sha256-bbc4674a5dd1d11962a8227ce5f1118e2e6ed7d00163ea92f1f35781caf46936',
+    'chronolog:wasm': 'wasm@1',
   }),
 })
 
@@ -633,4 +652,5 @@ export const DEFAULT_GENESIS_LIMITS: GenesisLimits = Object.freeze({
   maxMemoryBytes: 64 * 1024 * 1024,
   maxTopicStateBytes: 4 * 1024 * 1024,
   maxUpdatesPerOp: 16,
+  maxFuel: 200_000,
 })

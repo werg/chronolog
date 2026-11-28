@@ -1,12 +1,29 @@
 import { utf8 } from '@chronolog/canonical'
-import { computeCasHash, type ContentAddressedStore } from '@chronolog/records'
+import {
+  computeCasHash,
+  putPackageDag,
+  type ChronologBuiltinName,
+  type ContentAddressedStore,
+} from '@chronolog/records'
 import { STD_CRDT_SOURCE } from './std/crdt.js'
 import { STD_TEXT_SOURCE } from './std/text.js'
 import { STD_LEDGER_SOURCE } from './std/ledger.js'
 import { STD_WORKFLOW_SOURCE } from './std/workflow.js'
 import { STD_FS_SOURCE } from './std/fs.js'
+import { STD_MOUNTS_SOURCE } from './std/mounts.js'
+import { STD_BUILDERS_SOURCE } from './std/builders.js'
+import { STD_REGISTRY_SOURCE } from './std/registry.js'
 
-export { STD_CRDT_SOURCE, STD_TEXT_SOURCE, STD_LEDGER_SOURCE, STD_WORKFLOW_SOURCE, STD_FS_SOURCE }
+export {
+  STD_CRDT_SOURCE,
+  STD_TEXT_SOURCE,
+  STD_LEDGER_SOURCE,
+  STD_WORKFLOW_SOURCE,
+  STD_FS_SOURCE,
+  STD_MOUNTS_SOURCE,
+  STD_BUILDERS_SOURCE,
+  STD_REGISTRY_SOURCE,
+}
 
 export const STD_PERMISSIONS_SOURCE = `
 import { verifyEd25519, canonicalJson } from 'chronolog:crypto';
@@ -2285,6 +2302,27 @@ export const STANDARD_MODULE_SOURCES: Readonly<Record<string, string>> = Object.
   'chronolog/ledger': STD_LEDGER_SOURCE,
   'chronolog/workflow': STD_WORKFLOW_SOURCE,
   'chronolog/fs': STD_FS_SOURCE,
+  'chronolog/mounts': STD_MOUNTS_SOURCE,
+  'chronolog/builders': STD_BUILDERS_SOURCE,
+  'chronolog/registry': STD_REGISTRY_SOURCE,
+})
+
+export const STANDARD_MODULE_BUILTINS: Readonly<Record<string, readonly ChronologBuiltinName[]>> = Object.freeze({
+  'chronolog/permissions': ['chronolog:crypto'],
+  'chronolog/keys': ['chronolog:crypto'],
+  'chronolog/finality': ['chronolog:crypto'],
+  'chronolog/publications': ['chronolog:crypto'],
+  'chronolog/rls': [],
+  'chronolog/sql': ['chronolog:sqlite'],
+  'chronolog/sqlite-helpers': ['chronolog:sqlite'],
+  'chronolog/crdt': [],
+  'chronolog/text': [],
+  'chronolog/ledger': [],
+  'chronolog/workflow': [],
+  'chronolog/fs': ['chronolog:cas'],
+  'chronolog/mounts': ['chronolog:crypto'],
+  'chronolog/builders': ['chronolog:crypto'],
+  'chronolog/registry': ['chronolog:sqlite', 'chronolog:crypto'],
 })
 
 export const STANDARD_MODULE_IMPORTS: Readonly<Record<string, string>> = Object.freeze(
@@ -2299,6 +2337,23 @@ export async function seedStandardModules(cas: ContentAddressedStore): Promise<R
   for (const [spec, src] of Object.entries(STANDARD_MODULE_SOURCES)) {
     const hash = await cas.put(utf8(src), [], 'public')
     imports[spec] = `cas:sha256-${hash}`
+  }
+  return imports
+}
+
+/** Seed all standard audited modules as capability-attenuated chronolog-pkg/v1 DAG packages in public CAS. */
+export async function seedStandardPackages(cas: ContentAddressedStore): Promise<Record<string, string>> {
+  const imports: Record<string, string> = {}
+  for (const [spec, src] of Object.entries(STANDARD_MODULE_SOURCES)) {
+    const pkg = await putPackageDag(cas, {
+      name: spec,
+      version: '1.0.0',
+      runtime: 'esm-quickjs',
+      files: { 'index.js': src },
+      exports: { '.': 'index.js' },
+      builtins: STANDARD_MODULE_BUILTINS[spec] ?? [],
+    }, 'public')
+    imports[spec] = pkg.ref
   }
   return imports
 }

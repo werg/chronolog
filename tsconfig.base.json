@@ -42,7 +42,8 @@
       "@chronolog/peer-session/webrtc-native": ["packages/peer-session/src/webrtc-native.ts"],
       "@chronolog/peer-session/websocket": ["packages/peer-session/src/websocket.ts"],
       "@chronolog/peer-session/tendriller": ["packages/peer-session/src/tendriller.ts"],
-      "@chronolog/peer-session/kernel": ["packages/peer-session/src/kernel.ts"]
+      "@chronolog/peer-session/kernel": ["packages/peer-session/src/kernel.ts"],
+      "@chronolog/pack": ["packages/pack/src/index.ts"]
     }
   }
 }

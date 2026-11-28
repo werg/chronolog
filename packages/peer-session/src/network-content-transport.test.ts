@@ -118,16 +118,15 @@ describe('actual encrypted content transport qualification', () => {
     if (ws !== undefined) cleanup.push(() => ws.close())
     const connection = () => ws === undefined ? rtc() : ws.pair()
     const bytes = payload(CONTENT_CHUNK_BYTES * 3 + 37), reference = await a.content.putBytes(bytes), manifest = (await a.content.source().manifest(reference))!
-    const hashes = manifest.chunks.map(chunk => chunk.hash), counts = new Map<string, number>(), store = f.stores[0]!, get = store.get.bind(store)
+    const hashes = manifest.chunks.map(chunk => chunk.hash), counts = new Map<string, number>(), casGet = a.cas.get.bind(a.cas)
     const entered = deferred<void>(), gate = deferred<void>()
     let hold = true
-    store.get = async key => {
-      const hash = key.split('/').at(-1)!
-      if (key.includes('/chunk/') && hashes.includes(hash)) {
+    a.cas.get = async (hash, partition) => {
+      if (hashes.includes(hash)) {
         counts.set(hash, (counts.get(hash) ?? 0) + 1)
         if (hold && hash === hashes[1]) { entered.resolve(); await gate.promise }
       }
-      return get(key)
+      return casGet(hash, partition)
     }
     const connect = async () => {
       const [left, right] = await connection()

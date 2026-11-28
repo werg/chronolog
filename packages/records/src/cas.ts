@@ -77,6 +77,7 @@ export class ContentAddressedStore {
   readonly #cache = new Map<string, { readonly encoded: Uint8Array; readonly node: CasNode; readonly partitions: Set<CasPartition> }>()
   readonly #staged = new Map<string, { readonly encoded: Uint8Array; readonly node: CasNode; readonly partition: CasPartition }>()
   readonly #known = new Map<string, Set<CasPartition>>()
+  readonly #pinned = new Set<string>()
   #inBatch = false
 
   constructor(options: CasOptions) {
@@ -361,10 +362,116 @@ export class ContentAddressedStore {
     return visited
   }
 
-  /** Exact local mark-and-sweep GC preserving everything reachable from rootHashes, deleting in yielding batches. */
+  /** Pin a CAS root hash locally so mark-and-sweep GC preserves it and its transitive links. */
+  pin(hash: string): void {
+    assertHashHex(hash)
+    this.#pinned.add(hash)
+  }
+
+  /** Remove a local pin from a CAS root hash. */
+  unpin(hash: string): void {
+    this.#pinned.delete(hash)
+  }
+
+  isPinned(hash: string): boolean {
+    return this.#pinned.has(hash)
+  }
+
+  pinnedHashes(): readonly string[] {
+    return [...this.#pinned].sort()
+  }
+
+  /**
+   * Collect a bounded CAS subgraph reachable from rootHashes for single-round-trip peer replication.
+   * Respects partition visibility (e.g. 'public' for unprivileged peers / blind hosts).
+   */
+  async collectSubgraph(
+    rootHashes: Iterable<string>,
+    options: {
+      readonly allowedPartition?: CasPartition | 'any'
+      readonly maxNodes?: number
+      readonly maxBytes?: number
+    } = {},
+  ): Promise<readonly { readonly hash: string; readonly bytes: Uint8Array; readonly partition: CasPartition }[]> {
+    const allowed = options.allowedPartition ?? 'any'
+    const maxNodes = options.maxNodes ?? 256
+    const maxBytes = options.maxBytes ?? 8 * 1024 * 1024
+    const visited = new Set<string>()
+    const queue: string[] = []
+    for (const hash of rootHashes) {
+      if (HEX32.test(hash) && !visited.has(hash)) {
+        visited.add(hash)
+        queue.push(hash)
+      }
+    }
+    const out: { readonly hash: string; readonly bytes: Uint8Array; readonly partition: CasPartition }[] = []
+    let totalBytes = 0
+    while (queue.length > 0 && out.length < maxNodes) {
+      const current = queue.shift()!
+      const partitions: readonly CasPartition[] = allowed === 'any' ? ['public', 'private'] : [allowed]
+      let chosenPartition: CasPartition | null = null
+      let raw: Uint8Array | null = null
+      for (const p of partitions) {
+        const candidate = await this.getRaw(current, p)
+        if (candidate !== null) {
+          chosenPartition = p
+          raw = candidate
+          break
+        }
+      }
+      if (raw === null || chosenPartition === null) continue
+      if (out.length > 0 && totalBytes + raw.byteLength > maxBytes) break
+      out.push({ hash: current, bytes: raw, partition: chosenPartition })
+      totalBytes += raw.byteLength
+      const node = decodeCasNode(raw)
+      for (const link of node.links) {
+        if (!visited.has(link)) {
+          visited.add(link)
+          queue.push(link)
+        }
+      }
+    }
+    return out
+  }
+
+  /** Delete specific unpinned CAS nodes from a partition (used for lazy-bulk LRU cache eviction). */
+  async deleteNodes(hashes: Iterable<string>, partition: CasPartition): Promise<number> {
+    if (this.#inBatch) throw new Error('CAS_DELETE_DURING_BATCH')
+    const keys: string[] = []
+    const dropped: string[] = []
+    for (const hash of hashes) {
+      if (!HEX32.test(hash) || this.#pinned.has(hash)) continue
+      const parts = this.#known.get(hash)
+      if (parts !== undefined && parts.has(partition)) {
+        keys.push(this.#key(partition, hash))
+        dropped.push(hash)
+      }
+    }
+    if (keys.length === 0) return 0
+    for (let i = 0; i < keys.length; i += 32) {
+      await deleteBytesMany(this.#store, keys.slice(i, i + 32), { durability: 'relaxed' })
+    }
+    for (const hash of dropped) {
+      const parts = this.#known.get(hash)
+      if (parts !== undefined) {
+        parts.delete(partition)
+        if (parts.size === 0) this.#known.delete(hash)
+      }
+      const cached = this.#cache.get(hash)
+      if (cached !== undefined) {
+        cached.partitions.delete(partition)
+        if (cached.partitions.size === 0) this.#cache.delete(hash)
+      }
+    }
+    return dropped.length
+  }
+
+  /** Exact local mark-and-sweep GC preserving everything reachable from rootHashes + pinned roots, deleting in yielding batches. */
   async collectGarbage(rootHashes: Iterable<string>): Promise<{ readonly kept: number; readonly deleted: number }> {
     if (this.#inBatch) throw new Error('CAS_GC_DURING_BATCH')
-    const keep = await this.reachable(rootHashes)
+    const allRoots = new Set<string>(this.#pinned)
+    for (const h of rootHashes) allRoots.add(h)
+    const keep = await this.reachable(allRoots)
     const keysToDelete: string[] = []
     const hashesToDrop: string[] = []
     for (const [hash, partitions] of [...this.#known.entries()]) {

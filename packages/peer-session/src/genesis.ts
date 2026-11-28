@@ -1,6 +1,13 @@
 import { bytesToHex, concatBytes, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
 import { hpkeOpenBase, hpkeSealBase } from '@chronolog/crypto'
-import { computeCasHash } from '@chronolog/records'
+import {
+  computeCasHash,
+  ContentAddressedStore,
+  MemoryBytesStore,
+  putPackageDag,
+  type CasPartition,
+  type PutPackageInput,
+} from '@chronolog/records'
 import {
   DEFAULT_GENESIS_LIMITS,
   DEFAULT_RUNTIME_MANIFEST,
@@ -78,14 +85,43 @@ export interface LogTopicSeed {
   readonly initialState?: JsonValue
 }
 
+export interface GenesisCasNode {
+  readonly hash: string
+  readonly bytes: Uint8Array
+  readonly partition: CasPartition
+}
+
+export interface PackedBundleInput {
+  readonly imports: Readonly<Record<string, string>>
+  readonly casNodes: readonly GenesisCasNode[]
+}
+
+export interface BuildersSeed {
+  readonly builders: readonly string[]
+  readonly auditors?: readonly string[]
+  readonly threshold?: number
+  readonly requireAudit?: boolean
+  readonly requireMountApproval?: string | null
+}
+
 export interface CreateLogGenesisOptions {
   readonly creator: LogMemberSeed
   readonly members?: readonly LogMemberSeed[]
   readonly privateLog?: boolean
   /** When true, omits the `$reducers` reducer so topic bindings and import maps are permanently frozen. */
   readonly frozenReducers?: boolean
-  /** ES Module sources (specifier -> UTF-8 JS source) pinned into CAS and registered in `$reducers.imports`. */
+  /** ES Module sources (specifier -> UTF-8 JS source) pinned into public CAS and registered in `$reducers.imports`. */
   readonly imports?: Readonly<Record<string, string>>
+  /** Private application ES Module sources pinned into `private` CAS (only visible to encrypted ops on `privateLog: true`). */
+  readonly privateImports?: Readonly<Record<string, string>>
+  /** Multi-file or WASM `chronolog-pkg/v1` packages pinned into CAS and registered in `$reducers.imports`. */
+  readonly packages?: Readonly<Record<string, PutPackageInput & { readonly partition?: CasPartition }>>
+  /** Pre-packed bundle from `packReducers()` (imports + verified CAS DAG nodes). */
+  readonly bundle?: PackedBundleInput
+  /** Enable verified cross-log sub-state mounts (`$mounts` bound to `chronolog/mounts:verifiedMounts`). */
+  readonly enableMounts?: boolean
+  /** Enable M-of-N attested builds/audits (`$builders` + `attestedReducers` on `$reducers`). */
+  readonly builders?: BuildersSeed
   /** Application topics to register in `$reducers.topics` alongside standard `$*` control topics. */
   readonly topics?: Readonly<Record<string, LogTopicSeed>>
   /** Optional host public key for `chronolog/permissions` Ed25519 admission attestations. */
@@ -103,36 +139,63 @@ export interface CreatedLogGenesis {
   readonly logId: string
   readonly genesis: LogGenesis
   readonly genesisBytes: Uint8Array
-  /** Public CAS nodes (standard + app ES module sources) that must accompany this genesis. */
-  readonly casNodes: readonly { readonly hash: string; readonly bytes: Uint8Array; readonly partition: 'public' }[]
+  /** CAS nodes (standard + app modules & chronolog-pkg/v1 DAGs) that accompany this genesis. */
+  readonly casNodes: readonly GenesisCasNode[]
   /** Epoch 0 key if `privateLog` is true (undefined for public chains). */
   readonly epoch0Key?: Uint8Array
 }
 
 /**
- * Create a Chronolog v2 genesis block with hash-pinned standard and application ES Modules.
- * When `privateLog` is true (the default), generates epoch 0 and seals HPKE lockboxes for
- * all initial readers that provide a `wrapKey` after deriving the deterministic `logId`.
+ * Create a Chronolog v2 genesis block with hash-pinned standard modules, custom ES modules,
+ * multi-file/WASM `chronolog-pkg/v1` packages, optional `$mounts`, and optional `$builders`.
  */
 export async function createLogGenesis(options: CreateLogGenesisOptions): Promise<CreatedLogGenesis> {
   const privateLog = options.privateLog ?? true
   const runtime = options.runtime ?? DEFAULT_RUNTIME_MANIFEST
-  const casMap = new Map<string, Uint8Array>()
+  const casNodesMap = new Map<string, GenesisCasNode>()
   const imports: Record<string, string> = {}
 
-  const pinSource = (spec: string, source: string): void => {
+  const addNode = (hash: string, bytes: Uint8Array, partition: CasPartition): void => {
+    casNodesMap.set(`${partition}:${hash}`, { hash, bytes: bytes.slice(), partition })
+  }
+
+  const pinSource = (spec: string, source: string, partition: CasPartition): void => {
     const bytes = utf8(source)
     const hash = computeCasHash(bytes)
-    casMap.set(hash, bytes)
+    addNode(hash, bytes, partition)
     imports[spec] = `cas:sha256-${hash}`
   }
 
   for (const [spec, src] of Object.entries(STANDARD_MODULE_SOURCES)) {
-    pinSource(spec, src)
+    pinSource(spec, src, 'public')
   }
   if (options.imports !== undefined) {
     for (const [spec, src] of Object.entries(options.imports)) {
-      pinSource(spec, src)
+      pinSource(spec, src, 'public')
+    }
+  }
+  if (options.privateImports !== undefined) {
+    const partition: CasPartition = privateLog ? 'private' : 'public'
+    for (const [spec, src] of Object.entries(options.privateImports)) {
+      pinSource(spec, src, partition)
+    }
+  }
+  if (options.packages !== undefined) {
+    const tempCas = new ContentAddressedStore({ store: new MemoryBytesStore() })
+    for (const [spec, pkgInput] of Object.entries(options.packages)) {
+      const partition: CasPartition = pkgInput.partition === 'private' && privateLog ? 'private' : 'public'
+      const placed = await putPackageDag(tempCas, pkgInput, partition)
+      imports[spec] = placed.ref
+      const sub = await tempCas.collectSubgraph([placed.hash], { allowedPartition: partition, maxNodes: 4096, maxBytes: 32 * 1024 * 1024 })
+      for (const n of sub) addNode(n.hash, n.bytes, n.partition)
+    }
+  }
+  if (options.bundle !== undefined) {
+    for (const [spec, ref] of Object.entries(options.bundle.imports)) {
+      imports[spec] = ref
+    }
+    for (const n of options.bundle.casNodes) {
+      addNode(n.hash, n.bytes, n.partition)
     }
   }
 
@@ -143,8 +206,16 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     $publications: { module: 'chronolog/publications', export: 'signedReleases' },
     $signal_policy: { module: 'chronolog/permissions', export: 'defaultSignalPolicy' },
   }
+  if (options.enableMounts === true || options.builders?.requireMountApproval != null) {
+    topicBindings.$mounts = { module: 'chronolog/mounts', export: 'verifiedMounts' }
+  }
+  if (options.builders !== undefined) {
+    topicBindings.$builders = { module: 'chronolog/builders', export: 'attestedBuilders' }
+  }
   if (options.frozenReducers !== true) {
-    topicBindings.$reducers = { module: 'chronolog/permissions', export: 'adminOnlyReducers' }
+    topicBindings.$reducers = options.builders !== undefined
+      ? { module: 'chronolog/builders', export: 'attestedReducers' }
+      : { module: 'chronolog/permissions', export: 'adminOnlyReducers' }
   }
 
   const allMembers = [options.creator, ...(options.members ?? [])]
@@ -177,6 +248,18 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     $publications: { revision: 0, current: null, history: [] },
     ...(options.signalPolicy === undefined ? {} : { $signal_policy: options.signalPolicy }),
   }
+  if (options.enableMounts === true || options.builders?.requireMountApproval != null) {
+    initialTopics.$mounts = { mounts: {} }
+  }
+  if (options.builders !== undefined) {
+    initialTopics.$builders = {
+      builders: [...new Set(options.builders.builders)].sort(),
+      auditors: [...new Set(options.builders.auditors ?? [])].sort(),
+      threshold: options.builders.threshold ?? 1,
+      requireAudit: options.builders.requireAudit ?? false,
+      requireMountApproval: options.builders.requireMountApproval ?? null,
+    }
+  }
 
   if (options.topics !== undefined) {
     for (const [topicName, seed] of Object.entries(options.topics)) {
@@ -207,16 +290,8 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
   }
   const genesisBytes = encodeLogGenesis(genesis)
   const logId = bytesToHex(genesisLogId(genesisBytes))
-
-  // For private chains, epoch 0 is seeded either via local epoch0Key (and locked into $keys via initial op or epochKeys option).
-  // Keeping genesis deterministic without needing logId-before-genesis circularity!
   const epoch0Key = privateLog ? (options.epoch0Key ?? crypto.getRandomValues(new Uint8Array(32))) : undefined
-
-  const casNodes = [...casMap.entries()].map(([hash, bytes]) => ({
-    hash,
-    bytes,
-    partition: 'public' as const,
-  }))
+  const casNodes = [...casNodesMap.values()]
 
   return {
     logId,
@@ -225,4 +300,27 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     casNodes,
     ...(epoch0Key === undefined ? {} : { epoch0Key }),
   }
+}
+
+/**
+ * Create a dogfooded Chronolog Package Registry genesis (public by default, or private org registry).
+ * Uses `chronolog/registry` (SQLite + FTS5 full-text search + signed build/audit attestations).
+ */
+export function createRegistryGenesis(options: {
+  readonly creator: LogMemberSeed
+  readonly members?: readonly LogMemberSeed[]
+  readonly privateLog?: boolean
+  readonly salt?: Uint8Array
+  readonly epoch0Key?: Uint8Array
+}): Promise<CreatedLogGenesis> {
+  return createLogGenesis({
+    creator: options.creator,
+    ...(options.members === undefined ? {} : { members: options.members }),
+    privateLog: options.privateLog ?? false,
+    ...(options.salt === undefined ? {} : { salt: options.salt }),
+    ...(options.epoch0Key === undefined ? {} : { epoch0Key: options.epoch0Key }),
+    topics: {
+      packages: { module: 'chronolog/registry', export: 'packageRegistry' },
+    },
+  })
 }

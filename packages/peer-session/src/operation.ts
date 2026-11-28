@@ -10,13 +10,12 @@ export interface MaterializedOperation {
   readonly rejectionDetail?: string
 }
 
+/** One signed receipt covers a batch of retained operations (sync v3). */
 export interface RetentionStatement {
   readonly applicationId: string
-  readonly proposalId: string
-  readonly author: string
-  readonly envelopeDigest: string
   readonly peer: string
   readonly storageId: string
+  readonly items: readonly { readonly proposalId: string; readonly author: string; readonly envelopeDigest: string }[]
 }
 
 export type RetentionEvidence = Signed<RetentionStatement>

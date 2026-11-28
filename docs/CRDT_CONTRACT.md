@@ -15,25 +15,29 @@ No peer, host, relay, finalizer, transport receipt, or selected branch may assig
 ## 2. Two-Way Public/Encrypted Control Partition
 
 On chains with `privateLog: true`:
-- Control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`) may ONLY be mutated by `visibility: 'public'` operations.
+- Control topics (`$reducers`, `$permissions`, `$keys`, `$finality`, `$publications`, `$signal_policy`, `$mounts`, `$builders`) may ONLY be mutated by `visibility: 'public'` operations.
 - Public operations can ONLY read `$*` topics and `public` CAS nodes.
 - Application (non-`$`) topics may ONLY be mutated by `visibility: 'encrypted'` operations (wrapped in `EncryptedOperationEnvelope` under an epoch key).
 - Idempotency deduplication is scoped by `(visibility, author, operationId)` and authenticated in `seenOpsRoot` (stored in CAS).
 
 **Guarantee:** A blind host (`blindHostMode: true`) that holds zero decryption keys and replays only public operations derives bit-for-bit identical `$*` control topic state to every full replica, even under adversarial cross-partition `(author, operationId)` collisions.
 
-## 3. Hash-Pinned Import-Map Reducers (`$reducers`)
+## 3. Hash-Pinned Packages, Scoped Import Maps & Pure WASM (`$reducers`)
 
 `$reducers` defines:
-- `runtime`: pinned JS engine (`quickjs-ng@0.32.0`) and builtins (`chronolog:crypto`, `chronolog:cas`, `chronolog:sqlite`).
-- `imports`: map of bare module specifiers to `cas:sha256-<64-hex>` hashes in CAS.
-- `topics`: map of topic names to `{ module, export?, config? }`.
+- `runtime`: pinned JS engine (`quickjs-ng@0.32.0`) and builtins (`chronolog:crypto`, `chronolog:cas`, `chronolog:sqlite`, `chronolog:wasm`).
+- `imports`: map of bare module specifiers to `cas:sha256-<64-hex>` hashes in CAS (either single-file leaf modules or `chronolog-pkg/v1` Merkle-DAG packages).
+- `topics`: map of topic names to `{ module, export?, config? }` (accepting either an import alias or a direct `cas:sha256-<64-hex>` reference).
 
 Execution invariants:
-- Fresh `QuickJSContext` per `reduce()`, `query()`, and `describe()` invocation (zero cross-call state leakage).
-- Non-deterministic globals (`Date`, `Math.random`, `Intl`) are removed.
-- Missing CAS chunks, modules, or SQLite pages trigger an **uncatchable host-level `MissingDependencyError`** that user JS `try/catch` cannot swallow; replay halts cleanly before that operation until the missing dependency arrives.
+- Fresh `QuickJSContext` per `reduce()`, `query()`, `describe()`, `onConflict()`, and `derive()` invocation (zero cross-call state leakage).
+- Non-deterministic globals (`Date`, `Math.random`, `Intl`) are removed, and deterministic fuel metering (`limits.maxFuel`) rejects runaway loops uniformly as `vm:fuel_exhausted`.
+- `chronolog-pkg/v1` packages enforce scoped dependency resolution (eliminating diamond conflicts), package-local `./`/`../` relative imports, and per-package `builtins` capability attenuation.
+- Pure WASM reducers (`runtime: 'wasm-pure'`, `chronolog-wasm/v1` ABI) and `chronolog:wasm` libraries reject non-`chronolog` host imports and cache compiled `WebAssembly.Module` instances per `cas:sha256-...` hash.
+- Missing CAS chunks, modules, packages, or SQLite pages trigger an **uncatchable host-level `MissingDependencyError`** that user JS `try/catch` cannot swallow; replay halts cleanly before that operation until the missing dependency arrives (via `cas-want` subgraph pull or `casMirrors`).
+- Historical `$reducers` package hashes remain pinned in `TopicKernel.gcRoots()` across the active replay window so late-arriving ops and `materializeAt()` time-travel survive GC.
 - If `$reducers` has no topic binding for `"$reducers"`, rules are permanently frozen.
+- External Chronolog logs are never live-queried; cross-log state is composed deterministically via pinned signed snapshots in `$mounts` (`ctx.mount()` / `ctx.mountQuery()`).
 
 ## 4. State Root, Rolling History Digest & Revision Identity
 

@@ -1,5 +1,6 @@
 export * from './bytes-store.js'
 export * from './cas.js'
+export * from './cas-objects.js'
 export type * from './connection.js'
 export * from './stream.js'
 export * from './message-channel.js'

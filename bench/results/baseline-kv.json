@@ -1,0 +1,208 @@
+[
+  {
+    "reducer": "kv",
+    "n": 100,
+    "privateLog": true,
+    "submit": {
+      "totalMs": 2375.4888189999997,
+      "firstDecileMsPerOp": 28.623652800000002,
+      "lastDecileMsPerOp": 22.6502876999999,
+      "counters": {
+        "cbor.encode": 1500,
+        "ed25519.sign": 100,
+        "kernel.materialize": 200,
+        "kernel.materialize.ms": 226.75,
+        "session.rematerialize": 100,
+        "session.rematerialize.ms": 716.43,
+        "sha256Sync": 700,
+        "sha256Sync.bytes": 969199,
+        "vm.describe": 700,
+        "vm.newContext": 900,
+        "vm.query": 100,
+        "vm.reduce": 100
+      }
+    },
+    "reopen": {
+      "ms": 81.75252899999987,
+      "counters": {
+        "cbor.decode": 619,
+        "cbor.decode.bytes": 871739,
+        "cbor.encode": 1054,
+        "ed25519.verify": 100,
+        "kernel.materialize": 2,
+        "kernel.materialize.ms": 0.33,
+        "session.rematerialize": 1,
+        "session.rematerialize.ms": 50.52,
+        "sha256Sync": 312,
+        "sha256Sync.bytes": 97452,
+        "vm.newContext": 2,
+        "vm.query": 2
+      }
+    },
+    "coldSync": {
+      "ms": 635.4877390000001,
+      "bytesAtoB": 1883856,
+      "bytesBtoA": 699151,
+      "framesAtoB": 42,
+      "framesBtoA": 18,
+      "counters": {
+        "cbor.decode": 459,
+        "cbor.decode.bytes": 3183658,
+        "cbor.encode": 1524,
+        "ed25519.verify": 100,
+        "kernel.materialize": 2,
+        "kernel.materialize.ms": 164.2,
+        "session.rematerialize": 1,
+        "session.rematerialize.ms": 201.66,
+        "sha256Sync": 1302,
+        "sha256Sync.bytes": 1784208,
+        "vm.newContext": 101,
+        "vm.query": 1,
+        "vm.reduce": 100,
+        "wire.send.unknown": 11,
+        "wire.send.unknown.bytes": 2600225
+      }
+    },
+    "liveLatency": {
+      "medianMs": 46.912554999999884,
+      "maxMs": 61.90165699999989,
+      "bytesPerOpAtoB": 25056.15,
+      "counters": {
+        "cbor.decode": 138,
+        "cbor.decode.bytes": 1050180,
+        "cbor.encode": 775,
+        "ed25519.sign": 20,
+        "ed25519.verify": 20,
+        "kernel.materialize": 80,
+        "kernel.materialize.ms": 104.26,
+        "session.rematerialize": 40,
+        "session.rematerialize.ms": 466.61,
+        "sha256Sync": 9060,
+        "sha256Sync.bytes": 4268814,
+        "vm.describe": 140,
+        "vm.newContext": 220,
+        "vm.query": 40,
+        "vm.reduce": 40,
+        "wire.send.unknown": 77,
+        "wire.send.unknown.bytes": 992467
+      }
+    },
+    "reconnect": {
+      "ms": 967.6853620000002,
+      "bytesAtoB": 2532436,
+      "bytesBtoA": 2483931,
+      "counters": {
+        "cbor.decode": 348,
+        "cbor.decode.bytes": 5057529,
+        "cbor.encode": 458,
+        "sha256Sync": 1680,
+        "sha256Sync.bytes": 690284,
+        "wire.send.unknown": 11,
+        "wire.send.unknown.bytes": 5045343
+      }
+    }
+  },
+  {
+    "reducer": "kv",
+    "n": 400,
+    "privateLog": true,
+    "submit": {
+      "totalMs": 8775.702754999998,
+      "firstDecileMsPerOp": 21.25394444999997,
+      "lastDecileMsPerOp": 22.492740900000125,
+      "counters": {
+        "cbor.encode": 6000,
+        "ed25519.sign": 400,
+        "kernel.materialize": 800,
+        "kernel.materialize.ms": 1101.57,
+        "session.rematerialize": 400,
+        "session.rematerialize.ms": 2975.69,
+        "sha256Sync": 2800,
+        "sha256Sync.bytes": 10689037,
+        "vm.describe": 2800,
+        "vm.newContext": 3600,
+        "vm.query": 400,
+        "vm.reduce": 400
+      }
+    },
+    "reopen": {
+      "ms": 237.20629299999928,
+      "counters": {
+        "cbor.decode": 2419,
+        "cbor.decode.bytes": 9762355,
+        "cbor.encode": 4054,
+        "ed25519.verify": 400,
+        "kernel.materialize": 2,
+        "kernel.materialize.ms": 1.09,
+        "session.rematerialize": 1,
+        "session.rematerialize.ms": 132.03,
+        "sha256Sync": 1212,
+        "sha256Sync.bytes": 335054,
+        "vm.newContext": 2,
+        "vm.query": 2
+      }
+    },
+    "coldSync": {
+      "ms": 4800.188975000001,
+      "bytesAtoB": 19156952,
+      "bytesBtoA": 649965,
+      "framesAtoB": 393,
+      "framesBtoA": 17,
+      "counters": {
+        "cbor.decode": 2010,
+        "cbor.decode.bytes": 29182279,
+        "cbor.encode": 6425,
+        "ed25519.verify": 400,
+        "kernel.materialize": 2,
+        "kernel.materialize.ms": 741.45,
+        "session.rematerialize": 1,
+        "session.rematerialize.ms": 864.56,
+        "sha256Sync": 5202,
+        "sha256Sync.bytes": 20729629,
+        "vm.newContext": 401,
+        "vm.query": 1,
+        "vm.reduce": 400,
+        "wire.send.unknown": 11,
+        "wire.send.unknown.bytes": 20064283
+      }
+    },
+    "liveLatency": {
+      "medianMs": 90.60021599999891,
+      "maxMs": 163.40035400000124,
+      "bytesPerOpAtoB": 91835.35,
+      "counters": {
+        "cbor.decode": 179,
+        "cbor.decode.bytes": 3856510,
+        "cbor.encode": 859,
+        "ed25519.sign": 20,
+        "ed25519.verify": 20,
+        "kernel.materialize": 80,
+        "kernel.materialize.ms": 175.71,
+        "session.rematerialize": 40,
+        "session.rematerialize.ms": 1000.98,
+        "sha256Sync": 32762,
+        "sha256Sync.bytes": 15375016,
+        "vm.describe": 140,
+        "vm.newContext": 220,
+        "vm.query": 40,
+        "vm.reduce": 40,
+        "wire.send.unknown": 76,
+        "wire.send.unknown.bytes": 3661619
+      }
+    },
+    "reconnect": {
+      "ms": 7769.576635000001,
+      "bytesAtoB": 21317902,
+      "bytesBtoA": 21318583,
+      "counters": {
+        "cbor.decode": 1714,
+        "cbor.decode.bytes": 42941149,
+        "cbor.encode": 2589,
+        "sha256Sync": 5880,
+        "sha256Sync.bytes": 2417660,
+        "wire.send.unknown": 11,
+        "wire.send.unknown.bytes": 42889839
+      }
+    }
+  }
+]

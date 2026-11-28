@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { bytesToHex, sha256 } from '@chronolog/canonical'
+import { computeBlobDagHash } from '@chronolog/records'
 import { computeCasHash } from '@chronolog/records'
 import { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_BLOB_CHUNKS } from './content.js'
 import { assertContentWireMessage, createNetworkContent, type ContentWireMessage } from './network-content.js'
@@ -35,14 +35,14 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
     const empty = new Uint8Array(0)
     const emptyInfo = await f.contents[0]!.putBlob(empty)
     expect(emptyInfo.bytes).toBe(0)
-    expect(emptyInfo.hash).toBe(bytesToHex(await sha256(empty)))
+    expect(emptyInfo.hash).toBe(computeBlobDagHash(empty))
     expect(await f.contents[0]!.hasBlob(emptyInfo.hash)).toBe(true)
     expect(await f.contents[0]!.getBlob(emptyInfo.hash, { expectedBytes: 0 })).toEqual(empty)
 
     const large = payload(CONTENT_CHUNK_BYTES * 2 + 137)
     const largeInfo = await f.contents[0]!.putBlob(large)
     expect(largeInfo.bytes).toBe(large.byteLength)
-    expect(largeInfo.hash).toBe(bytesToHex(await sha256(large)))
+    expect(largeInfo.hash).toBe(computeBlobDagHash(large))
     expect(await f.contents[0]!.hasBlob(largeInfo.hash)).toBe(true)
     expect(await f.contents[0]!.getBlob(largeInfo.hash, { expectedBytes: large.byteLength })).toEqual(large)
 
@@ -237,7 +237,7 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
 
     const v1Html = new TextEncoder().encode('<!doctype html><h1>v1</h1>' + 'x'.repeat(8192))
     const v2Html = new TextEncoder().encode('<!doctype html><h1>v2</h1>')
-    const expectedV1Hash = bytesToHex(await sha256(v1Html))
+    const expectedV1Hash = computeBlobDagHash(v1Html)
 
     await (await a.publishRelease({
       entry: 'index.html',
@@ -245,9 +245,9 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
       authorTimestampMs: 100n,
     })).materialized()
 
-    // Eager CAS did NOT get bloated with UI file bytes (only lightweight seenOps metadata)!
-    expect(a.cas.hasSync(computeCasHash(v1Html), 'public')).toBe(false)
-    expect(a.cas.hasSync(expectedV1Hash, 'public')).toBe(false)
+    // Unified CAS: release files live directly in session.cas under chronolog-blob/v1 and are served via content.getBlob
+    expect(a.cas.hasSync(computeCasHash(v1Html), 'public')).toBe(true)
+    expect(a.cas.hasSync(expectedV1Hash, 'public')).toBe(true)
     expect(await a.content.hasBlob(expectedV1Hash)).toBe(true)
 
     await (await a.publishRelease({

@@ -1,4 +1,4 @@
-import { sha256 } from '@chronolog/canonical'
+import { perfCount, sha256 } from '@chronolog/canonical'
 
 import { concatBytes, utf8 } from './bytes.js'
 import { ProtocolError, protocolInvariant } from './errors.js'
@@ -69,6 +69,7 @@ export async function signDomain(
   payload: Uint8Array,
   privateKey: CryptoKey,
 ): Promise<Uint8Array> {
+  perfCount('ed25519.sign')
   try {
     const signature = await globalThis.crypto.subtle.sign(ED25519, privateKey, bufferSource(domainSeparatedBytes(domain, payload)))
     return new Uint8Array(signature)
@@ -84,6 +85,7 @@ export async function verifyDomain(
   publicKey: CryptoKey | Uint8Array,
 ): Promise<boolean> {
   if (signature.length !== 64) return false
+  perfCount('ed25519.verify')
   try {
     const key = publicKey instanceof Uint8Array ? await importEd25519PublicKey(publicKey) : publicKey
     return await globalThis.crypto.subtle.verify(

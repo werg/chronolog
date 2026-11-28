@@ -9,6 +9,7 @@ export default tseslint.config(
       ".chronolog/**",
       "coverage/**",
       "artifacts/**",
+      "bench/**",
       "dist/**",
       "node_modules/**",
       "packages/sqlite-cas/wasm/**",

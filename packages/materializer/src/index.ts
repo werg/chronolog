@@ -1,3 +1,5 @@
 export * from './std-modules.js'
 export * from './quickjs-sandbox.js'
+export * from './wasm-sandbox.js'
+export * from './derivation.js'
 export * from './kernel.js'

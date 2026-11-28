@@ -1,5 +1,6 @@
 import { compareBytes, concatBytes, decodeUtf8, equalBytes, utf8 } from './bytes.js'
 import { CanonicalError, canonicalInvariant } from './errors.js'
+import { perfCount } from './perf.js'
 
 export type CborMapKey = bigint | string | Uint8Array
 export type CborValue = null | boolean | bigint | string | Uint8Array | readonly CborValue[] | ReadonlyMap<CborMapKey, CborValue>
@@ -62,15 +63,20 @@ function encodeBigint(value: bigint): Uint8Array {
 function isMap(value: CborValue): value is ReadonlyMap<CborMapKey, CborValue> { return value instanceof Map }
 
 export function encodeCanonicalCbor(value: CborValue): Uint8Array {
+  perfCount('cbor.encode')
+  return encodeValue(value)
+}
+
+function encodeValue(value: CborValue): Uint8Array {
   if (value === null) return Uint8Array.of(0xf6)
   if (value === false) return Uint8Array.of(0xf4)
   if (value === true) return Uint8Array.of(0xf5)
   if (typeof value === 'bigint') return encodeBigint(value)
   if (typeof value === 'string') { const bytes = utf8(value); return concatBytes(encodeHead(3, BigInt(bytes.length)), bytes) }
   if (value instanceof Uint8Array) return concatBytes(encodeHead(2, BigInt(value.length)), value)
-  if (Array.isArray(value)) return concatBytes(encodeHead(4, BigInt(value.length)), ...value.map(encodeCanonicalCbor))
+  if (Array.isArray(value)) return concatBytes(encodeHead(4, BigInt(value.length)), ...value.map(encodeValue))
   if (isMap(value)) {
-    const entries = [...value].map(([key, item]) => ({ key: encodeCanonicalCbor(key), value: encodeCanonicalCbor(item) }))
+    const entries = [...value].map(([key, item]) => ({ key: encodeValue(key), value: encodeValue(item) }))
       .sort((a, b) => a.key.length === b.key.length ? compareBytes(a.key, b.key) : a.key.length - b.key.length)
     for (let index = 1; index < entries.length; index += 1) canonicalInvariant(!equalBytes(entries[index - 1]!.key, entries[index]!.key), 'CBOR_NON_CANONICAL', 'Duplicate canonical CBOR map key')
     return concatBytes(encodeHead(5, BigInt(entries.length)), ...entries.flatMap((entry) => [entry.key, entry.value]))
@@ -154,7 +160,7 @@ class Decoder {
   }
 }
 
-export function decodeCanonicalCbor(input: Uint8Array, limits: DecodeLimits): CborValue { return new Decoder(input, limits).decode() }
+export function decodeCanonicalCbor(input: Uint8Array, limits: DecodeLimits): CborValue { perfCount('cbor.decode'); perfCount('cbor.decode.bytes', input.length); return new Decoder(input, limits).decode() }
 export function assertCanonicalCbor(input: Uint8Array, limits: DecodeLimits): CborValue {
   const value = decodeCanonicalCbor(input, limits)
   canonicalInvariant(equalBytes(encodeCanonicalCbor(value), input), 'CBOR_NON_CANONICAL', 'CBOR bytes are not canonical')

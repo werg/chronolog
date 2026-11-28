@@ -25,12 +25,14 @@
     "test:signals-package": "node tools/test-signals-package.mjs",
     "package:session": "node tools/package-peer-session.mjs",
     "test:session-webrtc": "tsx tools/test-peer-session-webrtc.ts",
-    "package:authority": "node tools/package-authority.mjs"
+    "package:authority": "node tools/package-authority.mjs",
+    "bench": "tsx bench/sync.bench.ts"
   },
   "devDependencies": {
     "@chronolog/authority": "workspace:*",
     "@chronolog/crypto": "workspace:*",
     "@chronolog/materializer": "workspace:*",
+    "@chronolog/pack": "workspace:*",
     "@chronolog/peer-session": "workspace:*",
     "@chronolog/protocol": "workspace:*",
     "@chronolog/records": "workspace:*",

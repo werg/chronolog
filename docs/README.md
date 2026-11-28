@@ -1,6 +1,7 @@
 # Chronolog-DB Documentation
 
 - [Chronolog CRDT Contract](CRDT_CONTRACT.md) — formal invariants for ordering, public/encrypted partitioning, QuickJS-NG Import-Map reducers, deterministic SQLite-CAS, write RLS, keys, finality, and signals.
+- [Unified CAS, Packages, Derivations & Registry](PACKAGES_AND_DERIVATIONS.md) — `chronolog-blob/v1`, `chronolog-enc-blob/v1`, `chronolog-pkg/v1`, `chronolog-drv/v1`, scoped QuickJS/WASM runtimes, `$mounts`, `$builders`, `@chronolog/pack`, and the dogfooded Registry Chronolog.
 - [Authored Operation-Set Guide](authored-operation-set.md) — practical guide to authoring, replication, reconnect rewrapping, checkpoints, and reactive views.
 - [Browser Storage Architecture](browser-storage.md) — OPFS, IndexedDB, and single-owner worker isolation in browsers.
 

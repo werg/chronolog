@@ -21,6 +21,8 @@ export interface CreateApplicationSessionOptions<D extends ApplicationDefinition
   readonly sqliteWasmBytes?: Uint8Array
   readonly materializedSnapshot?: Uint8Array
   readonly maxOperations?: number
+  /** Optional read-only untrusted HTTP CAS mirror URLs (GET <mirror>/cas/sha256-<hex>). */
+  readonly casMirrors?: readonly string[]
 }
 
 /** Opens a Chronolog v2 local-first ApplicationSession on the claimed device. */

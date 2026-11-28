@@ -17,6 +17,9 @@ importers:
       '@chronolog/materializer':
         specifier: workspace:*
         version: link:packages/materializer
+      '@chronolog/pack':
+        specifier: workspace:*
+        version: link:packages/pack
       '@chronolog/peer-session':
         specifier: workspace:*
         version: link:packages/peer-session
@@ -122,6 +125,27 @@ importers:
       quickjs-emscripten-core:
         specifier: 0.32.0
         version: 0.32.0
+
+  packages/pack:
+    dependencies:
+      '@chronolog/canonical':
+        specifier: workspace:*
+        version: link:../canonical
+      '@chronolog/materializer':
+        specifier: workspace:*
+        version: link:../materializer
+      '@chronolog/peer-session':
+        specifier: workspace:*
+        version: link:../peer-session
+      '@chronolog/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@chronolog/records':
+        specifier: workspace:*
+        version: link:../records
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
 
   packages/peer-session:
     dependencies:

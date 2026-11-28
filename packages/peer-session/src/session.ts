@@ -1,16 +1,24 @@
-import { bytesToHex, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
+import { bytesToHex, hexToBytes, perfTimeAsync, sha256Sync, utf8 } from '@chronolog/canonical'
 import { openSqlBranch, type SqlBranch } from './sql-extensions.js'
 import { combineShares, decryptEpochPayload, encryptEpochPayload, splitSecret } from '@chronolog/crypto'
 import {
+  casRef,
+  computeBlobDagHash,
   computeCasHash,
   ContentAddressedStore,
+  parseCasRef,
+  putPackageDag,
+  tryDecodePackageNode,
+  tryParseCasRef,
   writeBytesMany,
   type BytesStore,
   type BytesStoreEntry,
   type CasPartition,
+  type PutPackageInput,
 } from '@chronolog/records'
 import {
   assertValidReducersConfig,
+  canonicalJson,
   compareOperationOrder,
   decodeEncryptedEnvelope,
   decodeLogGenesis,
@@ -61,18 +69,23 @@ import {
   type VerifiedFinalityV2,
 } from '@chronolog/authority'
 import {
+  createBytesStoreDerivationMemo,
+  evaluateDerivation,
   STANDARD_MODULE_SOURCES,
   TopicKernel,
+  type DerivationEvalResult,
   type EmittedKernelEvent,
   type KernelMaterializedCache,
   type KernelOperationInput,
   type QuickJsSandboxOptions,
   type SqliteBuiltinDriver,
+  type WasiDerivationRunner,
 } from '@chronolog/materializer'
 import { SignalChannel, type SignalAuthorization } from '@chronolog/signals'
 import { ApplicationContent } from './content.js'
 import type { ApplicationDevice } from './device.js'
 import { describeApplication, type ApplicationDefinition } from './definition.js'
+import { FactIdSet } from './reconcile.js'
 import {
   epochKeyCommitmentV2,
   hpkeOpenEpochKey,
@@ -113,6 +126,36 @@ export interface SessionCasNode {
   readonly hash: string
   readonly bytes: Uint8Array
   readonly partition: CasPartition
+}
+
+/** Sync-v3 fact scopes: public = public ops + finality checkpoints; private = encrypted envelopes. */
+export type FactScope = 'public' | 'private'
+
+/** Facts added since the last `onFacts` notification, tagged with the link that delivered them. */
+export interface FactsDelta {
+  readonly items: readonly { readonly scope: FactScope; readonly id: string; readonly source?: string }[]
+}
+
+/** Map that mirrors its keys into a reconciliation id set and reports additions. */
+class FactMap<V> extends Map<string, V> {
+  constructor(readonly ids: FactIdSet, readonly onAdd: (key: string) => void) { super() }
+  override set(key: string, value: V): this {
+    if (this.ids !== undefined && !super.has(key)) { this.ids.add(key); this.onAdd(key) }
+    return super.set(key, value)
+  }
+  override delete(key: string): boolean {
+    this.ids.delete(key)
+    return super.delete(key)
+  }
+  override clear(): void {
+    this.ids.clear()
+    super.clear()
+  }
+}
+
+let standardHashes: Set<string> | undefined
+function standardModuleHashes(): Set<string> {
+  return standardHashes ??= new Set(Object.values(STANDARD_MODULE_SOURCES).map(src => computeCasHash(utf8(src), [])))
 }
 
 export interface SessionFacts {
@@ -229,6 +272,8 @@ export interface OpenApplicationSessionOptions<D extends ApplicationDefinition =
   readonly sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly materializedSnapshot?: Uint8Array
   readonly maxOperations?: number
+  /** Optional read-only untrusted HTTP CAS mirror URLs (GET <mirror>/cas/sha256-<hex>). */
+  readonly casMirrors?: readonly string[]
   readonly release: () => void | Promise<void>
 }
 
@@ -334,6 +379,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #sqliteWasmModule?: WebAssembly.Module
   readonly #sqliteWasmLoader?: () => Promise<WebAssembly.Module>
   readonly #maxOperations: number
+  readonly #casMirrors: readonly string[]
+  readonly #mirrorAttempted = new Set<string>()
 
   #sqliteDriver?: SqliteBuiltinDriver
   #sqliteLoadPromise?: Promise<SqliteBuiltinDriver>
@@ -342,18 +389,26 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #controlKernel: TopicKernel | null = null
   #finalKernel: TopicKernel | null = null
 
-  readonly #publicOps = new Map<string, StoredPublicOp>()
-  readonly #encryptedEnvelopes = new Map<string, StoredEncryptedEnvelope>()
+  readonly #publicFactIds = new FactIdSet()
+  readonly #privateFactIds = new FactIdSet()
+  #pendingDelta: { scope: FactScope; id: string; source?: string }[] = []
+  /** Link id whose facts are currently being merged (undefined for local authoring). */
+  #factSource: string | undefined
+  #recordDelta(scope: FactScope, id: string): void {
+    this.#pendingDelta.push(this.#factSource === undefined ? { scope, id } : { scope, id, source: this.#factSource })
+  }
+  readonly #publicOps = new FactMap<StoredPublicOp>(this.#publicFactIds, id => this.#recordDelta('public', id))
+  readonly #encryptedEnvelopes = new FactMap<StoredEncryptedEnvelope>(this.#privateFactIds, id => this.#recordDelta('private', id))
   readonly #undecryptedEnvelopes = new Set<string>()
   readonly #localPending = new Map<string, LocalPendingOp>()
   readonly #retentions = new Map<string, Map<string, RetentionEvidence>>()
-  readonly #checkpoints = new Map<string, FinalityCheckpoint>()
+  readonly #checkpoints = new FactMap<FinalityCheckpoint>(this.#publicFactIds, id => this.#recordDelta('public', id))
   readonly #epochKeys = new Map<number, Uint8Array>()
   readonly #ringKeys = new Map<string, Map<number, Uint8Array>>()
 
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
   readonly #changeListeners = new Set<(change: ApplicationChange) => void>()
-  readonly #factListeners = new Set<() => void>()
+  readonly #factListeners = new Set<(delta: FactsDelta) => void>()
 
   #connectedPeers = 0
   #connectionRevision = 0
@@ -370,6 +425,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
   #cachedSignalPolicy: { stateRoot: string; rules: readonly { readonly topicPattern: string; readonly allowedAuthors: readonly string[]; readonly maxTtlMs: number; readonly allowRelay: boolean }[] } | null = null
   #cachedDescription: { stateRoot: string; value: ApplicationDescription } | null = null
+  #validationDescription: { readonly key: string; readonly value: ApplicationDescription | null } | null = null
   #evaluatedPermissions: EvaluatedPermissionsSummary | null = null
   #lastPermsStateJson = ''
   #pendingMaterializedCache: KernelMaterializedCache | null = null
@@ -412,6 +468,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (options.sqliteWasmLoader !== undefined) this.#sqliteWasmLoader = options.sqliteWasmLoader
     if (options.materializedSnapshot !== undefined) this.#pendingEncryptedSnapshot = options.materializedSnapshot.slice()
     this.#maxOperations = options.maxOperations ?? 50_000
+    this.#casMirrors = (options.casMirrors ?? []).map(u => u.replace(/\/+$/u, ''))
     this.#sandboxOptions = {
       ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
       ...(options.sqliteDriver === undefined ? {} : { sqliteDriver: options.sqliteDriver }),
@@ -439,6 +496,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     this.content = new ApplicationContent({
       store: this.#store,
+      cas: this.cas,
       identity: this.device.identity,
       storageId: this.device.storageId,
       authority: {
@@ -491,6 +549,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (options.casNodes !== undefined && options.casNodes.length > 0) {
       await cas.putManyVerified(options.casNodes)
     }
+    // The audited standard modules are part of every replica; peers never ship them (sync v3).
+    const missingStandard = Object.values(STANDARD_MODULE_SOURCES)
+      .map(src => utf8(src))
+      .filter(bytes => !cas.hasSync(computeCasHash(bytes, []), 'public'))
+    for (const bytes of missingStandard) await cas.put(bytes, [], 'public')
 
     let genesisBytes: Uint8Array | null
     if (options.genesis !== undefined) {
@@ -523,6 +586,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
     }
     await session.#hydrateFromEntries(nonCasEntries)
+    session.#pendingDelta = [] // facts loaded from local storage are not news to any peer
     await session.#rematerialize()
     return session
   }
@@ -864,6 +928,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       return
     }
     try {
+      await this.#kernel.commitSeenOpsRoot()
       await this.#store.put(
         `${this.#prefix}/materialized-cache`,
         encodeRecord(this.#kernel.exportMaterializedCache()),
@@ -887,8 +952,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   #emitFacts(): void {
+    const delta: FactsDelta = { items: this.#pendingDelta }
+    this.#pendingDelta = []
     for (const listener of this.#factListeners) {
-      try { listener() } catch { /* isolate observer */ }
+      try { listener(delta) } catch { /* isolate observer */ }
     }
   }
 
@@ -903,7 +970,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return () => { this.#changeListeners.delete(listener) }
   }
 
-  onFacts(listener: () => void): () => void {
+  onFacts(listener: (delta: FactsDelta) => void): () => void {
     this.#factListeners.add(listener)
     return () => { this.#factListeners.delete(listener) }
   }
@@ -932,35 +999,75 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#emitStatus()
   }
 
-  async #ensureSqliteIfNeeded(reducersOverride?: JsonValue | null): Promise<boolean> {
+  async #ensureSqliteIfNeeded(reducersOverride?: JsonValue | null, mountsOverride?: JsonValue | null): Promise<boolean> {
     if (this.#sqliteDriver !== undefined) return !this.#kernelHasSqlite
     const reducersRaw = reducersOverride !== undefined ? reducersOverride : this.#kernel.topic('$reducers')
     if (reducersRaw === null) return false
     let needsSqlite = false
     try {
-      const cfg = assertValidReducersConfig(reducersRaw)
       const queue: string[] = []
       const visited = new Set<string>()
-      for (const [topicName, binding] of Object.entries(cfg.topics)) {
-        if (this.#blindHostMode && this.genesis.privateLog && !isControlTopic(topicName)) continue
-        queue.push(binding.module)
+      const checkReducersCfg = (cfgRaw: JsonValue): void => {
+        const c = assertValidReducersConfig(cfgRaw)
+        for (const [topicName, binding] of Object.entries(c.topics)) {
+          if (this.#blindHostMode && this.genesis.privateLog && !isControlTopic(topicName)) continue
+          const ref = tryParseCasRef(binding.module) !== null ? binding.module : c.imports[binding.module]
+          if (binding.module === 'chronolog:sqlite' || binding.module === 'chronolog/sql' || binding.module === 'chronolog/sqlite-helpers' || binding.module === 'chronolog/registry') {
+            needsSqlite = true
+            return
+          }
+          if (ref !== undefined) queue.push(ref)
+          queue.push(binding.module)
+        }
+      }
+      const cfg = assertValidReducersConfig(reducersRaw)
+      checkReducersCfg(reducersRaw)
+      // Also inspect any mounted external logs' $reducers so ctx.mountQuery() against SQLite mounts works!
+      const mountsRaw = mountsOverride !== undefined ? mountsOverride : this.#kernel.topic('$mounts')
+      if (!needsSqlite && mountsRaw !== null && typeof mountsRaw === 'object' && !Array.isArray(mountsRaw)) {
+        const mountsMap = (mountsRaw as Readonly<Record<string, JsonValue>>).mounts
+        if (mountsMap !== null && typeof mountsMap === 'object' && !Array.isArray(mountsMap)) {
+          for (const mountEntry of Object.values(mountsMap)) {
+            if (mountEntry !== null && typeof mountEntry === 'object' && !Array.isArray(mountEntry)) {
+              const mt = (mountEntry as Readonly<Record<string, JsonValue>>).topics
+              if (mt !== null && typeof mt === 'object' && !Array.isArray(mt)) {
+                const mtRec = mt as Readonly<Record<string, JsonValue>>
+                if (mtRec.$reducers !== undefined) {
+                  try { checkReducersCfg(mtRec.$reducers) } catch { /* ignore invalid mount */ }
+                }
+              }
+            }
+          }
+        }
       }
       const importSpecRe = /\bfrom\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gu
-      while (queue.length > 0) {
-        const modSpec = queue.shift()!
-        if (visited.has(modSpec)) continue
-        visited.add(modSpec)
-        if (modSpec === 'chronolog:sqlite' || modSpec === 'chronolog/sql' || modSpec === 'chronolog/sqlite-helpers') {
+      while (!needsSqlite && queue.length > 0) {
+        const item = queue.shift()!
+        if (visited.has(item)) continue
+        visited.add(item)
+        if (item === 'chronolog:sqlite' || item === 'chronolog/sql' || item === 'chronolog/sqlite-helpers' || item === 'chronolog/registry') {
           needsSqlite = true
           break
         }
-        const ref = cfg.imports[modSpec]
+        const directHash = tryParseCasRef(item)
+        const ref = directHash !== null ? item : cfg.imports[item]
         if (ref === undefined || !ref.startsWith('cas:sha256-')) continue
         const hash = ref.slice(11)
         const node = await this.cas.get(hash, 'any')
         if (node === null) continue
+        const pkg = tryDecodePackageNode(node.bytes)
+        if (pkg !== null) {
+          if (pkg.builtins.includes('chronolog:sqlite')) {
+            needsSqlite = true
+            break
+          }
+          for (const depRef of Object.values(pkg.dependencies)) {
+            if (!visited.has(depRef)) queue.push(depRef)
+          }
+          continue
+        }
         const text = new TextDecoder().decode(node.bytes)
-        if (text.includes('chronolog:sqlite') || text.includes('chronolog/sql') || text.includes('chronolog/sqlite-helpers')) {
+        if (text.includes('chronolog:sqlite') || text.includes('chronolog/sql') || text.includes('chronolog/sqlite-helpers') || text.includes('chronolog/registry')) {
           needsSqlite = true
           break
         }
@@ -1187,12 +1294,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     } else if (rest.startsWith('retention/')) {
       try {
         const ev = decodeRecord<RetentionEvidence>(entry.value)
-        let byPeer = this.#retentions.get(ev.payload.proposalId)
-        if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(ev.payload.proposalId, byPeer) }
-        if (!byPeer.has(ev.signer)) {
-          byPeer.set(ev.signer, ev)
-          return true
-        }
+        if (Array.isArray(ev.payload.items) && this.#indexRetention(ev)) return true
       } catch { /* ignore */ }
     } else if (rest.startsWith('checkpoint/')) {
       const key = rest.slice('checkpoint/'.length)
@@ -1432,12 +1534,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       await this.#store.put(`${this.#prefix}/enc-env/${envDigest}`, envBytes)
+      const mergeSource = this.#factSource
+      this.#factSource = undefined
       this.#encryptedEnvelopes.set(envDigest, {
         digest: envDigest,
         raw: envBytes,
         envelope: env,
         decrypted: { opId, signed: pending.signed, core: pending.core },
       })
+      this.#factSource = mergeSource
       pending.currentEpoch = newestEpoch
       pending.currentEnvelopeDigest = envDigest
       await this.#store.put(`${this.#prefix}/local-pending/${opId}`, encodeRecord({
@@ -1471,6 +1576,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   async #rematerialize(): Promise<void> {
+    return perfTimeAsync('session.rematerialize', () => this.#rematerialize__impl())
+  }
+
+  async #rematerialize__impl(): Promise<void> {
     const prevDigest = this.#lastLocalRevision.digest
     const prevFinalDigest = this.#lastFinalRevision?.digest ?? null
     const prevOutcomes = new Map(this.#kernel.outcomes.map(o => [o.opId, `${o.outcome}:${o.rejectionCode ?? ''}`]))
@@ -1533,7 +1642,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         eligibleLocal.push(input)
       }
 
-      const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'))
+      const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'), controlKernel.topic('$mounts'))
       if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
         this.#kernel.sandbox.dispose()
         const nextKernel = new TopicKernel({
@@ -1619,6 +1728,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       let localResult = await this.#kernel.materialize(eligibleLocal)
+      if (localResult.pendingDependencies.length > 0 && this.#casMirrors.length > 0) {
+        const fetched = await this.#pullMissingFromMirrors()
+        if (fetched > 0) {
+          localResult = await this.#kernel.materialize(eligibleLocal)
+        }
+      }
       if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(this.#kernel.topic('$reducers')) && this.#sqliteDriver !== undefined) {
         const nextKernel = new TopicKernel({
           genesis: this.genesisBytes,
@@ -1929,7 +2044,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const appTopics = Object.keys(topics).filter(t => !isControlTopic(t))
     if (appTopics.length === 1) {
       const topic = appTopics[0]!
-      const described = await this.describe().catch(() => null)
+      const described = await this.#describeForValidation()
       const matchesDescribed = (cName: string): boolean =>
         cName === name || cName === `${topic}.${name}` || cName === `${topic}:${name}`
       if (described && described.commands.length > 0 && !described.commands.some(c => matchesDescribed(c.name))) {
@@ -1980,7 +2095,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const appTopics = Object.keys(topics).filter(t => !isControlTopic(t))
     if (appTopics.length === 1) {
       const topic = appTopics[0]!
-      const described = await this.describe().catch(() => null)
+      const described = await this.#describeForValidation()
       const matchesDescribed = (qName: string): boolean =>
         qName === name || qName === `${topic}.${name}` || qName === `${topic}:${name}`
       if (described && described.queries.length > 0 && !described.queries.some(q => matchesDescribed(q.name))) {
@@ -1993,6 +2108,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       return { applicationId: this.applicationId, revision: this.#lastLocalRevision, value }
     }
     throw new Error(`APPLICATION_QUERY_UNKNOWN:${name}`)
+  }
+
+  /**
+   * Command/query name validation only needs the reducer surface, which changes with `$reducers`,
+   * not with every application write; cache it per `$reducers` content hash.
+   */
+  async #describeForValidation(): Promise<ApplicationDescription | null> {
+    const key = this.#kernel.topicHash('$reducers') ?? ''
+    if (this.#validationDescription !== null && this.#validationDescription.key === key) return this.#validationDescription.value
+    const value = await this.describe().catch(() => null)
+    this.#validationDescription = { key, value }
+    return value
   }
 
   /** Describe available commands and queries (from local definition or in-chain reducer describe() exports). */
@@ -2654,7 +2781,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       let hash = f.hash
       let size = f.size
       if (f.bytes !== undefined) {
-        const computedHash = bytesToHex(sha256Sync(f.bytes))
+        const computedHash = computeBlobDagHash(f.bytes)
         if (hash !== undefined) check(hash === computedHash, 'PUBLICATION_FILE_HASH_MISMATCH')
         hash = computedHash
         size = f.bytes.length
@@ -2799,6 +2926,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
         })
         await tempKernel.materialize(included)
+        await tempKernel.commitSeenOpsRoot()
         const snap = tempKernel.snapshot()
 
         const inclusions = included.map(i => ({
@@ -3004,43 +3132,46 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   /** Sign and persist a batch of retention receipts in ONE batched store write + ONE fact emission. */
+  /** Index a (batch) retention receipt under every proposal it covers; true if anything was new. */
+  #indexRetention(ev: RetentionEvidence): boolean {
+    let added = false
+    for (const item of ev.payload.items) {
+      let byPeer = this.#retentions.get(item.proposalId)
+      if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(item.proposalId, byPeer) }
+      if (!byPeer.has(ev.signer)) { byPeer.set(ev.signer, ev); added = true }
+    }
+    return added
+  }
+
+  /**
+   * Sign ONE retention receipt covering every newly retained item (sync v3), instead of one
+   * signature, store write and gossip fact per operation.
+   */
   async retainMany(
     items: readonly { readonly proposalId: string; readonly author: string; readonly envelopeDigest: string }[],
   ): Promise<readonly RetentionEvidence[]> {
     if (items.length === 0) return []
-    const results: RetentionEvidence[] = []
-    const toWrite: BytesStoreEntry[] = []
-    for (const item of items) {
+    const fresh = items.filter(item => {
       const existing = this.#retentions.get(item.proposalId)?.get(this.identity.publicKey)
-      if (existing !== undefined && existing.payload.envelopeDigest === item.envelopeDigest) {
-        results.push(existing)
-        continue
-      }
-      const evidence = await signRecord('operation-retention', {
-        applicationId: this.applicationId,
-        proposalId: item.proposalId,
-        author: item.author,
-        envelopeDigest: item.envelopeDigest,
-        peer: this.identity.publicKey,
-        storageId: this.device.storageId,
-      }, this.device.identity)
+      return existing === undefined || !existing.payload.items.some(prior => prior.proposalId === item.proposalId && prior.envelopeDigest === item.envelopeDigest)
+    })
+    if (fresh.length === 0) return items.map(item => this.#retentions.get(item.proposalId)!.get(this.identity.publicKey)!)
+    const evidence = await signRecord('operation-retention', {
+      applicationId: this.applicationId,
+      peer: this.identity.publicKey,
+      storageId: this.device.storageId,
+      items: fresh.map(item => ({ proposalId: item.proposalId, author: item.author, envelopeDigest: item.envelopeDigest })),
+    }, this.device.identity)
+    for (const item of fresh) {
       let byPeer = this.#retentions.get(item.proposalId)
       if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(item.proposalId, byPeer) }
       byPeer.set(this.identity.publicKey, evidence)
-      toWrite.push({
-        key: `${this.#prefix}/retention/${item.proposalId}/${this.identity.publicKey}`,
-        value: encodeRecord(evidence),
-      })
-      results.push(evidence)
     }
-    if (toWrite.length > 0) {
-      for (let i = 0; i < toWrite.length; i += 128) {
-        await writeBytesMany(this.#store, toWrite.slice(i, i + 128), { durability: 'relaxed' })
-      }
-      this.#emitFacts()
-    }
-    return results
+    await this.#store.put(`${this.#prefix}/retention/${await recordDigest(evidence.payload)}`, encodeRecord(evidence), { durability: 'relaxed' })
+    this.#emitFacts()
+    return items.map(item => this.#retentions.get(item.proposalId)!.get(this.identity.publicKey)!)
   }
+
 
   // ---- Facts export & merge (P2P + blind host sync) ----
 
@@ -3063,6 +3194,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     ) {
       return null
     }
+    await this.#kernel.commitSeenOpsRoot()
     const cache = this.#kernel.exportMaterializedCache()
     const casNodes: SessionCasNode[] = []
     if (options.includeReachableCas !== false) {
@@ -3168,13 +3300,258 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
   }
 
+  /** Reconciliation id set for a sync-v3 scope (live view; do not mutate). */
+  factIds(scope: FactScope): FactIdSet {
+    return scope === 'public' ? this.#publicFactIds : this.#privateFactIds
+  }
+
+  /** Raw facts for the given ids of one scope (unknown ids are skipped). */
+  exportFactsById(scope: FactScope, ids: readonly string[]): SessionFacts {
+    const publicOps: Uint8Array[] = [], encryptedEnvelopes: Uint8Array[] = [], checkpoints: FinalityCheckpoint[] = []
+    for (const id of ids) {
+      if (scope === 'private') {
+        const env = this.#encryptedEnvelopes.get(id)
+        if (env !== undefined) encryptedEnvelopes.push(env.raw)
+        continue
+      }
+      const op = this.#publicOps.get(id)
+      if (op !== undefined) { publicOps.push(op.raw); continue }
+      const cp = this.#checkpoints.get(id)
+      if (cp !== undefined) checkpoints.push(cp)
+    }
+    return { publicOps, encryptedEnvelopes, casNodes: [], retentions: [], checkpoints }
+  }
+
+  /** CAS nodes by hash for an on-demand peer pull; walks explicit CasNode.links when subgraph=true. */
+  async exportCasNodes(
+    hashes: readonly string[],
+    includePrivate: boolean,
+    options: { readonly subgraph?: boolean; readonly maxNodes?: number; readonly maxBytes?: number } = {},
+  ): Promise<SessionCasNode[]> {
+    if (options.subgraph === true) {
+      const sub = await this.cas.collectSubgraph(hashes, {
+        allowedPartition: includePrivate ? 'any' : 'public',
+        ...(options.maxNodes === undefined ? {} : { maxNodes: options.maxNodes }),
+        ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+      })
+      return [...sub]
+    }
+    const out: SessionCasNode[] = []
+    for (const hash of hashes) {
+      for (const partition of includePrivate ? ['public', 'private'] as const : ['public'] as const) {
+        const raw = await this.cas.getRaw(hash, partition)
+        if (raw !== null) { out.push({ hash, bytes: raw, partition }); break }
+      }
+    }
+    return out
+  }
+
+  /** Fetch missing public CAS nodes (and walk their CasNode.links) from configured untrusted HTTP CAS mirrors. */
+  async #pullMissingFromMirrors(): Promise<number> {
+    if (this.#casMirrors.length === 0) return 0
+    let addedTotal = 0
+    const queue = this.missingCasDependencies().filter(h => !this.#mirrorAttempted.has(h))
+    const fetched = new Set<string>()
+    while (queue.length > 0 && fetched.size < 128) {
+      const hash = queue.shift()!
+      if (fetched.has(hash) || this.cas.hasSync(hash, 'public')) continue
+      this.#mirrorAttempted.add(hash)
+      for (const mirror of this.#casMirrors) {
+        try {
+          const resp = await fetch(`${mirror}/cas/sha256-${hash}`)
+          if (!resp.ok) continue
+          const buf = new Uint8Array(await resp.arrayBuffer())
+          const added = await this.cas.putManyVerified([{ hash, bytes: buf, partition: 'public' }])
+          if (added > 0) {
+            addedTotal += added
+            fetched.add(hash)
+            const node = await this.cas.get(hash, 'public')
+            if (node !== null) {
+              for (const link of node.links) {
+                if (!this.cas.hasSync(link, 'public') && !fetched.has(link)) queue.push(link)
+              }
+            }
+          }
+          break
+        } catch { /* try next mirror */ }
+      }
+    }
+    return addedTotal
+  }
+
+  /**
+   * Install a content-addressed `chronolog-pkg/v1` package (or pre-packed bundle / existing CAS ref)
+   * into this log's `$reducers` topic in one ergonomic call.
+   */
+  async installPackage(
+    pkg:
+      | string
+      | (PutPackageInput & { readonly partition?: CasPartition })
+      | { readonly ref: string; readonly casNodes: readonly SessionCasNode[] },
+    options: {
+      readonly alias: string
+      readonly topics?: Readonly<Record<string, { readonly export?: string; readonly config?: JsonValue }>>
+      readonly partition?: CasPartition
+      readonly attestations?: readonly JsonValue[]
+      readonly operationId?: string
+      readonly authorTimestampMs?: bigint
+    },
+  ): Promise<{ readonly pkgRef: string; readonly operation: ApplicationOperation }> {
+    let pkgRef: string
+    if (typeof pkg === 'string') {
+      pkgRef = casRef(tryParseCasRef(pkg) ?? pkg)
+    } else if ('casNodes' in pkg && 'ref' in pkg) {
+      if (pkg.casNodes.length > 0) {
+        await this.cas.putManyVerified(pkg.casNodes)
+      }
+      pkgRef = casRef(parseCasRef(pkg.ref))
+    } else {
+      const pkgInput = pkg
+      const partition: CasPartition = (options.partition ?? pkgInput.partition) === 'private' && this.genesis.privateLog
+        ? 'private'
+        : 'public'
+      const placed = await putPackageDag(this.cas, pkgInput, partition)
+      pkgRef = placed.ref
+    }
+
+    const topicUpdates: Record<string, JsonValue> = {}
+    if (options.topics !== undefined) {
+      for (const [topicName, binding] of Object.entries(options.topics)) {
+        topicUpdates[topicName] = {
+          module: options.alias,
+          ...(binding.export === undefined ? {} : { export: binding.export }),
+          ...(binding.config === undefined ? {} : { config: binding.config }),
+        }
+      }
+    }
+    const payload: Record<string, JsonValue> = {
+      imports: { [options.alias]: pkgRef },
+      ...(Object.keys(topicUpdates).length > 0 ? { topics: topicUpdates } : {}),
+      ...(options.attestations !== undefined ? { attestations: options.attestations } : {}),
+    }
+    const operation = await this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{ topic: '$reducers', input: payload }],
+    })
+    return { pkgRef, operation }
+  }
+
+  /**
+   * Pin a verified snapshot of an external Chronolog log into `$mounts` so reducers can query it
+   * deterministically via `ctx.mount(name)` and `ctx.mountQuery(name, topic, input)`.
+   */
+  async mountLog(
+    name: string,
+    source: ApplicationSession | {
+      readonly logId: string
+      readonly stateRoot: string
+      readonly topics: Readonly<Record<string, JsonValue>>
+      readonly casNodes?: readonly SessionCasNode[]
+      readonly trustedSigners?: readonly string[]
+      readonly signer?: string
+      readonly signature?: string
+    },
+    options: {
+      readonly trustedSigners?: readonly string[]
+      readonly operationId?: string
+      readonly authorTimestampMs?: bigint
+    } = {},
+  ): Promise<ApplicationOperation> {
+    let logId: string
+    let stateRoot: string
+    let topics: Readonly<Record<string, JsonValue>>
+    let casNodes: readonly SessionCasNode[]
+    let signer: string | undefined
+    let signature: string | undefined
+
+    if (source instanceof ApplicationSession) {
+      const snap = source.#kernel.snapshot()
+      logId = source.logId
+      stateRoot = snap.stateRoot
+      topics = snap.topics
+      const exported = await source.exportFacts({ includePrivateCas: !source.genesis.privateLog })
+      // Mounted snapshots live inside the public $mounts control topic, so their reachable CAS nodes are placed in public CAS.
+      casNodes = exported.casNodes.map(n => ({ hash: n.hash, bytes: n.bytes, partition: 'public' as const }))
+      const msg = utf8(`chronolog/mount/v1:${canonicalJson({ logId, stateRoot, topics })}`)
+      signer = source.device.identity.publicKey
+      signature = bytesToHex(new Uint8Array(await crypto.subtle.sign('Ed25519', source.device.identity.privateKey, new Uint8Array(msg))))
+    } else {
+      logId = source.logId
+      stateRoot = source.stateRoot
+      topics = source.topics
+      casNodes = source.casNodes ?? []
+      signer = source.signer
+      signature = source.signature
+    }
+
+    if (casNodes.length > 0) {
+      await this.cas.putManyVerified(casNodes)
+    }
+    const casRoots = [...new Set(casNodes.map(n => n.hash))].sort()
+    const payload: Record<string, JsonValue> = {
+      action: 'update',
+      name,
+      logId,
+      stateRoot,
+      topics,
+      casRoots,
+      ...(options.trustedSigners !== undefined ? { trustedSigners: [...options.trustedSigners] } : {}),
+      ...(signer !== undefined && signature !== undefined ? { signer, signature } : {}),
+    }
+    return this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{ topic: '$mounts', input: payload }],
+    })
+  }
+
+  /** Evaluate (or retrieve from durable memo cache) a content-addressed `chronolog-drv/v1` derivation. */
+  async evaluateDerivation(
+    drvRefOrHash: string,
+    options: {
+      readonly partition?: CasPartition
+      readonly skipMemo?: boolean
+      readonly wasiRunners?: Readonly<Record<string, WasiDerivationRunner>>
+    } = {},
+  ): Promise<DerivationEvalResult> {
+    const memo = createBytesStoreDerivationMemo(this.#store, `${this.#prefix}/drv-memo/`)
+    return evaluateDerivation({
+      drvRefOrHash,
+      cas: this.cas,
+      sandbox: this.#kernel.sandbox,
+      memo,
+      ...(options.partition === undefined ? {} : { partition: options.partition }),
+      ...(options.skipMemo === undefined ? {} : { skipMemo: options.skipMemo }),
+      ...(options.wasiRunners === undefined ? {} : { wasiRunners: options.wasiRunners }),
+    })
+  }
+
+  /** CAS hashes replay is blocked on (modules, reducer-read nodes, SQLite pages). */
+  missingCasDependencies(): string[] {
+    const out = new Set<string>()
+    for (const kernel of [this.#kernel, this.#controlKernel, this.#finalKernel]) {
+      for (const dep of kernel?.pendingDependencies ?? []) {
+        const hash = dep.slice(dep.indexOf('/') + 1)
+        if (/^[0-9a-f]{64}$/u.test(hash)) out.add(hash)
+      }
+    }
+    return [...out]
+  }
+
   async exportPublicControlFacts(): Promise<{
     readonly publicOps: readonly Uint8Array[]
     readonly casNodes: readonly SessionCasNode[]
     readonly checkpoints: readonly FinalityCheckpoint[]
   }> {
     const casNodes: SessionCasNode[] = []
+    const standard = standardModuleHashes()
     for (const hash of this.cas.listKnownHashes('public')) {
+      if (standard.has(hash)) continue // every replica and host seeds the audited standard modules itself
       const raw = await this.cas.getRaw(hash, 'public')
       if (raw !== null) casNodes.push({ hash, bytes: raw, partition: 'public' })
     }
@@ -3185,8 +3562,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
   }
 
-  mergeFacts(facts: SessionFacts): Promise<void> {
+  mergeFacts(facts: SessionFacts, options: { readonly source?: string } = {}): Promise<void> {
     return this.#serial(async () => {
+      this.#factSource = options.source
+      try { await this.#mergeFactsNow(facts) } finally { this.#factSource = undefined }
+    })
+  }
+
+  async #mergeFactsNow(facts: SessionFacts): Promise<void> {
+    {
       if (facts.genesisBytes !== undefined) {
         check(sameBytes(facts.genesisBytes, this.genesisBytes), 'FACTS_GENESIS_MISMATCH')
       }
@@ -3206,6 +3590,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
       for (const raw of facts.publicOps ?? []) {
         const signed = decodeSignedOperation(raw)
+        // Dedupe on the content-derived id before paying for signature verification.
+        if (this.#publicOps.has(bytesToHex(operationIdDigest(signed.coreBytes)))) continue
         const verified = await verifySignedOperation(signed)
         if (bytesToHex(verified.core.logId) !== this.logId) continue
         if (verified.core.visibility !== 'public') continue
@@ -3220,10 +3606,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       for (const raw of facts.encryptedEnvelopes ?? []) {
-        const envelope = decodeEncryptedEnvelope(raw)
-        if (bytesToHex(envelope.logId) !== this.logId) continue
         const digest = bytesToHex(encryptedEnvelopeDigest(raw))
         if (this.#encryptedEnvelopes.has(digest)) continue
+        const envelope = decodeEncryptedEnvelope(raw)
+        if (bytesToHex(envelope.logId) !== this.logId) continue
         check(this.#publicOps.size + this.#encryptedEnvelopes.size < this.#maxOperations, 'SESSION_OPERATION_LIMIT')
         const copy = raw.slice()
         storeBatch.push({ key: `${this.#prefix}/enc-env/${digest}`, value: copy })
@@ -3234,16 +3620,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       for (const ev of facts.retentions ?? []) {
-        if (ev.payload.applicationId !== this.applicationId) continue
+        if (ev.payload.applicationId !== this.applicationId || !Array.isArray(ev.payload.items)) continue
+        // Verify once per batch receipt, and only if it says something new.
+        if (ev.payload.items.every((item: { readonly proposalId: string }) => this.#retentions.get(item.proposalId)?.has(ev.signer) === true)) continue
         await verifyRecord('operation-retention', ev, ev.signer)
-        let byPeer = this.#retentions.get(ev.payload.proposalId)
-        if (byPeer === undefined) { byPeer = new Map(); this.#retentions.set(ev.payload.proposalId, byPeer) }
-        if (!byPeer.has(ev.signer)) {
-          byPeer.set(ev.signer, ev)
-          storeBatch.push({
-            key: `${this.#prefix}/retention/${ev.payload.proposalId}/${ev.signer}`,
-            value: encodeRecord(ev),
-          })
+        if (this.#indexRetention(ev)) {
+          storeBatch.push({ key: `${this.#prefix}/retention/${await recordDigest(ev.payload)}`, value: encodeRecord(ev) })
           factsChanged = true
         }
       }
@@ -3276,7 +3658,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       if (factsChanged) {
         this.#emitFacts()
       }
-    })
+    }
   }
 
   async collectGarbage(): Promise<{ readonly kept: number; readonly deleted: number }> {
