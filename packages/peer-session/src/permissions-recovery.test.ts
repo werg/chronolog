@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { combineShares, splitSecret } from '@chronolog/crypto'
+import { combineShares, KEY_BOX_SUITE_XWING, splitSecret, verifyEd25519Sync } from '@chronolog/crypto'
+import { ANONYMOUS_AUTHOR, decodeEncryptedEnvelope, decodeSignedOperation, envelopeMailboxSigningBytes, verifySignedOperation } from '@chronolog/protocol'
 import { MemoryBytesStore } from '@chronolog/records'
+import { replayBlindHostControl } from './blind-host.js'
 import { openApplicationDevice } from './device.js'
 import { createLogGenesis } from './genesis.js'
 import { createApplicationSession } from './runtime.js'
@@ -251,6 +253,183 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
     } finally {
       await sPubAdmin.close()
       await sNewcomer.close()
+    }
+  })
+
+  it('supports hybrid PQ X-Wing epochs, anonymous-author padded envelopes, blind-host mailbox verification, sealFor/unseal, write-once boxes, and kernel ring isolation', async () => {
+    const admin = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const bob = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const carol = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+
+    expect(admin.pqWrapKey?.publicKey).toMatch(/^[0-9a-f]{2432}$/u)
+
+    const created = await createLogGenesis({
+      creator: {
+        publicKey: admin.identity.publicKey,
+        wrapKey: admin.wrapKey.publicKey,
+        pqWrapKey: admin.pqWrapKey!.publicKey,
+        reader: true,
+        writer: true,
+        administrator: true,
+        publisher: true,
+        finalizer: true,
+      },
+      privateLog: true,
+      keysPolicy: {
+        minSuite: KEY_BOX_SUITE_XWING,
+        paddingBucketBytes: 512,
+        hideEnvelopeAuthor: true,
+      },
+      topics: {
+        notes: { module: 'chronolog/crdt', export: 'lwwMap' },
+        vault: { module: 'chronolog/crdt', export: 'lwwMap' },
+      },
+    })
+
+    const sAdmin = await createApplicationSession({
+      device: admin,
+      genesis: created.genesisBytes,
+      casNodes: created.casNodes,
+      epochKeys: new Map([[0, created.epoch0Key!]]),
+    })
+    const sBob = await createApplicationSession({ device: bob, genesis: created.genesisBytes, casNodes: created.casNodes })
+    const sCarol = await createApplicationSession({ device: carol, genesis: created.genesisBytes, casNodes: created.casNodes })
+
+    try {
+      // Admit Bob with hybrid PQ X-Wing key -> epoch 0 is created with suite hpke-xwing-aes256gcm + mailboxVerifyKey
+      const admitBob = await sAdmin.admitMember({
+        publicKey: bob.identity.publicKey,
+        wrapKey: bob.wrapKey.publicKey,
+        pqWrapKey: bob.pqWrapKey!.publicKey,
+      })
+      expect((await admitBob.materialized()).outcome).toBe('accepted')
+      expect(sAdmin.keysState().epochs['0']?.suite).toBe(KEY_BOX_SUITE_XWING)
+      expect(sAdmin.keysState().epochs['0']?.mailboxVerifyKey).toMatch(/^[0-9a-f]{64}$/u)
+
+      // Downgrade attempt below minSuite must be rejected by $keys
+      const badRotate = await sAdmin.submit({
+        visibility: 'public',
+        awaitMaterialized: true,
+        updates: [{
+          topic: '$keys',
+          input: {
+            action: 'rotateEpoch',
+            epoch: 1,
+            suite: 'hpke-x25519-aes256gcm',
+            keyCommitment: 'a'.repeat(64),
+            boxes: {},
+          },
+        }],
+      })
+      expect((await badRotate.materialized()).rejectionCode).toBe('suite_below_minimum')
+
+      // Sync to Bob; Bob unseals PQ X-Wing epoch 0 and writes a private note
+      await sBob.mergeFacts(await sAdmin.exportFacts())
+      expect(sBob.hasEpochKey(0)).toBe(true)
+
+      const bobOp = await sBob.command('notes:set', { key: 'secret', value: 'quantum-safe' })
+      expect((await bobOp.materialized()).outcome).toBe('accepted')
+
+      // Inspect raw encrypted envelope: outer author is zeroed (ANONYMOUS_AUTHOR), padded to power-of-2 bucket, and signed by epoch mailbox key!
+      const bobFacts = await sBob.exportFacts()
+      expect(bobFacts.encryptedEnvelopes.length).toBe(1)
+      const rawEnv = decodeEncryptedEnvelope(bobFacts.encryptedEnvelopes[0]!)
+      expect(rawEnv.author).toEqual(ANONYMOUS_AUTHOR)
+      expect(rawEnv.suite).toBe('hkdf-aes-256-gcm')
+      expect(rawEnv.nonce).toHaveLength(24)
+      expect(rawEnv.ciphertext.byteLength % 512).toBe(16) // 512-byte padded plaintext + 16-byte GCM tag
+      expect(rawEnv.mailboxTag).toHaveLength(64)
+
+      // Blind host replays public control ops and verifies mailboxTag strictly against derived mailboxVerifyKey without knowing Bob wrote it!
+      const ctrl = await sAdmin.exportPublicControlFacts()
+      const verifiedPublicOps = await Promise.all(ctrl.publicOps.map(async raw => {
+        const v = await verifySignedOperation(decodeSignedOperation(raw))
+        return { opId: v.opId, core: v.core, verified: true as const }
+      }))
+      const blind = await replayBlindHostControl({
+        genesis: created.genesis,
+        publicOps: verifiedPublicOps,
+        publicCasNodes: ctrl.casNodes.map(n => ({ hash: n.hash, bytes: n.bytes })),
+      })
+      const mbKeyHex = blind.mailboxVerifyKeys.default?.['0']
+      expect(mbKeyHex).toBe(sAdmin.keysState().epochs['0']!.mailboxVerifyKey!)
+      expect(verifyEd25519Sync(
+        Uint8Array.from(Buffer.from(mbKeyHex!, 'hex')),
+        envelopeMailboxSigningBytes(rawEnv),
+        rawEnv.mailboxTag!,
+      )).toBe(true)
+
+      // Admin decrypts Bob's anonymous envelope and verifies Bob is the true inner author!
+      await sAdmin.mergeFacts(bobFacts)
+      expect(sAdmin.topic('notes')).toMatchObject({ entries: { secret: { value: 'quantum-safe' } } })
+
+      // Non-admin write-once lockbox protection: Bob cannot overwrite admin's existing epoch 0 box!
+      const overwriteAttempt = await sBob.submit({
+        visibility: 'public',
+        awaitMaterialized: true,
+        updates: [{
+          topic: '$keys',
+          input: {
+            action: 'grantBoxes',
+            member: admin.identity.publicKey,
+            epochBoxes: { '0': { suite: KEY_BOX_SUITE_XWING, encapsulatedKey: '00', ciphertext: '00' } },
+          },
+        }],
+      })
+      expect((await overwriteAttempt.materialized()).rejectionCode).toBe('box_already_exists')
+
+      // Self-service wrap key rotation for Bob
+      const rotWrap = await sBob.rotateWrapKey()
+      expect((await rotWrap.materialized()).outcome).toBe('accepted')
+
+      // Selective per-recipient sealFor / unseal: admin seals a secret strictly to Bob (Carol cannot open)
+      await sAdmin.admitMember({
+        publicKey: carol.identity.publicKey,
+        wrapKey: carol.wrapKey.publicKey,
+        pqWrapKey: carol.pqWrapKey!.publicKey,
+      })
+      const sealed = await sAdmin.sealFor([bob.identity.publicKey], { ssn: '000-00-0000' })
+      expect(sealed.boxes[bob.identity.publicKey]?.suite).toBe(KEY_BOX_SUITE_XWING)
+      expect(await sBob.unseal(sealed)).toEqual({ ssn: '000-00-0000' })
+      await expect(sCarol.unseal(sealed)).rejects.toThrow('SEALED_BOX_NOT_A_RECIPIENT')
+
+      // On-log org group policy stored in $admission
+      const setGp = await sAdmin.submit({
+        visibility: 'public',
+        awaitMaterialized: true,
+        updates: [{
+          topic: '$admission',
+          input: {
+            action: 'setGroupPolicy',
+            groupPolicy: { revision: 1, rules: [{ ruleId: 'eng', group: 'github-org:acme', role: 'writer' }] },
+          },
+        }],
+      })
+      expect((await setGp.materialized()).outcome).toBe('accepted')
+      expect((sAdmin.permissions().admission as { groupPolicy?: unknown } | null)?.groupPolicy).toEqual({
+        revision: 1,
+        rules: [{ ruleId: 'eng', group: 'github-org:acme', role: 'writer' }],
+      })
+
+      // Compartment ring isolation enforced at kernel level: bind `vault` to `admins` ring
+      const comp = await sAdmin.createCompartment('admins', {
+        topics: ['vault'],
+        members: [{ publicKey: admin.identity.publicKey, pqWrapKey: admin.pqWrapKey!.publicKey }],
+      })
+      expect((await comp.operation.materialized()).outcome).toBe('accepted')
+      const vaultOk = await sAdmin.command('vault:set', { key: 'k', value: 'admin-only' })
+      expect((await vaultOk.materialized()).outcome).toBe('accepted')
+      // Mixing default ring (`notes`) and compartment ring (`vault`) fails fast
+      await expect(sAdmin.submit({
+        updates: [
+          { topic: 'notes', input: { action: 'set', key: 'a', value: 1 } },
+          { topic: 'vault', input: { action: 'set', key: 'b', value: 2 } },
+        ],
+      })).rejects.toThrow('OPERATION_CROSS_RING_FORBIDDEN')
+    } finally {
+      await sAdmin.close()
+      await sBob.close()
+      await sCarol.close()
     }
   })
 })

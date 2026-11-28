@@ -71,6 +71,8 @@ export {
   decodeEncryptedEnvelope,
   encodeEncryptedEnvelope,
   encryptedEnvelopeDigest,
+  envelopeMailboxSigningBytes,
+  ANONYMOUS_AUTHOR,
   operationIdDigest,
   isControlTopic,
   type LogGenesis,
@@ -79,6 +81,10 @@ export {
   type EncryptedOperationEnvelope,
   type JsonValue,
 } from '@chronolog/protocol'
+export {
+  verifyEd25519Sync,
+  deriveEpochMailboxKeyPair,
+} from '@chronolog/crypto'
 export {
   collectControlReferencedCasHashes,
   extractControlAdmission,

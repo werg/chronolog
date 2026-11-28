@@ -217,6 +217,8 @@ export interface BlindHostControlResult {
   readonly admission: AdmissionDecision
   readonly finalizedTopics: Readonly<Record<string, JsonValue>> | null
   readonly referencedCasHashes: ReadonlySet<string>
+  /** Per-ring per-epoch Ed25519 mailbox verification keys from `$keys` (`{ default: { '0': hex }, ... }`). */
+  readonly mailboxVerifyKeys: Readonly<Record<string, Readonly<Record<string, string>>>>
 }
 
 /**
@@ -287,6 +289,24 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
       cas,
     })
 
+    let mailboxVerifyKeys: Record<string, Record<string, string>> = { default: {} }
+    try {
+      const q = await kernel.query('$keys', { kind: 'mailboxKeys' })
+      if (q !== null && typeof q === 'object' && !Array.isArray(q)) {
+        const cleaned: Record<string, Record<string, string>> = {}
+        for (const [ring, epochs] of Object.entries(q as Record<string, unknown>)) {
+          if (epochs !== null && typeof epochs === 'object' && !Array.isArray(epochs)) {
+            const epMap: Record<string, string> = {}
+            for (const [ep, keyHex] of Object.entries(epochs as Record<string, unknown>)) {
+              if (typeof keyHex === 'string' && HEX32.test(keyHex)) epMap[ep] = keyHex
+            }
+            cleaned[ring] = epMap
+          }
+        }
+        mailboxVerifyKeys = cleaned
+      }
+    } catch { /* custom $keys without mailboxKeys query */ }
+
     return {
       stateRoot: snap.stateRoot,
       historyDigest: snap.historyDigest,
@@ -298,6 +318,7 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
       admission,
       finalizedTopics,
       referencedCasHashes,
+      mailboxVerifyKeys,
     }
   } finally {
     kernel.dispose()

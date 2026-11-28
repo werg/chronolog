@@ -27,6 +27,7 @@ export type {
   AdmissionMultisigInfo,
   AdmissionRoster,
   KeysTopicState,
+  SealedRecipientBox,
   CheckpointBootstrapSnapshot,
 } from './session.js'
 export type * from './session-types.js'
@@ -49,6 +50,8 @@ export {
   decodeEncryptedEnvelope,
   encryptedEnvelopeDigest,
   envelopeAad,
+  envelopeMailboxSigningBytes,
+  ANONYMOUS_AUTHOR,
   operationIdDigest,
   compareOperationOrder,
   isControlTopic,
@@ -86,7 +89,16 @@ export type * from './content.js'
 export { createApplicationBackend } from './tendriller.js'
 export { createApplicationOwner } from './session-owner.js'
 export type * from './owner-types.js'
-export { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
+export {
+  createWrapKeyPair,
+  importWrapPrivateKey,
+  createPqWrapKeyPair,
+  KEY_BOX_SUITE_X25519,
+  KEY_BOX_SUITE_XWING,
+  type WrapKeyPair,
+  type PqWrapKeyPair,
+  type KeyBoxSuite,
+} from './wrap-keys.js'
 export * from './multi-session.js'
 export type {
   FederatedSqlSource,
@@ -96,7 +108,13 @@ export type {
   TableRowDiff,
 } from './sql-extensions.js'
 export type { MerkleDbDiff } from 'chronolog-db'
-export { splitSecret, combineShares, type ShamirShare } from '@chronolog/crypto'
+export {
+  splitSecret,
+  combineShares,
+  deriveEpochMailboxKeyPair,
+  verifyEd25519Sync,
+  type ShamirShare,
+} from '@chronolog/crypto'
 
 export {
   MemoryBytesStore,

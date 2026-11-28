@@ -18,13 +18,16 @@ import { verifyEd25519, canonicalJson, sha256 } from 'chronolog:crypto';
 
 const HEX32 = /^[0-9a-f]{64}$/;
 const HEX64 = /^[0-9a-f]{128}$/;
+const HEX_XWING = /^[0-9a-f]{2432}$/;
 
 function sortedKeys(list) {
   return Array.from(new Set(list)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 function normalizeMember(m) {
-  if (!m || typeof m !== 'object' || !HEX32.test(m.publicKey || '') || (m.wrapKey !== undefined && m.wrapKey !== null && !HEX32.test(m.wrapKey))) {
+  if (!m || typeof m !== 'object' || !HEX32.test(m.publicKey || '') ||
+      (m.wrapKey !== undefined && m.wrapKey !== null && !HEX32.test(m.wrapKey)) ||
+      (m.pqWrapKey !== undefined && m.pqWrapKey !== null && !HEX_XWING.test(m.pqWrapKey))) {
     throw new Error('INVALID_MEMBER');
   }
   const scopes = Array.isArray(m.scopes)
@@ -36,6 +39,7 @@ function normalizeMember(m) {
   return {
     publicKey: m.publicKey,
     ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+    ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
     ...(typeof m.label === 'string' && m.label.length > 0 ? { label: m.label } : {}),
     ...(typeof m.subject === 'string' && m.subject.length > 0 ? { subject: m.subject } : {}),
     ...(scopes && scopes.length > 0 ? { scopes } : {}),
@@ -577,6 +581,22 @@ export const attestedAdmission = {
     const authorIsAdmin = checkMembersCapability(membersList, 'administrator', tx.author, { atMs });
     const authorIsReader = checkMembersCapability(membersList, 'reader', tx.author, { atMs });
 
+    if (input.action === 'rotateWrapKey') {
+      const existing = membersList.find(m => m.publicKey === tx.author);
+      if (!existing) return { ok: false, code: 'member_required' };
+      if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
+      if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
+      if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
+      const updated = normalizeMember({
+        ...existing,
+        ...(input.wrapKey !== undefined ? { wrapKey: input.wrapKey } : {}),
+        ...(input.pqWrapKey !== undefined ? { pqWrapKey: input.pqWrapKey } : {}),
+      });
+      const members = membersList.filter(m => m.publicKey !== tx.author).concat([updated]);
+      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+      return { ok: true, state: { ...cur, members }, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
+    }
+
     if (input.action === 'setMember') {
       if (!authorIsAdmin) {
         if (!authorIsReader || !input.attestation) return { ok: false, code: 'admin_required' };
@@ -746,6 +766,19 @@ export const attestedAdmission = {
       return { ok: true, state: { ...cur, admission: { ...admission, invites } }, events: [{ topic: '$admission.invite_revoked', payload: { inviteId: input.inviteId } }] };
     }
 
+    if (input.action === 'setGroupPolicy') {
+      const gp = input.groupPolicy;
+      if (gp !== null && (!gp || typeof gp !== 'object' || !Array.isArray(gp.rules) || gp.rules.length > 32)) {
+        return { ok: false, code: 'invalid_group_policy' };
+      }
+      const admission = cur.admission && typeof cur.admission === 'object' ? cur.admission : { mode: 'attested' };
+      return {
+        ok: true,
+        state: { ...cur, admission: { ...admission, groupPolicy: gp } },
+        events: [{ topic: '$admission.group_policy_updated', payload: { rules: gp ? gp.rules.length : 0 } }],
+      };
+    }
+
     if (input.action === 'setAdmission') {
       return { ok: true, state: { ...cur, admission: input.admission ?? null } };
     }
@@ -850,6 +883,24 @@ export const openAdmission = {
       return { ok: true, state: { ...cur, vouchedAuthors }, events: [{ topic: '$admission.author_vouched', payload: { publicKey: input.publicKey, by: tx.author } }] };
     }
 
+    if (input.action === 'rotateWrapKey') {
+      const existing = cur.members.find(m => m.publicKey === tx.author);
+      const isAdmin = cur.admins.includes(tx.author);
+      if (!existing && !isAdmin) return { ok: false, code: 'member_required' };
+      if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
+      if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
+      if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
+      const base = existing || { publicKey: tx.author, reader: true, writer: true, administrator: isAdmin, publisher: isAdmin, finalizer: false };
+      const updated = normalizeMember({
+        ...base,
+        ...(input.wrapKey !== undefined ? { wrapKey: input.wrapKey } : {}),
+        ...(input.pqWrapKey !== undefined ? { pqWrapKey: input.pqWrapKey } : {}),
+      });
+      const members = cur.members.filter(m => m.publicKey !== tx.author).concat([updated]);
+      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+      return { ok: true, state: { ...cur, members }, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
+    }
+
     if (!cur.admins.includes(tx.author)) return { ok: false, code: 'admin_required' };
 
     const common = applyCommonAdminControlActions(cur, input, tx);
@@ -951,6 +1002,7 @@ export const openAdmission = {
       synthesizedMap.set(a, {
         publicKey: a,
         ...(existing && existing.wrapKey ? { wrapKey: existing.wrapKey } : {}),
+        ...(existing && existing.pqWrapKey ? { pqWrapKey: existing.pqWrapKey } : {}),
         reader: true,
         writer: true,
         administrator: true,
@@ -1041,6 +1093,7 @@ function multisigMemberRecords(cur) {
     byKey.set(pk, {
       publicKey: pk,
       ...(entry.wrapKey ? { wrapKey: entry.wrapKey } : {}),
+      ...(entry.pqWrapKey ? { pqWrapKey: entry.pqWrapKey } : {}),
       reader: Boolean(entry.reader),
       writer: Boolean(entry.writer),
       administrator: cur.signers.includes(pk),
@@ -1063,6 +1116,7 @@ function applyMultisigProposal(cur, prop, tx) {
       ...cur.members,
       [m.publicKey]: {
         ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+        ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
         reader: m.reader,
         writer: m.writer,
         publisher: m.publisher,
@@ -1101,6 +1155,23 @@ export const multisigAdmission = {
     const cur = normalizeMultisigState(state);
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
+    if (input.action === 'rotateWrapKey') {
+      if (!cur.members[tx.author] && !cur.signers.includes(tx.author)) return { ok: false, code: 'member_required' };
+      if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
+      if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
+      if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
+      const prev = cur.members[tx.author] || { reader: true, writer: true, publisher: true, finalizer: false };
+      const nextMembers = {
+        ...cur.members,
+        [tx.author]: {
+          ...prev,
+          ...(input.wrapKey ? { wrapKey: input.wrapKey } : {}),
+          ...(input.pqWrapKey ? { pqWrapKey: input.pqWrapKey } : {}),
+        },
+      };
+      return { ok: true, state: { ...cur, members: nextMembers }, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
+    }
+
     if (!cur.signers.includes(tx.author)) return { ok: false, code: 'signer_required' };
 
     if (input.action === 'propose') {

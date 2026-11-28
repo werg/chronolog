@@ -1,5 +1,13 @@
 import { bytesToHex, concatBytes, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
-import { hpkeOpenBase, hpkeSealBase } from '@chronolog/crypto'
+import {
+  hpkeOpenBase,
+  hpkeSealBase,
+  KEY_BOX_SUITE_X25519,
+  KEY_BOX_SUITE_XWING,
+  xwingOpenBase,
+  xwingSealBase,
+  type KeyBoxSuite,
+} from '@chronolog/crypto'
 import {
   computeCasHash,
   ContentAddressedStore,
@@ -22,8 +30,17 @@ import {
 import { STANDARD_MODULE_SOURCES } from '@chronolog/materializer/std-modules'
 
 export interface EpochKeyBox {
+  readonly suite?: KeyBoxSuite
   readonly encapsulatedKey: string
   readonly ciphertext: string
+}
+
+export interface KeysPolicy {
+  readonly rotateOnRemove?: boolean
+  readonly maxOpsPerEpoch?: number
+  readonly minSuite?: KeyBoxSuite
+  readonly paddingBucketBytes?: number
+  readonly hideEnvelopeAuthor?: boolean
 }
 
 export function epochKeyCommitmentV2(epochKey: Uint8Array): string {
@@ -38,9 +55,18 @@ export async function hpkeSealEpochKey(
   epochKey: Uint8Array,
   logIdHex: string,
   epoch: number,
+  suite: KeyBoxSuite = KEY_BOX_SUITE_X25519,
 ): Promise<EpochKeyBox> {
   const info = utf8(`chronolog/epoch-key/v2:${logIdHex}:${epoch}`)
   const aad = utf8(`epoch:${epoch}`)
+  if (suite === KEY_BOX_SUITE_XWING) {
+    const sealed = await xwingSealBase(hexToBytes(recipientWrapPublicKeyHex), epochKey, info, aad)
+    return {
+      suite: KEY_BOX_SUITE_XWING,
+      encapsulatedKey: bytesToHex(sealed.encapsulatedKey),
+      ciphertext: bytesToHex(sealed.ciphertext),
+    }
+  }
   const sealed = await hpkeSealBase(hexToBytes(recipientWrapPublicKeyHex), epochKey, info, aad)
   return {
     encapsulatedKey: bytesToHex(sealed.encapsulatedKey),
@@ -54,9 +80,22 @@ export async function hpkeOpenEpochKey(
   box: EpochKeyBox,
   logIdHex: string,
   epoch: number,
+  recipientPqSecretKey?: Uint8Array,
 ): Promise<Uint8Array> {
   const info = utf8(`chronolog/epoch-key/v2:${logIdHex}:${epoch}`)
   const aad = utf8(`epoch:${epoch}`)
+  if (box.suite === KEY_BOX_SUITE_XWING) {
+    if (recipientPqSecretKey === undefined) {
+      throw new Error('PQ_WRAP_KEY_REQUIRED')
+    }
+    return xwingOpenBase(
+      recipientPqSecretKey,
+      hexToBytes(box.encapsulatedKey),
+      hexToBytes(box.ciphertext),
+      info,
+      aad,
+    )
+  }
   return hpkeOpenBase(
     recipientWrapPrivateKey,
     hexToBytes(recipientWrapPublicKeyHex),
@@ -70,6 +109,7 @@ export async function hpkeOpenEpochKey(
 export interface LogMemberSeed {
   readonly publicKey: string
   readonly wrapKey?: string
+  readonly pqWrapKey?: string
   readonly label?: string
   readonly subject?: string
   readonly scopes?: readonly string[]
@@ -147,6 +187,8 @@ export interface CreateLogGenesisOptions {
       readonly allowMutableReducer?: boolean
     }[]
   }
+  /** Optional initial on-log `$keys.policy` (minSuite, paddingBucketBytes, hideEnvelopeAuthor, rotateOnRemove, maxOpsPerEpoch). */
+  readonly keysPolicy?: KeysPolicy
   readonly runtime?: RuntimeManifest
   readonly limits?: GenesisLimits
   readonly salt?: Uint8Array
@@ -241,6 +283,7 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     memberByKey.set(m.publicKey, {
       publicKey: m.publicKey,
       ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+      ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
       ...(m.label ? { label: m.label } : {}),
       ...(m.subject ? { subject: m.subject } : {}),
       ...(m.scopes && m.scopes.length > 0 ? { scopes: [...m.scopes] } : {}),
@@ -289,7 +332,11 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
       reducers: sealReducers,
       paths: sealPaths,
     },
-    $keys: { currentEpoch: -1, epochs: {} },
+    $keys: {
+      currentEpoch: -1,
+      epochs: {},
+      ...(options.keysPolicy === undefined ? {} : { policy: options.keysPolicy as unknown as JsonValue }),
+    },
     $publications: { revision: 0, current: null, history: [] },
   }
   if (options.enableMounts === true || options.builders?.requireMountApproval != null) {

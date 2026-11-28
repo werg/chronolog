@@ -2,7 +2,7 @@ import { useDeviceStore } from './checkpoint-lifecycle.js'
 import { readBytesMany, type BytesStore } from '@chronolog/records'
 import { createSigningIdentity, type SigningIdentity } from '@chronolog/authority'
 import { assertCanonicalCbor, encodeCanonicalCbor, exportEd25519PrivateKey, hexToBytes, importEd25519PrivateKey, importEd25519PublicKey } from '@chronolog/protocol'
-import { createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
+import { createPqWrapKeyPair, createWrapKeyPair, importWrapPrivateKey } from './wrap-keys.js'
 import { assertDeviceNotRetired, DEVICE_RETIRED_KEY } from './checkpoint.js'
 
 export interface DeviceWrapKey {
@@ -10,9 +10,15 @@ export interface DeviceWrapKey {
   readonly privateKey: CryptoKey
 }
 
+export interface DevicePqWrapKey {
+  readonly publicKey: string
+  readonly secretKey: Uint8Array
+}
+
 export interface ApplicationDevice {
   readonly identity: SigningIdentity
   readonly wrapKey: DeviceWrapKey
+  readonly pqWrapKey?: DevicePqWrapKey
   readonly storageId: string
   /** Small identity and verified-control metadata, independent of application data. */
   readonly store: BytesStore
@@ -29,6 +35,7 @@ export interface DeviceMetadataStore extends BytesStore {
 
 const DEVICE_KEY = 'peer-session/device/v1'
 const DEVICE_WRAP_KEY = 'peer-session/device-wrap-key/v1'
+const DEVICE_PQ_WRAP_KEY = 'peer-session/device-pq-wrap-key/v1'
 const DEVICE_BINDING = 'peer-session/device-binding/v1'
 const STORAGE_BINDING = 'peer-session/storage-binding/v1'
 const STORAGE_OPENED = 'peer-session/storage-opened/v1'
@@ -45,13 +52,15 @@ export async function openApplicationDevice(options: {
   readonly managedSigner?: SigningIdentity
   /** Optional host-managed X25519 wrap key paired with managedSigner. */
   readonly managedWrapKey?: DeviceWrapKey
+  /** Optional host-managed hybrid PQ X-Wing wrap key paired with managedSigner. */
+  readonly managedPqWrapKey?: DevicePqWrapKey
   readonly openStorage?: () => ApplicationStorage | Promise<ApplicationStorage>
   readonly close?: () => void | Promise<void>
 }): Promise<ApplicationDevice> {
   const releaseOpening = useDeviceStore(options.store)
   try {
-    // One batched read for the retirement fence, signer, binding and wrap key (one IDB transaction).
-    const [retired, rawInitial, bindingInitial, wrapInitial] = await readBytesMany(options.store, [DEVICE_RETIRED_KEY, DEVICE_KEY, DEVICE_BINDING, DEVICE_WRAP_KEY])
+    // One batched read for the retirement fence, signer, binding and wrap keys (one IDB transaction).
+    const [retired, rawInitial, bindingInitial, wrapInitial, pqWrapInitial] = await readBytesMany(options.store, [DEVICE_RETIRED_KEY, DEVICE_KEY, DEVICE_BINDING, DEVICE_WRAP_KEY, DEVICE_PQ_WRAP_KEY])
     if (retired !== null) await assertDeviceNotRetired(options.store)
     const managedSigner = options.managedSigner && { ...options.managedSigner }
     // The sign/verify self-test runs once per key per process, not on every activation.
@@ -61,6 +70,7 @@ export async function openApplicationDevice(options: {
     }
     let raw = rawInitial ?? null, binding = bindingInitial ?? null
     let wrapRawInitial = wrapInitial ?? null
+    let pqWrapRawInitial = pqWrapInitial ?? null
     if (raw === null && binding !== null) raw = await options.store.get(DEVICE_KEY)
     let identity: SigningIdentity, storageId: string
     if (raw === null) {
@@ -79,10 +89,14 @@ export async function openApplicationDevice(options: {
         const pair = await createWrapKeyPair()
         entries.push({ key: DEVICE_WRAP_KEY, value: encodeCanonicalCbor([1n, pair.publicKey, pair.privateKey]) })
       }
+      if (options.managedPqWrapKey === undefined) {
+        const pqPair = createPqWrapKeyPair()
+        entries.push({ key: DEVICE_PQ_WRAP_KEY, value: encodeCanonicalCbor([1n, pqPair.publicKey, pqPair.secretKey]) })
+      }
       if (options.store.initialize !== undefined) await options.store.initialize(entries)
       else for (const entry of entries) await options.store.put(entry.key, entry.value)
-      const reread = await readBytesMany(options.store, [DEVICE_KEY, DEVICE_BINDING, DEVICE_WRAP_KEY])
-      raw = reread[0] ?? null; binding = reread[1] ?? null; wrapRawInitial = reread[2] ?? null
+      const reread = await readBytesMany(options.store, [DEVICE_KEY, DEVICE_BINDING, DEVICE_WRAP_KEY, DEVICE_PQ_WRAP_KEY])
+      raw = reread[0] ?? null; binding = reread[1] ?? null; wrapRawInitial = reread[2] ?? null; pqWrapRawInitial = reread[3] ?? null
       if (raw === null) throw new Error(binding === null ? 'APPLICATION_DEVICE_NOT_FOUND' : 'APPLICATION_DEVICE_KEYS_MISSING')
     }
     {
@@ -125,11 +139,36 @@ export async function openApplicationDevice(options: {
       wrapKey = Object.freeze({ publicKey: parsed[1], privateKey: await importWrapPrivateKey(parsed[2]) })
     }
 
+    // Resolve or lazily create the long-lived hybrid post-quantum X-Wing wrap key pair.
+    let pqWrapKey: DevicePqWrapKey
+    if (options.managedPqWrapKey !== undefined) {
+      if (!/^[0-9a-f]{2432}$/u.test(options.managedPqWrapKey.publicKey) || options.managedPqWrapKey.secretKey.length !== 32) {
+        throw new Error('APPLICATION_DEVICE_PQ_WRAP_KEY_INVALID')
+      }
+      pqWrapKey = Object.freeze({ publicKey: options.managedPqWrapKey.publicKey, secretKey: options.managedPqWrapKey.secretKey.slice() })
+    } else {
+      let pqRaw = pqWrapRawInitial
+      if (pqRaw === null) {
+        const pqPair = createPqWrapKeyPair()
+        const encoded = encodeCanonicalCbor([1n, pqPair.publicKey, pqPair.secretKey])
+        if (options.store.compareAndSwap !== undefined) await options.store.compareAndSwap(DEVICE_PQ_WRAP_KEY, null, encoded)
+        else await options.store.put(DEVICE_PQ_WRAP_KEY, encoded)
+        pqRaw = await options.store.get(DEVICE_PQ_WRAP_KEY)
+      }
+      if (pqRaw === null) throw new Error('APPLICATION_DEVICE_PQ_WRAP_KEY_MISSING')
+      const parsed = assertCanonicalCbor(pqRaw)
+      if (!Array.isArray(parsed) || parsed[0] !== 1n || typeof parsed[1] !== 'string' || !/^[0-9a-f]{2432}$/u.test(parsed[1]) || !(parsed[2] instanceof Uint8Array) || parsed[2].length !== 32) {
+        throw new Error('APPLICATION_DEVICE_PQ_WRAP_KEY_INVALID')
+      }
+      pqWrapKey = Object.freeze({ publicKey: parsed[1], secretKey: parsed[2].slice() })
+    }
+
     let closed = false, storage: ApplicationStorage | undefined
     let opening: Promise<ApplicationStorage> | undefined, closing: Promise<void> | undefined
     return Object.freeze({
       identity: Object.freeze(identity),
       wrapKey,
+      pqWrapKey,
       storageId,
       store: options.store,
       openStorage() {

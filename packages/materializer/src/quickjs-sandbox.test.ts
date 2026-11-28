@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { utf8 } from '@chronolog/canonical'
+import { bytesToHex, utf8 } from '@chronolog/canonical'
 import type { JsonValue } from '@chronolog/protocol'
 import { ContentAddressedStore, MemoryBytesStore } from '@chronolog/records'
 import { CRYPTO_BUILTIN_ID, QuickJsSandbox, type ReducerInvocationInput } from './quickjs-sandbox.js'
@@ -173,5 +173,40 @@ describe('QuickJsSandbox ctx', () => {
     expect(await sandbox.invoke(input({ exportName: 'mutator', state: { nested: { x: 1 } } }))).toMatchObject({ ok: false, code: 'reducer:crash' })
     expect(await sandbox.invoke(input({ exportName: 'badNaN' }))).toMatchObject({ ok: false, code: 'vm:invalid_output', detail: expect.stringContaining('$.state.balance') })
     expect(await sandbox.invoke(input({ exportName: 'badMap' }))).toMatchObject({ ok: false, code: 'vm:invalid_output', detail: expect.stringContaining('$.state.items') })
+  })
+
+  it('exposes deterministic hmacSha256 and verifyP256 on chronolog:crypto (crypto@2)', async () => {
+    const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
+    const pubHex = bytesToHex(new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey)))
+    const msg = 'passkey-assertion-v1'
+    const sigHex = bytesToHex(new Uint8Array(await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      kp.privateKey,
+      utf8(msg) as Uint8Array<ArrayBuffer>,
+    )))
+    const { sandbox, input } = await setup(`
+      import { hmacSha256, verifyP256 } from 'chronolog:crypto';
+      export default {
+        reduce(_state, tx) {
+          const { pubHex, msg, sigHex } = tx.payload;
+          return {
+            ok: true,
+            state: {
+              mac: hmacSha256('4a656665', 'what do ya want for nothing?'),
+              valid: verifyP256(pubHex, msg, sigHex),
+              invalid: verifyP256(pubHex, msg + '!', sigHex),
+            },
+          };
+        },
+      };
+    `)
+    expect(await value(sandbox, input({ builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID }, payload: { pubHex, msg, sigHex } }))).toEqual({
+      ok: true,
+      state: {
+        mac: '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843',
+        valid: true,
+        invalid: false,
+      },
+    })
   })
 })

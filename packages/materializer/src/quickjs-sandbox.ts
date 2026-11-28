@@ -8,7 +8,7 @@ import {
 } from 'quickjs-emscripten-core'
 import baseVariant from '@jitl/quickjs-ng-wasmfile-release-sync'
 import { bytesToHex, decodeUtf8, hexToBytes, perfCount, sha256Sync, utf8 } from '@chronolog/canonical'
-import { verifyEd25519Sync } from '@chronolog/crypto'
+import { hmacSha256Sync, verifyEd25519Sync, verifyP256Sync } from '@chronolog/crypto'
 import {
   assertValidReducersConfig,
   canonicalEventPayload,
@@ -31,7 +31,7 @@ import {
 import { WASM_BUILTIN_ID, WasmSandbox } from './wasm-sandbox.js'
 
 export const QUICKJS_RUNTIME_ID = 'quickjs-ng@0.32.0'
-export const CRYPTO_BUILTIN_ID = 'crypto@1'
+export const CRYPTO_BUILTIN_ID = 'crypto@2'
 export const CAS_BUILTIN_ID = 'cas@1'
 export const DEFAULT_MAX_FUEL = 200_000
 export { WASM_BUILTIN_ID }
@@ -192,7 +192,9 @@ export type ReducerInvocationResult =
 
 const CRYPTO_MODULE_SHIM = `
 export function sha256(input) { return globalThis.__chronologHost.sha256(input); }
+export function hmacSha256(keyHex, message) { return globalThis.__chronologHost.hmacSha256(keyHex, message); }
 export function verifyEd25519(pubKeyHex, message, sigHex) { return globalThis.__chronologHost.verifyEd25519(pubKeyHex, message, sigHex); }
+export function verifyP256(pubKeyHex, message, sigHex) { return globalThis.__chronologHost.verifyP256(pubKeyHex, message, sigHex); }
 export function canonicalJson(value) { return globalThis.__chronologHost.canonicalJson(value); }
 `
 
@@ -316,7 +318,7 @@ const MOUNT_HELPER_SOURCE = `(m, name) => m && typeof m === 'object' && m.mounts
 type HostBuiltin = 'chronolog:crypto' | 'chronolog:cas' | 'chronolog:wasm' | 'chronolog:sqlite'
 /** `globalThis.__chronologHost` methods installed when the corresponding builtin shim is loaded. */
 const HOST_BUILTIN_FUNCTIONS: Readonly<Record<HostBuiltin, readonly string[]>> = {
-  'chronolog:crypto': ['sha256', 'verifyEd25519', 'canonicalJson'],
+  'chronolog:crypto': ['sha256', 'hmacSha256', 'verifyEd25519', 'verifyP256', 'canonicalJson'],
   'chronolog:cas': ['casPut', 'casGet'],
   'chronolog:wasm': ['wasmInvoke', 'wasmInvokeJson'],
   'chronolog:sqlite': ['sqlOpen', 'sqlExec', 'sqlQuery', 'sqlValidateExpr', 'sqlCommit', 'sqlClose'],
@@ -929,6 +931,14 @@ export class QuickJsSandbox {
           return ctx.newString(bytesToHex(sha256Sync(bytes)))
         })
 
+        bindFn('hmacSha256', (keyH, msgH) => {
+          const keyHex = ctx.getString(keyH)
+          if (!/^(?:[0-9a-f]{2})+$/u.test(keyHex) || keyHex.length > 2048) throw new Error('HMAC_KEY_INVALID')
+          const msgRaw = ctx.dump(msgH) as unknown
+          const msgBytes = typeof msgRaw === 'string' ? utf8(msgRaw) : msgRaw instanceof Uint8Array ? msgRaw : utf8(JSON.stringify(msgRaw))
+          return ctx.newString(bytesToHex(hmacSha256Sync(hexToBytes(keyHex), msgBytes)))
+        })
+
         bindFn('verifyEd25519', (pubH, msgH, sigH) => {
           const pubHex = ctx.getString(pubH)
           const msgRaw = ctx.dump(msgH) as unknown
@@ -936,6 +946,15 @@ export class QuickJsSandbox {
           if (!/^[0-9a-f]{64}$/u.test(pubHex) || !/^[0-9a-f]{128}$/u.test(sigHex)) return ctx.false
           const msgBytes = typeof msgRaw === 'string' ? utf8(msgRaw) : msgRaw instanceof Uint8Array ? msgRaw : utf8(JSON.stringify(msgRaw))
           return verifyEd25519Sync(hexToBytes(pubHex), msgBytes, hexToBytes(sigHex)) ? ctx.true : ctx.false
+        })
+
+        bindFn('verifyP256', (pubH, msgH, sigH) => {
+          const pubHex = ctx.getString(pubH)
+          const msgRaw = ctx.dump(msgH) as unknown
+          const sigHex = ctx.getString(sigH)
+          if (!/^(?:[0-9a-f]{66}|[0-9a-f]{130})$/u.test(pubHex) || !/^[0-9a-f]{128,144}$/u.test(sigHex) || sigHex.length % 2 !== 0) return ctx.false
+          const msgBytes = typeof msgRaw === 'string' ? utf8(msgRaw) : msgRaw instanceof Uint8Array ? msgRaw : utf8(JSON.stringify(msgRaw))
+          return verifyP256Sync(hexToBytes(pubHex), msgBytes, hexToBytes(sigHex)) ? ctx.true : ctx.false
         })
 
         bindFn('canonicalJson', (valH) => {

@@ -1,15 +1,27 @@
 import { describe, expect, it } from 'vitest'
-import { utf8 } from '@chronolog/protocol'
+import { p256 } from '@noble/curves/nist.js'
+import { bytesToHex, utf8 } from '@chronolog/protocol'
 import {
   decryptEpochPayload,
+  deriveEpochMailboxKeyPair,
   encryptEpochPayload,
   exportX25519PrivateKey,
   generateX25519KeyPair,
+  generateXWingKeyPair,
+  hmacSha256Sync,
   hpkeOpenBase,
   hpkeSealBase,
   hpkeSendExportBase,
   hpkeReceiveExportBase,
   importX25519PrivateKey,
+  padPlaintext,
+  signEd25519Sync,
+  unpadPlaintext,
+  verifyEd25519Sync,
+  verifyP256Sync,
+  xwingOpenBase,
+  xwingPublicKeyFromSeed,
+  xwingSealBase,
 } from './index.js'
 
 const bytes = (value: number, length = 32) => new Uint8Array(length).fill(value)
@@ -123,5 +135,70 @@ describe('epoch payload encryption', () => {
     expect(await decryptEpochPayload(key, encrypted, utf8('visible header'))).toEqual(utf8('private transaction'))
     await expect(decryptEpochPayload(key, encrypted, utf8('different header'))).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
     await expect(decryptEpochPayload(key, { ...encrypted, epoch: 13n }, utf8('visible header'))).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
+  })
+
+  it('supports hkdf-aes-256-gcm (192-bit salt) with power-of-two bucket padding', async () => {
+    const key = bytes(0x33)
+    const aad = utf8('log/op/anon')
+    const shortMsg = utf8('hi')
+    const medMsg = utf8('a slightly longer message inside the same bucket')
+    const enc1 = await encryptEpochPayload(key, 3n, shortMsg, aad, undefined, { suite: 'hkdf-aes-256-gcm', paddingBucketBytes: 256 })
+    const enc2 = await encryptEpochPayload(key, 3n, medMsg, aad, undefined, { suite: 'hkdf-aes-256-gcm', paddingBucketBytes: 256 })
+    expect(enc1.suite).toBe('hkdf-aes-256-gcm')
+    expect(enc1.nonce).toHaveLength(24)
+    expect(enc1.ciphertext.byteLength).toBe(256 + 16)
+    expect(enc2.ciphertext.byteLength).toBe(256 + 16)
+    expect(await decryptEpochPayload(key, enc1, aad)).toEqual(shortMsg)
+    expect(await decryptEpochPayload(key, enc2, aad)).toEqual(medMsg)
+    expect(unpadPlaintext(padPlaintext(shortMsg, 0))).toEqual(shortMsg)
+    const padded = padPlaintext(shortMsg, 128)
+    expect(padded).toHaveLength(128)
+    expect(unpadPlaintext(padded)).toEqual(shortMsg)
+    padded[127] = 1
+    expect(() => unpadPlaintext(padded)).toThrow()
+  })
+})
+
+describe('hybrid post-quantum X-Wing HPKE, P-256, HMAC, and mailbox derivation', () => {
+  it('seals and opens X-Wing (ML-KEM-768 + X25519) ciphertexts with deterministic seed derivation', async () => {
+    const seed = bytes(0x42, 32)
+    const kp = generateXWingKeyPair(seed)
+    expect(kp.publicKey).toHaveLength(1216)
+    expect(kp.secretKey).toHaveLength(32)
+    expect(xwingPublicKeyFromSeed(seed)).toEqual(kp.publicKey)
+
+    const plaintext = bytes(0x99, 32)
+    const info = utf8('chronolog/epoch-key/v2:test:0')
+    const aad = utf8('epoch:0')
+    const sealed = await xwingSealBase(kp.publicKey, plaintext, info, aad)
+    expect(sealed.encapsulatedKey).toHaveLength(1120)
+    expect(await xwingOpenBase(kp.secretKey, sealed.encapsulatedKey, sealed.ciphertext, info, aad)).toEqual(plaintext)
+    await expect(xwingOpenBase(kp.secretKey, sealed.encapsulatedKey, sealed.ciphertext, info, utf8('wrong'))).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
+
+    const other = generateXWingKeyPair()
+    await expect(xwingOpenBase(other.secretKey, sealed.encapsulatedKey, sealed.ciphertext, info, aad)).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
+  })
+
+  it('verifies NIST P-256 WebAuthn compact & DER signatures, HMAC-SHA256, and epoch mailbox keys', () => {
+    // RFC 4231 test case 2 for HMAC-SHA256
+    const mac = hmacSha256Sync(utf8('Jefe'), utf8('what do ya want for nothing?'))
+    expect(bytesToHex(mac)).toBe('5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
+
+    const priv = p256.utils.randomSecretKey()
+    const pubUncompressed = p256.getPublicKey(priv, false)
+    const pubCompressed = p256.getPublicKey(priv, true)
+    const msg = utf8('webauthn-challenge-payload')
+    const compactSig = p256.sign(msg, priv, { format: 'compact' })
+    const derSig = p256.sign(msg, priv, { format: 'der' })
+    expect(verifyP256Sync(pubUncompressed, msg, compactSig)).toBe(true)
+    expect(verifyP256Sync(pubCompressed, msg, derSig)).toBe(true)
+    expect(verifyP256Sync(pubUncompressed, utf8('tampered'), derSig)).toBe(false)
+
+    const epochKey = bytes(0x77, 32)
+    const mb = deriveEpochMailboxKeyPair(epochKey)
+    expect(mb.publicKey).toHaveLength(32)
+    const tag = signEd25519Sync(mb.seed, utf8('envelope-header'))
+    expect(verifyEd25519Sync(mb.publicKey, utf8('envelope-header'), tag)).toBe(true)
+    expect(verifyEd25519Sync(mb.publicKey, utf8('other'), tag)).toBe(false)
   })
 })

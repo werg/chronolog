@@ -39,6 +39,8 @@ export interface KernelOperationInput {
   readonly core: OperationCore
   /** Caller already verified opId === operationIdDigest(core); skips O(N) CBOR+SHA-256 re-verification on every materialize(). */
   readonly verified?: boolean
+  /** Compartment key ring that decrypted this encrypted operation ('default' when omitted). */
+  readonly ring?: string
 }
 
 export interface KernelRevision {
@@ -1040,6 +1042,32 @@ export class TopicKernel {
       } else {
         if (core.updates.some(u => isControlTopic(u.topic))) {
           return makeRejected('partition:encrypted_op_control_topic')
+        }
+        // Kernel-enforced compartment ring isolation: any topic bound in `$keys.topicRings`
+        // MUST be encrypted under that exact ring and cannot be mixed with another ring.
+        const keysObj =
+          work.topics.$keys !== null && typeof work.topics.$keys === 'object' && !Array.isArray(work.topics.$keys)
+            ? (work.topics.$keys as Readonly<Record<string, JsonValue>>)
+            : null
+        const rawTopicRings = keysObj?.topicRings
+        const topicRings =
+          rawTopicRings !== undefined && rawTopicRings !== null && typeof rawTopicRings === 'object' && !Array.isArray(rawTopicRings)
+            ? (rawTopicRings as Readonly<Record<string, JsonValue>>)
+            : null
+        if (topicRings !== null) {
+          let requiredRing: string | null = null
+          for (const u of core.updates) {
+            const bound = topicRings[u.topic]
+            const topicRing = typeof bound === 'string' && bound.length > 0 ? bound : 'default'
+            if (requiredRing === null) requiredRing = topicRing
+            else if (requiredRing !== topicRing) {
+              return makeRejected('ring:mixed_updates', `Cannot mix topics from rings "${requiredRing}" and "${topicRing}"`)
+            }
+          }
+          const actualRing = entry.ring ?? 'default'
+          if (requiredRing !== null && actualRing !== requiredRing) {
+            return makeRejected('ring:mismatch', `Expected ring "${requiredRing}", got "${actualRing}"`)
+          }
         }
       }
     }

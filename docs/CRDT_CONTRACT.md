@@ -49,13 +49,14 @@ After each operation:
 
 Checkpoints and snapshots carry `topics`, `seenOpsRoot` and `historyDigest`; restoring them and replaying the suffix produces the exact same `stateRoot` AND `revision.digest` as a cold replay from genesis. Per-operation cost is O(changed state), not O(history): no per-op seen-set node, no whole-state clone, no whole-map state hash.
 
-## 5. Keys, Rotation & Reconnect Rewrapping (`$keys`)
+## 5. Keys, Hybrid Post-Quantum HPKE, Anonymous Envelopes & Reconnect Rewrapping (`$keys`)
 
-- Each device holds a persistent Ed25519 signing identity and a persistent X25519 `wrapKey`.
-- `$keys` stores per-epoch `keyCommitment` and HPKE (`DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/AES-256-GCM`) lockboxes per authorized reader.
-- Admitting a fresh device on a chain with rotated epochs atomically updates `$admission` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history.
+- Each device holds a persistent Ed25519 signing identity, a persistent X25519 `wrapKey`, and a persistent hybrid post-quantum X-Wing (`ML-KEM-768 + X25519`) `pqWrapKey`.
+- `$keys` stores per-epoch `suite` (`hpke-x25519-aes256gcm` or hybrid PQ `hpke-xwing-aes256gcm`), `keyCommitment`, one-way derived `mailboxVerifyKey`, write-once per-member HPKE lockboxes, compartment `rings`/`topicRings` (enforced fail-closed by `TopicKernel`), and on-log `$keys.policy` (`rotateOnRemove`, `maxOpsPerEpoch`, `minSuite`, `paddingBucketBytes`, `hideEnvelopeAuthor`).
+- Encrypted envelopes use 192-bit HKDF-SHA256 per-operation AES-256-GCM subkeys (`hkdf-aes-256-gcm`) with optional power-of-2 bucket padding. When `hideEnvelopeAuthor` is enabled, outer `envelope.author` is zeroed (`ANONYMOUS_AUTHOR`) and authenticated via `mailboxTag` signed by the epoch's derived Ed25519 mailbox key so blind hosts reject unauthorized uploads without learning writer identity or payload length.
+- Admitting a fresh device on a chain with rotated epochs atomically updates `$admission` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history. Members can self-rotate wrap keys via `$admission.rotateWrapKey` and seal selective per-recipient payloads via `session.sealFor()` / `session.unseal()`.
 - Encrypted envelopes are reconciled by `encryptedEnvelopeDigest` (not `opId` alone). When an offline device reconnects after an epoch rotation, it re-encrypts its exact original signed operation bytes under the newest epoch while preserving `opId`, `authorTimestampMs`, and signature.
-- Under `finality: none`, membership and key grants are provisional until all earlier operations are known; post-revocation confidentiality applies to epochs rotated after revocation whose ciphertext is not distributed to revoked peers.
+- Under `open` history admission, membership and key grants are provisional until all earlier operations are known; post-revocation confidentiality applies to epochs rotated after revocation whose ciphertext is not distributed to revoked peers. See [Sub-Linear Group Key Rotation Design Brief](SUBLINEAR_GROUP_ROTATION.md) for the planned `O(log N)` tree-based `$keys` upgrade.
 
 ## 6. Deterministic SQLite-CAS Profile & Write RLS (`chronolog:sqlite`, `chronolog/rls`)
 

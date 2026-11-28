@@ -153,6 +153,10 @@ export interface SignedOperation {
   readonly signature: Uint8Array
 }
 
+export type EnvelopeSuite = 'aes-256-gcm' | 'hkdf-aes-256-gcm'
+
+export const ANONYMOUS_AUTHOR: Uint8Array = new Uint8Array(32)
+
 export interface EncryptedOperationEnvelope {
   readonly version: 1
   readonly logId: Uint8Array
@@ -163,6 +167,10 @@ export interface EncryptedOperationEnvelope {
   readonly ciphertext: Uint8Array
   /** Optional compartment key ring name; omitted when using the default log ring. */
   readonly ring?: string
+  /** Optional cipher suite ('aes-256-gcm' for 12-byte nonce, 'hkdf-aes-256-gcm' for 24-byte HKDF salt + framing). */
+  readonly suite?: EnvelopeSuite
+  /** Optional 64-byte Ed25519 epoch mailbox tag authenticating anonymous-author envelopes to blind hosts. */
+  readonly mailboxTag?: Uint8Array
 }
 
 export interface OperationOrderKey {
@@ -603,11 +611,13 @@ function signedOperationFields(raw: CborValue): SignedOperation {
 
 const RING_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/u
 
-export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8Array {
+function buildEnvelopeBodyMap(env: EncryptedOperationEnvelope): Map<CborMapKey, CborValue> {
   protocolInvariant(env.version === 1, 'UNSUPPORTED_VERSION', 'Envelope version must be 1')
   protocolInvariant(env.logId.length === 32 && env.opId.length === 32 && env.author.length === 32, 'SCHEMA_INVALID', 'Invalid envelope 32-byte field')
   protocolInvariant(Number.isSafeInteger(env.epoch) && env.epoch >= 0, 'SCHEMA_INVALID', 'Invalid epoch')
-  protocolInvariant(env.nonce.length === 12 && env.ciphertext.length > 0, 'SCHEMA_INVALID', 'Invalid ciphertext/nonce')
+  const suite: EnvelopeSuite = env.suite ?? (env.nonce.length === 24 ? 'hkdf-aes-256-gcm' : 'aes-256-gcm')
+  const expectedNonceLen = suite === 'hkdf-aes-256-gcm' ? 24 : 12
+  protocolInvariant(env.nonce.length === expectedNonceLen && env.ciphertext.length > 0, 'SCHEMA_INVALID', 'Invalid ciphertext/nonce')
   const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
     [1n, env.logId],
@@ -621,6 +631,26 @@ export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8A
     protocolInvariant(typeof env.ring === 'string' && RING_NAME_RE.test(env.ring), 'SCHEMA_INVALID', 'Invalid envelope ring name')
     map.set(7n, env.ring)
   }
+  if (suite === 'hkdf-aes-256-gcm') {
+    map.set(8n, suite)
+  }
+  return map
+}
+
+/** Canonical bytes signed by an epoch's derived Ed25519 mailbox auth key for anonymous-author envelopes. */
+export function envelopeMailboxSigningBytes(env: EncryptedOperationEnvelope): Uint8Array {
+  return encodeCanonicalCbor(new Map<CborMapKey, CborValue>([
+    [0n, 'chronolog/mailbox-tag/v1'],
+    [1n, encodeCanonicalCbor(buildEnvelopeBodyMap(env))],
+  ]))
+}
+
+export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8Array {
+  const map = buildEnvelopeBodyMap(env)
+  if (env.mailboxTag !== undefined) {
+    protocolInvariant(env.mailboxTag instanceof Uint8Array && env.mailboxTag.length === 64, 'SCHEMA_INVALID', 'Invalid envelope mailboxTag')
+    map.set(9n, env.mailboxTag)
+  }
   return encodeCanonicalCbor(map)
 }
 
@@ -629,23 +659,36 @@ export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEn
 }
 
 function encryptedEnvelopeFields(raw: CborValue): EncryptedOperationEnvelope {
-  protocolInvariant(raw instanceof Map && (raw.size === 7 || (raw.size === 8 && raw.has(7n))), 'SCHEMA_INVALID', 'Invalid envelope')
+  protocolInvariant(raw instanceof Map && raw.size >= 7 && raw.size <= 10, 'SCHEMA_INVALID', 'Invalid envelope')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
+  for (const k of map.keys()) {
+    protocolInvariant(typeof k === 'bigint' && k >= 0n && k <= 9n, 'SCHEMA_INVALID', 'Unexpected envelope field')
+  }
   protocolInvariant(map.get(0n) === 1n, 'SCHEMA_INVALID', 'Invalid envelope')
   const logId = map.get(1n), opId = map.get(2n), author = map.get(3n), epoch = map.get(4n), nonce = map.get(5n), ciphertext = map.get(6n)
+  const rawRing = map.get(7n)
+  const rawSuite = map.get(8n)
+  const rawMailboxTag = map.get(9n)
+  const suite: EnvelopeSuite | undefined = rawSuite === undefined ? undefined : (rawSuite === 'hkdf-aes-256-gcm' ? 'hkdf-aes-256-gcm' : undefined)
+  if (rawSuite !== undefined) {
+    protocolInvariant(suite === 'hkdf-aes-256-gcm', 'SCHEMA_INVALID', 'Invalid envelope suite')
+  }
+  const expectedNonceLen = suite === 'hkdf-aes-256-gcm' ? 24 : 12
   protocolInvariant(
     logId instanceof Uint8Array && logId.length === 32 &&
       opId instanceof Uint8Array && opId.length === 32 &&
       author instanceof Uint8Array && author.length === 32 &&
       typeof epoch === 'bigint' && epoch >= 0n && epoch <= BigInt(Number.MAX_SAFE_INTEGER) &&
-      nonce instanceof Uint8Array && nonce.length === 12 &&
+      nonce instanceof Uint8Array && nonce.length === expectedNonceLen &&
       ciphertext instanceof Uint8Array && ciphertext.length > 0,
     'SCHEMA_INVALID',
     'Invalid envelope fields',
   )
-  const rawRing = map.get(7n)
   if (rawRing !== undefined) {
     protocolInvariant(typeof rawRing === 'string' && rawRing !== 'default' && RING_NAME_RE.test(rawRing), 'SCHEMA_INVALID', 'Invalid envelope ring')
+  }
+  if (rawMailboxTag !== undefined) {
+    protocolInvariant(rawMailboxTag instanceof Uint8Array && rawMailboxTag.length === 64, 'SCHEMA_INVALID', 'Invalid envelope mailboxTag')
   }
   return {
     version: 1,
@@ -656,6 +699,8 @@ function encryptedEnvelopeFields(raw: CborValue): EncryptedOperationEnvelope {
     nonce: nonce.slice(),
     ciphertext: ciphertext.slice(),
     ...(rawRing === undefined ? {} : { ring: rawRing }),
+    ...(suite === undefined ? {} : { suite }),
+    ...(rawMailboxTag === undefined ? {} : { mailboxTag: rawMailboxTag.slice() }),
   }
 }
 
@@ -684,7 +729,7 @@ export function assertHex32(value: string, label = 'hash'): string {
 export const DEFAULT_RUNTIME_MANIFEST: RuntimeManifest = Object.freeze({
   js: 'quickjs-ng@0.32.0',
   builtins: Object.freeze({
-    'chronolog:crypto': 'crypto@1',
+    'chronolog:crypto': 'crypto@2',
     'chronolog:cas': 'cas@1',
     'chronolog:sqlite': 'sqlite-cas@1#sha256-c1e6ecad7402fc981728ff06143ba9b453724dc4faa144cacb085f60e18e280c',
     'chronolog:wasm': 'wasm@1',

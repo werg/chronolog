@@ -1,6 +1,16 @@
 import { bytesToHex, decodeCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, hexToBytes, perfTimeAsync, sha256Sync, utf8 } from '@chronolog/canonical'
 import { openSqlBranch, type SqlBranch } from './sql-extensions.js'
-import { combineShares, decryptEpochPayload, encryptEpochPayload, splitSecret } from '@chronolog/crypto'
+import {
+  combineShares,
+  decryptEpochPayload,
+  deriveEpochMailboxKeyPair,
+  encryptEpochPayload,
+  KEY_BOX_SUITE_X25519,
+  KEY_BOX_SUITE_XWING,
+  signEd25519Sync,
+  splitSecret,
+  type KeyBoxSuite,
+} from '@chronolog/crypto'
 import {
   casRef,
   computeBlobDagHash,
@@ -18,6 +28,7 @@ import {
   type PutPackageInput,
 } from '@chronolog/records'
 import {
+  ANONYMOUS_AUTHOR,
   assertValidReducersConfig,
   canonicalJson,
   compareOperationOrder,
@@ -32,6 +43,7 @@ import {
   encodeSignedOperation,
   encryptedEnvelopeDigest,
   envelopeAad,
+  envelopeMailboxSigningBytes,
   genesisLogId,
   isControlTopic,
   normalizeAssumptionsConfig,
@@ -97,6 +109,7 @@ import {
   hpkeOpenEpochKey,
   hpkeSealEpochKey,
   type EpochKeyBox,
+  type KeysPolicy,
 } from './genesis.js'
 import {
   applicationPeerDiagnostics,
@@ -202,6 +215,7 @@ export interface SimulationResult {
 export interface MemberRecord {
   readonly publicKey: string
   readonly wrapKey?: string
+  readonly pqWrapKey?: string
   readonly label?: string
   readonly scopes?: readonly string[]
   readonly expiresAtMs?: number
@@ -261,16 +275,21 @@ export interface KeyRingState {
   readonly currentEpoch: number
   readonly epochs: Readonly<Record<string, {
     readonly epoch: number
+    readonly suite?: KeyBoxSuite
     readonly keyCommitment: string
+    readonly mailboxVerifyKey?: string
     readonly boxes: Readonly<Record<string, EpochKeyBox>>
   }>>
 }
 
 export interface KeysTopicState {
   readonly currentEpoch: number
+  readonly policy?: KeysPolicy
   readonly epochs: Readonly<Record<string, {
     readonly epoch: number
+    readonly suite?: KeyBoxSuite
     readonly keyCommitment: string
+    readonly mailboxVerifyKey?: string
     readonly boxes: Readonly<Record<string, EpochKeyBox>>
   }>>
   readonly rings?: Readonly<Record<string, KeyRingState>>
@@ -280,6 +299,14 @@ export interface KeysTopicState {
     readonly guardianShares: Readonly<Record<string, { readonly index: number; readonly box: EpochKeyBox }>>
   }
   readonly recoveryGrants?: Readonly<Record<string, Readonly<Record<string, { readonly index: number; readonly box: EpochKeyBox }>>>>
+}
+
+export interface SealedRecipientBox {
+  readonly format: 'chronolog-sealed/v1'
+  readonly encoding: 'json' | 'bytes'
+  readonly nonce: string
+  readonly ciphertext: string
+  readonly boxes: Readonly<Record<string, EpochKeyBox>>
 }
 
 export interface CheckpointBootstrapSnapshot {
@@ -811,6 +838,87 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return raw
   }
 
+  keysPolicy(): Required<Pick<KeysPolicy, 'rotateOnRemove' | 'minSuite' | 'paddingBucketBytes' | 'hideEnvelopeAuthor'>> & {
+    readonly maxOpsPerEpoch?: number
+  } {
+    const raw = this.keysState().policy
+    return {
+      rotateOnRemove: raw?.rotateOnRemove !== false,
+      minSuite: raw?.minSuite === KEY_BOX_SUITE_XWING ? KEY_BOX_SUITE_XWING : KEY_BOX_SUITE_X25519,
+      paddingBucketBytes:
+        typeof raw?.paddingBucketBytes === 'number' && Number.isSafeInteger(raw.paddingBucketBytes) && raw.paddingBucketBytes >= 0
+          ? raw.paddingBucketBytes
+          : 0,
+      hideEnvelopeAuthor: raw?.hideEnvelopeAuthor === true,
+      ...(typeof raw?.maxOpsPerEpoch === 'number' && Number.isSafeInteger(raw.maxOpsPerEpoch) && raw.maxOpsPerEpoch >= 1
+        ? { maxOpsPerEpoch: raw.maxOpsPerEpoch }
+        : {}),
+    }
+  }
+
+  #mailboxVerifyKey(epochKey: Uint8Array): string {
+    return bytesToHex(deriveEpochMailboxKeyPair(epochKey).publicKey)
+  }
+
+  async #sealBoxForMember(
+    member: { readonly wrapKey?: string; readonly pqWrapKey?: string },
+    key: Uint8Array,
+    scope: string,
+    epoch: number,
+    requestedSuite?: KeyBoxSuite,
+  ): Promise<EpochKeyBox | null> {
+    const policy = this.keysPolicy()
+    const requirePq = requestedSuite === KEY_BOX_SUITE_XWING || policy.minSuite === KEY_BOX_SUITE_XWING
+    if (requirePq) {
+      if (!member.pqWrapKey) return null
+      return hpkeSealEpochKey(member.pqWrapKey, key, scope, epoch, KEY_BOX_SUITE_XWING)
+    }
+    if (member.pqWrapKey && requestedSuite !== KEY_BOX_SUITE_X25519) {
+      return hpkeSealEpochKey(member.pqWrapKey, key, scope, epoch, KEY_BOX_SUITE_XWING)
+    }
+    if (member.wrapKey) {
+      return hpkeSealEpochKey(member.wrapKey, key, scope, epoch, KEY_BOX_SUITE_X25519)
+    }
+    return null
+  }
+
+  async #encryptOperationEnvelope(options: {
+    readonly epochKey: Uint8Array
+    readonly epoch: number
+    readonly opBytes: Uint8Array
+    readonly logIdBytes: Uint8Array
+    readonly opIdBytes: Uint8Array
+    readonly authorBytes: Uint8Array
+    readonly ring: string
+  }): Promise<EncryptedOperationEnvelope> {
+    const policy = this.keysPolicy()
+    const envAuthor = policy.hideEnvelopeAuthor ? ANONYMOUS_AUTHOR : options.authorBytes
+    const aad = envelopeAad(options.logIdBytes, options.opIdBytes, envAuthor)
+    const enc = await encryptEpochPayload(
+      options.epochKey,
+      BigInt(options.epoch),
+      options.opBytes,
+      aad,
+      undefined,
+      { suite: 'hkdf-aes-256-gcm', paddingBucketBytes: policy.paddingBucketBytes },
+    )
+    const baseEnv: EncryptedOperationEnvelope = {
+      version: 1,
+      logId: options.logIdBytes,
+      opId: options.opIdBytes,
+      author: envAuthor,
+      epoch: options.epoch,
+      nonce: enc.nonce,
+      ciphertext: enc.ciphertext,
+      ...(options.ring === 'default' ? {} : { ring: options.ring }),
+      suite: 'hkdf-aes-256-gcm',
+    }
+    if (!policy.hideEnvelopeAuthor) return baseEnv
+    const mailboxKp = deriveEpochMailboxKeyPair(options.epochKey)
+    const mailboxTag = signEd25519Sync(mailboxKp.seed, envelopeMailboxSigningBytes(baseEnv))
+    return { ...baseEnv, mailboxTag }
+  }
+
   currentEpoch(): number {
     const state = this.keysState()
     if (state.currentEpoch >= 0) return state.currentEpoch
@@ -868,13 +976,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const members = this.permissions().members
     let sealedMembers = 0
     for (const member of members) {
-      if (!member.reader || !member.wrapKey) continue
+      if (!member.reader || (!member.wrapKey && !member.pqWrapKey)) continue
       const epochBoxes: Record<string, EpochKeyBox> = {}
       for (let ep = minEp; ep <= keysState.currentEpoch; ep++) {
         const epKey = this.#epochKeys.get(ep)
         if (epKey === undefined) continue
         if (keysState.epochs?.[String(ep)]?.boxes?.[member.publicKey] !== undefined) continue
-        epochBoxes[String(ep)] = await hpkeSealEpochKey(member.wrapKey, epKey, this.logId, ep)
+        const sealed = await this.#sealBoxForMember(member, epKey, this.logId, ep)
+        if (sealed !== null) epochBoxes[String(ep)] = sealed
       }
       if (Object.keys(epochBoxes).length === 0) continue
       await this.submit({
@@ -1455,6 +1564,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           box,
           this.logId,
           entry.epoch,
+          this.device.pqWrapKey?.secretKey,
         )
         if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
         await this.installEpochKey(entry.epoch, plainKey)
@@ -1476,6 +1586,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             box,
             `${this.logId}:${ringName}`,
             entry.epoch,
+            this.device.pqWrapKey?.secretKey,
           )
           if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
           await this.installRingKey(ringName, entry.epoch, plainKey)
@@ -1518,6 +1629,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             epoch: BigInt(entry.envelope.epoch),
             nonce: entry.envelope.nonce,
             ciphertext: entry.envelope.ciphertext,
+            ...(entry.envelope.suite === undefined ? {} : { suite: entry.envelope.suite }),
           }, aad)
           let verified: { readonly core: OperationCore; readonly opId: Uint8Array }
           let signed: SignedOperation
@@ -1536,7 +1648,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           }
           if (bytesToHex(verified.core.logId) !== this.logId) return
           if (verified.core.visibility !== 'encrypted') return
-          if (!sameBytes(verified.opId, entry.envelope.opId) || !sameBytes(verified.core.author, entry.envelope.author)) return
+          const isAnonymousEnv = sameBytes(entry.envelope.author, ANONYMOUS_AUTHOR)
+          if (!sameBytes(verified.opId, entry.envelope.opId)) return
+          if (!isAnonymousEnv && !sameBytes(verified.core.author, entry.envelope.author)) return
           entry.decrypted = { opId: bytesToHex(verified.opId), signed, core: verified.core }
           this.#undecryptedEnvelopes.delete(digest)
         } catch {
@@ -1564,20 +1678,21 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     let rewrapped = false
     for (const [opId, pending] of this.#localPending) {
+      const keysState = this.#keysStateFrom(kernel)
+      const pendingRing = keysState.topicRings?.[pending.core.updates[0]?.topic ?? ''] ?? 'default'
+      if (pendingRing !== 'default') continue
       if (pending.currentEpoch >= newestEpoch) continue
       const logIdBytes = hexToBytes(this.logId)
       const opIdBytes = hexToBytes(opId)
-      const aad = envelopeAad(logIdBytes, opIdBytes, pending.core.author)
-      const enc = await encryptEpochPayload(newestKey, BigInt(newestEpoch), pending.raw, aad)
-      const env: EncryptedOperationEnvelope = {
-        version: 1,
-        logId: logIdBytes,
-        opId: opIdBytes,
-        author: pending.core.author,
+      const env = await this.#encryptOperationEnvelope({
+        epochKey: newestKey,
         epoch: newestEpoch,
-        nonce: enc.nonce,
-        ciphertext: enc.ciphertext,
-      }
+        opBytes: pending.raw,
+        logIdBytes,
+        opIdBytes,
+        authorBytes: pending.core.author,
+        ring: 'default',
+      })
       const envBytes = encodeEncryptedEnvelope(env)
       const envDigest = bytesToHex(encryptedEnvelopeDigest(envBytes))
 
@@ -1609,10 +1724,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #sqliteScanNegative = new Set<string>()
   /** operationId -> opId for ops authored by this identity (O(1) inspect by caller-chosen id). */
   readonly #ownOperationIds = new Map<string, string>()
-  #kernelInput(opId: string, core: OperationCore): KernelOperationInput {
+  #kernelInput(opId: string, core: OperationCore, ring?: string): KernelOperationInput {
     let input = this.#kernelInputs.get(opId)
-    if (input === undefined || input.core !== core) {
-      input = { opId: hexToBytes(opId), core, verified: true }
+    if (input === undefined || input.core !== core || input.ring !== ring) {
+      input = { opId: hexToBytes(opId), core, verified: true, ...(ring === undefined ? {} : { ring }) }
       this.#kernelInputs.set(opId, input)
       if (bytesToHex(core.author) === this.identity.publicKey) this.#ownOperationIds.set(core.operationId, opId)
     }
@@ -1628,7 +1743,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       for (const entry of this.#encryptedEnvelopes.values()) {
         if (entry.decrypted === undefined) continue
         if (!byOpId.has(entry.decrypted.opId)) {
-          byOpId.set(entry.decrypted.opId, this.#kernelInput(entry.decrypted.opId, entry.decrypted.core))
+          byOpId.set(
+            entry.decrypted.opId,
+            this.#kernelInput(entry.decrypted.opId, entry.decrypted.core, entry.envelope.ring ?? 'default'),
+          )
         }
       }
     }
@@ -2040,18 +2158,15 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ? this.#epochKeys.get(epoch)
           : this.#ringKeys.get(ring)?.get(epoch)
         check(epochKey !== undefined, 'EPOCH_KEY_MISSING')
-        const aad = envelopeAad(logIdBytes, opIdBytes, authorBytes)
-        const enc = await encryptEpochPayload(epochKey, BigInt(epoch), opBytes, aad)
-        const env: EncryptedOperationEnvelope = {
-          version: 1,
-          logId: logIdBytes,
-          opId: opIdBytes,
-          author: authorBytes,
+        const env = await this.#encryptOperationEnvelope({
+          epochKey,
           epoch,
-          nonce: enc.nonce,
-          ciphertext: enc.ciphertext,
-          ...(ring === 'default' ? {} : { ring }),
-        }
+          opBytes,
+          logIdBytes,
+          opIdBytes,
+          authorBytes,
+          ring,
+        })
         const envBytes = encodeEncryptedEnvelope(env)
         const envDigest = bytesToHex(encryptedEnvelopeDigest(envBytes))
         // Single atomic multi-key write instead of two sequential transactions!
@@ -2477,6 +2592,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async admitMember(options: {
     readonly publicKey: string
     readonly wrapKey?: string
+    readonly pqWrapKey?: string
     readonly label?: string
     readonly subject?: string
     readonly scopes?: readonly string[]
@@ -2494,6 +2610,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const memberPayload: Record<string, JsonValue> = {
       publicKey: options.publicKey,
       ...(options.wrapKey ? { wrapKey: options.wrapKey } : {}),
+      ...(options.pqWrapKey ? { pqWrapKey: options.pqWrapKey } : {}),
       ...(options.label ? { label: options.label } : {}),
       ...(options.subject ? { subject: options.subject } : {}),
       ...(options.scopes && options.scopes.length > 0 ? { scopes: [...options.scopes] } : {}),
@@ -2515,36 +2632,60 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       },
     ]
 
-    if (this.genesis.privateLog && (options.reader ?? true) && options.wrapKey) {
+    if (this.genesis.privateLog && (options.reader ?? true) && (options.wrapKey || options.pqWrapKey)) {
       const keysState = this.keysState()
+      const policy = this.keysPolicy()
       if (keysState.currentEpoch < 0) {
         const epoch0 = this.#epochKeys.get(0) ?? crypto.getRandomValues(new Uint8Array(32))
         await this.installEpochKey(0, epoch0)
         const boxes: Record<string, EpochKeyBox> = {}
-        const allReaders = new Map<string, string>()
+        const allReaders = new Map<string, { readonly wrapKey?: string; readonly pqWrapKey?: string }>()
         for (const m of this.permissions().members) {
-          if (m.reader && m.wrapKey) allReaders.set(m.publicKey, m.wrapKey)
+          if (m.reader && (m.wrapKey || m.pqWrapKey)) {
+            allReaders.set(m.publicKey, {
+              ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+              ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
+            })
+          }
         }
-        allReaders.set(options.publicKey, options.wrapKey)
-        for (const [pk, wk] of allReaders) {
-          boxes[pk] = await hpkeSealEpochKey(wk, epoch0, this.logId, 0)
+        allReaders.set(options.publicKey, {
+          ...(options.wrapKey ? { wrapKey: options.wrapKey } : {}),
+          ...(options.pqWrapKey ? { pqWrapKey: options.pqWrapKey } : {}),
+        })
+        let allPq = allReaders.size > 0
+        for (const [pk, keys] of allReaders) {
+          const box = await this.#sealBoxForMember(keys, epoch0, this.logId, 0)
+          if (box !== null) {
+            boxes[pk] = box
+            if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
+          }
         }
+        const epochSuite: KeyBoxSuite = (policy.minSuite === KEY_BOX_SUITE_XWING || allPq)
+          ? KEY_BOX_SUITE_XWING
+          : KEY_BOX_SUITE_X25519
         updates.push({
           topic: '$keys',
           input: {
             action: 'rotateEpoch',
             epoch: 0,
+            ...(epochSuite !== KEY_BOX_SUITE_X25519 ? { suite: epochSuite } : {}),
             keyCommitment: epochKeyCommitmentV2(epoch0),
+            mailboxVerifyKey: this.#mailboxVerifyKey(epoch0),
             boxes: boxes as unknown as JsonValue,
           },
         })
       } else {
         const minEp = options.minEpoch ?? 0
         const epochBoxes: Record<string, EpochKeyBox> = {}
+        const targetKeys = {
+          ...(options.wrapKey ? { wrapKey: options.wrapKey } : {}),
+          ...(options.pqWrapKey ? { pqWrapKey: options.pqWrapKey } : {}),
+        }
         for (let ep = minEp; ep <= keysState.currentEpoch; ep++) {
           const epKey = this.#epochKeys.get(ep)
           if (epKey === undefined) continue
-          epochBoxes[String(ep)] = await hpkeSealEpochKey(options.wrapKey, epKey, this.logId, ep)
+          const box = await this.#sealBoxForMember(targetKeys, epKey, this.logId, ep)
+          if (box !== null) epochBoxes[String(ep)] = box
         }
         if (Object.keys(epochBoxes).length > 0) {
           updates.push({
@@ -2571,22 +2712,36 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async rotateEpoch(options: {
     readonly excludeMembers?: readonly string[]
     readonly newEpochKey?: Uint8Array
+    readonly suite?: KeyBoxSuite
     readonly operationId?: string
     readonly authorTimestampMs?: bigint
   } = {}): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> {
     check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_LOG_ONLY')
     await this.#flushPendingMaterialization()
     const keysState = this.keysState()
+    const policy = this.keysPolicy()
     const nextEpoch = keysState.currentEpoch + 1
     const key = options.newEpochKey ?? crypto.getRandomValues(new Uint8Array(32))
     await this.installEpochKey(nextEpoch, key)
 
     const exclude = new Set(options.excludeMembers ?? [])
     const boxes: Record<string, EpochKeyBox> = {}
+    let boxCount = 0
+    let allPq = true
     for (const m of this.permissions().members) {
-      if (!m.reader || !m.wrapKey || exclude.has(m.publicKey)) continue
-      boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, this.logId, nextEpoch)
+      if (!m.reader || (!m.wrapKey && !m.pqWrapKey) || exclude.has(m.publicKey)) continue
+      const box = await this.#sealBoxForMember(m, key, this.logId, nextEpoch, options.suite)
+      if (box !== null) {
+        boxes[m.publicKey] = box
+        boxCount++
+        if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
+      }
     }
+    const epochSuite: KeyBoxSuite = options.suite ?? (
+      (policy.minSuite === KEY_BOX_SUITE_XWING || (boxCount > 0 && allPq))
+        ? KEY_BOX_SUITE_XWING
+        : KEY_BOX_SUITE_X25519
+    )
 
     const operation = await this.submit({
       visibility: 'public',
@@ -2598,12 +2753,122 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         input: {
           action: 'rotateEpoch',
           epoch: nextEpoch,
+          ...(epochSuite !== KEY_BOX_SUITE_X25519 ? { suite: epochSuite } : {}),
           keyCommitment: epochKeyCommitmentV2(key),
+          mailboxVerifyKey: this.#mailboxVerifyKey(key),
           boxes: boxes as unknown as JsonValue,
         },
       }],
     })
     return { epoch: nextEpoch, operation }
+  }
+
+  /** Update on-log `$keys.policy` (minSuite, paddingBucketBytes, hideEnvelopeAuthor, rotateOnRemove, maxOpsPerEpoch). */
+  async setKeysPolicy(
+    policy: KeysPolicy,
+    options: { readonly operationId?: string; readonly authorTimestampMs?: bigint } = {},
+  ): Promise<ApplicationOperation> {
+    return this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$keys',
+        input: {
+          action: 'setPolicy',
+          policy: policy as unknown as JsonValue,
+        },
+      }],
+    })
+  }
+
+  /** Self-service member wrap-key rotation (X25519 `wrapKey` and/or hybrid PQ X-Wing `pqWrapKey`). */
+  async rotateWrapKey(options: {
+    readonly wrapKey?: string
+    readonly pqWrapKey?: string
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  } = {}): Promise<ApplicationOperation> {
+    const wrapKey = options.wrapKey ?? this.device.wrapKey.publicKey
+    const pqWrapKey = options.pqWrapKey ?? this.device.pqWrapKey?.publicKey
+    return this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [{
+        topic: '$admission',
+        input: {
+          action: 'rotateWrapKey',
+          wrapKey,
+          ...(pqWrapKey === undefined ? {} : { pqWrapKey }),
+        },
+      }],
+    })
+  }
+
+  /**
+   * Selective per-recipient encryption helper: encrypts a JSON value or raw bytes to a chosen
+   * subset of members (by publicKey resolved from `$admission`, or explicit wrapKey/pqWrapKey),
+   * automatically upgrading to hybrid PQ X-Wing for recipients with `pqWrapKey`.
+   */
+  async sealFor(
+    recipients: readonly (string | { readonly publicKey: string; readonly wrapKey?: string; readonly pqWrapKey?: string })[],
+    payload: JsonValue | Uint8Array,
+  ): Promise<SealedRecipientBox> {
+    check(recipients.length > 0, 'SEAL_RECIPIENTS_REQUIRED')
+    const encoding: 'json' | 'bytes' = payload instanceof Uint8Array ? 'bytes' : 'json'
+    const plainBytes = payload instanceof Uint8Array ? payload : utf8(canonicalJson(normalizeJsonValue(payload)))
+    const dek = crypto.getRandomValues(new Uint8Array(32))
+    const aad = utf8(`chronolog-sealed/v1:${this.logId}:${encoding}`)
+    const enc = await encryptEpochPayload(dek, 0n, plainBytes, aad, undefined, { suite: 'hkdf-aes-256-gcm' })
+    const boxes: Record<string, EpochKeyBox> = {}
+    for (const r of recipients) {
+      const target = typeof r === 'string'
+        ? this.member(r)
+        : r
+      check(target !== null && (target.wrapKey !== undefined || target.pqWrapKey !== undefined), 'SEAL_RECIPIENT_WRAP_KEY_MISSING')
+      const box = await this.#sealBoxForMember(target, dek, `${this.logId}:sealed`, 0)
+      check(box !== null, 'SEAL_RECIPIENT_WRAP_KEY_MISSING')
+      boxes[target.publicKey] = box
+    }
+    dek.fill(0)
+    return {
+      format: 'chronolog-sealed/v1',
+      encoding,
+      nonce: bytesToHex(enc.nonce),
+      ciphertext: bytesToHex(enc.ciphertext),
+      boxes,
+    }
+  }
+
+  /** Unseal a `SealedRecipientBox` created by `sealFor()` using this device's X25519 or hybrid PQ X-Wing wrap key. */
+  async unseal<T = JsonValue>(box: SealedRecipientBox): Promise<T> {
+    check(box !== null && typeof box === 'object' && box.format === 'chronolog-sealed/v1', 'SEALED_BOX_INVALID')
+    const myBox = box.boxes[this.identity.publicKey]
+    check(myBox !== undefined, 'SEALED_BOX_NOT_A_RECIPIENT')
+    const dek = await hpkeOpenEpochKey(
+      this.device.wrapKey.privateKey,
+      this.device.wrapKey.publicKey,
+      myBox,
+      `${this.logId}:sealed`,
+      0,
+      this.device.pqWrapKey?.secretKey,
+    )
+    try {
+      const aad = utf8(`chronolog-sealed/v1:${this.logId}:${box.encoding}`)
+      const plainBytes = await decryptEpochPayload(dek, {
+        epoch: 0n,
+        nonce: hexToBytes(box.nonce),
+        ciphertext: hexToBytes(box.ciphertext),
+        suite: 'hkdf-aes-256-gcm',
+      }, aad)
+      if (box.encoding === 'bytes') return plainBytes as unknown as T
+      return JSON.parse(new TextDecoder().decode(plainBytes)) as T
+    } finally {
+      dek.fill(0)
+    }
   }
 
   /**
@@ -2614,7 +2879,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     ringName: string,
     options: {
       readonly topics: readonly string[]
-      readonly members: readonly { readonly publicKey: string; readonly wrapKey: string }[]
+      readonly members: readonly { readonly publicKey: string; readonly wrapKey?: string; readonly pqWrapKey?: string }[]
+      readonly suite?: KeyBoxSuite
       readonly operationId?: string
       readonly authorTimestampMs?: bigint
     },
@@ -2623,15 +2889,28 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     check(typeof ringName === 'string' && ringName.length > 0 && ringName !== 'default', 'RING_NAME_INVALID')
     await this.#flushPendingMaterialization()
     const keysState = this.keysState()
+    const policy = this.keysPolicy()
     const prevRing = keysState.rings?.[ringName]
     const nextEpoch = (prevRing?.currentEpoch ?? -1) + 1
     const key = crypto.getRandomValues(new Uint8Array(32))
     await this.installRingKey(ringName, nextEpoch, key)
 
     const boxes: Record<string, EpochKeyBox> = {}
+    let boxCount = 0
+    let allPq = true
     for (const m of options.members) {
-      boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, `${this.logId}:${ringName}`, nextEpoch)
+      const box = await this.#sealBoxForMember(m, key, `${this.logId}:${ringName}`, nextEpoch, options.suite)
+      if (box !== null) {
+        boxes[m.publicKey] = box
+        boxCount++
+        if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
+      }
     }
+    const ringSuite: KeyBoxSuite = options.suite ?? (
+      (policy.minSuite === KEY_BOX_SUITE_XWING || (boxCount > 0 && allPq))
+        ? KEY_BOX_SUITE_XWING
+        : KEY_BOX_SUITE_X25519
+    )
 
     const operation = await this.submit({
       visibility: 'public',
@@ -2644,7 +2923,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           action: 'rotateRingEpoch',
           ring: ringName,
           epoch: nextEpoch,
+          ...(ringSuite !== KEY_BOX_SUITE_X25519 ? { suite: ringSuite } : {}),
           keyCommitment: epochKeyCommitmentV2(key),
+          mailboxVerifyKey: this.#mailboxVerifyKey(key),
           boxes: boxes as unknown as JsonValue,
           topics: [...options.topics],
         },
@@ -2886,21 +3167,35 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const updates: TopicUpdate[] = [
       { topic: '$admission', input: { action: 'removeMember', publicKey } },
     ]
-    if (this.genesis.privateLog && options.rotateEpoch !== false) {
+    const policy = this.keysPolicy()
+    const shouldRotate = options.rotateEpoch ?? policy.rotateOnRemove
+    if (this.genesis.privateLog && shouldRotate) {
       const nextEpoch = this.keysState().currentEpoch + 1
       const key = crypto.getRandomValues(new Uint8Array(32))
       await this.installEpochKey(nextEpoch, key)
       const boxes: Record<string, EpochKeyBox> = {}
+      let boxCount = 0
+      let allPq = true
       for (const m of this.permissions().members) {
-        if (!m.reader || !m.wrapKey || m.publicKey === publicKey) continue
-        boxes[m.publicKey] = await hpkeSealEpochKey(m.wrapKey, key, this.logId, nextEpoch)
+        if (!m.reader || (!m.wrapKey && !m.pqWrapKey) || m.publicKey === publicKey) continue
+        const box = await this.#sealBoxForMember(m, key, this.logId, nextEpoch)
+        if (box !== null) {
+          boxes[m.publicKey] = box
+          boxCount++
+          if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
+        }
       }
+      const epochSuite: KeyBoxSuite = (policy.minSuite === KEY_BOX_SUITE_XWING || (boxCount > 0 && allPq))
+        ? KEY_BOX_SUITE_XWING
+        : KEY_BOX_SUITE_X25519
       updates.push({
         topic: '$keys',
         input: {
           action: 'rotateEpoch',
           epoch: nextEpoch,
+          ...(epochSuite !== KEY_BOX_SUITE_X25519 ? { suite: epochSuite } : {}),
           keyCommitment: epochKeyCommitmentV2(key),
+          mailboxVerifyKey: this.#mailboxVerifyKey(key),
           boxes: boxes as unknown as JsonValue,
         },
       })
@@ -3446,7 +3741,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     if (includePrivate) {
       for (const env of this.#encryptedEnvelopes.values()) {
-        if (bytesToHex(env.envelope.author) === authorPublicKey) {
+        const envAuthor = env.decrypted !== undefined
+          ? bytesToHex(env.decrypted.core.author)
+          : bytesToHex(env.envelope.author)
+        if (envAuthor === authorPublicKey) {
           const opId = bytesToHex(env.envelope.opId)
           if (this.#retentions.get(opId)?.get(self) === undefined) ids.push(opId)
         }

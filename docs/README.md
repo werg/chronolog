@@ -4,6 +4,7 @@
 - [Unified CAS, Packages, Derivations & Registry](PACKAGES_AND_DERIVATIONS.md) — `chronolog-blob/v1`, `chronolog-enc-blob/v1`, `chronolog-pkg/v1`, `chronolog-tree/v1`, `chronolog-drv/v1`, scoped QuickJS/WASM runtimes, `$mounts`, `$builders`, WinterCG HTTP CAS mirrors, `@chronolog/pack`, and the dogfooded Registry Chronolog.
 - [Authored Operation-Set Guide](authored-operation-set.md) — practical guide to authoring, replication, reconnect rewrapping, checkpoints, and reactive views.
 - [Browser Storage Architecture](browser-storage.md) — OPFS, IndexedDB, and single-owner worker isolation in browsers.
+- [Sub-Linear Group Key Rotation Design Brief](SUBLINEAR_GROUP_ROTATION.md) — planned CRDT-native `hpke-tree-v1` O(log N) group key rotation over CAS and how v2.0 `$keys` prepares for it.
 - [Performance](PERFORMANCE.md) — `sync-v3` reconciliation protocol, O(changed) kernel cost model, and the `pnpm bench` harness.
 
 ## Package Guides

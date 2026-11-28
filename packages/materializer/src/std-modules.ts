@@ -47,6 +47,8 @@ export {
 
 export const STD_KEYS_SOURCE = `
 const HEX32 = /^[0-9a-f]{64}$/;
+const VALID_SUITES = ['hpke-x25519-aes256gcm', 'hpke-xwing-aes256gcm'];
+const SUITE_RANK = { 'hpke-x25519-aes256gcm': 1, 'hpke-xwing-aes256gcm': 2 };
 
 function isAdmin(ctx, author) { return ctx.can('administrator', author); }
 function isReader(ctx, author) { return ctx.can('reader', author); }
@@ -54,11 +56,57 @@ function isGuardian(ctx, author) { return ctx.can('guardian', author); }
 
 const RING_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
+function normalizeSuite(raw, fallback) {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw === 'string' && VALID_SUITES.includes(raw)) return raw;
+  return null;
+}
+
+function validateBox(box, defaultSuite) {
+  if (!box || typeof box !== 'object' || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') return null;
+  const suite = normalizeSuite(box.suite, defaultSuite);
+  if (!suite) return null;
+  return {
+    ...(suite !== 'hpke-x25519-aes256gcm' ? { suite } : {}),
+    encapsulatedKey: box.encapsulatedKey,
+    ciphertext: box.ciphertext,
+  };
+}
+
+function normalizePolicy(raw) {
+  const p = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const minSuite = normalizeSuite(p.minSuite, 'hpke-x25519-aes256gcm');
+  if (!minSuite) return null;
+  const paddingBucketBytes = p.paddingBucketBytes === undefined ? 0 : Number(p.paddingBucketBytes);
+  if (!Number.isSafeInteger(paddingBucketBytes) || paddingBucketBytes < 0 || paddingBucketBytes > 65536) return null;
+  const maxOpsPerEpoch = p.maxOpsPerEpoch === undefined || p.maxOpsPerEpoch === null ? null : Number(p.maxOpsPerEpoch);
+  if (maxOpsPerEpoch !== null && (!Number.isSafeInteger(maxOpsPerEpoch) || maxOpsPerEpoch < 1)) return null;
+  return {
+    rotateOnRemove: p.rotateOnRemove !== false,
+    ...(maxOpsPerEpoch !== null ? { maxOpsPerEpoch } : {}),
+    minSuite,
+    paddingBucketBytes,
+    hideEnvelopeAuthor: p.hideEnvelopeAuthor === true,
+  };
+}
+
 export const hpkeEpochs = {
   reduce(state, tx, ctx) {
     const cur = state && typeof state === 'object' ? state : { currentEpoch: -1, epochs: {} };
     const input = tx.payload;
     if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
+    const policy = normalizePolicy(cur.policy) || { rotateOnRemove: true, minSuite: 'hpke-x25519-aes256gcm', paddingBucketBytes: 0, hideEnvelopeAuthor: false };
+
+    if (input.action === 'setPolicy') {
+      if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
+      const nextPolicy = normalizePolicy({ ...policy, ...(input.policy || input) });
+      if (!nextPolicy) return { ok: false, code: 'invalid_keys_policy' };
+      return {
+        ok: true,
+        state: { ...cur, policy: nextPolicy },
+        events: [{ topic: '$keys.policy_updated', payload: nextPolicy }],
+      };
+    }
 
     if (input.action === 'setRecoveryVault') {
       if (!isAdmin(ctx, tx.author)) return { ok: false, code: 'admin_required' };
@@ -71,10 +119,12 @@ export const hpkeEpochs = {
       }
       const guardianShares = {};
       for (const [pk, item] of Object.entries(input.guardianShares)) {
-        if (!HEX32.test(pk) || !item || !Number.isSafeInteger(item.index) || item.index < 1 || item.index > 255 || !item.box || typeof item.box.encapsulatedKey !== 'string' || typeof item.box.ciphertext !== 'string') {
+        if (!HEX32.test(pk) || !item || !Number.isSafeInteger(item.index) || item.index < 1 || item.index > 255) {
           return { ok: false, code: 'guardian_share_invalid' };
         }
-        guardianShares[pk] = { index: item.index, box: { encapsulatedKey: item.box.encapsulatedKey, ciphertext: item.box.ciphertext } };
+        const b = validateBox(item.box, 'hpke-x25519-aes256gcm');
+        if (!b) return { ok: false, code: 'guardian_share_invalid' };
+        guardianShares[pk] = { index: item.index, box: b };
       }
       return {
         ok: true,
@@ -91,15 +141,13 @@ export const hpkeEpochs = {
 
     if (input.action === 'submitRecoveryShare') {
       if (!isGuardian(ctx, tx.author)) return { ok: false, code: 'guardian_required' };
-      if (!HEX32.test(input.member || '') || !Number.isSafeInteger(input.index) || input.index < 1 || input.index > 255 || !input.box || typeof input.box.encapsulatedKey !== 'string' || typeof input.box.ciphertext !== 'string') {
+      const b = validateBox(input.box, 'hpke-x25519-aes256gcm');
+      if (!HEX32.test(input.member || '') || !Number.isSafeInteger(input.index) || input.index < 1 || input.index > 255 || !b) {
         return { ok: false, code: 'recovery_share_invalid' };
       }
       const recoveryGrants = { ...(cur.recoveryGrants || {}) };
       const forMember = { ...(recoveryGrants[input.member] || {}) };
-      forMember[tx.author] = {
-        index: input.index,
-        box: { encapsulatedKey: input.box.encapsulatedKey, ciphertext: input.box.ciphertext },
-      };
+      forMember[tx.author] = { index: input.index, box: b };
       recoveryGrants[input.member] = forMember;
       return {
         ok: true,
@@ -117,17 +165,30 @@ export const hpkeEpochs = {
       const epoch = input.epoch;
       if (!Number.isSafeInteger(epoch) || epoch !== prevRing.currentEpoch + 1) return { ok: false, code: 'epoch_sequence_invalid' };
       if (!HEX32.test(input.keyCommitment || '')) return { ok: false, code: 'key_commitment_invalid' };
+      if (input.mailboxVerifyKey !== undefined && !HEX32.test(input.mailboxVerifyKey || '')) return { ok: false, code: 'mailbox_key_invalid' };
+      const suite = normalizeSuite(input.suite, 'hpke-x25519-aes256gcm');
+      if (!suite) return { ok: false, code: 'suite_invalid' };
+      if (SUITE_RANK[suite] < SUITE_RANK[policy.minSuite]) return { ok: false, code: 'suite_below_minimum' };
       if (!input.boxes || typeof input.boxes !== 'object') return { ok: false, code: 'boxes_invalid' };
       const boxes = {};
-      for (const [pk, box] of Object.entries(input.boxes)) {
-        if (!HEX32.test(pk) || !box || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') {
-          return { ok: false, code: 'box_invalid' };
-        }
-        boxes[pk] = { encapsulatedKey: box.encapsulatedKey, ciphertext: box.ciphertext };
+      for (const [pk, rawBox] of Object.entries(input.boxes)) {
+        if (!HEX32.test(pk)) return { ok: false, code: 'box_invalid' };
+        const b = validateBox(rawBox, suite);
+        if (!b) return { ok: false, code: 'box_invalid' };
+        const bSuite = b.suite || 'hpke-x25519-aes256gcm';
+        if (SUITE_RANK[bSuite] < SUITE_RANK[policy.minSuite]) return { ok: false, code: 'suite_below_minimum' };
+        boxes[pk] = b;
       }
+      const entry = {
+        epoch,
+        ...(suite !== 'hpke-x25519-aes256gcm' ? { suite } : {}),
+        keyCommitment: input.keyCommitment,
+        ...(input.mailboxVerifyKey ? { mailboxVerifyKey: input.mailboxVerifyKey } : {}),
+        boxes,
+      };
       rings[ringName] = {
         currentEpoch: epoch,
-        epochs: { ...prevRing.epochs, [String(epoch)]: { epoch, keyCommitment: input.keyCommitment, boxes } },
+        epochs: { ...prevRing.epochs, [String(epoch)]: entry },
       };
       const topicRings = { ...(cur.topicRings || {}) };
       if (Array.isArray(input.topics)) {
@@ -138,28 +199,37 @@ export const hpkeEpochs = {
       return {
         ok: true,
         state: { ...cur, rings, topicRings },
-        events: [{ topic: '$keys.ring_rotated', payload: { ring: ringName, epoch } }],
+        events: [{ topic: '$keys.ring_rotated', payload: { ring: ringName, epoch, suite } }],
       };
     }
 
     if (input.action === 'grantRingBoxes') {
-      if (!isAdmin(ctx, tx.author) && !isReader(ctx, tx.author)) return { ok: false, code: 'reader_required' };
+      const admin = isAdmin(ctx, tx.author);
+      if (!admin && !isReader(ctx, tx.author)) return { ok: false, code: 'reader_required' };
       const ringName = typeof input.ring === 'string' && RING_RE.test(input.ring) ? input.ring : null;
       const rings = { ...(cur.rings || {}) };
       if (!ringName || !rings[ringName]) return { ok: false, code: 'ring_not_found' };
       if (!HEX32.test(input.member || '') || !input.epochBoxes || typeof input.epochBoxes !== 'object') {
         return { ok: false, code: 'grant_boxes_invalid' };
       }
+      if (!admin && !isReader(ctx, input.member)) {
+        return { ok: false, code: 'member_not_authorized' };
+      }
+      const allowReplace = admin && input.replace === true;
       const nextEpochs = { ...rings[ringName].epochs };
-      for (const [epKey, box] of Object.entries(input.epochBoxes)) {
+      for (const [epKey, rawBox] of Object.entries(input.epochBoxes)) {
         const existing = nextEpochs[epKey];
         if (!existing) return { ok: false, code: 'epoch_missing' };
-        if (!box || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') {
-          return { ok: false, code: 'box_invalid' };
+        if (existing.boxes && existing.boxes[input.member] && !allowReplace) {
+          return { ok: false, code: 'box_already_exists' };
         }
+        const b = validateBox(rawBox, existing.suite || 'hpke-x25519-aes256gcm');
+        if (!b) return { ok: false, code: 'box_invalid' };
+        const bSuite = b.suite || 'hpke-x25519-aes256gcm';
+        if (SUITE_RANK[bSuite] < SUITE_RANK[policy.minSuite]) return { ok: false, code: 'suite_below_minimum' };
         nextEpochs[epKey] = {
           ...existing,
-          boxes: { ...existing.boxes, [input.member]: { encapsulatedKey: box.encapsulatedKey, ciphertext: box.ciphertext } },
+          boxes: { ...existing.boxes, [input.member]: b },
         };
       }
       rings[ringName] = { ...rings[ringName], epochs: nextEpochs };
@@ -175,42 +245,61 @@ export const hpkeEpochs = {
       const epoch = input.epoch;
       if (!Number.isSafeInteger(epoch) || epoch !== cur.currentEpoch + 1) return { ok: false, code: 'epoch_sequence_invalid' };
       if (!HEX32.test(input.keyCommitment || '')) return { ok: false, code: 'key_commitment_invalid' };
+      if (input.mailboxVerifyKey !== undefined && !HEX32.test(input.mailboxVerifyKey || '')) return { ok: false, code: 'mailbox_key_invalid' };
+      const suite = normalizeSuite(input.suite, 'hpke-x25519-aes256gcm');
+      if (!suite) return { ok: false, code: 'suite_invalid' };
+      if (SUITE_RANK[suite] < SUITE_RANK[policy.minSuite]) return { ok: false, code: 'suite_below_minimum' };
       if (!input.boxes || typeof input.boxes !== 'object') return { ok: false, code: 'boxes_invalid' };
       const boxes = {};
-      for (const [pk, box] of Object.entries(input.boxes)) {
-        if (!HEX32.test(pk) || !box || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') {
-          return { ok: false, code: 'box_invalid' };
-        }
-        boxes[pk] = { encapsulatedKey: box.encapsulatedKey, ciphertext: box.ciphertext };
+      for (const [pk, rawBox] of Object.entries(input.boxes)) {
+        if (!HEX32.test(pk)) return { ok: false, code: 'box_invalid' };
+        const b = validateBox(rawBox, suite);
+        if (!b) return { ok: false, code: 'box_invalid' };
+        const bSuite = b.suite || 'hpke-x25519-aes256gcm';
+        if (SUITE_RANK[bSuite] < SUITE_RANK[policy.minSuite]) return { ok: false, code: 'suite_below_minimum' };
+        boxes[pk] = b;
       }
-      const nextEpochs = { ...cur.epochs, [String(epoch)]: { epoch, keyCommitment: input.keyCommitment, boxes } };
+      const entry = {
+        epoch,
+        ...(suite !== 'hpke-x25519-aes256gcm' ? { suite } : {}),
+        keyCommitment: input.keyCommitment,
+        ...(input.mailboxVerifyKey ? { mailboxVerifyKey: input.mailboxVerifyKey } : {}),
+        boxes,
+      };
+      const nextEpochs = { ...cur.epochs, [String(epoch)]: entry };
       return {
         ok: true,
         state: { ...cur, currentEpoch: epoch, epochs: nextEpochs },
-        events: [{ topic: '$keys.rotated', payload: { epoch } }],
+        events: [{ topic: '$keys.rotated', payload: { epoch, suite } }],
       };
     }
 
-    // Grant a newly admitted fresh device lockboxes for one or more retained historical epochs (0..N or checkpointEpoch..N).
-    // Any existing reader holding the epoch keys may seal lockboxes for an already-authorized reader in $permissions.
+    // Grant a newly admitted fresh device lockboxes for one or more retained historical epochs.
+    // Append-only per (epoch, member) unless an administrator explicitly sets replace: true (e.g. wrap-key rotation).
     if (input.action === 'grantBoxes') {
-      if (!isAdmin(ctx, tx.author) && !isReader(ctx, tx.author)) return { ok: false, code: 'reader_required' };
+      const admin = isAdmin(ctx, tx.author);
+      if (!admin && !isReader(ctx, tx.author)) return { ok: false, code: 'reader_required' };
       if (!HEX32.test(input.member || '') || !input.epochBoxes || typeof input.epochBoxes !== 'object') {
         return { ok: false, code: 'grant_boxes_invalid' };
       }
-      if (!isAdmin(ctx, tx.author) && !isReader(ctx, input.member)) {
+      if (!admin && !isReader(ctx, input.member)) {
         return { ok: false, code: 'member_not_authorized' };
       }
+      const allowReplace = admin && input.replace === true;
       const nextEpochs = { ...cur.epochs };
-      for (const [epKey, box] of Object.entries(input.epochBoxes)) {
+      for (const [epKey, rawBox] of Object.entries(input.epochBoxes)) {
         const existing = nextEpochs[epKey];
         if (!existing) return { ok: false, code: 'epoch_missing' };
-        if (!box || typeof box.encapsulatedKey !== 'string' || typeof box.ciphertext !== 'string') {
-          return { ok: false, code: 'box_invalid' };
+        if (existing.boxes && existing.boxes[input.member] && !allowReplace) {
+          return { ok: false, code: 'box_already_exists' };
         }
+        const b = validateBox(rawBox, existing.suite || 'hpke-x25519-aes256gcm');
+        if (!b) return { ok: false, code: 'box_invalid' };
+        const bSuite = b.suite || 'hpke-x25519-aes256gcm';
+        if (SUITE_RANK[bSuite] < SUITE_RANK[policy.minSuite]) return { ok: false, code: 'suite_below_minimum' };
         nextEpochs[epKey] = {
           ...existing,
-          boxes: { ...existing.boxes, [input.member]: { encapsulatedKey: box.encapsulatedKey, ciphertext: box.ciphertext } },
+          boxes: { ...existing.boxes, [input.member]: b },
         };
       }
       return {
@@ -225,6 +314,23 @@ export const hpkeEpochs = {
   query(state, input) {
     const cur = state || { currentEpoch: -1, epochs: {} };
     if (input && typeof input === 'object') {
+      if (input.kind === 'policy') {
+        return normalizePolicy(cur.policy) || { rotateOnRemove: true, minSuite: 'hpke-x25519-aes256gcm', paddingBucketBytes: 0, hideEnvelopeAuthor: false };
+      }
+      if (input.kind === 'mailboxKeys') {
+        const out = { default: {} };
+        for (const [ep, entry] of Object.entries(cur.epochs || {})) {
+          if (entry && typeof entry.mailboxVerifyKey === 'string') out.default[ep] = entry.mailboxVerifyKey;
+        }
+        for (const [ringName, ring] of Object.entries(cur.rings || {})) {
+          const map = {};
+          for (const [ep, entry] of Object.entries((ring && ring.epochs) || {})) {
+            if (entry && typeof entry.mailboxVerifyKey === 'string') map[ep] = entry.mailboxVerifyKey;
+          }
+          out[ringName] = map;
+        }
+        return out;
+      }
       if (typeof input.recoveryFor === 'string') {
         const vault = cur.recovery ? cur.recovery.vault : null;
         const shares = cur.recoveryGrants && cur.recoveryGrants[input.recoveryFor] ? cur.recoveryGrants[input.recoveryFor] : {};
@@ -242,7 +348,7 @@ export const hpkeEpochs = {
           const out = {};
           for (const [ep, entry] of Object.entries(ring.epochs || {})) {
             if (entry.boxes && entry.boxes[input.member]) {
-              out[ep] = { epoch: entry.epoch, keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
+              out[ep] = { epoch: entry.epoch, suite: entry.suite || 'hpke-x25519-aes256gcm', keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
             }
           }
           return { ring: input.ring, currentEpoch: ring.currentEpoch, memberEpochs: out };
@@ -253,7 +359,7 @@ export const hpkeEpochs = {
         const out = {};
         for (const [ep, entry] of Object.entries(cur.epochs || {})) {
           if (entry.boxes && entry.boxes[input.member]) {
-            out[ep] = { epoch: entry.epoch, keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
+            out[ep] = { epoch: entry.epoch, suite: entry.suite || 'hpke-x25519-aes256gcm', keyCommitment: entry.keyCommitment, box: entry.boxes[input.member] };
           }
         }
         return { currentEpoch: cur.currentEpoch, memberEpochs: out };
