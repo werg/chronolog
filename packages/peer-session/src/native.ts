@@ -11,6 +11,16 @@ import { registerExitCleanup } from './exit-cleanup.js'
 export { createApplicationSession } from './index.js'
 export type { CreateApplicationSessionOptions } from './runtime.js'
 export { NativeBytesStore } from '@chronolog/records/native'
+export {
+  ensurePrivateDirectory,
+  acquireAtomicLock,
+  openExclusiveSqliteFence,
+  startNativeIpcServer,
+  connectNativeIpc,
+  type AtomicLockHandle,
+  type ExclusiveSqliteFence,
+  type NativeIpcConnection,
+} from './native-supervisor.js'
 
 export interface DisposableNativeDevice extends ApplicationDevice {
   readonly ephemeral: true

@@ -44,6 +44,7 @@
       "@chronolog/peer-session/tendriller": ["packages/peer-session/src/tendriller.ts"],
       "@chronolog/peer-session/kernel": ["packages/peer-session/src/kernel.ts"],
       "@chronolog/peer-session/mirror": ["packages/peer-session/src/mirror.ts"],
+      "@chronolog/peer-session/workerd-plugin": ["packages/peer-session/src/workerd-plugin.ts"],
       "@chronolog/pack": ["packages/pack/src/index.ts"]
     }
   }

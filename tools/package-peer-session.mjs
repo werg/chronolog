@@ -23,7 +23,7 @@ const nativeRtc = !values['no-native-rtc'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 
 const entries = Object.fromEntries([
-  'index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'kernel', 'mirror',
+  'index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'kernel', 'mirror', 'workerd-plugin',
   ...(nativeRtc ? ['webrtc-native'] : []),
 ].map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 

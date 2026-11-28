@@ -26,6 +26,7 @@
     "package:session": "node tools/package-peer-session.mjs",
     "test:session-webrtc": "tsx tools/test-peer-session-webrtc.ts",
     "package:authority": "node tools/package-authority.mjs",
+    "package:pack": "node tools/package-pack.mjs",
     "bench": "tsx bench/sync.bench.ts"
   },
   "devDependencies": {

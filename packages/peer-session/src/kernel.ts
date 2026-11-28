@@ -11,6 +11,7 @@ export {
   evaluateDerivation,
   verifyDerivationOutput,
   createBytesStoreDerivationMemo,
+  createWasiCasRunner,
   signBuildAttestation,
   verifyBuildAttestation,
   signAuditAttestation,
@@ -98,3 +99,10 @@ export {
   type BlueprintSqlSchema,
   type LogBlueprintV1,
 } from './utilities.js'
+export {
+  runEphemeralHostedSession,
+  type HostedEncryptedEnvelopeExport,
+  type HostedSealedCasItem,
+  type RunEphemeralHostedSessionOptions,
+  type EphemeralHostedSessionDelta,
+} from './hosted-runner.js'

@@ -13,7 +13,8 @@
     "./websocket": "./src/websocket.ts",
     "./tendriller": "./src/tendriller.ts",
     "./kernel": "./src/kernel.ts",
-    "./mirror": "./src/mirror.ts"
+    "./mirror": "./src/mirror.ts",
+    "./workerd-plugin": "./src/workerd-plugin.ts"
   },
   "dependencies": {
     "@chronolog/authority": "workspace:*",
