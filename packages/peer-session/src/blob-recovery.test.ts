@@ -64,7 +64,9 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
     const recovered = await f.contents[1]!.getBlob(info.hash, { expectedBytes: bytes.byteLength })
     expect(recovered).toEqual(bytes)
     expect(p.messages.filter(m => m.message.type === 'blob-info-request')).toHaveLength(2)
-    expect(p.messages.filter(m => m.message.type === 'blob-chunk-request')).toHaveLength(3)
+    // One streamed range request carries all three leaves, each verified by its own hash.
+    expect(p.messages.filter(m => m.message.type === 'blob-chunks-request')).toHaveLength(1)
+    expect(p.messages.filter(m => m.message.type === 'blob-chunk-response')).toHaveLength(3)
 
     // Cached locally: remains available after disconnecting the peer.
     p.close()
@@ -92,9 +94,9 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
     // Single corrupt peer: fails SHA-256 verification and never caches corrupt bytes.
     const corruptPair = pair(f, (message, side) => {
       if (side === 0 && message.type === 'blob-chunk-response' && message.bytes !== null) {
-        const raw = Uint8Array.from(atob(message.bytes), c => c.charCodeAt(0))
+        const raw = message.bytes.slice()
         raw[0] = (raw[0]! + 1) & 0xff
-        return { ...message, bytes: btoa(String.fromCharCode(...raw)) }
+        return { ...message, bytes: raw }
       }
       return message
     })
@@ -125,7 +127,7 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
     await expect(f.contents[1]!.getBlob(info.hash, { expectedBytes: 1024 })).rejects.toThrow('CONTENT_BLOB_INVALID')
     await expect(f.contents[1]!.getBlob(info.hash, { maxBytes: 1024 })).rejects.toThrow('CONTENT_READ_LIMIT_EXCEEDED')
     // No chunk-requests should have been sent!
-    expect(p.messages.filter(m => m.message.type === 'blob-chunk-request')).toHaveLength(0)
+    expect(p.messages.filter(m => m.message.type === 'blob-chunks-request')).toHaveLength(0)
   })
 
   it('validates blob wire frames strictly before decoding', () => {
@@ -133,18 +135,18 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
     expect(() => assertContentWireMessage({ type: 'blob-info-request', id, hash })).not.toThrow()
     expect(() => assertContentWireMessage({ type: 'blob-info-request', id, hash: 'short' })).toThrow('CONTENT_WIRE_INVALID')
     expect(() => assertContentWireMessage({ type: 'blob-info-request', id, hash, extra: 1 })).toThrow('CONTENT_WIRE_INVALID')
-    expect(() => assertContentWireMessage({ type: 'blob-chunk-request', id, hash, index: 0 })).not.toThrow()
-    expect(() => assertContentWireMessage({ type: 'blob-chunk-request', id, hash, index: -1 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
-    expect(() => assertContentWireMessage({ type: 'blob-chunk-request', id, hash, index: MAX_BLOB_CHUNKS })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
-    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: null })).not.toThrow()
-    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: MAX_BLOB_BYTES })).not.toThrow()
-    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: MAX_BLOB_BYTES + 1 })).toThrow('CONTENT_WIRE_INVALID')
-    expect(() => assertContentWireMessage({ type: 'blob-chunk-response', id, bytes: null })).not.toThrow()
+    expect(() => assertContentWireMessage({ type: 'blob-chunks-request', id, hash, start: 0, count: 1 })).not.toThrow()
+    expect(() => assertContentWireMessage({ type: 'blob-chunks-request', id, hash, start: -1, count: 1 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-chunks-request', id, hash, start: MAX_BLOB_CHUNKS, count: 1 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-chunks-request', id, hash, start: 0, count: 17 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: null, nodes: [] })).not.toThrow()
+    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: null, nodes: [new Uint8Array(1)] })).toThrow('CONTENT_WIRE_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: MAX_BLOB_BYTES, nodes: [] })).not.toThrow()
+    expect(() => assertContentWireMessage({ type: 'blob-info-response', id, bytes: MAX_BLOB_BYTES + 1, nodes: [] })).toThrow('CONTENT_WIRE_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-chunk-response', id, index: 0, bytes: null })).not.toThrow()
     // >64 KiB raw chunk rejected even though encrypted chunk limit is larger
-    const oversized = new Uint8Array(CONTENT_CHUNK_BYTES + 1)
-    let bin = ''
-    for (let i = 0; i < oversized.length; i += 8192) bin += String.fromCharCode(...oversized.subarray(i, i + 8192))
-    expect(() => assertContentWireMessage({ type: 'blob-chunk-response', id, bytes: btoa(bin) })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-chunk-response', id, index: 0, bytes: new Uint8Array(CONTENT_CHUNK_BYTES + 1) })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'blob-chunk-response', id, index: 0, bytes: 'AAAA' })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
   })
 
   it('recovers historical blobs end-to-end across authenticated ApplicationSession peers and WorkerApplicationSession RPC', async () => {
@@ -270,5 +272,27 @@ describe('SHA-256 hash-addressed P2P historical blob recovery', () => {
     expect(pubState.revision).toBe(3)
     expect(pubState.current.rollbackOf).toBe(1)
     expect(pubState.current.files[0]?.hash).toBe(expectedV1Hash)
+  })
+})
+
+describe('windowed multi-source pull', () => {
+  it('spreads range requests over several sources and retries chunks a source lacks or corrupts', async () => {
+    const f = await contentFixture(3); cleanup.push(f.close)
+    const bytes = payload(CONTENT_CHUNK_BYTES * 20 + 3), info = await f.contents[0]!.putBlob(bytes), honest = f.contents[0]!.source()
+    const served = { honest: 0, flaky: 0 }
+    f.contents[1]!.attachSource('flaky', {
+      manifest: async () => null, chunk: async () => null,
+      blobChunks: async (hash, start, count, onChunk, options) => {
+        served.flaky += count
+        await honest.blobChunks!(hash, start, count, (index, chunk) => onChunk(index, index % 2 === 0 || chunk === null ? null : chunk.map(b => b ^ 1)), options)
+      },
+    })
+    f.contents[1]!.attachSource('honest', { ...honest, blobChunks: (hash, start, count, onChunk, options) => { served.honest += count; return honest.blobChunks!(hash, start, count, onChunk, options) } })
+    const got = await f.contents[1]!.getBlob(info.hash, { expectedBytes: bytes.length })
+    expect(got !== null && Buffer.compare(got, bytes) === 0).toBe(true) // toEqual on MiB arrays is slow
+    expect(served.flaky).toBeGreaterThan(0)
+    expect(served.honest).toBeGreaterThanOrEqual(21)
+    const local = await f.contents[1]!.getBlob(info.hash, { localOnly: true })
+    expect(local !== null && Buffer.compare(local, bytes) === 0).toBe(true)
   })
 })

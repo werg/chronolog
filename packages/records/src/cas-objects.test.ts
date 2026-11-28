@@ -147,3 +147,26 @@ describe('Unified CAS Merkle-DAG objects', () => {
     expect(await cas.get(root, 'public')).toBeNull()
   })
 })
+
+describe('blob DAG index (per-leaf verification)', () => {
+  it('round-trips a multi-level index and rejects tampered, reordered or truncated nodes', async () => {
+    const { blobDagIndex, putBlobDag, verifyBlobDagIndex, CAS_BLOB_CHUNK_BYTES, computeCasHash } = await import('./index.js')
+    const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
+    const bytes = new Uint8Array(CAS_BLOB_CHUNK_BYTES * 70 + 5).map((_, i) => i % 253)
+    const { hash } = await putBlobDag(cas, bytes, 'public')
+    const index = (await blobDagIndex(cas, hash, 'public'))!
+    expect(index.nodes).toHaveLength(3) // root + two level-1 nodes (64 + 7 leaves)
+    const { leaves, interior } = verifyBlobDagIndex(hash, bytes.length, index.nodes)
+    expect(leaves).toEqual(index.leaves)
+    expect(interior.map(node => node.hash)[0]).toBe(hash)
+    expect(computeCasHash(bytes.subarray(0, CAS_BLOB_CHUNK_BYTES))).toBe(leaves[0]!.hash)
+    const tampered = index.nodes.map(node => node.slice()); const last = tampered[2]!; last[last.length - 1] = last[last.length - 1]! ^ 1
+    expect(() => verifyBlobDagIndex(hash, bytes.length, tampered)).toThrow('CAS_BLOB_INDEX_INVALID')
+    expect(() => verifyBlobDagIndex(hash, bytes.length, [index.nodes[0]!, index.nodes[2]!, index.nodes[1]!])).toThrow('CAS_BLOB_INDEX_INVALID')
+    expect(() => verifyBlobDagIndex(hash, bytes.length, index.nodes.slice(0, 2))).toThrow('CAS_BLOB_INDEX_INVALID')
+    expect(() => verifyBlobDagIndex(hash, bytes.length + 1, index.nodes)).toThrow('CAS_BLOB_INDEX_INVALID')
+    const small = await putBlobDag(cas, bytes.subarray(0, 10), 'public')
+    expect(verifyBlobDagIndex(small.hash, 10, []).leaves).toEqual([{ hash: small.hash, bytes: 10 }])
+    expect(() => verifyBlobDagIndex(small.hash, 10, [index.nodes[0]!])).toThrow('CAS_BLOB_INDEX_INVALID')
+  })
+})

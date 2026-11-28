@@ -7,6 +7,7 @@ pnpm bench                                   # kv + sql reducers, N = 100,500,10
 pnpm bench --sizes 400,2000 --reducers sql --json bench/results/run.json
 BENCH_DEBUG=1 pnpm bench --sizes 50          # phase logging
 pnpm tsx bench/vm.bench.ts                   # cost breakdown of one QuickJS reducer call
+pnpm tsx bench/content.bench.ts              # blob/content pull: 1 and 16 MiB, 0 and 50 ms RTT
 ```
 
 `bench/sync.bench.ts` reports, per log size N: local submit ms/op (first and last decile, so per-op
@@ -69,3 +70,38 @@ heap) per kernel; isolation is unchanged because every call still runs in a fres
 
 Submit cost no longer grows with N (N=2000: ~6 ms/op flat). The largest remaining per-op cost is
 the fresh QuickJS context and module evaluation per reducer call (~1 ms).
+
+## Content transfer (lazy blob pipe)
+
+- **Raw bytes end to end.** An encrypted chunk is stored and sent as
+  `[format u8][epoch u64][nonce 12][AES-GCM ciphertext+tag]` (plaintext + 37 bytes); the binary
+  wire codec carries it as a CBOR byte string. Public blob leaves are sent as their CAS bytes.
+- **Streamed range requests.** `chunks-request` / `blob-chunks-request` name `start` + `count`
+  (≤ 16) and are answered by one `chunk-response` / `blob-chunk-response` per chunk, in order, each
+  sent only after the previous one was handed to the transport (per-request backpressure).
+  `blob-info-response` also carries the blob DAG's interior nodes, so every leaf is verified by its
+  own hash as it arrives. Up to 16 requests per peer each way; a busy peer answers `CONTENT_BUSY`.
+  Content has its own ordered lane into the peer wire, so pipelining never overflows its queue.
+- **Windowed multi-peer pull** (`content-pull.ts`): up to 4 MiB in flight ahead of the consumer,
+  8-chunk batches spread over all attached sources; a chunk a source lacks or mis-delivers is
+  retried on the next one. Streaming reads slow-start (window 1, doubling per chunk taken) so a
+  reader that stops early fetches about what it read; retention and public blobs open the full
+  window. Cancellation aborts every in-flight request (`cancel` frames).
+- **Verify once.** A received chunk is hashed exactly once, inside `cas.putVerified` (stored with
+  `cache: false`, so bulk content does not evict reducer pages from the CAS LRU). Locally stored
+  chunks are not rehashed when served or read; local blob reads no longer rehash the whole blob,
+  and serving a blob leaf no longer reassembles the whole blob per chunk.
+
+`bench/content.bench.ts`, in-memory framed pair, pull on a synchronized fresh peer (loaded machine;
+SHA-256 counters cover both peers in one process):
+
+| blob | before | after | A→B wire bytes before → after |
+|---|---|---|---|
+| public 1 MiB, 0 / 50 ms RTT | 400 / 1190 ms | 75 / 170 ms | 1.34 MiB → 1.00 MiB |
+| public 16 MiB, 0 / 50 ms RTT | 7.7 / 22.7 s | 0.70 / 0.82 s | 21.4 MiB → 16.06 MiB |
+| private 1 MiB, 0 / 50 ms RTT | 1258 / 2125 ms | 50 / 293 ms | 2.67 MiB → 1.00 MiB |
+| private 16 MiB, 0 / 50 ms RTT | 23.2 / 41.5 s | 0.85 / 1.76 s | 42.8 MiB → 16.07 MiB |
+
+SHA-256 for a private 16 MiB pull fell from 128 MiB hashed to 32 MiB (one hash on the sender's
+store read, one on receipt); private 16 MiB `put` fell from ~3–4.8 s to ~0.5 s. Raw results:
+`bench/results/content-before.json`, `bench/results/content-after.json`.

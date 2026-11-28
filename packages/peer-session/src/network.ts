@@ -279,15 +279,22 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       })()
     }
 
+    // Content has its own ordered lane into the wire: many pipelined requests and streamed chunk
+    // responses never exceed the wire's bounded message queue, and each sender is paced by delivery.
+    let contentOut: Promise<void> = Promise.resolve()
     contentLink = createNetworkContent({
       content: session.content,
       peerId,
       signal,
       authorize: () => session.isReader(peerId) && session.isReader(session.device.identity.publicKey),
-      send: message => wire.send(
-        { kind: 'content', message } satisfies Message,
-        () => check(session.isReader(peerId) && session.isReader(session.device.identity.publicKey), 'CONTENT_FORBIDDEN'),
-      ),
+      send: message => {
+        const task = contentOut.then(() => wire.send(
+          { kind: 'content', message } satisfies Message,
+          () => check(session.isReader(peerId) && session.isReader(session.device.identity.publicKey), 'CONTENT_FORBIDDEN'),
+        ))
+        contentOut = task.catch(() => undefined)
+        return task
+      },
     })
 
     const self = session.device.identity.publicKey

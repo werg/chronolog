@@ -366,6 +366,101 @@ export async function* streamBlobDag(
   }
 }
 
+export interface BlobDagLeaf { readonly hash: string; readonly bytes: number }
+/** Interior structure of a chronolog-blob/v1 DAG: everything a peer needs to verify leaves one by one. */
+export interface BlobDagIndex {
+  readonly hash: string
+  readonly bytes: number
+  /** Interior tree-node payloads in breadth-first order (root first); empty for a single-leaf blob. */
+  readonly nodes: readonly Uint8Array[]
+  readonly leaves: readonly BlobDagLeaf[]
+}
+
+/** Read the interior nodes and ordered leaf list of a local blob DAG without touching leaf bytes. */
+export async function blobDagIndex(
+  cas: ContentAddressedStore,
+  rootHash: string,
+  partition: CasPartition | 'any' = 'any',
+): Promise<BlobDagIndex | null> {
+  const root = await cas.get(rootHash, partition)
+  if (root === null) return null
+  const tree = tryDecodeBlobTreeNode(root.bytes, root.links)
+  if (tree === null) return { hash: rootHash, bytes: root.bytes.byteLength, nodes: [], leaves: [{ hash: rootHash, bytes: root.bytes.byteLength }] }
+  const nodes: Uint8Array[] = [root.bytes], leaves: BlobDagLeaf[] = []
+  let level: BlobTreeNode[] = [tree]
+  for (let height = blobDagHeight(tree.bytes); height > 1; height--) {
+    const next: BlobTreeNode[] = []
+    for (const parent of level) {
+      for (const child of parent.children) {
+        const node = await cas.get(child.hash, partition)
+        if (node === null) throw new Error(`CAS_BLOB_MISSING_NODE:${child.hash}`)
+        const sub = tryDecodeBlobTreeNode(node.bytes, node.links)
+        if (sub === null) throw new Error('CAS_BLOB_SHAPE_INVALID')
+        nodes.push(node.bytes); next.push(sub)
+      }
+    }
+    level = next
+  }
+  for (const parent of level) leaves.push(...parent.children)
+  return { hash: rootHash, bytes: tree.bytes, nodes, leaves }
+}
+
+/** Number of tree levels above the leaves of the canonical chronolog-blob/v1 DAG for `bytes`. */
+function blobDagHeight(bytes: number): number {
+  let count = Math.ceil(bytes / CAS_BLOB_CHUNK_BYTES), height = 0
+  while (count > 1) { count = Math.ceil(count / CAS_BLOB_FANOUT); height++ }
+  return height
+}
+
+/**
+ * Authenticate peer-supplied interior nodes against `rootHash` (each node hashed once) and return the
+ * canonical leaf list, so each leaf can be verified by its own hash as it arrives. Rejects any shape
+ * `putBlobDag` would not produce for `bytes`.
+ */
+export function verifyBlobDagIndex(
+  rootHash: string,
+  bytes: number,
+  nodes: readonly Uint8Array[],
+): { readonly leaves: readonly BlobDagLeaf[]; readonly interior: readonly { readonly hash: string; readonly bytes: Uint8Array; readonly links: readonly string[] }[] } {
+  if (!HEX32.test(rootHash) || !Number.isSafeInteger(bytes) || bytes < 0) throw new Error('CAS_BLOB_INDEX_INVALID')
+  const leafCount = Math.ceil(bytes / CAS_BLOB_CHUNK_BYTES)
+  if (leafCount <= 1) {
+    if (nodes.length !== 0) throw new Error('CAS_BLOB_INDEX_INVALID')
+    return { leaves: [{ hash: rootHash, bytes }], interior: [] }
+  }
+  const interior: { hash: string; bytes: Uint8Array; links: readonly string[] }[] = []
+  let cursor = 0, level: { readonly hash: string; readonly bytes: number }[] = [{ hash: rootHash, bytes }]
+  for (let height = blobDagHeight(bytes); height > 0; height--) {
+    const next: { readonly hash: string; readonly bytes: number }[] = []
+    for (const expected of level) {
+      const raw = nodes[cursor++]
+      if (raw === undefined) throw new Error('CAS_BLOB_INDEX_INVALID')
+      const links = [...new Set(blobTreeChildren(raw).map(child => child.hash))].sort()
+      const tree = tryDecodeBlobTreeNode(raw, links)
+      if (tree === null || tree.bytes !== expected.bytes || computeCasHash(raw, links) !== expected.hash) throw new Error('CAS_BLOB_INDEX_INVALID')
+      if (tree.children.reduce((sum, child) => sum + child.bytes, 0) !== tree.bytes || tree.children.length > CAS_BLOB_FANOUT) throw new Error('CAS_BLOB_INDEX_INVALID')
+      interior.push({ hash: expected.hash, bytes: raw, links })
+      next.push(...tree.children)
+    }
+    level = next
+  }
+  if (cursor !== nodes.length || level.length !== leafCount) throw new Error('CAS_BLOB_INDEX_INVALID')
+  for (let index = 0; index < leafCount; index++) {
+    const expected = index === leafCount - 1 ? bytes - index * CAS_BLOB_CHUNK_BYTES : CAS_BLOB_CHUNK_BYTES
+    if (level[index]!.bytes !== expected) throw new Error('CAS_BLOB_INDEX_INVALID')
+  }
+  return { leaves: level, interior }
+}
+
+function blobTreeChildren(raw: Uint8Array): readonly { readonly hash: string }[] {
+  try {
+    const decoded = assertCanonicalCbor(raw, DEFAULT_DECODE_LIMITS)
+    const children = decoded instanceof Map ? (decoded as ReadonlyMap<CborMapKey, CborValue>).get('children') : undefined
+    if (!Array.isArray(children)) return []
+    return children.map(item => ({ hash: Array.isArray(item) && typeof item[0] === 'string' ? item[0] : '' }))
+  } catch { return [] }
+}
+
 /** Synchronous full read of a leaf or chunked chronolog-blob/v1 (for QuickJS/WASM sync loading). */
 export function readBlobDagSync(
   cas: ContentAddressedStore,

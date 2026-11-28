@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { CONTENT_CHUNK_BYTES } from './content.js'
+import { CONTENT_CHUNK_BYTES, MAX_CONTENT_ENCRYPTED_CHUNK_BYTES } from './content.js'
 import { assertContentWireMessage, CONTENT_NETWORK_LIMITS, createNetworkContent, type ContentWireMessage } from './network-content.js'
 import { contentFixture, deferred, payload } from './content-test-fixture.js'
 
@@ -27,8 +27,13 @@ describe('bounded content protocol on an authenticated channel', () => {
     expect(receipts[0]?.signer).toBe(f.identities[1]!.publicKey)
     expect(await f.contents[0]!.retained(reference)).toEqual(receipts)
     expect(await f.contents[1]!.readBytes(reference, { maxBytes: bytes.length })).toEqual(bytes)
-    expect(p.messages.filter(item => item.message.type === 'chunk-request')).toHaveLength(3)
-    expect(p.messages.filter(item => item.message.type === 'chunk-response').every(item => item.message.type === 'chunk-response' && item.message.bytes!.length <= CONTENT_NETWORK_LIMITS.chunkBase64Characters)).toBe(true)
+    // Retention on peer 1 pulled all three chunks in one streamed range request; peer 1's read was local.
+    expect(p.messages.filter(item => item.message.type === 'chunks-request')).toHaveLength(1)
+    const streamed = p.messages.filter(item => item.message.type === 'chunk-response')
+    expect(streamed).toHaveLength(3)
+    // Raw ciphertext on the wire: exactly header + plaintext + AES tag, no hex/base64 inflation.
+    expect(streamed.every(item => item.message.type === 'chunk-response' && item.message.bytes instanceof Uint8Array && item.message.bytes.length <= MAX_CONTENT_ENCRYPTED_CHUNK_BYTES)).toBe(true)
+    expect(MAX_CONTENT_ENCRYPTED_CHUNK_BYTES).toBe(CONTENT_CHUNK_BYTES + 37)
     p.close()
     expect(await f.contents[1]!.readBytes(reference, { maxBytes: bytes.length })).toEqual(bytes)
   })
@@ -39,7 +44,7 @@ describe('bounded content protocol on an authenticated channel', () => {
     let mode: 'chunk' | 'receipt' = 'chunk'
     const p = pair(f, (message, side) => {
       if (side === 0 && mode === 'chunk' && message.type === 'chunk-response' && message.bytes !== null) {
-        return { ...message, bytes: btoa(String.fromCharCode(...new Uint8Array(atob(message.bytes).length))) }
+        return { ...message, bytes: new Uint8Array(message.bytes.length) }
       }
       if (side === 1 && mode === 'receipt' && message.type === 'retain-response') return { ...message, receipt: { ...message.receipt, signature: '00'.repeat(64) } }
       return message
@@ -57,12 +62,13 @@ describe('bounded content protocol on an authenticated channel', () => {
     const reference = await f.contents[0]!.putBytes(payload(1)), messages: ContentWireMessage[] = [], stop = new AbortController()
     const link = createNetworkContent({ content: f.contents[1]!, peerId: f.identities[0]!.publicKey, signal: stop.signal, authorize: () => true, send: async message => { messages.push(message) } })
     cleanup.push(() => link.close())
-    const reads = Array.from({ length: 5 }, () => f.contents[1]!.readBytes(reference, { maxBytes: 1 }).then(() => 'unexpected', (error: Error) => error.message))
-    await vi.waitFor(() => expect(messages.filter(message => message.type === 'manifest-request')).toHaveLength(4))
+    const limit = CONTENT_NETWORK_LIMITS.pending
+    const reads = Array.from({ length: limit + 1 }, () => f.contents[1]!.readBytes(reference, { maxBytes: 1 }).then(() => 'unexpected', (error: Error) => error.message))
+    await vi.waitFor(() => expect(messages.filter(message => message.type === 'manifest-request')).toHaveLength(limit))
     link.close()
     const results = await Promise.all(reads)
     expect(results.filter(result => result === 'CONTENT_REQUEST_LIMIT')).toHaveLength(1)
-    expect(results.filter(result => result === 'CONTENT_NETWORK_CLOSED')).toHaveLength(4)
+    expect(results.filter(result => result === 'CONTENT_NETWORK_CLOSED')).toHaveLength(limit)
     await expect(f.contents[1]!.readBytes(reference, { maxBytes: 1 })).rejects.toThrow('CONTENT_MANIFEST_MISSING')
   })
 
@@ -71,10 +77,10 @@ describe('bounded content protocol on an authenticated channel', () => {
     const reference = await f.contents[0]!.putBytes(payload(1)), messages: ContentWireMessage[] = [], gate = deferred<void>(), store = f.stores[0]!, get = store.get.bind(store)
     store.get = async key => { if (key.endsWith(`/manifest/${reference.id}`)) await gate.promise; return get(key) }
     const stop = new AbortController(), link = createNetworkContent({ content: f.contents[0]!, peerId: f.identities[1]!.publicKey, signal: stop.signal, authorize: () => true, send: async message => { messages.push(message) } }); cleanup.push(() => link.close())
-    const ids = Array.from({ length: 5 }, () => crypto.randomUUID())
+    const limit = CONTENT_NETWORK_LIMITS.active, ids = Array.from({ length: limit + 1 }, () => crypto.randomUUID())
     for (const id of ids) await link.handle({ type: 'manifest-request', id, reference })
-    expect(messages).toEqual([{ type: 'error', id: ids[4], code: 'CONTENT_BUSY' }])
-    for (const id of ids.slice(0, 4)) await link.handle({ type: 'cancel', id })
+    expect(messages).toEqual([{ type: 'error', id: ids[limit], code: 'CONTENT_BUSY' }])
+    for (const id of ids.slice(0, limit)) await link.handle({ type: 'cancel', id })
     gate.resolve(); await vi.waitFor(() => expect(messages).toHaveLength(1))
     await link.handle({ type: 'manifest-request', id: crypto.randomUUID(), reference })
     await vi.waitFor(() => expect(messages.filter(message => message.type === 'manifest-response')).toHaveLength(1))
@@ -102,11 +108,14 @@ describe('bounded content protocol on an authenticated channel', () => {
     await expect(f.contents[1]!.readBytes(reference, { maxBytes: 1 })).rejects.toThrow('CONTENT_FORBIDDEN')
     await expect(link.handle({ type: 'manifest-request', id: crypto.randomUUID(), reference })).rejects.toThrow('CONTENT_FORBIDDEN')
     expect(messages).toEqual([])
-    for (const bytes of ['A'.repeat(CONTENT_NETWORK_LIMITS.chunkBase64Characters + 4), 'AA', 'AR==', '%===']) {
-      expect(() => assertContentWireMessage({ type: 'chunk-response', id: crypto.randomUUID(), bytes })).toThrow()
+    for (const bytes of [new Uint8Array(CONTENT_NETWORK_LIMITS.chunkBytes + 1), 'AA', [1, 2]]) {
+      expect(() => assertContentWireMessage({ type: 'chunk-response', id: crypto.randomUUID(), index: 0, bytes })).toThrow()
     }
+    expect(() => assertContentWireMessage({ type: 'chunk-response', id: crypto.randomUUID(), index: -1, bytes: null })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'chunks-request', id: crypto.randomUUID(), reference, start: 0, count: 0 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'chunks-request', id: crypto.randomUUID(), reference, start: 0, count: CONTENT_NETWORK_LIMITS.rangeChunks + 1 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
     expect(() => assertContentWireMessage({ type: 'manifest-request', id: crypto.randomUUID(), reference, extra: true })).toThrow('CONTENT_WIRE_INVALID')
-    expect(() => assertContentWireMessage({ type: 'chunk-request', id: crypto.randomUUID(), reference, index: 1 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
+    expect(() => assertContentWireMessage({ type: 'chunks-request', id: crypto.randomUUID(), reference, start: 1, count: 1 })).toThrow('CONTENT_WIRE_CHUNK_INVALID')
     expect(() => assertContentWireMessage({ type: 'manifest-response', id: crypto.randomUUID(), manifest: { stageId: crypto.randomUUID(), reference: {}, chunks: new Array(2049) } })).toThrow()
   })
 })

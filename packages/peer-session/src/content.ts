@@ -1,15 +1,18 @@
 import {
   ContentAddressedStore,
+  blobDagIndex,
   computeBlobDagHash,
   computeCasHash,
   encodeEncBlobManifest,
   putBlobDag,
   readBlobDag,
   statBlobDag,
+  verifyBlobDagIndex,
+  type BlobDagLeaf,
   type BytesStore,
 } from '@chronolog/records'
 import { encryptEpochPayload, decryptEpochPayload, type EncryptedEpochPayload } from '@chronolog/crypto'
-import { bytesToHex, concatBytes, sha256, utf8 } from '@chronolog/canonical'
+import { bytesToHex, concatBytes, equalBytes, sha256, utf8 } from '@chronolog/canonical'
 import { check, decodeRecord, encodeRecord, equalRecord, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from '@chronolog/authority'
 import {
   CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_CONTENT_BYTES,
@@ -21,6 +24,7 @@ import {
   type ContentStreamPutOptions,
 } from './content-bytes.js'
 import { awaitOwnedTask } from './lifetime.js'
+import { ChunkPuller, type ChunkSink, type RangeSource } from './content-pull.js'
 export { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_BLOB_CHUNKS, isPublicBlobReference, isPrivateContentReference } from './content-bytes.js'
 export type {
   BlobGetOptions, BlobInfo, BlobPutOptions, BlobReference,
@@ -37,19 +41,34 @@ export interface ContentAuthority {
 }
 
 export const MAX_CONTENT_CHUNKS = MAX_CONTENT_BYTES / CONTENT_CHUNK_BYTES
-/** Canonical encrypted-envelope bytes: 64 KiB plaintext, AES tag, hex encoding and bounded metadata. */
-export const MAX_CONTENT_ENCRYPTED_CHUNK_BYTES = CONTENT_CHUNK_BYTES * 2 + 1024
+/**
+ * Binary encrypted chunk (stored and sent as-is): [format u8 = 1][epoch u64 BE][nonce 12][AES-GCM ciphertext+tag].
+ * Exactly `CONTENT_CHUNK_HEADER_BYTES + plaintext + 16` bytes; no hex, JSON or base64 anywhere.
+ */
+export const CONTENT_CHUNK_HEADER_BYTES = 21
+const CONTENT_CHUNK_FORMAT = 1, AES_GCM_TAG_BYTES = 16
+export const MAX_CONTENT_ENCRYPTED_CHUNK_BYTES = CONTENT_CHUNK_BYTES + CONTENT_CHUNK_HEADER_BYTES + AES_GCM_TAG_BYTES
 export const MAX_CONTENT_MANIFEST_BYTES = 256 * 1024
+/** Bytes a single lazy pull keeps in flight ahead of its consumer (sliding window over all sources). */
+export const CONTENT_FETCH_WINDOW_BYTES = 4 * 1024 * 1024
 export interface ContentReference { readonly profile: 'authored-content-v1'; readonly applicationId: string; readonly id: string; readonly epoch: number; readonly bytes: number; readonly mediaType: string }
 export interface ContentManifest { readonly stageId: string; readonly reference: Omit<ContentReference, 'id'>; readonly chunks: readonly { readonly hash: string; readonly bytes: number }[] }
 export type ContentRetention = Signed<{ readonly reference: ContentReference; readonly peer: string; readonly storageId: string }>
 export interface ContentOptions { readonly signal?: AbortSignal }
+/** Interior nodes of a public blob DAG; enough to verify every leaf by its own hash. */
+export interface BlobIndex { readonly hash: string; readonly bytes: number; readonly nodes: readonly Uint8Array[] }
+export type { ChunkSink } from './content-pull.js'
 export interface ContentSource {
   manifest(reference: ContentReference, options?: ContentOptions): Promise<ContentManifest | null>
   chunk(reference: ContentReference, index: number, options?: ContentOptions): Promise<Uint8Array | null>
+  /** Stream chunks `start..start+count-1` in order to `onChunk` (null = not available here). */
+  chunks?(reference: ContentReference, start: number, count: number, onChunk: ChunkSink, options?: ContentOptions): Promise<void>
   retained?(reference: ContentReference, options?: ContentOptions): Promise<ContentRetention>
   blobInfo?(hash: string, options?: ContentOptions): Promise<BlobInfo | null>
   blobChunk?(hash: string, index: number, options?: ContentOptions): Promise<Uint8Array | null>
+  blobIndex?(hash: string, options?: ContentOptions): Promise<BlobIndex | null>
+  /** Stream blob leaves `start..start+count-1` in order to `onChunk` (null = not available here). */
+  blobChunks?(hash: string, start: number, count: number, onChunk: ChunkSink, options?: ContentOptions): Promise<void>
 }
 export interface ContentUpload {
   readonly id: string
@@ -100,15 +119,35 @@ export function assertBlobInfo(value: unknown): asserts value is BlobInfo {
   check(digest(value.hash) && Number.isSafeInteger(value.bytes) && Number(value.bytes) >= 0 && Number(value.bytes) <= MAX_BLOB_BYTES, 'CONTENT_BLOB_INVALID')
 }
 function body(reference: ContentReference): Omit<ContentReference, 'id'> { const { id: _id, ...rest } = reference; return rest }
+function encodeChunk(payload: EncryptedEpochPayload): Uint8Array {
+  const out = new Uint8Array(CONTENT_CHUNK_HEADER_BYTES + payload.ciphertext.length)
+  out[0] = CONTENT_CHUNK_FORMAT
+  new DataView(out.buffer).setBigUint64(1, payload.epoch)
+  out.set(payload.nonce, 9); out.set(payload.ciphertext, CONTENT_CHUNK_HEADER_BYTES)
+  return out
+}
+/** Parse a binary encrypted chunk as zero-copy views; the exact length binds it to its plaintext size. */
 function envelope(bytes: Uint8Array, epoch: number, plaintextBytes: number): EncryptedEpochPayload {
-  check(bytes.length > 0 && bytes.length <= MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, 'CONTENT_CHUNK_INVALID')
-  const value = decodeRecord<EncryptedEpochPayload>(bytes)
-  object(value, ['epoch', 'nonce', 'ciphertext'])
-  check(value.epoch === BigInt(epoch) && value.nonce instanceof Uint8Array && value.nonce.length === 12 &&
-    value.ciphertext instanceof Uint8Array && value.ciphertext.length === plaintextBytes + 16, 'CONTENT_CHUNK_INVALID')
-  return value
+  check(bytes instanceof Uint8Array && bytes.length === CONTENT_CHUNK_HEADER_BYTES + plaintextBytes + AES_GCM_TAG_BYTES && bytes[0] === CONTENT_CHUNK_FORMAT, 'CONTENT_CHUNK_INVALID')
+  const value = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(1)
+  check(value === BigInt(epoch), 'CONTENT_CHUNK_INVALID')
+  return { epoch: value, nonce: bytes.subarray(9, CONTENT_CHUNK_HEADER_BYTES), ciphertext: bytes.subarray(CONTENT_CHUNK_HEADER_BYTES) }
+}
+const plainBytesAt = (reference: Omit<ContentReference, 'id'>, index: number): number => Math.min(CONTENT_CHUNK_BYTES, reference.bytes - index * CONTENT_CHUNK_BYTES)
+/** Adapt a source to streamed range fetches; single-chunk sources are called once per index. */
+function rangeOf(
+  ranged: ((start: number, count: number, onChunk: ChunkSink, signal: AbortSignal) => Promise<void>) | undefined,
+  single: (index: number, signal: AbortSignal) => Promise<Uint8Array | null>,
+): RangeSource {
+  return {
+    async fetch(start, count, onChunk, signal) {
+      if (ranged !== undefined) { await awaitOwnedTask(signal, () => ranged(start, count, onChunk, signal)); return }
+      for (let index = start; index < start + count; index++) await onChunk(index, await awaitOwnedTask(signal, () => single(index, signal)))
+    },
+  }
 }
 
+interface ChunkReader { next(index: number): Promise<Uint8Array>; close(): void }
 interface CacheEntry {
   readonly kind: 'public' | 'private'
   readonly key: string
@@ -134,6 +173,8 @@ export class ApplicationContent {
     readonly maxCacheBytes?: number
   }
   #cacheIndex: Map<string, CacheEntry> | null = null
+  /** Last validated manifest per id, keyed by its exact stored bytes so a changed record is revalidated. */
+  readonly #manifests = new Map<string, { readonly raw: Uint8Array; readonly manifest: ContentManifest }>()
   #tail: Promise<unknown> = Promise.resolve()
   constructor(options: {
     readonly store: BytesStore
@@ -284,9 +325,9 @@ export class ApplicationContent {
           const aad = encodeRecord([this.#prefix, id, index]), existing = await this.#options.store.get(`${key}/chunk/${index}`)
           if (existing !== null) {
             const plaintext = await decryptEpochPayload(epochKey, envelope(existing, stage.reference.epoch, bytes.length), aad)
-            check(equalRecord(plaintext, bytes), 'CONTENT_CHUNK_CONFLICT'); return
+            check(equalBytes(plaintext, bytes), 'CONTENT_CHUNK_CONFLICT'); return
           }
-          const encrypted = encodeRecord(await encryptEpochPayload(epochKey, BigInt(stage.reference.epoch), bytes, aad))
+          const encrypted = encodeChunk(await encryptEpochPayload(epochKey, BigInt(stage.reference.epoch), bytes, aad))
           await this.#options.store.put(`${key}/chunk/${index}`, encrypted)
         })
       },
@@ -310,7 +351,7 @@ export class ApplicationContent {
           const bytes = await this.#options.store.get(`${key}/chunk/${index}`); check(bytes !== null, 'CONTENT_INCOMPLETE')
           const plainBytes = Math.min(CONTENT_CHUNK_BYTES, stage.reference.bytes - index * CONTENT_CHUNK_BYTES)
           await decryptEpochPayload(epochKey, envelope(bytes, stage.reference.epoch, plainBytes), encodeRecord([this.#prefix, id, index]))
-          const hash = await this.#cas.put(bytes, [], 'public')
+          const hash = await this.#cas.put(bytes, [], 'public', { cache: false })
           chunks.push({ hash, bytes: bytes.length })
           encManifestChunks.push({ hash, bytes: bytes.length, plainBytes })
         }
@@ -349,13 +390,23 @@ export class ApplicationContent {
     assertContentManifest(manifest)
     check(equalRecord(manifest.reference, body(reference)) && await recordDigest(manifest) === reference.id, 'CONTENT_MANIFEST_INVALID')
   }
+  #rememberManifest(id: string, raw: Uint8Array, manifest: ContentManifest): void {
+    this.#manifests.delete(id); this.#manifests.set(id, { raw, manifest })
+    while (this.#manifests.size > 64) this.#manifests.delete(this.#manifests.keys().next().value!)
+  }
   async #manifest(reference: ContentReference, signal: AbortSignal, localOnly = false): Promise<ContentManifest | null> {
     signal.throwIfAborted(); this.#reader()
     const raw = await awaitOwnedTask(signal, () => this.#options.store.get(`${this.#prefix}/manifest/${reference.id}`))
     if (raw !== null && raw.length > 0) {
       check(raw.length <= MAX_CONTENT_MANIFEST_BYTES, 'CONTENT_MANIFEST_INVALID')
-      const manifest = decodeRecord<ContentManifest>(raw); await this.#validateManifest(manifest, reference); signal.throwIfAborted(); return manifest
+      // Serving issues one manifest lookup per range request: skip re-validation of identical bytes.
+      const known = this.#manifests.get(reference.id)
+      if (known !== undefined && equalBytes(known.raw, raw)) { signal.throwIfAborted(); return known.manifest }
+      const manifest = decodeRecord<ContentManifest>(raw); await this.#validateManifest(manifest, reference); signal.throwIfAborted()
+      this.#rememberManifest(reference.id, raw, manifest)
+      return manifest
     }
+    this.#manifests.delete(reference.id)
     if (localOnly) return null
     let failure: unknown
     for (const source of [...this.#sources.values()]) {
@@ -372,42 +423,68 @@ export class ApplicationContent {
     if (failure !== undefined) throw failure instanceof Error ? failure : new Error('CONTENT_SOURCE_FAILED', { cause: failure })
     throw new Error('CONTENT_MANIFEST_MISSING')
   }
-  async #chunk(reference: ContentReference, manifest: ContentManifest, index: number, signal: AbortSignal, localOnly = false): Promise<Uint8Array | null> {
+  /** A locally stored chunk. CAS is keyed by hash and verifies bytes loaded from the store, so no rehash here. */
+  async #localChunk(reference: ContentReference, manifest: ContentManifest, index: number, signal: AbortSignal): Promise<Uint8Array | null> {
     signal.throwIfAborted(); this.#reader()
     const descriptor = manifest.chunks[index]; check(descriptor !== undefined, 'CONTENT_CHUNK_INDEX_INVALID')
-    const valid = async (bytes: Uint8Array): Promise<void> => {
-      check(bytes instanceof Uint8Array && bytes.length === descriptor.bytes && bytes.length <= MAX_CONTENT_ENCRYPTED_CHUNK_BYTES && computeCasHash(bytes, []) === descriptor.hash, 'CONTENT_CHUNK_INVALID')
-      envelope(bytes, reference.epoch, Math.min(CONTENT_CHUNK_BYTES, reference.bytes - index * CONTENT_CHUNK_BYTES))
+    const storedNode = await awaitOwnedTask(signal, () => this.#cas.get(descriptor.hash, 'public', { cache: false }))
+    if (storedNode === null || storedNode.bytes.length === 0) return null
+    check(storedNode.bytes.length === descriptor.bytes, 'CONTENT_CHUNK_INVALID')
+    envelope(storedNode.bytes, reference.epoch, plainBytesAt(reference, index))
+    signal.throwIfAborted()
+    return storedNode.bytes
+  }
+  /** Verify a remote chunk exactly once (envelope shape, then one hash inside the CAS write) and persist it. */
+  async #acceptChunk(reference: ContentReference, manifest: ContentManifest, index: number, bytes: Uint8Array, signal: AbortSignal): Promise<Uint8Array> {
+    const descriptor = manifest.chunks[index]; check(descriptor !== undefined, 'CONTENT_CHUNK_INDEX_INVALID')
+    check(bytes instanceof Uint8Array && bytes.length === descriptor.bytes, 'CONTENT_CHUNK_INVALID')
+    envelope(bytes, reference.epoch, plainBytesAt(reference, index))
+    await this.#serial(async () => {
+      signal.throwIfAborted(); this.#reader()
+      try { await this.#cas.putVerified(descriptor.hash, bytes, [], 'public', { cache: false }) }
+      catch (error) { throw error instanceof Error && error.message === 'CAS_HASH_MISMATCH' ? new Error('CONTENT_CHUNK_INVALID') : error }
+    })
+    return bytes
+  }
+  /** In-order chunk reader: local chunks directly, remote ones through one windowed multi-source puller. */
+  #chunkReader(reference: ContentReference, manifest: ContentManifest, signal: AbortSignal, eager = false): ChunkReader {
+    let puller: ChunkPuller | undefined
+    return {
+      next: async index => {
+        if (puller === undefined) {
+          const local = await this.#localChunk(reference, manifest, index, signal)
+          if (local !== null) return local
+          const sources = [...this.#sources.values()].map(source => rangeOf(
+            source.chunks === undefined ? undefined : (start, count, sink, s) => source.chunks!(reference, start, count, sink, { signal: s }),
+            (i, s) => source.chunk(reference, i, { signal: s })))
+          if (sources.length === 0) throw new Error('CONTENT_CHUNK_MISSING')
+          puller = new ChunkPuller({
+            count: manifest.chunks.length, start: index, sources, signal, missing: 'CONTENT_CHUNK_MISSING',
+            local: (i, s) => this.#localChunk(reference, manifest, i, s),
+            accept: (i, bytes, s) => this.#acceptChunk(reference, manifest, i, bytes, s),
+            windowChunks: CONTENT_FETCH_WINDOW_BYTES / CONTENT_CHUNK_BYTES,
+            // Streaming reads slow-start so an early stop pulls about what was read; retention wants it all.
+            ...(eager ? { initialWindow: CONTENT_FETCH_WINDOW_BYTES / CONTENT_CHUNK_BYTES } : {}),
+          })
+        }
+        return puller.take(index)
+      },
+      close: () => puller?.close(),
     }
-    const storedNode = await awaitOwnedTask(signal, () => this.#cas.get(descriptor.hash, 'public'))
-    if (storedNode !== null && storedNode.bytes.length > 0) { await valid(storedNode.bytes); signal.throwIfAborted(); return storedNode.bytes }
-    if (localOnly) return null
-    let failure: unknown
-    for (const source of [...this.#sources.values()]) {
-      try {
-        const candidate = await awaitOwnedTask(signal, () => source.chunk(reference, index, { signal }))
-        if (candidate === null) continue
-        check(candidate instanceof Uint8Array && candidate.length <= MAX_CONTENT_ENCRYPTED_CHUNK_BYTES, 'CONTENT_CHUNK_INVALID')
-        const bytes = candidate.slice()
-        await valid(bytes)
-        await this.#serial(async () => { signal.throwIfAborted(); this.#reader(); await this.#cas.put(bytes, [], 'public') })
-        return bytes.slice()
-      } catch (error) { signal.throwIfAborted(); failure = error }
-    }
-    if (failure !== undefined) throw failure instanceof Error ? failure : new Error('CONTENT_SOURCE_FAILED', { cause: failure })
-    throw new Error('CONTENT_CHUNK_MISSING')
   }
   async *read(input: ContentReference, options: ContentOptions = {}): AsyncIterable<Uint8Array> {
     const reference = this.#reference(input), scope = this.#readScope(reference, options)
+    let chunks: ChunkReader | undefined
     try {
       const manifest = await this.#manifest(reference, scope.signal); check(manifest !== null, 'CONTENT_MANIFEST_MISSING')
       const key = this.#options.authority.epochKey(reference.epoch); check(key !== null, 'CONTENT_KEY_MISSING')
+      chunks = this.#chunkReader(reference, manifest, scope.signal)
       for (let index = 0; index < manifest.chunks.length; index++) {
-        const bytes = await this.#chunk(reference, manifest, index, scope.signal); check(bytes !== null, 'CONTENT_CHUNK_MISSING')
-        const plaintext = await decryptEpochPayload(key, envelope(bytes, reference.epoch, Math.min(CONTENT_CHUNK_BYTES, reference.bytes - index * CONTENT_CHUNK_BYTES)), encodeRecord([this.#prefix, manifest.stageId, index]))
+        const bytes = await chunks.next(index)
+        const plaintext = await decryptEpochPayload(key, envelope(bytes, reference.epoch, plainBytesAt(reference, index)), encodeRecord([this.#prefix, manifest.stageId, index]))
         scope.signal.throwIfAborted(); this.#reader(); yield plaintext
       }
-    } finally { scope.release() }
+    } finally { chunks?.close(); scope.release() }
   }
   async #receipt(reference: ContentReference, signal: AbortSignal): Promise<ContentRetention> {
     const receipt = await signRecord('content-retention', { reference, peer: this.#options.identity.publicKey, storageId: this.#options.storageId }, this.#options.identity)
@@ -418,7 +495,8 @@ export class ApplicationContent {
     const reference = this.#reference(input), scope = this.#readScope(reference, options)
     try {
       const manifest = await this.#manifest(reference, scope.signal); check(manifest !== null, 'CONTENT_MANIFEST_MISSING')
-      for (let index = 0; index < manifest.chunks.length; index++) await this.#chunk(reference, manifest, index, scope.signal)
+      const chunks = this.#chunkReader(reference, manifest, scope.signal, true)
+      try { for (let index = 0; index < manifest.chunks.length; index++) await chunks.next(index) } finally { chunks.close() }
       return await this.#receipt(reference, scope.signal)
     } finally { scope.release() }
   }
@@ -482,16 +560,53 @@ export class ApplicationContent {
     signal.throwIfAborted()
     return { hash, bytes: st.bytes }
   }
-  async #localBlobChunk(hash: string, info: BlobInfo, index: number, signal: AbortSignal): Promise<Uint8Array | null> {
+  /** Verified leaf list of a local blob, or null when it is not (fully indexed) here. */
+  async #localBlobIndex(hash: string, signal: AbortSignal): Promise<BlobIndex & { readonly leaves: readonly BlobDagLeaf[] } | null> {
     signal.throwIfAborted(); this.#reader()
-    const count = Math.ceil(info.bytes / CONTENT_CHUNK_BYTES)
-    check(Number.isSafeInteger(index) && index >= 0 && index < count, 'CONTENT_CHUNK_INDEX_INVALID')
-    const full = await awaitOwnedTask(signal, () => readBlobDag(this.#cas, hash, 'public', { maxBytes: MAX_BLOB_BYTES }))
-    if (full === null) return null
-    const start = index * CONTENT_CHUNK_BYTES
-    const end = Math.min(full.byteLength, start + CONTENT_CHUNK_BYTES)
+    try { return await awaitOwnedTask(signal, () => blobDagIndex(this.#cas, hash, 'public')) }
+    catch (error) { signal.throwIfAborted(); if (error instanceof Error && error.message.startsWith('CAS_BLOB_')) return null; throw error }
+  }
+  /** Pull every leaf of a verified blob index through the windowed puller; leaves are hashed once on arrival. */
+  async #pullBlob(hash: string, bytes: number, leaves: readonly BlobDagLeaf[], interior: readonly { readonly hash: string; readonly bytes: Uint8Array; readonly links: readonly string[] }[],
+    first: ContentSource, cache: boolean, signal: AbortSignal): Promise<Uint8Array> {
+    const ordered = [first, ...[...this.#sources.values()].filter(source => source !== first)]
+    const sources = ordered.filter(source => source.blobChunks !== undefined || source.blobChunk !== undefined)
+      .map(source => rangeOf(
+        source.blobChunks === undefined ? undefined : (start, count, sink, s) => source.blobChunks!(hash, start, count, sink, { signal: s }),
+        async (i, s) => source.blobChunk === undefined ? null : source.blobChunk(hash, i, { signal: s })))
+    const assembled = new Uint8Array(bytes)
+    const puller = new ChunkPuller({
+      count: leaves.length, sources, signal, missing: 'CONTENT_BLOB_MISSING',
+      windowChunks: CONTENT_FETCH_WINDOW_BYTES / CONTENT_CHUNK_BYTES, initialWindow: CONTENT_FETCH_WINDOW_BYTES / CONTENT_CHUNK_BYTES,
+      local: async (i, s) => {
+        const node = await awaitOwnedTask(s, () => this.#cas.get(leaves[i]!.hash, 'public', { cache: false }))
+        return node !== null && node.links.length === 0 && node.bytes.length === leaves[i]!.bytes ? node.bytes : null
+      },
+      accept: async (i, chunk, s) => {
+        const leaf = leaves[i]!
+        check(chunk instanceof Uint8Array && chunk.byteLength === leaf.bytes, 'CONTENT_BLOB_INVALID')
+        if (!cache) { check(computeCasHash(chunk, []) === leaf.hash, 'CONTENT_BLOB_INVALID'); return chunk }
+        await this.#serial(async () => {
+          s.throwIfAborted(); this.#reader()
+          try { await this.#cas.putVerified(leaf.hash, chunk, [], 'public', { cache: false }) }
+          catch (error) { throw error instanceof Error && error.message === 'CAS_HASH_MISMATCH' ? new Error('CONTENT_BLOB_INVALID') : error }
+        })
+        return chunk
+      },
+    })
+    try {
+      for (let index = 0; index < leaves.length; index++) assembled.set(await puller.take(index), index * CONTENT_CHUNK_BYTES)
+    } finally { puller.close() }
     signal.throwIfAborted()
-    return full.slice(start, end)
+    if (cache) {
+      await this.#serial(async () => {
+        signal.throwIfAborted(); this.#reader()
+        // Interior nodes bottom-up, root last: a stored root always means a complete local DAG.
+        for (let index = interior.length - 1; index >= 0; index--) await this.#cas.putVerified(interior[index]!.hash, interior[index]!.bytes, interior[index]!.links, 'public')
+        await this.#touchCacheEntry('public', hash, bytes)
+      })
+    }
+    return assembled
   }
   async #storeLocalBlob(bytes: Uint8Array, signal: AbortSignal): Promise<BlobInfo> {
     let info!: BlobInfo
@@ -536,18 +651,27 @@ export class ApplicationContent {
       if (localInfo !== null) {
         if (options.expectedBytes !== undefined) check(localInfo.bytes === options.expectedBytes, 'CONTENT_BLOB_INVALID')
         check(localInfo.bytes <= maxBytes, 'CONTENT_READ_LIMIT_EXCEEDED')
+        // CAS nodes are addressed by hash and verified when loaded from the store: no whole-blob rehash.
         const assembled = await awaitOwnedTask(scope.signal, () => readBlobDag(this.#cas, hash, 'public', { maxBytes }))
-        if (assembled !== null) {
-          check(computeBlobDagHash(assembled) === hash, 'CONTENT_BLOB_INVALID')
-          scope.signal.throwIfAborted()
-          return assembled
-        }
+        if (assembled !== null) { scope.signal.throwIfAborted(); return assembled }
       }
       if (options.localOnly === true) return null
       let failure: unknown
       for (const source of [...this.#sources.values()]) {
-        if (source.blobInfo === undefined || source.blobChunk === undefined) continue
         try {
+          if (source.blobIndex !== undefined) {
+            const index = await awaitOwnedTask(scope.signal, () => source.blobIndex!(hash, { signal: scope.signal }))
+            if (index === null) continue
+            check(index !== null && typeof index === 'object' && index.hash === hash && Array.isArray(index.nodes) && index.nodes.length <= 64, 'CONTENT_BLOB_INVALID')
+            assertBlobInfo({ hash: index.hash, bytes: index.bytes })
+            if (options.expectedBytes !== undefined) check(index.bytes === options.expectedBytes, 'CONTENT_BLOB_INVALID')
+            check(index.bytes <= maxBytes, 'CONTENT_READ_LIMIT_EXCEEDED')
+            let verified: ReturnType<typeof verifyBlobDagIndex>
+            try { verified = verifyBlobDagIndex(hash, index.bytes, index.nodes) } catch { throw new Error('CONTENT_BLOB_INVALID') }
+            return await this.#pullBlob(hash, index.bytes, verified.leaves, verified.interior, source, options.cache !== false, scope.signal)
+          }
+          if (source.blobInfo === undefined || source.blobChunk === undefined) continue
+          // Sources without an index: whole-blob verification after assembly.
           const info = await awaitOwnedTask(scope.signal, () => source.blobInfo!(hash, { signal: scope.signal }))
           if (info === null) continue
           assertBlobInfo(info)
@@ -584,24 +708,47 @@ export class ApplicationContent {
   }
   /** Serve only verified local bytes. Serving never recursively consults remote sources. */
   source(): ContentSource {
+    const range = (count: number, start: number, length: number): void => {
+      check(Number.isSafeInteger(start) && Number.isSafeInteger(length) && start >= 0 && length > 0 && start + length <= count, 'CONTENT_CHUNK_INDEX_INVALID')
+    }
+    const chunks = async (input: ContentReference, start: number, count: number, onChunk: ChunkSink, options: ContentOptions = {}): Promise<void> => {
+      const reference = this.#reference(input), scope = this.#readScope(reference, options)
+      try {
+        range(Math.ceil(reference.bytes / CONTENT_CHUNK_BYTES), start, count)
+        const manifest = await this.#manifest(reference, scope.signal, true)
+        for (let index = start; index < start + count; index++) await onChunk(index, manifest === null ? null : await this.#localChunk(reference, manifest, index, scope.signal))
+      } finally { scope.release() }
+    }
+    const blobChunks = async (hash: string, start: number, count: number, onChunk: ChunkSink, options: ContentOptions = {}): Promise<void> => {
+      check(digest(hash), 'CONTENT_BLOB_INVALID')
+      const scope = this.#blobScope(hash, options)
+      try {
+        check(Number.isSafeInteger(start) && Number.isSafeInteger(count) && start >= 0 && count > 0 && start + count <= MAX_BLOB_BYTES / CONTENT_CHUNK_BYTES, 'CONTENT_CHUNK_INDEX_INVALID')
+        const index = await this.#localBlobIndex(hash, scope.signal)
+        for (let i = start; i < start + count; i++) {
+          const leaf = index?.leaves[i]
+          const node = leaf === undefined ? null : await awaitOwnedTask(scope.signal, () => this.#cas.get(leaf.hash, 'public', { cache: false }))
+          await onChunk(i, node === null || node.links.length !== 0 ? null : node.bytes)
+        }
+      } finally { scope.release() }
+    }
+    const one = async (run: (sink: ChunkSink) => Promise<void>): Promise<Uint8Array | null> => {
+      let value: Uint8Array | null = null
+      await run((_index, bytes) => { value = bytes })
+      return value
+    }
     return {
       manifest: async (input, options = {}) => {
         const reference = this.#reference(input), scope = this.#readScope(reference, options)
         try { return await this.#manifest(reference, scope.signal, true) } finally { scope.release() }
       },
-      chunk: async (input, index, options = {}) => {
-        const reference = this.#reference(input), scope = this.#readScope(reference, options)
-        try {
-          const manifest = await this.#manifest(reference, scope.signal, true)
-          check(Number.isSafeInteger(index) && index >= 0 && index < Math.ceil(reference.bytes / CONTENT_CHUNK_BYTES), 'CONTENT_CHUNK_INDEX_INVALID')
-          return manifest === null ? null : await this.#chunk(reference, manifest, index, scope.signal, true)
-        } finally { scope.release() }
-      },
+      chunk: (input, index, options = {}) => one(sink => chunks(input, index, 1, sink, options)),
+      chunks,
       retained: async (input, options = {}) => {
         const reference = this.#reference(input), scope = this.#readScope(reference, options)
         try {
           const manifest = await this.#manifest(reference, scope.signal, true); check(manifest !== null, 'CONTENT_MANIFEST_MISSING')
-          for (let index = 0; index < manifest.chunks.length; index++) check(await this.#chunk(reference, manifest, index, scope.signal, true) !== null, 'CONTENT_INCOMPLETE')
+          for (let index = 0; index < manifest.chunks.length; index++) check(await this.#localChunk(reference, manifest, index, scope.signal) !== null, 'CONTENT_INCOMPLETE')
           return await this.#receipt(reference, scope.signal)
         } finally { scope.release() }
       },
@@ -610,15 +757,16 @@ export class ApplicationContent {
         const scope = this.#blobScope(hash, options)
         try { return await this.#localBlobInfo(hash, scope.signal) } finally { scope.release() }
       },
-      blobChunk: async (hash, index, options = {}) => {
+      blobIndex: async (hash, options = {}) => {
         check(digest(hash), 'CONTENT_BLOB_INVALID')
         const scope = this.#blobScope(hash, options)
         try {
-          const info = await this.#localBlobInfo(hash, scope.signal)
-          if (info === null) return null
-          return await this.#localBlobChunk(hash, info, index, scope.signal)
+          const index = await this.#localBlobIndex(hash, scope.signal)
+          return index === null ? null : { hash, bytes: index.bytes, nodes: index.nodes }
         } finally { scope.release() }
       },
+      blobChunk: (hash, index, options = {}) => one(sink => blobChunks(hash, index, 1, sink, options)),
+      blobChunks,
     }
   }
   putBytes(bytes: Uint8Array, options?: ContentPutBytesOptions): Promise<ContentReference> { return putContentBytes(this, bytes, options) }
@@ -661,7 +809,7 @@ export class ApplicationContent {
       const nonceDigest = await awaitOwnedTask(signal, () =>
         sha256(concatBytes(utf8('chronolog/convergent-nonce/v2:'), epochKey, utf8(this.#prefix), plainDigest, utf8(`:${index}`))),
       )
-      const encrypted = encodeRecord(await awaitOwnedTask(signal, () =>
+      const encrypted = encodeChunk(await awaitOwnedTask(signal, () =>
         encryptEpochPayload(epochKey, BigInt(epoch), plainChunk, encodeRecord([this.#prefix, id, index]), nonceDigest.subarray(0, 12)),
       ))
       const hash = computeCasHash(encrypted, [])
@@ -678,7 +826,7 @@ export class ApplicationContent {
       const encManifestChunks: { hash: string; bytes: number; plainBytes: number }[] = []
       for (let index = 0; index < encryptedChunks.length; index++) {
         const chunk = encryptedChunks[index]!
-        await this.#cas.put(chunk.bytes, [], 'public')
+        await this.#cas.put(chunk.bytes, [], 'public', { cache: false })
         encManifestChunks.push({
           hash: chunk.hash,
           bytes: chunk.bytes.length,

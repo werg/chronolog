@@ -202,19 +202,43 @@ export class ContentAddressedStore {
   }
 
   /** Async durable put (for seeding modules, syncing blobs from peers, or outside a batch). */
-  async put(bytes: Uint8Array, links: readonly string[] = [], partition: CasPartition = 'private'): Promise<string> {
+  async put(bytes: Uint8Array, links: readonly string[] = [], partition: CasPartition = 'private', options: { readonly cache?: boolean } = {}): Promise<string> {
     if (bytes.byteLength > this.#maxChunkBytes) throw new Error('CAS_CHUNK_TOO_LARGE')
     const encoded = encodeCasNode(bytes, links)
     const hash = hashCasNode(encoded)
-    const node: CasNode = { bytes: bytes.slice(), links: [...new Set(links)].sort() }
     if (!this.#known.get(hash)?.has(partition)) {
       await this.#store.put(this.#key(partition, hash), encoded, { durability: 'relaxed' })
       const parts = this.#known.get(hash) ?? new Set<CasPartition>()
       parts.add(partition)
       this.#known.set(hash, parts)
     }
-    this.#touchCache(hash, encoded, node, partition)
+    if (options.cache !== false) this.#touchCache(hash, encoded, { bytes: bytes.slice(), links: [...new Set(links)].sort() }, partition)
     return hash
+  }
+
+  /**
+   * Verify-and-store in one pass: encodes and hashes `bytes` exactly once, rejects with
+   * `CAS_HASH_MISMATCH` unless the node hash equals `expectedHash`, then persists it. Bulk content
+   * (`cache: false`) is not kept in the synchronous LRU, so large transfers never evict reducer pages.
+   */
+  async putVerified(
+    expectedHash: string,
+    bytes: Uint8Array,
+    links: readonly string[] = [],
+    partition: CasPartition = 'private',
+    options: { readonly cache?: boolean } = {},
+  ): Promise<void> {
+    assertHashHex(expectedHash)
+    if (bytes.byteLength > this.#maxChunkBytes) throw new Error('CAS_CHUNK_TOO_LARGE')
+    const encoded = encodeCasNode(bytes, links)
+    if (hashCasNode(encoded) !== expectedHash) throw new Error('CAS_HASH_MISMATCH')
+    if (!this.#known.get(expectedHash)?.has(partition)) {
+      await this.#store.put(this.#key(partition, expectedHash), encoded, { durability: 'relaxed' })
+      const parts = this.#known.get(expectedHash) ?? new Set<CasPartition>()
+      parts.add(partition)
+      this.#known.set(expectedHash, parts)
+    }
+    if (options.cache !== false) this.#touchCache(expectedHash, encoded, { bytes: bytes.slice(), links: [...new Set(links)].sort() }, partition)
   }
 
   /** Put raw pre-encoded canonical CAS node bytes (verifying digest matches expectedHash). */
@@ -296,7 +320,7 @@ export class ContentAddressedStore {
   }
 
   /** Async read checking RAM cache first, then BytesStore (respecting partition visibility). */
-  async get(hash: string, allowedPartition: CasPartition | 'any' = 'any'): Promise<CasNode | null> {
+  async get(hash: string, allowedPartition: CasPartition | 'any' = 'any', options: { readonly cache?: boolean } = {}): Promise<CasNode | null> {
     const sync = this.getSync(hash, allowedPartition)
     if (sync !== null) return sync
     const partitions: readonly CasPartition[] = allowedPartition === 'any' ? ['public', 'private'] : [allowedPartition]
@@ -308,6 +332,8 @@ export class ContentAddressedStore {
       const parts = this.#known.get(hash) ?? new Set<CasPartition>()
       parts.add(partition)
       this.#known.set(hash, parts)
+      // decodeCasNode already returned a fresh copy; only a cached node needs a defensive one.
+      if (options.cache === false) return node
       this.#touchCache(hash, raw, node, partition)
       return { bytes: node.bytes.slice(), links: [...node.links] }
     }
