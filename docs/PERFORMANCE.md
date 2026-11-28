@@ -7,7 +7,15 @@ pnpm bench                                   # kv + sql reducers, N = 100,500,10
 pnpm bench --sizes 400,2000 --reducers sql --json bench/results/run.json
 BENCH_DEBUG=1 pnpm bench --sizes 50          # phase logging
 pnpm tsx bench/vm.bench.ts                   # cost breakdown of one QuickJS reducer call
+pnpm tsx bench/coldopen.bench.ts --sizes 400,2000,5000 --json bench/results/coldopen-after.json
+pnpm tsx bench/coldopen.bench.ts --sizes 2000 --stores memory --scenarios reopen --reps 1 --profile /tmp/prof
 ```
+
+`bench/coldopen.bench.ts` measures, per N (SQL reducer, private log): reopen of device + session
+from a `MemoryBytesStore` and a `NativeBytesStore` (median of 3), the same with the persisted
+materialized cache deleted, and a fresh peer's time to the author's revision ("first state") and
+to completed synchronization, with snapshot bootstrap disabled (`snapshotBootstrap: false`, full
+replay) and enabled. `--profile <dir>` writes a `.cpuprofile` per measured phase.
 
 `bench/sync.bench.ts` reports, per log size N: local submit ms/op (first and last decile, so per-op
 growth with N is visible), reopen, cold sync to a fresh peer (wall time and wire bytes each way),
@@ -36,6 +44,13 @@ messages by kind. Counters are deterministic, so compare them when wall time is 
    sent point-to-point to the peer that delivered the facts.
 7. Membership is verified after the first public round (so in-flight admissions apply); private
    facts and content flow only after that.
+8. **Snapshot bootstrap**: a replica with no history (`wantsSnapshotBootstrap()`: no private
+   envelopes on a private log, no public ops on a public log, no frontier, no pending own ops)
+   sends `snapshot-want`; the peer answers `snapshot` with its v3 bundle or null. Private logs ask
+   right after membership is verified (posted before the public-round ack), public logs before
+   the public round; the server posts the reply before handling anything after the request, so
+   the snapshot is imported before the history facts arrive. Those facts still reconcile and are
+   verified as usual, but ops covered by the snapshot frontier are not replayed.
 
 Messages use a compact binary CBOR codec (`wire-codec.ts`) with a 13-byte fragment header; there is
 no JSON or hex on the hot path.
@@ -69,3 +84,76 @@ heap) per kernel; isolation is unchanged because every call still runs in a fres
 
 Submit cost no longer grows with N (N=2000: ~6 ms/op flat). The largest remaining per-op cost is
 the fresh QuickJS context and module evaluation per reducer call (~1 ms).
+
+## Cold open and snapshot bootstrap
+
+**Trust shortcuts** (accepted trade of transitory safety for speed; each is commented in code):
+
+- *Own-store records on cold open.* Public ops are keyed by the op id verified at ingress, so
+  reopen uses the key and a structural decode (`decodeTrusted*` in `@chronolog/protocol`: no
+  canonical re-encode, no SHA-256). Encrypted envelopes are keyed by their digest. An envelope
+  re-read from the store whose op id is in a persisted materialized cache, or is a pending op this
+  device authored, is bound to that id by hashing its core bytes but not Ed25519-verified again;
+  own pending ops reuse the plaintext kept in their `local-pending` record and are not decrypted.
+  Envelopes received from peers are always decrypted and fully verified.
+- *CAS preload* indexes nodes by key and decodes them on first read (hash = key).
+- *IndexedDB record envelope v2* is `u8 2 | u16 keyLen | key | u32 CRC-32 | value`: key binding
+  plus a corruption check, no SHA-256 or canonical CBOR per record.
+- *Device open* batches its metadata reads into one `getMany` and runs the signer sign/verify
+  self-test once per key per process instead of on every activation.
+- *Snapshot adoption.* A fresh replica adopts a member-signed snapshot as its frontier without
+  replaying the history it summarizes. The bundle signature (Ed25519, domain
+  `chronolog/materialized-snapshot/v3`) is always checked, the signer must be a member under the
+  permissions the replica knows, private-log bundles are AES-GCM encrypted under the epoch key, and
+  CAS nodes are re-hashed. Facts received afterwards are verified individually.
+
+**Materialized cache** (`materialized-cache` key, `encodeMaterializedCache` in
+`@chronolog/materializer`): binary header JSON (topics, roots, digests, author table, last op per
+topic) + raw 32-byte frontier and suffix op ids + positional outcome tuples. Restore maps suffix
+ids to inputs in O(N) without re-sorting and never re-reads op updates. It is written right after
+the first materialization of a replica, debounced (1.5 s) afterwards, on close, on page hide
+(`visibilitychange`/`pagehide` where a document exists) and via `flushMaterializedCache()`; an
+unchanged cache is not rewritten after open.
+
+**Snapshot bundle v3** (`snapshot-codec.ts`): `[3, logId, 0, signer, sig, body]` or
+`[3, logId, 1, epoch, nonce, AES-GCM([signer, sig, body])]`, body = `[logId, frontier-only cache,
+reachable CAS nodes]`. It carries no outcomes or events: size is the reachable state (SQLite pages,
+seen set) plus 32 bytes per covered op. The same bytes serve the wire `snapshot` message and the
+host path (`exportMaterializedSnapshot()` / `importMaterializedSnapshot()` /
+`materializedSnapshot` open option). A snapshot-bootstrapped replica reports outcomes and events
+only for ops after its frontier.
+
+**Frontier rewinds.** An op that sorts at or before the frontier's latest timestamp (or a rewind
+below a restored suffix) makes the kernel throw `KERNEL_FRONTIER_REWIND`; the session then drops
+the frontier and replays every op it holds, so ordering stays deterministic.
+
+### Before / after (2026-11-28, SQL reducer, private log)
+
+The machine was shared with other agents (load average noted per run), so wall times are noisy;
+the deterministic counters are the comparison to trust.
+
+Wall times (median of 3 for reopen; before load avg ≈ 6–9, after ≈ 8):
+
+| | N=400 before → after | N=2000 before → after | N=5000 before → after |
+|---|---|---|---|
+| reopen, MemoryBytesStore | 163 → 112 ms | 1399 → 305 ms | 3190 → 1001 ms |
+| reopen, NativeBytesStore | 203 → 177 ms | 1022 → 667 ms | 4616 → 841 ms |
+| fresh peer, first state (replay → snapshot) | 815 → 67 ms | 5183 → 73 ms | 12409 → 266 ms |
+| fresh peer, full sync (replay → snapshot) | 822 → 312 ms | 5217 → 738 ms | 12475 → 1776 ms |
+| fresh peer bytes A→B (replay → snapshot) | 155 → 230 KiB | 763 → 1066 KiB | 1906 → 2633 KiB |
+
+Reopen counters per open (deterministic; identical for both stores):
+
+| N | cbor.encode | cbor.decode bytes | sha256Sync | ed25519.verify |
+|---|---|---|---|---|
+| 2000 before → after | 22,202 → 89 | 14.4 MB → 2.7 MB | 6,057 → 57 | 2,000 → 0 |
+| 5000 before → after | 49,202 → 90 | 20.3 MB → 6.6 MB | 15,057 → 58 | 5,000 → 0 |
+
+Fresh peer at N=5000: replay runs 5,003 reducer calls; snapshot bootstrap runs 0 and verifies one
+bundle signature before first state, then still verifies all 5,000 received ops by full sync. The
+bundle adds the reachable SQLite pages and seen set to the history facts, so total bytes rise
+about 38%. Reopen without a cache is unchanged (full replay: ≈ 6 s at N=2000, 10–15 s at N=5000).
+Raw results: `bench/results/coldopen-before.json`, `bench/results/coldopen-after.json`.
+
+Remaining reopen cost is the structural CBOR decode of every op core (O(N), ≈ 0.1 ms per op);
+making cores lazy until a replay needs them is the next step.

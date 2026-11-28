@@ -160,7 +160,7 @@ async function timedReopen(f: Fixture, kind: string, dir: string, dropCache: boo
   return { ms: times[0]!, medianMs: median(times), counters }
 }
 
-async function timedFresh(f: Fixture, snapshot: boolean): Promise<Timed & { bytesAtoB: number; bytesBtoA: number }> {
+async function timedFresh(f: Fixture, snapshot: boolean): Promise<Timed & { fullSyncMs: number; fullSyncCounters: Counters; bytesAtoB: number; bytesBtoA: number }> {
   const storeA = new MemoryBytesStore()
   await storeA.putAllIfEmpty(f.entries)
   const sessA = await openSession(storeA, f.a, f)
@@ -177,10 +177,13 @@ async function timedFresh(f: Fixture, snapshot: boolean): Promise<Timed & { byte
   await profiled(`fresh-${snapshot ? 'snapshot' : 'replay'}-${f.n}`, () => until(() => sessB.revision().digest === f.digest))
   const ms = performance.now() - t
   const counters = perfCounters()
+  // Full sync: history facts (still individually verified on B) have all been received and merged.
   await Promise.all([linkA.synchronize(), linkB.synchronize()])
+  const fullSyncMs = performance.now() - t
+  const fullSyncCounters = perfCounters()
   await Promise.all([linkA.close(), linkB.close()])
   await Promise.all([sessA.close(), sessB.close()])
-  return { ms, medianMs: ms, counters, bytesAtoB: meter.a, bytesBtoA: meter.b }
+  return { ms, medianMs: ms, counters, fullSyncMs, fullSyncCounters, bytesAtoB: meter.a, bytesBtoA: meter.b }
 }
 
 const results: unknown[] = []
@@ -207,12 +210,12 @@ try {
     if (scenarios.has('fresh')) {
       const r = await timedFresh(f, false)
       row.fresh = r
-      console.log(`  fresh peer (replay): ${r.ms.toFixed(0)} ms, ${(r.bytesAtoB / 1024).toFixed(0)} KiB A→B`)
+      console.log(`  fresh peer (replay): first state ${r.ms.toFixed(0)} ms, full sync ${r.fullSyncMs.toFixed(0)} ms, ${(r.bytesAtoB / 1024).toFixed(0)} KiB A→B`)
     }
     if (scenarios.has('freshSnapshot')) {
       const r = await timedFresh(f, true)
       row.freshSnapshot = r
-      console.log(`  fresh peer (snapshot): ${r.ms.toFixed(0)} ms, ${(r.bytesAtoB / 1024).toFixed(0)} KiB A→B`)
+      console.log(`  fresh peer (snapshot): first state ${r.ms.toFixed(0)} ms, full sync ${r.fullSyncMs.toFixed(0)} ms, ${(r.bytesAtoB / 1024).toFixed(0)} KiB A→B`)
     }
     results.push(row)
   }
