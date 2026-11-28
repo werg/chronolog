@@ -6,6 +6,7 @@ import {
   computeBlobDagHash,
   computeCasHash,
   ContentAddressedStore,
+  encodeTreeNode,
   parseCasRef,
   putPackageDag,
   tryDecodePackageNode,
@@ -88,6 +89,7 @@ import {
 import { SignalChannel, type SignalAuthorization } from '@chronolog/signals'
 import { decodeSnapshotBundle, encodeSnapshotBundle } from './snapshot-codec.js'
 import { ApplicationContent } from './content.js'
+import { createCasMirrorClient } from './cas-mirror.js'
 import type { ApplicationDevice } from './device.js'
 import { describeApplication, type ApplicationDefinition } from './definition.js'
 import { FactIdSet } from './reconcile.js'
@@ -2818,11 +2820,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async publishRelease(options: {
     readonly entry: string
     readonly files: readonly { readonly path: string; readonly bytes?: Uint8Array; readonly hash?: string; readonly size?: number; readonly type: string }[]
+    readonly includeTreeRoot?: boolean
     readonly expectedRevision?: number
     readonly operationId?: string
     readonly authorTimestampMs?: bigint
   }): Promise<ApplicationOperation> {
     const descriptors: { readonly path: string; readonly hash: string; readonly size: number; readonly type: string }[] = []
+    const treeEntries: Record<string, string> = {}
     for (const f of options.files) {
       let hash = f.hash
       let size = f.size
@@ -2837,6 +2841,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
       check(hash !== undefined && size !== undefined, 'PUBLICATION_FILE_INVALID')
       descriptors.push({ path: f.path, hash, size, type: f.type })
+      treeEntries[f.path] = casRef(hash)
+    }
+    let treeRoot: string | undefined
+    if (options.includeTreeRoot !== false && descriptors.length > 0) {
+      const encodedTree = encodeTreeNode({ format: 'chronolog-tree/v1', entries: treeEntries })
+      const treeHash = await this.cas.put(encodedTree.bytes, encodedTree.links, 'public')
+      treeRoot = casRef(treeHash)
     }
     return this.submit({
       visibility: 'public',
@@ -2849,6 +2860,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           action: 'publish',
           entry: options.entry,
           files: descriptors as unknown as JsonValue,
+          ...(treeRoot === undefined ? {} : { treeRoot }),
           ...(options.expectedRevision === undefined ? {} : { expectedRevision: options.expectedRevision }),
         },
       }],
@@ -3400,33 +3412,24 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return out
   }
 
-  /** Fetch missing public CAS nodes (and walk their CasNode.links) from configured untrusted HTTP CAS mirrors. */
+  /** Fetch missing public CAS subgraphs from configured untrusted HTTP CAS mirrors. */
   async #pullMissingFromMirrors(): Promise<number> {
     if (this.#casMirrors.length === 0) return 0
     let addedTotal = 0
-    const queue = this.missingCasDependencies().filter(h => !this.#mirrorAttempted.has(h))
-    const fetched = new Set<string>()
-    while (queue.length > 0 && fetched.size < 128) {
-      const hash = queue.shift()!
-      if (fetched.has(hash) || this.cas.hasSync(hash, 'public')) continue
+    const missing = this.missingCasDependencies().filter(h => !this.#mirrorAttempted.has(h))
+    for (const hash of missing) {
+      if (this.cas.hasSync(hash, 'public')) continue
       this.#mirrorAttempted.add(hash)
       for (const mirror of this.#casMirrors) {
         try {
-          const resp = await fetch(`${mirror}/cas/sha256-${hash}`)
-          if (!resp.ok) continue
-          const buf = new Uint8Array(await resp.arrayBuffer())
-          const added = await this.cas.putManyVerified([{ hash, bytes: buf, partition: 'public' }])
-          if (added > 0) {
-            addedTotal += added
-            fetched.add(hash)
-            const node = await this.cas.get(hash, 'public')
-            if (node !== null) {
-              for (const link of node.links) {
-                if (!this.cas.hasSync(link, 'public') && !fetched.has(link)) queue.push(link)
-              }
-            }
-          }
-          break
+          const client = createCasMirrorClient(mirror)
+          const nodes = await client.fetchSubgraph(hash, { maxNodes: 256, maxBytes: 8 * 1024 * 1024 })
+          if (nodes.length === 0) continue
+          const added = await this.cas.putManyVerified(
+            nodes.map(n => ({ hash: n.hash, bytes: n.bytes, partition: 'public' as const })),
+          )
+          addedTotal += added
+          if (this.cas.hasSync(hash, 'public')) break
         } catch { /* try next mirror */ }
       }
     }
@@ -3564,16 +3567,62 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
   }
 
-  /** Evaluate (or retrieve from durable memo cache) a content-addressed `chronolog-drv/v1` derivation. */
+  /**
+   * Evaluate (or retrieve from local memo cache or trusted `$builders` derivation mirror)
+   * a content-addressed `chronolog-drv/v1` derivation.
+   */
   async evaluateDerivation(
     drvRefOrHash: string,
     options: {
       readonly partition?: CasPartition
       readonly skipMemo?: boolean
+      readonly skipMirror?: boolean
+      readonly mirrors?: readonly string[]
+      readonly trustedBuilders?: readonly string[]
+      readonly threshold?: number
       readonly wasiRunners?: Readonly<Record<string, WasiDerivationRunner>>
     } = {},
-  ): Promise<DerivationEvalResult> {
+  ): Promise<DerivationEvalResult & { readonly attestedBy?: readonly string[] }> {
     const memo = createBytesStoreDerivationMemo(this.#store, `${this.#prefix}/drv-memo/`)
+    const drvHash = tryParseCasRef(drvRefOrHash) ?? drvRefOrHash
+    const partition: CasPartition = options.partition ?? 'public'
+
+    // Check trusted mirror derivation cache (against explicit trustedBuilders or log's $builders topic)
+    if (!options.skipMirror && partition === 'public') {
+      const buildersTopic = this.topic('$builders') as {
+        readonly builders?: readonly string[]
+        readonly threshold?: number
+      } | undefined
+      const trustedBuilders = options.trustedBuilders ?? buildersTopic?.builders ?? []
+      const threshold = options.threshold ?? buildersTopic?.threshold ?? 1
+      const mirrorUrls = options.mirrors ?? this.#casMirrors
+      if (trustedBuilders.length > 0 && mirrorUrls.length > 0 && /^[0-9a-f]{64}$/u.test(drvHash)) {
+        for (const mirror of mirrorUrls) {
+          try {
+            const client = createCasMirrorClient(mirror)
+            const { trusted } = await client.fetchDerivationAttestations(drvHash, { trustedBuilders, threshold })
+            if (trusted === null) continue
+            const nodes = await client.fetchSubgraph(trusted.outputHash, { maxNodes: 512, maxBytes: 16 * 1024 * 1024 })
+            if (nodes.length === 0) continue
+            await this.cas.putManyVerified(
+              nodes.map(n => ({ hash: n.hash, bytes: n.bytes, partition: 'public' as const })),
+            )
+            if (this.cas.hasSync(trusted.outputHash, 'public')) {
+              await memo.set(drvHash, trusted.outputHash)
+              return {
+                drvHash,
+                drvRef: casRef(drvHash),
+                outputHash: trusted.outputHash,
+                outputRef: trusted.outputRef,
+                fromCache: true,
+                attestedBy: trusted.signers,
+              }
+            }
+          } catch { /* fall through to next mirror or local execution */ }
+        }
+      }
+    }
+
     return evaluateDerivation({
       drvRefOrHash,
       cas: this.cas,

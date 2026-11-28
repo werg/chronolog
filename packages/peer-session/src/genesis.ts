@@ -71,6 +71,8 @@ export async function hpkeOpenEpochKey(
 export interface LogMemberSeed {
   readonly publicKey: string
   readonly wrapKey?: string
+  readonly label?: string
+  readonly subject?: string
   readonly reader?: boolean
   readonly writer?: boolean
   readonly administrator?: boolean
@@ -126,6 +128,8 @@ export interface CreateLogGenesisOptions {
   readonly topics?: Readonly<Record<string, LogTopicSeed>>
   /** Optional host public key for `chronolog/permissions` Ed25519 admission attestations. */
   readonly hostPublicKey?: string
+  /** Optional full initial `$permissions.admission` policy object (overrides `hostPublicKey` default). */
+  readonly admission?: JsonValue | null
   /** Initial `$finality` schedule (defaults to `finality: none`). */
   readonly finalitySchedule?: readonly ScheduledFinalityEntry[]
   readonly signalPolicy?: JsonValue
@@ -224,6 +228,8 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     memberByKey.set(m.publicKey, {
       publicKey: m.publicKey,
       ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+      ...(m.label ? { label: m.label } : {}),
+      ...(m.subject ? { subject: m.subject } : {}),
       reader: m.reader ?? true,
       writer: m.writer ?? true,
       administrator: m.administrator ?? (m.publicKey === options.creator.publicKey),
@@ -238,10 +244,14 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
     policy: entry.policy,
   }))
 
+  const admissionPolicy: JsonValue = options.admission !== undefined
+    ? options.admission
+    : (options.hostPublicKey ? { hostKey: options.hostPublicKey } : null)
+
   const initialTopics: Record<string, JsonValue> = {
     $permissions: {
       members: members as unknown as JsonValue,
-      admission: options.hostPublicKey ? { hostKey: options.hostPublicKey } : null,
+      admission: admissionPolicy,
     },
     $keys: { currentEpoch: -1, epochs: {} },
     $finality: { schedule },

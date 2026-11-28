@@ -2,6 +2,7 @@ import type { ApplicationDefinition } from './definition.js'
 import type { CreateApplicationSessionOptions } from './runtime.js'
 import type { ApplicationSession } from './session.js'
 import type { queryFederatedSql as QueryFederatedSqlFn } from './sql-extensions.js'
+import type { dryRunReducerUpgrade as DryRunReducerUpgradeFn } from './blind-host.js'
 
 /** Passive import; actual storage and execution modules load only on explicit local open. */
 export async function createApplicationSession<const D extends ApplicationDefinition = ApplicationDefinition>(
@@ -92,6 +93,40 @@ export type {
 } from './sql-extensions.js'
 export type { MerkleDbDiff } from 'chronolog-db'
 export { splitSecret, combineShares, type ShamirShare } from '@chronolog/crypto'
+
+export {
+  MemoryBytesStore,
+  computeCasHash,
+  casRef,
+  parseCasRef,
+  tryParseCasRef,
+  computeBlobDagHash,
+  type BytesStore,
+  type CasPartition,
+  type PutPackageInput,
+  type ChronologPackageNode,
+  type ChronologTreeNode,
+  type ChronologDerivationNode,
+} from '@chronolog/records'
+export {
+  collectCasRefsFromValue,
+  exportLogBlueprint,
+  validateLogBlueprint,
+  attachCasPinner,
+  type BlueprintSqlSchema,
+  type LogBlueprintV1,
+} from './utilities.js'
+export type {
+  DryRunReducerUpgradeOptions,
+  DryRunReducerUpgradeResult,
+} from './blind-host.js'
+
+/** Lazy passive wrapper so importing @chronolog/peer-session never eagerly pulls QuickJS. */
+export async function dryRunReducerUpgrade(
+  ...args: Parameters<typeof DryRunReducerUpgradeFn>
+): ReturnType<typeof DryRunReducerUpgradeFn> {
+  return (await import('./blind-host.js')).dryRunReducerUpgrade(...args)
+}
 
 /** Lazy passive wrapper so importing @chronolog/peer-session never eagerly pulls sqlite-cas WASM. */
 export async function queryFederatedSql(
