@@ -1,4 +1,6 @@
 import { perfCount, sha256 } from '@chronolog/canonical'
+import * as ed from '@noble/ed25519'
+import { sha512 } from '@noble/hashes/sha512'
 
 import { concatBytes, utf8 } from './bytes.js'
 import { ProtocolError, protocolInvariant } from './errors.js'
@@ -65,21 +67,6 @@ export async function exportEd25519PrivateKey(privateKey: CryptoKey): Promise<Ui
   }
 }
 
-/** Imported Ed25519 verification keys per raw public key (one import per author, not per op). */
-const verifyKeys = new Map<string, Promise<CryptoKey>>()
-function cachedPublicKey(raw: Uint8Array): Promise<CryptoKey> {
-  let id = ''
-  for (const byte of raw) id += byte.toString(16).padStart(2, '0')
-  let key = verifyKeys.get(id)
-  if (key === undefined) {
-    if (verifyKeys.size >= 4096) verifyKeys.clear()
-    key = importEd25519PublicKey(raw)
-    verifyKeys.set(id, key)
-    key.catch(() => verifyKeys.delete(id))
-  }
-  return key
-}
-
 export async function signDomain(
   domain: ProtocolDomain,
   payload: Uint8Array,
@@ -94,29 +81,47 @@ export async function signDomain(
   }
 }
 
+ed.hashes.sha512 = (message: Uint8Array) => sha512(message) as Uint8Array<ArrayBuffer>
+
 /**
- * The protocol's single Ed25519 verification entry point (operation signatures, host attestations,
- * authority records). Every other verifier must agree with it bit-for-bit on acceptance.
- *
- * NOTE: this still delegates to WebCrypto, while `@chronolog/crypto`'s `verifyEd25519Sync`
- * (reducers, blind hosts) uses noble strict mode (`zip215: false`). They agree on every honestly
- * produced signature but may disagree on adversarial edge cases (small-order components, cofactored
- * vs cofactorless equation). Unifying requires `@noble/ed25519` as a dependency of this package.
+ * Chronolog's single Ed25519 verification rule set (RFC 8032 / FIPS 186-5 strict, noble `zip215: false`):
+ * canonical `A` and `R` encodings (`y < p`), `S < L`, small-order public keys rejected, cofactored
+ * group equation. Operation signatures, host attestations, authority records, reducers
+ * (`chronolog:crypto`) and blind hosts all verify with exactly this function, so signature acceptance
+ * is a deterministic function of the bytes on every runtime (WebCrypto is never consulted).
+ */
+export function verifyEd25519Sync(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
+  if (publicKey.length !== 32 || signature.length !== 64) return false
+  perfCount('ed25519.verify')
+  try {
+    return ed.verify(signature, message, publicKey, { zip215: false })
+  } catch {
+    return false
+  }
+}
+
+/** Raw public key bytes per imported verification `CryptoKey` (one export per key object). */
+const rawKeys = new WeakMap<CryptoKey, Promise<Uint8Array | null>>()
+function rawPublicKey(key: CryptoKey): Promise<Uint8Array | null> {
+  let raw = rawKeys.get(key)
+  if (raw === undefined) {
+    raw = globalThis.crypto.subtle.exportKey('raw', key).then(buf => new Uint8Array(buf), () => null)
+    rawKeys.set(key, raw)
+  }
+  return raw
+}
+
+/**
+ * Async convenience over `verifyEd25519Sync` that also accepts an extractable `CryptoKey`
+ * (a non-extractable key cannot be verified and returns false).
  */
 export async function verifyEd25519(
   publicKey: CryptoKey | Uint8Array,
   message: Uint8Array,
   signature: Uint8Array,
 ): Promise<boolean> {
-  if (signature.length !== 64) return false
-  if (publicKey instanceof Uint8Array && publicKey.length !== 32) return false
-  perfCount('ed25519.verify')
-  try {
-    const key = publicKey instanceof Uint8Array ? await cachedPublicKey(publicKey) : publicKey
-    return await globalThis.crypto.subtle.verify(ED25519, key, bufferSource(signature), bufferSource(message))
-  } catch {
-    return false
-  }
+  const raw = publicKey instanceof Uint8Array ? publicKey : await rawPublicKey(publicKey)
+  return raw !== null && verifyEd25519Sync(raw, message, signature)
 }
 
 export async function verifyDomain(

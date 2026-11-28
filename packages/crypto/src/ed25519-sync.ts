@@ -8,20 +8,8 @@ import { protocolInvariant, utf8 } from '@chronolog/protocol'
 
 ed.hashes.sha512 = (message: Uint8Array) => sha512(message) as Uint8Array<ArrayBuffer>
 
-/**
- * Chronolog's single Ed25519 verification rule set (RFC 8032 / FIPS 186-5 strict, noble `zip215: false`):
- * canonical `A` and `R` encodings (`y < p`), `S < L`, small-order public keys rejected, cofactored
- * group equation. Every replica, reducer (`chronolog:crypto`), and blind host must verify with exactly
- * this function so signature acceptance is a deterministic function of the bytes.
- */
-export function verifyEd25519Sync(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
-  if (publicKey.length !== 32 || signature.length !== 64) return false
-  try {
-    return ed.verify(signature, message, publicKey, { zip215: false })
-  } catch {
-    return false
-  }
-}
+/** Chronolog's single Ed25519 verification rule set lives in `@chronolog/protocol` (noble strict). */
+export { verifyEd25519Sync } from '@chronolog/protocol'
 
 /** Synchronous Ed25519 signing from a 32-byte seed (used for per-epoch anonymous mailbox tags). */
 export function signEd25519Sync(seed32: Uint8Array, message: Uint8Array): Uint8Array {

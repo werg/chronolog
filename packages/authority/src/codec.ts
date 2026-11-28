@@ -1,5 +1,5 @@
 import { bytesToHex, hexToBytes, equalBytes, sha256 } from '@chronolog/canonical'
-import { generateEd25519KeyPair, importEd25519PublicKey, exportEd25519PrivateKey, importEd25519PrivateKey } from '@chronolog/protocol'
+import { generateEd25519KeyPair, exportEd25519PrivateKey, importEd25519PrivateKey, verifyEd25519Sync } from '@chronolog/protocol'
 export { bytesToHex, hexToBytes }
 export interface SigningIdentity { readonly publicKey: string; readonly privateKey: CryptoKey }
 export interface Signed<T> { readonly payload: T; readonly signer: string; readonly signature: string }
@@ -47,8 +47,7 @@ export async function signRecord<T>(domain: string, payload: T, identity: Signin
 export async function verifyRecord<T>(domain: string, signed: Signed<T>, expectedSigner?: string): Promise<void> {
   hex(signed.signer); hex(signed.signature, 64)
   check(expectedSigner === undefined || signed.signer === expectedSigner, 'AUTHORITY_SIGNER_MISMATCH')
-  const key = await importEd25519PublicKey(hexToBytes(signed.signer))
-  check(await crypto.subtle.verify('Ed25519', key, Uint8Array.from(hexToBytes(signed.signature)).buffer, Uint8Array.from(signedBytes(domain, signed.payload)).buffer), 'AUTHORITY_SIGNATURE_INVALID')
+  check(verifyEd25519Sync(hexToBytes(signed.signer), signedBytes(domain, signed.payload), hexToBytes(signed.signature)), 'AUTHORITY_SIGNATURE_INVALID')
 }
 export async function createSigningIdentity(): Promise<SigningIdentity> { const pair = await generateEd25519KeyPair(); return { publicKey: bytesToHex(pair.publicKeyBytes), privateKey: pair.privateKey } }
 export async function exportSigningIdentity(identity: SigningIdentity): Promise<{ publicKey: string; privateKey: string }> { return { publicKey: identity.publicKey, privateKey: bytesToHex(await exportEd25519PrivateKey(identity.privateKey)) } }

@@ -562,6 +562,7 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       const tree2 = await sAdmin.rotateTreeEpoch()
       expect((await tree2.operation.materialized()).outcome).toBe('accepted')
       expect(tree2.epoch).toBe(2)
+      console.log("COPATH", tree1.copathBoxes, tree2.copathBoxes)
       expect(tree2.copathBoxes).toBeLessThanOrEqual(8)
       expect((await sAdmin.keysNeedsRotation()).needsRotation).toBe(false)
 

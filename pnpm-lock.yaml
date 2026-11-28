@@ -191,6 +191,12 @@ importers:
       '@chronolog/canonical':
         specifier: workspace:*
         version: link:../canonical
+      '@noble/ed25519':
+        specifier: ^3.2.0
+        version: 3.2.0
+      '@noble/hashes':
+        specifier: 1.8.0
+        version: 1.8.0
 
   packages/records:
     dependencies:

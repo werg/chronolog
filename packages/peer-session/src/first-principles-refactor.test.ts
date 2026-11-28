@@ -204,6 +204,18 @@ describe('First-principles Chronolog refactor verification', () => {
       expect(sessC.status.keyState).toBe('missing-lockbox')
       expect(sessC.hasEpochKey(0)).toBe(false)
 
+      // A reader that neither administers the log nor admitted C must not author a grant $keys rejects.
+      const sessB = await createApplicationSession({ device: devB, genesis, casNodes })
+      try {
+        await sessB.mergeFacts({ publicOps: pub1.publicOps, encryptedEnvelopes: [], casNodes: pub1.casNodes, retentions: [], evidence: [] })
+        expect(sessB.hasEpochKey(0)).toBe(true)
+        const before = (await sessB.exportPublicControlFacts()).publicOps.length
+        expect(await sessB.backfillMissingEpochBoxes()).toBe(0)
+        expect((await sessB.exportPublicControlFacts()).publicOps.length).toBe(before)
+      } finally {
+        await sessB.close()
+      }
+
       const healed = await sessA.backfillMissingEpochBoxes()
       expect(healed).toBe(1)
 
