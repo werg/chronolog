@@ -1,6 +1,7 @@
 import {
   assertCanonicalCbor,
   bytesToHex,
+  decodeCanonicalCbor,
   DEFAULT_DECODE_LIMITS,
   encodeCanonicalCbor,
   equalBytes,
@@ -54,6 +55,19 @@ export function decodeCasNode(encoded: Uint8Array): CasNode {
   return { bytes: bytes.slice(), links }
 }
 
+function decodeCasNodeTrusted(encoded: Uint8Array): CasNode {
+  const decoded = decodeCanonicalCbor(encoded, DEFAULT_DECODE_LIMITS)
+  if (!Array.isArray(decoded) || decoded.length !== 2) throw new Error('CAS_NODE_INVALID')
+  const [bytes, rawLinks] = (decoded as unknown) as readonly [CborValue, CborValue]
+  if (!(bytes instanceof Uint8Array) || !Array.isArray(rawLinks)) throw new Error('CAS_NODE_INVALID')
+  const links: string[] = []
+  for (const item of rawLinks) {
+    if (!(item instanceof Uint8Array) || item.length !== 32) throw new Error('CAS_NODE_LINK_INVALID')
+    links.push(bytesToHex(item))
+  }
+  return { bytes, links }
+}
+
 export function hashCasNode(encoded: Uint8Array): string {
   return bytesToHex(hashDomainSync('cas', encoded))
 }
@@ -74,7 +88,8 @@ export class ContentAddressedStore {
   readonly #prefix: string
   readonly #maxCacheEntries: number
   readonly #maxChunkBytes: number
-  readonly #cache = new Map<string, { readonly encoded: Uint8Array; readonly node: CasNode; readonly partitions: Set<CasPartition> }>()
+  /** `node` is decoded lazily: nodes preloaded on cold open are only decoded when first read. */
+  readonly #cache = new Map<string, { readonly encoded: Uint8Array; node: CasNode | null; readonly partitions: Set<CasPartition> }>()
   readonly #staged = new Map<string, { readonly encoded: Uint8Array; readonly node: CasNode; readonly partition: CasPartition }>()
   readonly #known = new Map<string, Set<CasPartition>>()
   readonly #pinned = new Set<string>()
@@ -91,7 +106,13 @@ export class ContentAddressedStore {
     return `${this.#prefix}${partition === 'public' ? 'pub' : 'priv'}/${hash}`
   }
 
-  #touchCache(hash: string, encoded: Uint8Array, node: CasNode, partition: CasPartition): void {
+  #nodeOf(entry: { readonly encoded: Uint8Array; node: CasNode | null }): CasNode {
+    // Entries are keyed by their content hash (checked on put, trusted for this device's own store
+    // on preload), so a plain structural decode suffices here.
+    return entry.node ??= decodeCasNodeTrusted(entry.encoded)
+  }
+
+  #touchCache(hash: string, encoded: Uint8Array, node: CasNode | null, partition: CasPartition): void {
     const existing = this.#cache.get(hash)
     if (existing !== undefined) {
       existing.partitions.add(partition)
@@ -147,10 +168,7 @@ export class ContentAddressedStore {
     parts.add(partition)
     this.#known.set(hash, parts)
     const shouldPreload = options.preloadCache ?? (partition === 'public' || this.#cache.size < this.#maxCacheEntries)
-    if (shouldPreload) {
-      const node = decodeCasNode(entry.value)
-      this.#touchCache(hash, entry.value, node, partition)
-    }
+    if (shouldPreload) this.#touchCache(hash, entry.value, null, partition)
     return true
   }
 
@@ -314,7 +332,8 @@ export class ContentAddressedStore {
     if (cached !== undefined && (allowedPartition === 'any' || cached.partitions.has(allowedPartition))) {
       this.#cache.delete(hash)
       this.#cache.set(hash, cached)
-      return { bytes: cached.node.bytes.slice(), links: [...cached.node.links] }
+      const node = this.#nodeOf(cached)
+      return { bytes: node.bytes.slice(), links: [...node.links] }
     }
     return null
   }

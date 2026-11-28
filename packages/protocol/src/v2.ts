@@ -1,6 +1,7 @@
 import {
   assertCanonicalCbor,
   compareBytes,
+  decodeCanonicalCbor,
   DEFAULT_DECODE_LIMITS,
   encodeCanonicalCbor,
   equalBytes,
@@ -486,7 +487,32 @@ export function encodeOperationCore(core: OperationCore): Uint8Array {
 }
 
 export function decodeOperationCore(bytes: Uint8Array): OperationCore {
-  const raw = assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
+  const core = decodeOperationCoreFields(assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS))
+  protocolInvariant(equalBytes(encodeOperationCore(core), bytes), 'CBOR_NON_CANONICAL', 'OperationCore bytes not canonical')
+  return core
+}
+
+/**
+ * Decode OperationCore bytes that were already fully validated (canonical form, schema and
+ * signature) when they entered this replica, e.g. records re-read from the device's own store
+ * on cold open. Skips the canonical re-encode round trips; schema checks still run. Never use
+ * this for bytes received from a peer or any other untrusted source.
+ */
+export function decodeTrustedOperationCore(bytes: Uint8Array): OperationCore {
+  return decodeOperationCoreFields(decodeCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS))
+}
+
+/** SignedOperation counterpart of decodeTrustedOperationCore (locally re-read, already verified bytes). */
+export function decodeTrustedSignedOperation(bytes: Uint8Array): SignedOperation {
+  return signedOperationFields(decodeCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS))
+}
+
+/** EncryptedOperationEnvelope counterpart of decodeTrustedOperationCore. */
+export function decodeTrustedEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEnvelope {
+  return encryptedEnvelopeFields(decodeCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS))
+}
+
+function decodeOperationCoreFields(raw: CborValue): OperationCore {
   protocolInvariant(raw instanceof Map && (raw.size === 8 || (raw.size === 9 && raw.has(8n))), 'SCHEMA_INVALID', 'OperationCore must be an 8- or 9-entry map')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'UNSUPPORTED_VERSION', 'Unsupported op version')
@@ -522,7 +548,6 @@ export function decodeOperationCore(bytes: Uint8Array): OperationCore {
     updates,
     ...(assumptions === undefined ? {} : { assumptions }),
   }
-  protocolInvariant(equalBytes(encodeOperationCore(core), bytes), 'CBOR_NON_CANONICAL', 'OperationCore bytes not canonical')
   return core
 }
 
@@ -553,7 +578,10 @@ export function encodeSignedOperation(op: SignedOperation): Uint8Array {
 }
 
 export function decodeSignedOperation(bytes: Uint8Array): SignedOperation {
-  const raw = assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
+  return signedOperationFields(assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS))
+}
+
+function signedOperationFields(raw: CborValue): SignedOperation {
   protocolInvariant(raw instanceof Map && raw.size === 2, 'SCHEMA_INVALID', 'SignedOperation invalid')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   const coreBytes = map.get(0n), signature = map.get(1n)
@@ -585,7 +613,10 @@ export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8A
 }
 
 export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEnvelope {
-  const raw = assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
+  return encryptedEnvelopeFields(assertCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS))
+}
+
+function encryptedEnvelopeFields(raw: CborValue): EncryptedOperationEnvelope {
   protocolInvariant(raw instanceof Map && (raw.size === 7 || (raw.size === 8 && raw.has(7n))), 'SCHEMA_INVALID', 'Invalid envelope')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   protocolInvariant(map.get(0n) === 1n, 'SCHEMA_INVALID', 'Invalid envelope')

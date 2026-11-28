@@ -137,6 +137,10 @@ type Message =
   | { readonly kind: 'ack'; readonly requestId: string }
   | { readonly kind: 'content'; readonly message: ContentWireMessage }
   | { readonly kind: 'rtc'; readonly message: RtcSignalMessage }
+  /** A replica without history asks for the peer's latest signed (and, on private logs, encrypted) snapshot. */
+  | { readonly kind: 'snapshot-want'; readonly requestId: string }
+  /** Snapshot bundle v3 (see snapshot-codec.ts), or null when the peer has none to offer. */
+  | { readonly kind: 'snapshot'; readonly requestId: string; readonly bytes: Uint8Array | null }
 
 /** Physical feed counters only protect framing. Every operation authenticates its own immutable authored order. */
 export async function connectApplicationPeer(session: ApplicationSession, options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
@@ -405,6 +409,26 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       }
     }
 
+    // ---- snapshot bootstrap: a replica with no history adopts a member-signed snapshot as its
+    // frontier, then reconciles facts as usual (frontier ops are not replayed). The request goes
+    // out before the round that would deliver the bulk of history (public logs: before the public
+    // round; private logs: right after membership is verified), and the serving side posts its
+    // reply before handling anything that follows, so the snapshot lands ahead of those facts.
+    const SNAPSHOT_MAX_BYTES = 24 * 1024 * 1024
+    const snapshotWaiters = new Map<string, () => void>()
+    let snapshotRequested = false
+    const snapshotScopeAllowed = (): boolean => !session.genesis.privateLog || privateAllowed()
+    const requestSnapshot = (): Promise<void> => {
+      if (snapshotRequested || !snapshotScopeAllowed() || !session.wantsSnapshotBootstrap()) return Promise.resolve()
+      snapshotRequested = true
+      const requestId = crypto.randomUUID()
+      return new Promise<void>(resolve => {
+        const timer = setTimeout(() => { snapshotWaiters.delete(requestId); resolve() }, 30_000)
+        snapshotWaiters.set(requestId, () => { clearTimeout(timer); snapshotWaiters.delete(requestId); resolve() })
+        void post({ kind: 'snapshot-want', requestId })
+      })
+    }
+
     // ---- reconciliation rounds ----
     interface Round { readonly scope: FactScope; outstanding: number; readonly wants: Set<string>; ended: boolean; resolve(): void; reject(error: unknown): void }
     const rounds = new Map<string, Round>()
@@ -461,8 +485,10 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     const initialSync = new Promise<void>(resolve => { markReady = resolve })
     void initialSync.catch(() => undefined)
     const runInitialSync = async (): Promise<void> => {
+      if (!session.genesis.privateLog) await requestSnapshot()
       await runRound('public')
       verifyMember()
+      if (session.genesis.privateLog) await requestSnapshot()
       await runRound('private')
       void post({ kind: 'ready' })
       markReady()
@@ -489,7 +515,11 @@ export async function connectApplicationPeer(session: ApplicationSession, option
               break
             }
             case 'recon-end': {
-              if (message.scope === 'public') verifyMember()
+              if (message.scope === 'public') {
+                verifyMember()
+                // Posted before the ack, so the peer serves it before starting the private round.
+                if (session.genesis.privateLog) void requestSnapshot()
+              }
               void post({ kind: 'ack', requestId: message.round })
               break
             }
@@ -547,6 +577,29 @@ export async function connectApplicationPeer(session: ApplicationSession, option
                 void inBandRtc.receive(message.message).catch(() => undefined)
               }
               break
+            case 'snapshot-want': {
+              check(typeof message.requestId === 'string' && message.requestId.length <= 64, 'PEER_REQUEST_INVALID')
+              let bytes: Uint8Array | null = null
+              // Private-log peers ask only after their public round settled (just before the ack
+              // that would trigger our own check), so verify membership here as that ack would.
+              if (session.genesis.privateLog) verifyMember()
+              if (snapshotScopeAllowed()) {
+                try { bytes = await session.exportMaterializedSnapshot() } catch { bytes = null }
+                if (bytes !== null && bytes.length > SNAPSHOT_MAX_BYTES) bytes = null
+              }
+              void post({ kind: 'snapshot', requestId: message.requestId, bytes })
+              break
+            }
+            case 'snapshot': {
+              const waiter = snapshotWaiters.get(message.requestId)
+              if (waiter === undefined) break
+              // Imported inline: facts the peer sent after this message merge on top of the frontier.
+              if (message.bytes instanceof Uint8Array && snapshotScopeAllowed()) {
+                try { await session.importMaterializedSnapshot(message.bytes) } catch { /* fall back to replay */ }
+              }
+              waiter()
+              break
+            }
             case 'ack': {
               const round = rounds.get(message.requestId)
               if (round !== undefined) round.resolve()
@@ -559,12 +612,14 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       finally {
         for (const round of rounds.values()) round.reject(signal.reason ?? new Error('PEER_CLOSED'))
         for (const waiter of casRequests.values()) waiter.reject(signal.reason ?? new Error('PEER_CLOSED'))
+        for (const waiter of snapshotWaiters.values()) waiter()
         if (receiptTimer !== undefined) clearTimeout(receiptTimer)
         await close()
       }
     })()
 
     if (initiator) void runInitialSync().catch(error => { lifetime.abort(error) })
+    else if (!session.genesis.privateLog) void requestSnapshot()
     const completion = signal.aborted ? Promise.resolve() : new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
     const link: ApplicationPeerLink = {
       peerIdentity: peerId,
