@@ -279,7 +279,7 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
     genesis: options.genesis,
     cas,
     blindHostMode: true,
-    ...(options.wasmModule === undefined ? {} : { sandboxOptions: { wasmModule: options.wasmModule } }),
+    ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
   })
   try {
     const initialPermissions = await extractControlPermissions(kernel, options.genesis.initialTopics.$permissions)
@@ -308,7 +308,7 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
         genesis: options.genesis,
         cas,
         blindHostMode: true,
-        ...(options.wasmModule === undefined ? {} : { sandboxOptions: { wasmModule: options.wasmModule } }),
+        ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
       })
       try {
         await finalKernel.materialize(finalOps)
@@ -415,7 +415,7 @@ export async function dryRunReducerUpgrade(options: DryRunReducerUpgradeOptions)
   const kernel = new TopicKernel({
     genesis,
     cas,
-    ...(options.wasmModule === undefined ? {} : { sandboxOptions: { wasmModule: options.wasmModule } }),
+    ...(options.wasmModule === undefined ? {} : { wasmModule: options.wasmModule }),
   })
   const sampleOutcomes: { readonly ok: boolean; readonly code?: string; readonly state?: JsonValue }[] = []
   try {
