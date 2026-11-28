@@ -1,0 +1,14 @@
+{
+  "description": "QuickJsSandbox.invoke per call, old (8cab581) vs new implementation in one process, interleaved, min over 20 rounds (kv 200, perm 60, sql 100 calls per round). Machine shared with other agents.",
+  "date": "2026-11-28",
+  "runs": [
+    { "loadAvg1m": 16.2, "kv": { "beforeMs": 0.933, "afterMs": 0.703 }, "permissionsQuery": { "beforeMs": 5.649, "afterMs": 5.487 }, "sqlReduce": { "beforeMs": 2.181, "afterMs": 1.930 } },
+    { "loadAvg1m": 26.4, "kv": { "beforeMs": 1.144, "afterMs": 0.793 }, "permissionsQuery": { "beforeMs": 4.977, "afterMs": 4.840 }, "sqlReduce": { "beforeMs": 5.156, "afterMs": 3.506 } },
+    { "loadAvg1m": 22.0, "kv": { "beforeMs": 3.360, "afterMs": 2.510 }, "permissionsQuery": { "beforeMs": 14.924, "afterMs": 14.106 }, "sqlReduce": { "beforeMs": 6.087, "afterMs": 5.832 } }
+  ],
+  "vmBenchAfter": {
+    "loadAvg1m": 8.1,
+    "invokeKvMs": 0.626, "invokePermissionsQueryMs": 3.899, "invokeSqlMs": 1.433,
+    "newContextDefaultMs": 0.303, "newContextNoDateMs": 0.246, "plusPreludeMs": 0.315, "plusKvModuleImportMs": 0.282, "plusPermissionsModuleImportMs": 3.136
+  }
+}

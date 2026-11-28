@@ -138,14 +138,16 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
     const leakyHash = await cas.put(utf8(`
       let leaked = 0;
+      // Global (realm) state must not survive either: each call sees a fresh globalThis.
+      const bumpGlobal = () => (globalThis.__leakedGlobal = (globalThis.__leakedGlobal ?? 0) + 1);
       export default {
         reduce(state) {
           leaked += 1;
-          return { ok: true, state: (state ?? 0) + leaked };
+          return { ok: true, state: (state ?? 0) + leaked * bumpGlobal() };
         },
         query(state) {
           leaked += 100;
-          return { state, leaked };
+          return { state, leaked: leaked * bumpGlobal() };
         },
       };
     `), [], 'public')
