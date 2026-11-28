@@ -31,7 +31,7 @@ On chains with `privateLog: true`:
 
 Execution invariants:
 - Fresh `QuickJSContext` per `reduce()`, `query()`, `describe()`, `onConflict()`, and `derive()` invocation (zero cross-call state leakage).
-- Non-deterministic globals (`Date`, `Math.random`, `Intl`) are removed, and deterministic fuel metering (`limits.maxFuel`) rejects runaway loops uniformly as `vm:fuel_exhausted`.
+- Non-deterministic globals (`Date`, `performance`, `Math.random`, `Intl`) are removed (contexts are created without the Date intrinsic, which in quickjs-ng also supplies the `performance` clock), and deterministic fuel metering (`limits.maxFuel`) rejects runaway loops uniformly as `vm:fuel_exhausted`.
 - `chronolog-pkg/v1` packages enforce scoped dependency resolution (eliminating diamond conflicts), package-local `./`/`../` relative imports, and per-package `builtins` capability attenuation.
 - Pure WASM reducers (`runtime: 'wasm-pure'`, `chronolog-wasm/v1` ABI) and `chronolog:wasm` libraries reject non-`chronolog` host imports and cache compiled `WebAssembly.Module` instances per `cas:sha256-...` hash.
 - Missing CAS chunks, modules, packages, or SQLite pages trigger an **uncatchable host-level `MissingDependencyError`** that user JS `try/catch` cannot swallow; replay halts cleanly before that operation until the missing dependency arrives (via `cas-want` subgraph pull or `casMirrors`).

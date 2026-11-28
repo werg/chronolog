@@ -68,4 +68,73 @@ heap) per kernel; isolation is unchanged because every call still runs in a fres
 | reconnect, nothing new | 7.8 s, 41.6 MB | 12–48 ms, 4.9 KB | 18.6 s, 60 MB | 29 ms, 4.9 KB |
 
 Submit cost no longer grows with N (N=2000: ~6 ms/op flat). The largest remaining per-op cost is
-the fresh QuickJS context and module evaluation per reducer call (~1 ms).
+the fresh QuickJS context and module evaluation per reducer call (~1 ms, ~0.7 ms after the change below).
+
+## QuickJS reducer invocation fixed cost
+
+Every `reduce`/`query`/`describe`/`onConflict`/`derive` call still runs in a fresh
+`QuickJSContext` (pristine globals and module instances, see the CRDT contract). What changed is the
+work done around that context:
+
+- **No per-call JS stub.** The `ctx` argument and the run step used to be an entry-module string
+  (~10 closures) compiled in every context; compiling it was the largest cost after context creation.
+  `ctx` is now built from host functions plus two one-line helpers returned by the prelude eval
+  (`makeCtx` freezes the members, `finish` is `JSON.stringify({ __ok: true, value })`). The entry
+  module only re-exports the target export, and the reducer is called with `callFunction`, so the
+  separate run eval and the env global are gone. Semantics are kept member for member (order,
+  freezing, `String()` coercion, topic-object identity, `toJSON(key)`, argument positions, error
+  codes); `ctx.mount()` keeps its JS body, compiled only on first use. The `ctx` tests in
+  `quickjs-sandbox.test.ts` pass against both the old and the new implementation.
+- **No Date intrinsic.** Contexts are created without it (~10% of context creation). The prelude
+  still defines `Date` as a non-writable `undefined`. In quickjs-ng that intrinsic also installs
+  `performance`, whose `now()` returned wall-clock time inside reducers and was never stripped; it is
+  gone now.
+- **Builtin bridges on demand.** `globalThis.__chronologHost` methods for `chronolog:crypto`,
+  `chronolog:cas`, `chronolog:wasm` and `chronolog:sqlite` are created only when that builtin's shim
+  module is loaded (module loading finishes before any module body runs). They used to be created
+  for every call, whether the builtin was enabled or not. `readTopic`/`opOutcome`/`queryTopic`/
+  `queryMount` are no longer exposed on it, because `ctx` calls the host directly.
+
+Measured in one process, old and new interleaved, minimum over 20 rounds (machine load average
+16–26, so the absolute figures are inflated; the ratios are what to compare):
+
+| per call | before | after | change |
+|---|---|---|---|
+| trivial KV reduce | 0.93–1.14 ms | 0.70–0.79 ms | −25 to −31% |
+| SQL reduce (`chronolog:sqlite`, fresh db) | 2.2–5.2 ms | 1.9–3.5 ms | −4 to −32% (SQLite-dominated) |
+| `chronolog/permissions` query (600-line std module) | 5.0–5.6 ms | 4.8–5.5 ms | −3% (compile-dominated) |
+
+`pnpm tsx bench/vm.bench.ts` (min-of-rounds) breaks it down. At load ~8: context creation 0.30 ms
+(0.25 ms without Date), determinism prelude +0.05–0.07 ms, kv module import +0.04 ms. The
+permissions module import is +2.9 ms, nearly all of it compiling the source. The end-to-end
+`pnpm bench --sizes 400,2000 --reducers kv,sql` runs (before/after JSON in
+`bench/results/vm-{before,after}-kv-sql.json`, A/B in `bench/results/vm-invoke-ab.json`) could not resolve a ~0.3 ms/op gain under that load: submit ms/op varied
+by 2× between identical runs. Their deterministic counters (`vm.*`, `vm.newContext`) are identical
+before and after.
+
+Ideas evaluated and not done:
+
+- **Reusing a context, or batching one op's updates into one context.** Module instances and
+  globals are per context, so state left by one call (module `let`s, `globalThis`, prototype
+  pollution, mutated `ctx.topic()` objects) would be visible to the next. That breaks the
+  fresh-context invariant and the leakage tests, so it is not done.
+- **Folding the old stub into one global script with bound dispatchers.** Measured slower: the cost
+  is compiling the closures, not the number of evals.
+- **Bypassing the entry module** by evaluating the target module under its canonical name. That
+  would save one tiny module, but module-load error details (which can end up in rejected outcomes)
+  would differ from older replicas.
+- **Bytecode caching (the real win for std modules).** A module compiled in one context cannot be
+  run in another: bytecode keeps its realm and would resolve globals in the old context. Caching
+  therefore means serializing bytecode once per module hash and reading it into each fresh context.
+  The stock `@jitl/quickjs-ng-wasmfile-release-sync` build cannot do this. `QTS_bjson_encode` and
+  `QTS_bjson_decode` call `JS_WriteObject`/`JS_ReadObject` with flags `0`, and reading bytecode fails
+  with "no bytecode allowed". The FFI also has no call to run a read module. A custom wasm build would
+  need:
+  1. `QTS_bjson_encode(ctx, val, JS_WRITE_OBJ_BYTECODE)` on a `compileOnly` module.
+  2. `QTS_bjson_decode(ctx, data, JS_READ_OBJ_BYTECODE)`.
+  3. A new `QTS_EvalModuleBytecode(ctx, val)` doing `JS_ResolveModule` + `JS_EvalFunction` and
+     registering the module under its canonical name.
+
+  Bytecode would be cached per CAS hash in `#moduleCache`, and the bytecode format would be pinned
+  with `QUICKJS_RUNTIME_ID`. Expected gain: most of the 2.9 ms compile of `chronolog/permissions` (and
+  ~0.04 ms for small reducers), leaving deserialization, estimated at 0.2–0.4 ms for that module.

@@ -1,4 +1,5 @@
 import {
+  DefaultIntrinsics,
   newQuickJSWASMModuleFromVariant,
   newVariant,
   type QuickJSHandle,
@@ -195,13 +196,62 @@ export function openDb(dbRoot = null) {
 }
 `
 
+/**
+ * Determinism prelude, evaluated first in every fresh context (before any module body). Its
+ * completion value hands the host the intrinsics and two tiny helpers it needs, so the per-call
+ * `ctx` object is assembled from host functions without compiling a JS stub per invocation:
+ * `[JSON, JSON.parse, JSON.stringify, String, Object.is, makeCtx, finish]`.
+ */
 const DETERMINISM_PRELUDE = `
 Object.defineProperty(globalThis, 'Date', { value: undefined, writable: false, configurable: false });
 Object.defineProperty(Math, 'random', { value: () => { throw new Error('NONDETERMINISTIC_MATH_RANDOM'); }, writable: false, configurable: false });
 if (typeof Intl !== 'undefined') {
   Object.defineProperty(globalThis, 'Intl', { value: undefined, writable: false, configurable: false });
 }
+[JSON, JSON.parse, JSON.stringify, String, Object.is,
+  (topic, query, mount, mountQuery, opOutcome, topicLastOpId, config) => Object.freeze({ topic, query, mount, mountQuery, opOutcome, topicLastOpId, config }),
+  (out) => JSON.stringify({ __ok: true, value: out })];
 `
+
+/** Carries a VM exception out of a host-side coercion so a host `ctx` method can rethrow it unchanged. */
+class VmThrow extends Error {
+  constructor(readonly error: QuickJSHandle) { super('VM_EXCEPTION') }
+}
+
+/** Per-invocation entry module name (also what a reducer resolves `__chronolog_entry__` to). */
+const ENTRY_MODULE_NAME = '__chronolog_entry__'
+
+/** Entry module: imports the target export and re-exports it as `default` for the host to read. */
+function entryModuleSource(moduleSpecifier: string, exportName: string): string {
+  return exportName === 'default'
+    ? `import __target from ${JSON.stringify(moduleSpecifier)};\nexport default __target;`
+    : `import { ${exportName} as __target } from ${JSON.stringify(moduleSpecifier)};\nexport default __target;`
+}
+
+/** `ctx.mount(name)` body of the former in-VM stub; compiled lazily on first use only. */
+const MOUNT_HELPER_SOURCE = `(m, name) => m && typeof m === 'object' && m.mounts && Object.prototype.hasOwnProperty.call(m.mounts, String(name)) ? m.mounts[String(name)] : null`
+
+type HostBuiltin = 'chronolog:crypto' | 'chronolog:cas' | 'chronolog:wasm' | 'chronolog:sqlite'
+/** `globalThis.__chronologHost` methods installed when the corresponding builtin shim is loaded. */
+const HOST_BUILTIN_FUNCTIONS: Readonly<Record<HostBuiltin, readonly string[]>> = {
+  'chronolog:crypto': ['sha256', 'verifyEd25519', 'canonicalJson'],
+  'chronolog:cas': ['casPut', 'casGet'],
+  'chronolog:wasm': ['wasmInvoke', 'wasmInvokeJson'],
+  'chronolog:sqlite': ['sqlOpen', 'sqlExec', 'sqlQuery', 'sqlValidateExpr', 'sqlCommit', 'sqlClose'],
+}
+
+/** The `tx` argument as the reducer sees it (`payload` included), or null. */
+function txJson(input: ReducerInvocationInput): JsonValue {
+  return input.tx === undefined ? null : { ...input.tx, payload: input.payload }
+}
+
+/**
+ * Reducer contexts are created without the Date intrinsic: the prelude removes `Date` anyway, and in
+ * quickjs-ng that intrinsic also installs the wall-clock `performance` global (`performance.now()`),
+ * which the prelude did not strip. Skipping it is both cheaper (~10% of context creation) and closes
+ * that non-determinism hole. All other default intrinsics are kept.
+ */
+const CONTEXT_OPTIONS = { intrinsics: { ...DefaultIntrinsics, Date: false } } as const
 
 let defaultQuickJsPromise: Promise<QuickJSWASMModule> | null = null
 /**
@@ -447,6 +497,9 @@ export class QuickJsSandbox {
       }
     }
 
+    // Assigned once the context exists; the module loader only runs inside that context's evals.
+    let installHost: (builtin: HostBuiltin) => void = () => { throw new Error('HOST_NOT_READY') }
+
     try {
       runtime.setMemoryLimit(input.maxMemoryBytes)
       runtime.setMaxStackSize(512 * 1024)
@@ -469,37 +522,27 @@ export class QuickJsSandbox {
         (moduleName: string) => {
           if (moduleName === 'chronolog:crypto') {
             if (!Object.hasOwn(input.builtins, 'chronolog:crypto')) return { error: new Error('BUILTIN_NOT_ENABLED:chronolog:crypto') }
+            installHost('chronolog:crypto')
             return CRYPTO_MODULE_SHIM
           }
           if (moduleName === 'chronolog:cas') {
             if (!Object.hasOwn(input.builtins, 'chronolog:cas')) return { error: new Error('BUILTIN_NOT_ENABLED:chronolog:cas') }
+            installHost('chronolog:cas')
             return CAS_MODULE_SHIM
           }
           if (moduleName === 'chronolog:wasm') {
             if (!Object.hasOwn(input.builtins, 'chronolog:wasm')) return { error: new Error('BUILTIN_NOT_ENABLED:chronolog:wasm') }
+            installHost('chronolog:wasm')
             return WASM_MODULE_SHIM
           }
           if (moduleName === 'chronolog:sqlite') {
             if (!Object.hasOwn(input.builtins, 'chronolog:sqlite') || this.#sqliteDriver === undefined) {
               return { error: new Error('BUILTIN_NOT_ENABLED:chronolog:sqlite') }
             }
+            installHost('chronolog:sqlite')
             return SQLITE_MODULE_SHIM
           }
-          if (moduleName === '__chronolog_entry__') {
-            const exp = input.exportName === 'default'
-              ? `import __target from ${JSON.stringify(input.moduleSpecifier)};`
-              : `import { ${input.exportName} as __target } from ${JSON.stringify(input.moduleSpecifier)};`
-            const callExpr = input.method === 'reduce'
-              ? 'fn(env.state, env.tx, ctx)'
-              : input.method === 'onConflict'
-                ? 'fn(env.state, env.tx, ctx, env.conflict)'
-                : input.method === 'query'
-                  ? 'fn(env.state, env.payload, ctx)'
-                  : input.method === 'derive'
-                    ? 'fn(env.payload, ctx)'
-                    : 'fn(env.state, ctx)'
-            return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const topicCache = new Map(); const readTopicCached = (name) => { const key = String(name); if (!topicCache.has(key)) topicCache.set(key, JSON.parse(globalThis.__chronologHost.readTopic(key))); return topicCache.get(key); }; const ctx = Object.freeze({ topic(name) { return readTopicCached(name); }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, mount(name) { const m = readTopicCached('$mounts'); return m && typeof m === 'object' && m.mounts && Object.prototype.hasOwnProperty.call(m.mounts, String(name)) ? m.mounts[String(name)] : null; }, mountQuery(name, topic, input = null) { return JSON.parse(globalThis.__chronologHost.queryMount(String(name), String(topic), JSON.stringify(input === undefined ? null : input))); }, opOutcome(opId) { return JSON.parse(globalThis.__chronologHost.opOutcome(String(opId))); }, topicLastOpId(name) { const key = String(name); return env.topicLastOpIds && Object.prototype.hasOwnProperty.call(env.topicLastOpIds, key) ? env.topicLastOpIds[key] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${callExpr}; return JSON.stringify({ __ok: true, value: out }); };`
-          }
+          if (moduleName === ENTRY_MODULE_NAME) return entryModuleSource(input.moduleSpecifier, input.exportName)
           if (moduleName.startsWith('pkg:')) {
             const rest = moduleName.slice(4)
             const slash = rest.indexOf('/')
@@ -534,7 +577,7 @@ export class QuickJsSandbox {
           return { error: new Error(`MODULE_NOT_FOUND:${moduleName}`) }
         },
         (baseModuleName: string, requestedName: string) => {
-          if (requestedName === '__chronolog_entry__') return '__chronolog_entry__'
+          if (requestedName === ENTRY_MODULE_NAME) return ENTRY_MODULE_NAME
 
           // 1. Builtin capability check + per-package capability attenuation
           if (requestedName.startsWith('chronolog:')) {
@@ -629,48 +672,48 @@ export class QuickJsSandbox {
         },
       )
       perfCount('vm.newContext')
-      const ctx = runtime.newContext()
+      const ctx = runtime.newContext(CONTEXT_OPTIONS)
+      const owned: QuickJSHandle[] = []
+      const own = (h: QuickJSHandle): QuickJSHandle => { owned.push(h); return h }
       try {
         const preludeRes = ctx.evalCode(DETERMINISM_PRELUDE, '__prelude__.js')
         if (preludeRes.error) { preludeRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }
-        preludeRes.value.dispose()
+        const preludeOut = own(preludeRes.value)
+        const intrinsic = (i: number): QuickJSHandle => own(ctx.getProp(preludeOut, i))
 
-        // Install host bridges
-        const hostObj = ctx.newObject()
-        const bindFn = (name: string, fn: (...args: QuickJSHandle[]) => QuickJSHandle | void): void => {
-          const handle = ctx.newFunction(name, (...args) => {
-            if (missingDep !== null) throw missingDep
-            return fn(...args)
-          })
-          ctx.setProp(hostObj, name, handle)
-          handle.dispose()
+        // Builtin host bridges: registered here, installed on `__chronologHost` only when the builtin's
+        // shim module is loaded (all loading happens before any module body runs).
+        type HostFn = (...args: QuickJSHandle[]) => QuickJSHandle | void
+        const hostImpls = new Map<string, HostFn>()
+        const bindFn = (name: string, fn: HostFn): void => { hostImpls.set(name, fn) }
+        const hostObj = own(ctx.newObject())
+        ctx.setProp(ctx.global, '__chronologHost', hostObj)
+        const installed = new Set<HostBuiltin>()
+        installHost = (builtin) => {
+          if (installed.has(builtin)) return
+          installed.add(builtin)
+          for (const name of HOST_BUILTIN_FUNCTIONS[builtin]) {
+            const fn = hostImpls.get(name)
+            if (fn === undefined) continue
+            const handle = ctx.newFunction(name, (...args) => {
+              if (missingDep !== null) throw missingDep
+              return fn(...args)
+            })
+            ctx.setProp(hostObj, name, handle)
+            handle.dispose()
+          }
         }
 
-        bindFn('readTopic', (topicH) => {
-          const topicName = ctx.getString(topicH)
-          return ctx.newString(JSON.stringify(Object.hasOwn(input.topics, topicName) ? input.topics[topicName]! : null))
-        })
-
-        bindFn('opOutcome', (opIdH) => {
-          const key = ctx.getString(opIdH)
-          if (input.opOutcome !== undefined) {
-            return ctx.newString(JSON.stringify(input.opOutcome(key)))
-          }
-          const val = input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, key) ? input.opOutcomes[key]! : null
-          return ctx.newString(JSON.stringify(val))
-        })
-
-        bindFn('queryTopic', (topicH, inputJsonH) => {
+        const queryTopic = (topicName: string, inputJson: string): string => {
           if (depth >= 4) throw new Error('TOPIC_QUERY_DEPTH_EXCEEDED')
-          const topicName = ctx.getString(topicH)
           if (readPartition === 'public' && !isControlTopic(topicName)) {
-            return ctx.newString('null')
+            return 'null'
           }
-          const rawQueryInput = JSON.parse(ctx.getString(inputJsonH)) as unknown
+          const rawQueryInput = JSON.parse(inputJson) as unknown
           const topicState: JsonValue = Object.hasOwn(input.topics, topicName) ? input.topics[topicName]! : null
           const binding = input.topicBindings?.[topicName]
           if (binding === undefined) {
-            return ctx.newString(JSON.stringify(topicState))
+            return JSON.stringify(topicState)
           }
           const nestedPartition: CasPartition = (readPartition === 'public' || isControlTopic(topicName)) ? 'public' : input.casPartition
           const modRef = input.imports[binding.module] ?? binding.module
@@ -685,7 +728,7 @@ export class QuickJsSandbox {
             if (hit !== undefined) {
               this.#nestedQueryCache.delete(memoKey)
               this.#nestedQueryCache.set(memoKey, hit)
-              return ctx.newString(hit)
+              return hit
             }
           }
           let nestedRes: ReducerInvocationResult
@@ -717,7 +760,7 @@ export class QuickJsSandbox {
           }
           if (!nestedRes.ok) {
             if (nestedRes.code === 'vm:missing_method:query') {
-              return ctx.newString(JSON.stringify(topicState))
+              return JSON.stringify(topicState)
             }
             throw new Error(`TOPIC_QUERY_FAILED:${nestedRes.code}:${nestedRes.detail ?? ''}`)
           }
@@ -729,41 +772,39 @@ export class QuickJsSandbox {
               if (oldest !== undefined) this.#nestedQueryCache.delete(oldest)
             }
           }
-          return ctx.newString(serialized)
-        })
+          return serialized
+        }
 
         // Verified cross-log sub-state query against a pinned snapshot inside $mounts!
-        bindFn('queryMount', (mountNameH, topicH, inputJsonH) => {
+        const queryMount = (mountName: string, topicName: string, inputJson: string): string => {
           if (depth >= 4) throw new Error('TOPIC_QUERY_DEPTH_EXCEEDED')
-          const mountName = ctx.getString(mountNameH)
-          const topicName = ctx.getString(topicH)
-          const rawQueryInput = JSON.parse(ctx.getString(inputJsonH)) as unknown
+          const rawQueryInput = JSON.parse(inputJson) as unknown
           const mountsTopic = input.topics.$mounts
           if (mountsTopic === null || typeof mountsTopic !== 'object' || Array.isArray(mountsTopic)) {
-            return ctx.newString('null')
+            return 'null'
           }
           const mountsMap = (mountsTopic as Readonly<Record<string, JsonValue>>).mounts
           if (mountsMap === null || typeof mountsMap !== 'object' || Array.isArray(mountsMap)) {
-            return ctx.newString('null')
+            return 'null'
           }
           const mountRec = (mountsMap as Readonly<Record<string, JsonValue>>)[mountName]
           if (mountRec === null || typeof mountRec !== 'object' || Array.isArray(mountRec)) {
-            return ctx.newString('null')
+            return 'null'
           }
           const mountedTopics = (mountRec as Readonly<Record<string, JsonValue>>).topics
           if (mountedTopics === null || typeof mountedTopics !== 'object' || Array.isArray(mountedTopics)) {
-            return ctx.newString('null')
+            return 'null'
           }
           const mt = mountedTopics as Readonly<Record<string, JsonValue>>
           const targetState: JsonValue = Object.hasOwn(mt, topicName) ? mt[topicName]! : null
           const mountedReducersRaw = mt.$reducers
           if (mountedReducersRaw === undefined) {
-            return ctx.newString(JSON.stringify(targetState))
+            return JSON.stringify(targetState)
           }
           const mountedReducers = assertValidReducersConfig(mountedReducersRaw)
           const binding = mountedReducers.topics[topicName]
           if (binding === undefined) {
-            return ctx.newString(JSON.stringify(targetState))
+            return JSON.stringify(targetState)
           }
           let nestedRes: ReducerInvocationResult
           try {
@@ -793,12 +834,12 @@ export class QuickJsSandbox {
           }
           if (!nestedRes.ok) {
             if (nestedRes.code === 'vm:missing_method:query') {
-              return ctx.newString(JSON.stringify(targetState))
+              return JSON.stringify(targetState)
             }
             throw new Error(`MOUNT_QUERY_FAILED:${nestedRes.code}:${nestedRes.detail ?? ''}`)
           }
-          return ctx.newString(JSON.stringify(nestedRes.value))
-        })
+          return JSON.stringify(nestedRes.value)
+        }
 
         bindFn('sha256', (dataHandle) => {
           const raw = ctx.dump(dataHandle) as unknown
@@ -934,25 +975,105 @@ export class QuickJsSandbox {
           })
         }
 
-        ctx.setProp(ctx.global, '__chronologHost', hostObj)
-        hostObj.dispose()
+        // Intrinsics captured after the prelude and before any reducer module body runs.
+        const jsonH = intrinsic(0)
+        const jsonParseH = intrinsic(1)
+        const jsonStringifyH = intrinsic(2)
+        const stringH = intrinsic(3)
+        const objectIsH = intrinsic(4)
+        const makeCtxH = intrinsic(5)
+        const finishH = intrinsic(6)
+        /** `JSON.parse(text)` in the VM; the result (or the VM exception) is owned by the caller. */
+        const vmParse = (text: string) => {
+          const textH = ctx.newString(text)
+          try { return ctx.callFunction(jsonParseH, jsonH, textH) } finally { textH.dispose() }
+        }
+        /** `String(value)` in the VM, read back as a host string (rethrows the VM exception unchanged). */
+        const vmString = (valueH: QuickJSHandle | undefined): string => {
+          const res = ctx.callFunction(stringH, ctx.undefined, valueH ?? ctx.undefined)
+          if (res.error) throw new VmThrow(res.error)
+          try { return ctx.getString(res.value) } finally { res.value.dispose() }
+        }
+        /** `JSON.stringify(value === undefined ? null : value)` in the VM; `'undefined'` when it yields undefined. */
+        const vmStringifyInput = (valueH: QuickJSHandle | undefined): string => {
+          const res = valueH === undefined || ctx.typeof(valueH) === 'undefined'
+            ? ctx.callFunction(jsonStringifyH, jsonH, ctx.null)
+            : ctx.callFunction(jsonStringifyH, jsonH, valueH)
+          if (res.error) throw new VmThrow(res.error)
+          try { return ctx.getString(res.value) } finally { res.value.dispose() }
+        }
+        /** Host-implemented `ctx` method: VM exceptions from coercions propagate as-is. */
+        const ctxMethod = (name: string, fn: (...args: QuickJSHandle[]) => QuickJSHandle | { error: QuickJSHandle } | { value: QuickJSHandle }) => {
+          const handle = ctx.newFunction(name, (...args) => {
+            if (missingDep !== null) throw missingDep
+            try {
+              return fn(...args)
+            } catch (err) {
+              if (err instanceof VmThrow) return { error: err.error }
+              throw err
+            }
+          })
+          ctxMembers.push(own(handle))
+        }
+        const topicCache = new Map<string, QuickJSHandle>()
+        const readTopicCached = (key: string): QuickJSHandle => {
+          let cached = topicCache.get(key)
+          if (cached === undefined) {
+            const res = vmParse(JSON.stringify(Object.hasOwn(input.topics, key) ? input.topics[key]! : null))
+            if (res.error) throw new VmThrow(res.error)
+            cached = own(res.value)
+            topicCache.set(key, cached)
+          }
+          return cached
+        }
+        let mountHelperH: QuickJSHandle | null = null
 
-        const envJson = JSON.stringify({
-          state: input.state,
-          payload: input.payload,
-          tx: input.tx === undefined ? null : { ...input.tx, payload: input.payload },
-          conflict: input.conflict ?? null,
-          topicLastOpIds: input.topicLastOpIds ?? {},
-          config: input.config ?? null,
+        // ctx: same members, order, freezing and coercions as the former in-VM stub, built from host
+        // functions so nothing has to be compiled per invocation.
+        const ctxMembers: QuickJSHandle[] = []
+        ctxMethod('topic', (nameH) => readTopicCached(vmString(nameH)).dup())
+        ctxMethod('query', (nameH, inputH) => {
+          const name = vmString(nameH)
+          return vmParse(queryTopic(name, vmStringifyInput(inputH)))
         })
-        const envHandle = ctx.newString(envJson)
-        ctx.setProp(ctx.global, '__chronologEnvJson', envHandle)
-        envHandle.dispose()
+        ctxMethod('mount', (nameH) => {
+          const mountsH = readTopicCached('$mounts')
+          if (mountHelperH === null) {
+            // Rarely used: compiled only on first call, with the exact former semantics.
+            const res = ctx.evalCode(MOUNT_HELPER_SOURCE, '__chronolog_mount__.js')
+            if (res.error) return { error: res.error }
+            mountHelperH = own(res.value)
+          }
+          return ctx.callFunction(mountHelperH, ctx.undefined, mountsH, nameH ?? ctx.undefined)
+        })
+        ctxMethod('mountQuery', (nameH, topicH, inputH) => {
+          const name = vmString(nameH)
+          const topic = vmString(topicH)
+          return vmParse(queryMount(name, topic, vmStringifyInput(inputH)))
+        })
+        ctxMethod('opOutcome', (opIdH) => {
+          const key = vmString(opIdH)
+          const outcome = input.opOutcome !== undefined
+            ? input.opOutcome(key)
+            : input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, key) ? input.opOutcomes[key]! : null
+          return outcome === null ? ctx.null : ctx.newString(outcome)
+        })
+        ctxMethod('topicLastOpId', (nameH) => {
+          const key = vmString(nameH)
+          const ids = input.topicLastOpIds
+          return ids !== undefined && Object.hasOwn(ids, key) ? ctx.newString(ids[key]!) : ctx.null
+        })
+        const configRes = vmParse(JSON.stringify(input.config ?? null))
+        if (configRes.error) { configRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }
+        ctxMembers.push(own(configRes.value))
+        const ctxRes = ctx.callFunction(makeCtxH, ctx.undefined, ...ctxMembers)
+        if (ctxRes.error) { ctxRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }
+        const ctxObj = own(ctxRes.value)
 
         // Load entry module (triggers 2-arg scoped normalizer + Import Map loading)
         const loadRes = ctx.evalCode(
-          `import '__chronolog_entry__';`,
-          '__bootstrap__.mjs',
+          entryModuleSource(input.moduleSpecifier, input.exportName),
+          ENTRY_MODULE_NAME,
           { type: 'module' },
         )
         if (loadRes.error) {
@@ -963,15 +1084,52 @@ export class QuickJsSandbox {
           if (timedOut) throw new OperationalTimeoutError()
           return { ok: false, code: 'vm:module_load_error', detail: moduleLoadState.error !== null ? moduleLoadState.error.message : formatJsError(dumped) }
         }
-        loadRes.value.dispose()
+        own(loadRes.value)
         if (missingDep !== null) throw missingDep as Error
         if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
         if (timedOut) throw new OperationalTimeoutError()
 
-        const runRes = ctx.evalCode('globalThis.__chronologRun()', '__run__.js')
-        if (runRes.error) {
-          const dumped = ctx.dump(runRes.error) as unknown
-          runRes.error.dispose()
+        // Run: `const fn = target && target[method]; fn(...args)`; output is
+        // `JSON.stringify({ __ok: true, value: out })`, exactly as before.
+        const runResult = ((): { kind: 'missing' } | { kind: 'error'; error: QuickJSHandle } | { kind: 'ok'; json: string } => {
+          const target = own(ctx.getProp(loadRes.value, 'default'))
+          const targetType = ctx.typeof(target)
+          if (targetType !== 'object' && targetType !== 'function' && !(ctx.dump(target) as unknown)) return { kind: 'missing' }
+          if (targetType === 'object') {
+            // `null` is the only falsy object; the WASM build exposes no equality, so ask `Object.is`.
+            const isNull = ctx.callFunction(objectIsH, ctx.undefined, target, ctx.null)
+            if (isNull.error) return { kind: 'error', error: isNull.error }
+            const nullTarget = ctx.dump(isNull.value) === true
+            isNull.value.dispose()
+            if (nullTarget) return { kind: 'missing' }
+          }
+          const fnRes = ctx.getProp(target, input.method)
+          own(fnRes)
+          if (ctx.typeof(fnRes) !== 'function') return { kind: 'missing' }
+          const argsJson = input.method === 'reduce' ? [input.state, txJson(input)]
+            : input.method === 'onConflict' ? [input.state, txJson(input), input.conflict ?? null]
+              : input.method === 'query' ? [input.state, input.payload]
+                : input.method === 'derive' ? [input.payload]
+                  : [input.state]
+          const argsRes = vmParse(JSON.stringify(argsJson))
+          if (argsRes.error) return { kind: 'error', error: argsRes.error }
+          const argsArr = own(argsRes.value)
+          const args = argsJson.map((_, i) => own(ctx.getProp(argsArr, i)))
+          // ctx is the third argument for reduce/onConflict/query, second for derive/describe.
+          const ctxIndex = input.method === 'derive' || input.method === 'describe' ? 1 : 2
+          args.splice(ctxIndex, 0, ctxObj)
+          const callRes = ctx.callFunction(fnRes, ctx.undefined, ...args)
+          if (callRes.error) return { kind: 'error', error: callRes.error }
+          const out = own(callRes.value)
+          const strRes = ctx.callFunction(finishH, ctx.undefined, out)
+          if (strRes.error) return { kind: 'error', error: strRes.error }
+          const json = ctx.getString(strRes.value)
+          strRes.value.dispose()
+          return { kind: 'ok', json }
+        })()
+        if (runResult.kind === 'error') {
+          const dumped = ctx.dump(runResult.error) as unknown
+          runResult.error.dispose()
           if (missingDep !== null) throw missingDep as Error
           if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
           if (timedOut) throw new OperationalTimeoutError()
@@ -979,16 +1137,14 @@ export class QuickJsSandbox {
           const code = /out of memory|memory limit/i.test(detail) ? 'vm:limit' : 'reducer:throw'
           return { ok: false, code, detail }
         }
-        const rawOut = ctx.getString(runRes.value)
-        runRes.value.dispose()
         if (missingDep !== null) throw missingDep as Error
         if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
         if (timedOut) throw new OperationalTimeoutError()
-
-        const parsed = JSON.parse(rawOut) as { __missingMethod?: boolean; __ok?: boolean; value?: unknown }
-        if (parsed.__missingMethod) {
+        if (runResult.kind === 'missing') {
           return { ok: false, code: `vm:missing_method:${input.method}` }
         }
+
+        const parsed = JSON.parse(runResult.json) as { __ok?: boolean; value?: unknown }
         try {
           const normalized = normalizeJsonValue(parsed.value)
           return { ok: true, value: normalized }
@@ -998,6 +1154,7 @@ export class QuickJsSandbox {
       } finally {
         for (const db of openDbs.values()) { try { db.close() } catch { /* ignore */ } }
         openDbs.clear()
+        for (let i = owned.length - 1; i >= 0; i--) { const h = owned[i]!; if (h.alive) h.dispose() }
         try { ctx.dispose() } catch { healthy = false }
       }
     } catch (err) {
