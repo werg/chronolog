@@ -375,4 +375,5 @@ pnpm package:session     # Universal zero-native-build @chronolog/peer-session t
 - [Chronolog CRDT Contract](docs/CRDT_CONTRACT.md) — formal invariants for ordering, public/encrypted partitioning, QuickJS-NG Import-Map reducers, deterministic SQLite-CAS, write RLS, keys, finality, and signals.
 - [Authored Operation-Set Guide](docs/authored-operation-set.md) — operation lifecycle, offline authoring, reconnect rewrapping, reactive views, and checkpoint bootstrap.
 - [Browser Storage Architecture](docs/browser-storage.md) — OPFS, IndexedDB, capability probing, and single-owner worker isolation.
+- [Performance](docs/PERFORMANCE.md) — sync-v3 reconciliation protocol, kernel cost model, and the `pnpm bench` harness.
 - [Documentation Index](docs/README.md) — package guides for `@chronolog/peer-session`, `@chronolog/materializer`, `chronolog-db`, `@chronolog/authority`, `@chronolog/signals`, and `@chronolog/transport-webrtc`.

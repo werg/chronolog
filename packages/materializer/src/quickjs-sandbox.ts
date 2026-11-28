@@ -7,7 +7,7 @@ import {
   type QuickJSWASMModule,
 } from 'quickjs-emscripten-core'
 import baseVariant from '@jitl/quickjs-ng-wasmfile-release-sync'
-import { bytesToHex, decodeUtf8, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
+import { bytesToHex, decodeUtf8, hexToBytes, perfCount, sha256Sync, utf8 } from '@chronolog/canonical'
 import { verifyEd25519Sync } from '@chronolog/crypto'
 import { canonicalEventPayload, isControlTopic, normalizeJsonValue, type JsonValue } from '@chronolog/protocol'
 import type { CasPartition, ContentAddressedStore } from '@chronolog/records'
@@ -112,9 +112,13 @@ export interface ReducerInvocationInput {
     readonly operationId: string
   }
   readonly conflict?: AssumptionFailureInfo
-  readonly opOutcomes?: Readonly<Record<string, 'accepted' | 'rejected'>>
+  /** Lazy outcome lookup for ops visible to this invocation (never serialized wholesale into the VM). */
+  readonly opOutcome?: (opId: string) => 'accepted' | 'rejected' | null
   readonly topicLastOpIds?: Readonly<Record<string, string>>
+  /** Visible topic states; read lazily by `ctx.topic()` / `ctx.query()` through host calls. */
   readonly topics: Readonly<Record<string, JsonValue>>
+  /** Optional precomputed content hash of a visible topic state (memoization key for nested queries). */
+  readonly topicHash?: (topic: string) => string | undefined
   readonly config?: JsonValue
   readonly cas: ContentAddressedStore
   readonly casPartition: CasPartition
@@ -219,6 +223,7 @@ export class QuickJsSandbox {
     const readPartition: CasPartition | 'any' = input.casPartition === 'public' ? 'public' : 'any'
     for (let faults = 0; faults < 256; faults++) {
       try {
+        perfCount(`vm.${input.method}`)
         return this.#invokeSync(qjs, input, 0)
       } catch (err) {
         if (err instanceof MissingDependencyError && await input.cas.ensureLoaded(err.hash, readPartition)) {
@@ -302,7 +307,7 @@ export class QuickJsSandbox {
               : input.method === 'query'
                 ? 'fn(env.state, env.payload, ctx)'
                 : 'fn(env.state, ctx)'
-          return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const ctx = Object.freeze({ topic(name) { return Object.prototype.hasOwnProperty.call(env.topics, name) ? env.topics[name] : null; }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, opOutcome(opId) { const key = String(opId); return env.opOutcomes && Object.prototype.hasOwnProperty.call(env.opOutcomes, key) ? env.opOutcomes[key] : null; }, topicLastOpId(name) { const key = String(name); return env.topicLastOpIds && Object.prototype.hasOwnProperty.call(env.topicLastOpIds, key) ? env.topicLastOpIds[key] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${callExpr}; return JSON.stringify({ __ok: true, value: out }); };`
+          return `${exp}\nglobalThis.__chronologRun = () => { const env = JSON.parse(globalThis.__chronologEnvJson); const topicCache = new Map(); const ctx = Object.freeze({ topic(name) { const key = String(name); if (!topicCache.has(key)) topicCache.set(key, JSON.parse(globalThis.__chronologHost.readTopic(key))); return topicCache.get(key); }, query(name, input = null) { return JSON.parse(globalThis.__chronologHost.queryTopic(String(name), JSON.stringify(input === undefined ? null : input))); }, opOutcome(opId) { return JSON.parse(globalThis.__chronologHost.opOutcome(String(opId))); }, topicLastOpId(name) { const key = String(name); return env.topicLastOpIds && Object.prototype.hasOwnProperty.call(env.topicLastOpIds, key) ? env.topicLastOpIds[key] : null; }, config: env.config ?? null }); const fn = __target && __target[${JSON.stringify(input.method)}]; if (typeof fn !== 'function') { return JSON.stringify({ __missingMethod: true }); } const out = ${callExpr}; return JSON.stringify({ __ok: true, value: out }); };`
         }
         const ref = input.imports[moduleName]
         if (ref === undefined) return { error: new Error(`MODULE_NOT_FOUND:${moduleName}`) }
@@ -317,6 +322,7 @@ export class QuickJsSandbox {
         return decodeUtf8(node.bytes)
       })
 
+      perfCount('vm.newContext')
       const ctx = runtime.newContext()
       try {
         const preludeRes = ctx.evalCode(DETERMINISM_PRELUDE, '__prelude__.js')
@@ -333,6 +339,15 @@ export class QuickJsSandbox {
           ctx.setProp(hostObj, name, handle)
           handle.dispose()
         }
+
+        bindFn('readTopic', (topicH) => {
+          const topicName = ctx.getString(topicH)
+          return ctx.newString(JSON.stringify(Object.hasOwn(input.topics, topicName) ? input.topics[topicName]! : null))
+        })
+
+        bindFn('opOutcome', (opIdH) => {
+          return ctx.newString(JSON.stringify(input.opOutcome?.(ctx.getString(opIdH)) ?? null))
+        })
 
         bindFn('queryTopic', (topicH, inputJsonH) => {
           if (depth >= 4) throw new Error('TOPIC_QUERY_DEPTH_EXCEEDED')
@@ -352,7 +367,7 @@ export class QuickJsSandbox {
           const canMemoize = isControlTopic(topicName) && modRef.startsWith('cas:sha256-') && Object.keys(input.imports).length <= 32
           let memoKey: string | null = null
           if (canMemoize) {
-            const stateKey = bytesToHex(sha256Sync(utf8(JSON.stringify(topicState))))
+            const stateKey = input.topicHash?.(topicName) ?? bytesToHex(sha256Sync(utf8(JSON.stringify(topicState))))
             const inputKey = JSON.stringify(rawQueryInput)
             const configKey = binding.config === undefined ? '' : JSON.stringify(binding.config)
             memoKey = `${nestedPartition}\0${modRef}\0${binding.export ?? 'default'}\0${stateKey}\0${configKey}\0${inputKey}`
@@ -375,6 +390,7 @@ export class QuickJsSandbox {
               state: topicState,
               payload: normalizeJsonValue(rawQueryInput),
               topics: input.topics,
+              ...(input.topicHash === undefined ? {} : { topicHash: input.topicHash }),
               ...(binding.config === undefined ? {} : { config: binding.config }),
               cas: input.cas,
               casPartition: nestedPartition,
@@ -507,9 +523,7 @@ export class QuickJsSandbox {
           payload: input.payload,
           tx: input.tx === undefined ? null : { ...input.tx, payload: input.payload },
           conflict: input.conflict ?? null,
-          opOutcomes: input.opOutcomes ?? {},
           topicLastOpIds: input.topicLastOpIds ?? {},
-          topics: input.topics,
           config: input.config ?? null,
         })
         const envHandle = ctx.newString(envJson)

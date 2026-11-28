@@ -1,4 +1,4 @@
-import { sha256 } from '@chronolog/canonical'
+import { perfCount, sha256 } from '@chronolog/canonical'
 
 import { concatBytes, utf8 } from './bytes.js'
 import { ProtocolError, protocolInvariant } from './errors.js'
@@ -64,11 +64,27 @@ export async function exportEd25519PrivateKey(privateKey: CryptoKey): Promise<Ui
   }
 }
 
+/** Imported Ed25519 verification keys per raw public key (one import per author, not per op). */
+const verifyKeys = new Map<string, Promise<CryptoKey>>()
+function cachedPublicKey(raw: Uint8Array): Promise<CryptoKey> {
+  let id = ''
+  for (const byte of raw) id += byte.toString(16).padStart(2, '0')
+  let key = verifyKeys.get(id)
+  if (key === undefined) {
+    if (verifyKeys.size >= 4096) verifyKeys.clear()
+    key = importEd25519PublicKey(raw)
+    verifyKeys.set(id, key)
+    key.catch(() => verifyKeys.delete(id))
+  }
+  return key
+}
+
 export async function signDomain(
   domain: ProtocolDomain,
   payload: Uint8Array,
   privateKey: CryptoKey,
 ): Promise<Uint8Array> {
+  perfCount('ed25519.sign')
   try {
     const signature = await globalThis.crypto.subtle.sign(ED25519, privateKey, bufferSource(domainSeparatedBytes(domain, payload)))
     return new Uint8Array(signature)
@@ -84,8 +100,9 @@ export async function verifyDomain(
   publicKey: CryptoKey | Uint8Array,
 ): Promise<boolean> {
   if (signature.length !== 64) return false
+  perfCount('ed25519.verify')
   try {
-    const key = publicKey instanceof Uint8Array ? await importEd25519PublicKey(publicKey) : publicKey
+    const key = publicKey instanceof Uint8Array ? await cachedPublicKey(publicKey) : publicKey
     return await globalThis.crypto.subtle.verify(
       ED25519,
       key,

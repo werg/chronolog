@@ -1,3 +1,4 @@
+import { perfTimeAsync } from '@chronolog/canonical'
 import {
   bytesToHex,
   encodeCanonicalCbor,
@@ -13,7 +14,6 @@ import {
   encodeLogGenesis,
   genesisLogId,
   isControlTopic,
-  jsonToCbor,
   normalizeJsonValue,
   operationIdDigest,
   type LogGenesis,
@@ -73,12 +73,15 @@ interface RecordedOpOutcome {
   readonly visibility: OperationVisibility
 }
 
+/**
+ * Cheap positional snapshot. Topic values are immutable (never mutated in place), so a snapshot
+ * is a shallow copy of the topic record plus the lengths of the append-only seen/outcome logs.
+ */
 export interface KernelSnapshot {
   readonly topics: Readonly<Record<string, JsonValue>>
-  readonly seenOps: ReadonlySet<string>
-  readonly opOutcomes: ReadonlyMap<string, RecordedOpOutcome>
+  readonly topicHashes: ReadonlyMap<string, string>
   readonly topicLastOpIds: ReadonlyMap<string, string>
-  readonly seenOpsRoot: string
+  readonly seenLength: number
   readonly historyDigest: string
   readonly stateRoot: string
   readonly orderLength: number
@@ -96,12 +99,48 @@ export interface KernelMaterializedCache {
   readonly outcomes: readonly KernelOperationOutcome[]
 }
 
+/** Append-only keyed log that can be truncated back to an earlier length (O(removed)). */
+class AppendLog<V> {
+  readonly keys: string[] = []
+  readonly #map = new Map<string, { readonly value: V; readonly pos: number }>()
+  get length(): number { return this.keys.length }
+  has(key: string): boolean { return this.#map.has(key) }
+  get(key: string): V | undefined { return this.#map.get(key)?.value }
+  /** Value only if it was appended at a position below `limit`. */
+  getBefore(key: string, limit: number): V | undefined {
+    const entry = this.#map.get(key)
+    return entry !== undefined && entry.pos < limit && this.keys[entry.pos] === key ? entry.value : undefined
+  }
+  /** Position of `key` if present below `limit`. */
+  positionBefore(key: string, limit: number): number | undefined {
+    const entry = this.#map.get(key)
+    return entry !== undefined && entry.pos < limit && this.keys[entry.pos] === key ? entry.pos : undefined
+  }
+  add(key: string, value: V): void {
+    if (this.#map.has(key)) return
+    this.#map.set(key, { value, pos: this.keys.length }); this.keys.push(key)
+  }
+  truncate(length: number): void {
+    while (this.keys.length > length) {
+      const key = this.keys.pop()!
+      const entry = this.#map.get(key)
+      if (entry !== undefined && entry.pos >= length) this.#map.delete(key)
+    }
+  }
+  clear(): void { this.keys.length = 0; this.#map.clear() }
+  clone(length = this.keys.length): AppendLog<V> {
+    const out = new AppendLog<V>()
+    for (let i = 0; i < length; i++) out.add(this.keys[i]!, this.#map.get(this.keys[i]!)!.value)
+    return out
+  }
+}
+
 interface KernelMutableState {
   topics: Record<string, JsonValue>
-  seenOps: Set<string>
-  opOutcomes: Map<string, RecordedOpOutcome>
+  topicHashes: Map<string, string>
+  seen: AppendLog<true>
+  outcomes: AppendLog<RecordedOpOutcome>
   topicLastOpIds: Map<string, string>
-  seenOpsRoot: string
   historyDigest: string
   stateRoot: string
 }
@@ -109,6 +148,8 @@ interface KernelMutableState {
 export interface KernelMaterializeResult {
   readonly revision: KernelRevision
   readonly outcomes: readonly KernelOperationOutcome[]
+  /** Outcomes before this index are unchanged (same objects) since the previous materialize. */
+  readonly replayedFrom?: number
   readonly pendingDependencies: readonly string[]
   readonly skippedOpIds: readonly string[]
 }
@@ -124,22 +165,58 @@ export interface TopicKernelOptions extends QuickJsSandboxOptions {
 
 const ZERO_HASH = '0'.repeat(64)
 
+/** Per-input memo: hex op id and whether this input object already passed id/log validation. */
+const inputMeta = new WeakMap<KernelOperationInput, { readonly opIdHex: string; readonly logIdHex: string }>()
+function metaOf(item: KernelOperationInput): { readonly opIdHex: string; readonly logIdHex: string } {
+  let meta = inputMeta.get(item)
+  if (meta === undefined) {
+    const opIdHex = bytesToHex(item.opId)
+    if (item.verified !== true && bytesToHex(operationIdDigest(item.core)) !== opIdHex) throw new Error('KERNEL_OP_ID_MISMATCH')
+    meta = { opIdHex, logIdHex: bytesToHex(item.core.logId) }
+    inputMeta.set(item, meta)
+  }
+  return meta
+}
+
 function seenOpKey(visibility: OperationVisibility, authorHex: string, operationId: string): string {
   return `${visibility}:${authorHex}:${operationId}`
 }
 
-function hashSeenOpsSet(seen: ReadonlySet<string>, cas: ContentAddressedStore, partition: CasPartition): string {
+/** Commit an idempotency key set as one CAS node (only at snapshot/checkpoint export, never per op). */
+function hashSeenOpsSet(seen: Iterable<string>, cas: ContentAddressedStore, partition: CasPartition): string {
   const sorted = [...seen].sort()
   const bytes = encodeCanonicalCbor(sorted)
   return cas.putSync(bytes, [], partition)
 }
 
-function computeStateRoot(topics: Readonly<Record<string, JsonValue>>, seenOpsRoot: string): string {
-  const payload = encodeCanonicalCbor(new Map<string, CborValue>([
-    ['seenOpsRoot', seenOpsRoot],
-    ['topics', jsonToCbor(normalizeJsonValue(topics))],
-  ]))
+/** Content hash of one topic state (domain 'state' over its canonical CBOR). */
+function hashTopicBytes(encoded: Uint8Array): string {
+  return bytesToHex(hashDomainSync('topic', encoded))
+}
+
+function topicHashOf(value: JsonValue): string {
+  return hashTopicBytes(encodeCanonicalJsonCbor(value))
+}
+
+/**
+ * v3 state root: a commitment to the per-topic content hashes. Idempotency (seen-op) state is
+ * a deterministic function of the ordered history (already committed by historyDigest), so it is
+ * no longer folded into every per-op state root; snapshots/checkpoints carry `seenOpsRoot` explicitly.
+ */
+function stateRootFromHashes(topicHashes: ReadonlyMap<string, string>): string {
+  const names = [...topicHashes.keys()].sort()
+  const payload = encodeCanonicalCbor(new Map<string, CborValue>(names.map(name => [name, topicHashes.get(name)!])))
   return bytesToHex(hashDomainSync('state', payload))
+}
+
+function computeTopicHashes(topics: Readonly<Record<string, JsonValue>>): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const [name, value] of Object.entries(topics)) out.set(name, topicHashOf(value))
+  return out
+}
+
+function computeStateRoot(topics: Readonly<Record<string, JsonValue>>): string {
+  return stateRootFromHashes(computeTopicHashes(topics))
 }
 
 function advanceHistoryDigest(
@@ -226,22 +303,31 @@ export class TopicKernel {
   #order: KernelOperationInput[] = []
   #outcomes: KernelOperationOutcome[] = []
   #topics: Record<string, JsonValue>
-  #seenOps = new Set<string>()
-  #opOutcomes = new Map<string, RecordedOpOutcome>()
+  #topicHashes: Map<string, string>
+  /** Live idempotency log; `#committedSeenLength` is its committed prefix. */
+  #seen = new AppendLog<true>()
+  #committedSeenLength = 0
+  /** Live outcome log, positionally aligned with `#order` (+ any restored base). */
+  #outcomeLog = new AppendLog<RecordedOpOutcome>()
+  #seenRootCache: { readonly length: number; readonly root: string } | null = null
+  /** Set when a materialize threw mid-replay: the live logs no longer match committed state. */
+  #logsDirty = false
   #topicLastOpIds = new Map<string, string>()
-  #seenOpsRoot: string
   #historyDigest: string = ZERO_HASH
   #stateRoot: string
   #pendingDependencies = new Set<string>()
   #skippedOpIds = new Set<string>()
   #snapshots = new Map<number, KernelSnapshot>()
+  /** All $reducers module/package CAS hashes ever activated in the current replay window (prevents GC from dropping intermediate upgrades). */
+  #historicalReducerRoots = new Set<string>()
   #frontierOpIds = new Set<string>()
   #frontierOrderLength = 0
   #frontierMaxTimestampMs = 0n
   readonly #genesisSnapshot: KernelSnapshot
   #cacheRestores = 0
-  #cachedDescribe: { stateRoot: string; value: Readonly<Record<string, JsonValue>> } | null = null
-  #queryCacheStateRoot = ''
+  /** describe() results per topic, keyed by binding + reducers config + topic content hash. */
+  #describeCache = new Map<string, JsonValue | undefined>()
+  /** query() results keyed by the exact state they can observe (see #queryScope). */
   #queryCache = new Map<string, JsonValue>()
 
   constructor(options: TopicKernelOptions) {
@@ -260,19 +346,19 @@ export class TopicKernel {
     this.#topics = this.blindHostMode
       ? filterPublicTopics(structuredClone(this.genesis.initialTopics))
       : structuredClone(this.genesis.initialTopics)
-    this.#seenOpsRoot = hashSeenOpsSet(this.#seenOps, this.cas, 'public')
-    this.#stateRoot = computeStateRoot(this.#topics, this.#seenOpsRoot)
+    this.#topicHashes = computeTopicHashes(this.#topics)
+    this.#stateRoot = stateRootFromHashes(this.#topicHashes)
+    if (this.#topics.$reducers !== undefined) extractCasHashes(this.#topics.$reducers, this.#historicalReducerRoots)
     this.#genesisSnapshot = this.#captureSnapshot(0)
     this.#snapshots.set(0, this.#genesisSnapshot)
   }
 
   #captureSnapshotFrom(state: KernelMutableState, orderLength: number): KernelSnapshot {
     return {
-      topics: structuredClone(state.topics),
-      seenOps: new Set(state.seenOps),
-      opOutcomes: new Map(state.opOutcomes),
+      topics: { ...state.topics },
+      topicHashes: new Map(state.topicHashes),
       topicLastOpIds: new Map(state.topicLastOpIds),
-      seenOpsRoot: state.seenOpsRoot,
+      seenLength: state.seen.length,
       historyDigest: state.historyDigest,
       stateRoot: state.stateRoot,
       orderLength,
@@ -281,23 +367,52 @@ export class TopicKernel {
 
   #captureSnapshot(orderLength: number): KernelSnapshot {
     return {
-      topics: structuredClone(this.#topics),
-      seenOps: new Set(this.#seenOps),
-      opOutcomes: new Map(this.#opOutcomes),
+      topics: { ...this.#topics },
+      topicHashes: new Map(this.#topicHashes),
       topicLastOpIds: new Map(this.#topicLastOpIds),
-      seenOpsRoot: this.#seenOpsRoot,
+      seenLength: this.#committedSeenLength,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
       orderLength,
     }
   }
 
+  /** Reset live logs to a restored base: `seenKeys` consumed, no op outcomes yet. */
+  #resetLogs(seenKeys: Iterable<string>): void {
+    this.#seen.clear()
+    for (const key of seenKeys) this.#seen.add(key, true)
+    this.#committedSeenLength = this.#seen.length
+    this.#outcomeLog.clear()
+    this.#seenRootCache = null
+    this.#logsDirty = false
+  }
+
   get topics(): Readonly<Record<string, JsonValue>> {
     return structuredClone(this.#topics)
   }
 
+  /** CAS root of the committed idempotency set; computed lazily (O(N log N)) and cached per commit. */
   get seenOpsRoot(): string {
-    return this.#seenOpsRoot
+    if (this.#seenRootCache === null || this.#seenRootCache.length !== this.#committedSeenLength) {
+      const partition: CasPartition = this.genesis.privateLog && this.blindHostMode ? 'public' : 'private'
+      const root = hashSeenOpsSet(this.#seen.keys.slice(0, this.#committedSeenLength), this.cas, partition)
+      this.#seenRootCache = { length: this.#committedSeenLength, root }
+    }
+    return this.#seenRootCache.root
+  }
+
+  /** Durably persist the committed idempotency set node and return its root (call before exporting state). */
+  async commitSeenOpsRoot(): Promise<string> {
+    const partition: CasPartition = this.genesis.privateLog && this.blindHostMode ? 'public' : 'private'
+    const length = this.#committedSeenLength
+    const root = await this.cas.put(encodeCanonicalCbor([...this.#seen.keys.slice(0, length)].sort()), [], partition)
+    if (this.#committedSeenLength === length) this.#seenRootCache = { length, root }
+    return root
+  }
+
+  /** Content hash of a committed topic state (or undefined when absent). */
+  topicHash(name: string): string | undefined {
+    return this.#topicHashes.get(name)
   }
 
   snapshot(): {
@@ -308,7 +423,7 @@ export class TopicKernel {
   } {
     return {
       topics: structuredClone(this.#topics),
-      seenOpsRoot: this.#seenOpsRoot,
+      seenOpsRoot: this.seenOpsRoot,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
     }
@@ -319,7 +434,14 @@ export class TopicKernel {
   }
 
   opOutcome(opId: string): 'accepted' | 'rejected' | null {
-    return this.#opOutcomes.get(opId)?.outcome ?? null
+    const committed = this.#outcomes.length
+    if (!this.#logsDirty) {
+      const hit = this.#outcomeLog.getBefore(opId, committed)
+      if (hit !== undefined) return hit.outcome
+    }
+    // Slow path (mid-replay or dirty logs): consult the committed outcome list.
+    for (let i = committed - 1; i >= 0; i--) if (this.#outcomes[i]!.opId === opId) return this.#outcomes[i]!.outcome
+    return null
   }
 
   topicLastOpId(topic: string): string | null {
@@ -328,6 +450,20 @@ export class TopicKernel {
 
   get outcomes(): readonly KernelOperationOutcome[] {
     return this.#outcomes.slice()
+  }
+
+  /** Committed outcome for one op in O(1) (falls back to a scan mid-replay). */
+  outcomeOf(opId: string): KernelOperationOutcome | undefined {
+    if (!this.#logsDirty) {
+      const pos = this.#outcomeLog.positionBefore(opId, this.#outcomes.length)
+      if (pos !== undefined && this.#outcomes[pos]?.opId === opId) return this.#outcomes[pos]
+    }
+    return this.#outcomes.find(o => o.opId === opId)
+  }
+
+  /** Committed outcome list without copying (replaced, never mutated, on each commit). */
+  get materializedOutcomes(): readonly KernelOperationOutcome[] {
+    return this.#outcomes
   }
 
   get pendingDependencies(): readonly string[] {
@@ -356,15 +492,12 @@ export class TopicKernel {
     return this.#frontierOpIds.has(opId)
   }
 
-  /** Collect all CAS root hashes reachable from current state + retained suffix snapshots (for local GC). */
+  /** Collect all CAS root hashes reachable from current state + retained suffix snapshots + historical $reducers (for local GC). */
   gcRoots(): Set<string> {
-    const roots = new Set<string>()
-    roots.add(this.#seenOpsRoot)
+    const roots = new Set<string>(this.#historicalReducerRoots)
+    if (this.#seenRootCache !== null) roots.add(this.#seenRootCache.root)
     extractCasHashes(this.#topics, roots)
-    for (const snap of this.#snapshots.values()) {
-      roots.add(snap.seenOpsRoot)
-      extractCasHashes(snap.topics, roots)
-    }
+    for (const snap of this.#snapshots.values()) extractCasHashes(snap.topics, roots)
     return roots
   }
 
@@ -379,7 +512,7 @@ export class TopicKernel {
       logId: this.logIdHex,
       blindHostMode: this.blindHostMode,
       topics: structuredClone(this.#topics),
-      seenOpsRoot: this.#seenOpsRoot,
+      seenOpsRoot: this.seenOpsRoot,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
       orderOpIds: this.#order.map(item => bytesToHex(item.opId)),
@@ -427,7 +560,7 @@ export class TopicKernel {
     ) {
       return false
     }
-    if (computeStateRoot(cache.topics, cache.seenOpsRoot) !== cache.stateRoot) {
+    if (computeStateRoot(cache.topics) !== cache.stateRoot) {
       return false
     }
     const seenNode = await this.cas.get(cache.seenOpsRoot, 'any')
@@ -492,20 +625,20 @@ export class TopicKernel {
       })),
     }))
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
-    this.#seenOps = new Set(decodedSeen)
-    this.#opOutcomes = new Map()
+    this.#topicHashes = computeTopicHashes(this.#topics)
+    this.#resetLogs(decodedSeen)
+    this.#seenRootCache = { length: this.#committedSeenLength, root: cache.seenOpsRoot }
     this.#topicLastOpIds = new Map()
     for (let i = 0; i < this.#outcomes.length; i++) {
       const o = this.#outcomes[i]!
       const entry = this.#order[i]!
-      this.#opOutcomes.set(o.opId, { outcome: o.outcome, visibility: o.visibility })
+      this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
       if (o.outcome === 'accepted') {
         for (const u of entry.core.updates) {
           this.#topicLastOpIds.set(u.topic, o.opId)
         }
       }
     }
-    this.#seenOpsRoot = cache.seenOpsRoot
     this.#historyDigest = cache.historyDigest
     this.#stateRoot = cache.stateRoot
     this.#pendingDependencies.clear()
@@ -536,21 +669,23 @@ export class TopicKernel {
         await import('@chronolog/canonical').then(m => m.assertCanonicalCbor(seenNode.bytes, m.DEFAULT_DECODE_LIMITS)),
       )),
     ) as string[]
-    const computedStateRoot = computeStateRoot(checkpoint.topics, checkpoint.seenOpsRoot)
+    const computedStateRoot = computeStateRoot(checkpoint.topics)
     if (computedStateRoot !== checkpoint.stateRoot) {
       throw new Error(`CHECKPOINT_STATE_ROOT_MISMATCH: expected ${checkpoint.stateRoot}, got ${computedStateRoot}`)
     }
     this.#order = []
     this.#outcomes = []
-    this.#opOutcomes.clear()
     this.#topicLastOpIds.clear()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(checkpoint.topics)) : structuredClone(checkpoint.topics)
-    this.#seenOps = new Set(decodedSeen)
-    this.#seenOpsRoot = checkpoint.seenOpsRoot
+    this.#topicHashes = computeTopicHashes(this.#topics)
+    this.#resetLogs(decodedSeen)
+    this.#seenRootCache = { length: this.#committedSeenLength, root: checkpoint.seenOpsRoot }
     this.#historyDigest = checkpoint.historyDigest
     this.#stateRoot = checkpoint.stateRoot
     this.#snapshots.clear()
     this.#snapshots.set(0, this.#captureSnapshot(0))
+    this.#historicalReducerRoots.clear()
+    if (this.#topics.$reducers !== undefined) extractCasHashes(this.#topics.$reducers, this.#historicalReducerRoots)
   }
 
   /**
@@ -566,7 +701,7 @@ export class TopicKernel {
     readonly orderOpIds: readonly string[]
     readonly maxAuthorTimestampMs?: bigint | string | number
   }): Promise<boolean> {
-    if (computeStateRoot(snapshot.topics, snapshot.seenOpsRoot) !== snapshot.stateRoot) {
+    if (computeStateRoot(snapshot.topics) !== snapshot.stateRoot) {
       return false
     }
     const seenNode = await this.cas.get(snapshot.seenOpsRoot, 'any')
@@ -589,11 +724,11 @@ export class TopicKernel {
     }
     this.#order = []
     this.#outcomes = []
-    this.#opOutcomes.clear()
     this.#topicLastOpIds.clear()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(snapshot.topics)) : structuredClone(snapshot.topics)
-    this.#seenOps = new Set(decodedSeen)
-    this.#seenOpsRoot = snapshot.seenOpsRoot
+    this.#topicHashes = computeTopicHashes(this.#topics)
+    this.#resetLogs(decodedSeen)
+    this.#seenRootCache = { length: this.#committedSeenLength, root: snapshot.seenOpsRoot }
     this.#historyDigest = snapshot.historyDigest
     this.#stateRoot = snapshot.stateRoot
     this.#frontierOpIds = new Set(snapshot.orderOpIds)
@@ -612,17 +747,19 @@ export class TopicKernel {
    * Rewinds only to the earliest snapshot before the first changed position (suffix replay).
    */
   async materialize(inputs: readonly KernelOperationInput[]): Promise<KernelMaterializeResult> {
+    return perfTimeAsync('kernel.materialize', () => this.materialize__impl(inputs))
+  }
+
+  async materialize__impl(inputs: readonly KernelOperationInput[]): Promise<KernelMaterializeResult> {
     // Filter for blindHostMode and logId, sort strictly by canonical comparator
     const eligible: KernelOperationInput[] = []
     const seenIds = new Set<string>()
     for (const item of inputs) {
-      if (bytesToHex(item.core.logId) !== this.logIdHex) continue
+      const meta = metaOf(item)
+      if (meta.logIdHex !== this.logIdHex) continue
       if (this.blindHostMode && this.genesis.privateLog && item.core.visibility !== 'public') continue
-      const opIdHex = bytesToHex(item.opId)
+      const opIdHex = meta.opIdHex
       if (this.#frontierOpIds.has(opIdHex)) continue
-      if (item.verified !== true && bytesToHex(operationIdDigest(item.core)) !== opIdHex) {
-        throw new Error('KERNEL_OP_ID_MISMATCH')
-      }
       if (seenIds.has(opIdHex)) continue
       seenIds.add(opIdHex)
       eligible.push(item)
@@ -635,20 +772,27 @@ export class TopicKernel {
     // Find first divergence point from current materialized prefix
     let diff = 0
     while (diff < this.#order.length && diff < eligible.length) {
-      if (bytesToHex(this.#order[diff]!.opId) !== bytesToHex(eligible[diff]!.opId)) break
+      const prev = this.#order[diff]!, next = eligible[diff]!
+      if (prev !== next && metaOf(prev).opIdHex !== metaOf(next).opIdHex) break
       diff++
     }
     // Fast path: identical eligible set and no pending dependencies — nothing to re-evaluate
     if (diff === eligible.length && this.#order.length === eligible.length && this.#pendingDependencies.size === 0) {
       return {
         revision: this.revision('local'),
-        outcomes: this.#outcomes.slice(),
+        outcomes: this.#outcomes,
+        replayedFrom: this.#outcomes.length,
         pendingDependencies: this.pendingDependencies,
         skippedOpIds: [...this.#skippedOpIds],
       }
     }
-    // If previous run had missing dependencies, re-evaluate from earliest missing point (0 if uncertain)
-    if (this.#pendingDependencies.size > 0) diff = 0
+    // A previous run that stopped at a missing dependency simply left #order shorter; the divergence
+    // scan above already resumes from that point. Only a replay that threw mid-way (dirty logs)
+    // forces a rebuild from the base snapshot.
+    if (this.#logsDirty) {
+      diff = 0
+      for (const idx of [...this.#snapshots.keys()]) if (idx !== 0) this.#snapshots.delete(idx)
+    }
 
     // Find nearest cached snapshot <= diff (includes the rolling tip snapshot at this.#order.length!)
     let snapIndex = 0
@@ -656,12 +800,17 @@ export class TopicKernel {
       if (idx <= diff && idx > snapIndex) snapIndex = idx
     }
     const snap = this.#snapshots.get(snapIndex)!
+    // Rewind the live logs to the snapshot (O(rewound ops)); topic values are immutable so the
+    // working topic record is a shallow copy.
+    this.#seen.truncate(snap.seenLength)
+    this.#outcomeLog.truncate(snapIndex)
+    this.#logsDirty = true
     const work: KernelMutableState = {
-      topics: structuredClone(snap.topics),
-      seenOps: new Set(snap.seenOps),
-      opOutcomes: new Map(snap.opOutcomes),
+      topics: { ...snap.topics },
+      topicHashes: new Map(snap.topicHashes),
+      seen: this.#seen,
+      outcomes: this.#outcomeLog,
       topicLastOpIds: new Map(snap.topicLastOpIds),
-      seenOpsRoot: snap.seenOpsRoot,
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
     }
@@ -709,14 +858,15 @@ export class TopicKernel {
       // Atomically commit all derived state once replay and CAS flush succeed so concurrent
       // readers never observe a rewound or partially materialized kernel.
       this.#topics = work.topics
-      this.#seenOps = work.seenOps
-      this.#opOutcomes = work.opOutcomes
+      this.#topicHashes = work.topicHashes
       this.#topicLastOpIds = work.topicLastOpIds
-      this.#seenOpsRoot = work.seenOpsRoot
       this.#historyDigest = work.historyDigest
       this.#stateRoot = work.stateRoot
       this.#order = nextOrder
       this.#outcomes = nextOutcomes
+      this.#committedSeenLength = this.#seen.length
+      this.#seenRootCache = null
+      this.#logsDirty = false
       this.#pendingDependencies = nextPendingDeps
       this.#skippedOpIds = nextSkippedOps
       this.#snapshots = nextSnapshots
@@ -727,7 +877,9 @@ export class TopicKernel {
 
     return {
       revision: this.revision('local'),
-      outcomes: this.#outcomes.slice(),
+      // Committed outcome arrays are never mutated in place, so callers may hold this reference.
+      outcomes: this.#outcomes,
+      replayedFrom: Math.min(snapIndex, this.#outcomes.length),
       pendingDependencies: this.pendingDependencies,
       skippedOpIds: [...this.#skippedOpIds],
     }
@@ -758,7 +910,7 @@ export class TopicKernel {
         ...(extra?.conflictRecorded === true ? { conflictRecorded: true } : {}),
         events: evs,
       }
-      work.opOutcomes.set(opIdHex, { outcome: 'rejected', visibility: core.visibility })
+      work.outcomes.add(opIdHex, { outcome: 'rejected', visibility: core.visibility })
       work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'rejected', code, evs)
       return { kind: 'done', outcome }
     }
@@ -782,7 +934,7 @@ export class TopicKernel {
 
     // Scoped idempotency check: (visibility, author, operationId)
     const dedupKey = seenOpKey(core.visibility, authorHex, core.operationId)
-    if (work.seenOps.has(dedupKey)) {
+    if (work.seen.has(dedupKey)) {
       return makeRejected('operation_conflict')
     }
 
@@ -790,13 +942,10 @@ export class TopicKernel {
     const casPartition: CasPartition = (this.genesis.privateLog && core.visibility === 'public') ? 'public' : 'private'
     const isPublicOnPrivate = this.genesis.privateLog && core.visibility === 'public'
 
-    const buildVisibleOutcomes = (): Record<string, 'accepted' | 'rejected'> => {
-      const out: Record<string, 'accepted' | 'rejected'> = {}
-      for (const [k, rec] of work.opOutcomes) {
-        if (isPublicOnPrivate && rec.visibility !== 'public') continue
-        out[k] = rec.outcome
-      }
-      return out
+    const visibleOutcome = (opId: string): 'accepted' | 'rejected' | null => {
+      const rec = work.outcomes.get(opId)
+      if (rec === undefined || (isPublicOnPrivate && rec.visibility !== 'public')) return null
+      return rec.outcome
     }
     const buildVisibleTopicLastOpIds = (): Record<string, string> => {
       const out: Record<string, string> = {}
@@ -810,15 +959,14 @@ export class TopicKernel {
     // Evaluate signed operation-level assumptions before applying topic updates
     if (core.assumptions !== undefined && core.assumptions.checks.length > 0) {
       const visibleTopicsForAssumptions = isPublicOnPrivate ? filterPublicTopics(work.topics) : work.topics
-      const visibleOutcomes = buildVisibleOutcomes()
       const visibleTopicLastOps = buildVisibleTopicLastOpIds()
       let failure: { readonly code: string; readonly detail?: string; readonly checkIndex: number } | null = null
 
       for (let i = 0; i < core.assumptions.checks.length; i++) {
         const chk: OperationAssumption = core.assumptions.checks[i]!
         if (chk.kind === 'op_accepted') {
-          const st = Object.hasOwn(visibleOutcomes, chk.opId) ? visibleOutcomes[chk.opId] : undefined
-          if (st === undefined) {
+          const st = visibleOutcome(chk.opId)
+          if (st === null) {
             failure = { code: 'assumption:missing_op', detail: `Required op ${chk.opId} not present`, checkIndex: i }
             break
           }
@@ -827,8 +975,8 @@ export class TopicKernel {
             break
           }
         } else if (chk.kind === 'op_rejected') {
-          const st = Object.hasOwn(visibleOutcomes, chk.opId) ? visibleOutcomes[chk.opId] : undefined
-          if (st === undefined) {
+          const st = visibleOutcome(chk.opId)
+          if (st === null) {
             failure = { code: 'assumption:missing_op', detail: `Referenced op ${chk.opId} not present`, checkIndex: i }
             break
           }
@@ -873,7 +1021,7 @@ export class TopicKernel {
                 method: 'query',
                 state: topicState,
                 payload: chk.query,
-                opOutcomes: visibleOutcomes,
+                opOutcome: visibleOutcome,
                 topicLastOpIds: visibleTopicLastOps,
                 topics: visibleTopicsForAssumptions,
                 ...(binding.config === undefined ? {} : { config: binding.config }),
@@ -905,8 +1053,7 @@ export class TopicKernel {
       }
 
       if (failure !== null) {
-        work.seenOps.add(dedupKey)
-        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+        work.seen.add(dedupKey, true)
         if (core.assumptions.onFailed === 'record_conflict' && failure.code !== 'partition:public_op_private_assumption') {
           const primaryUpdate = core.updates[0]!
           let reducersConfig: ReducersConfig | null = null
@@ -932,7 +1079,7 @@ export class TopicKernel {
                   operationId: core.operationId,
                 },
                 conflict: failure,
-                opOutcomes: visibleOutcomes,
+                opOutcome: visibleOutcome,
                 topicLastOpIds: visibleTopicLastOps,
                 topics: visibleTopicsForAssumptions,
                 ...(binding.config === undefined ? {} : { config: binding.config }),
@@ -974,23 +1121,24 @@ export class TopicKernel {
                     }
                   }
                   work.topics = { ...work.topics, [primaryUpdate.topic]: nextTopicState }
-                  work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+                  work.topicHashes.set(primaryUpdate.topic, hashTopicBytes(encodedTopic))
+                  work.stateRoot = stateRootFromHashes(work.topicHashes)
                   return makeRejected(failure.code, failure.detail, { conflictRecorded: true, events: conflictEvents })
                 }
               }
             }
           }
         }
-        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
         return makeRejected(failure.code, failure.detail)
       }
     }
 
-    // Copy-on-write working topics map
-    const workingTopics: Record<string, JsonValue> = structuredClone(work.topics)
+    // Copy-on-write working topics map (topic values are immutable; only the record is copied)
+    const workingTopics: Record<string, JsonValue> = { ...work.topics }
+    const workingHashes = new Map<string, string>()
+    const topicHash = (name: string): string | undefined => workingHashes.get(name) ?? work.topicHashes.get(name)
     const emitted: EmittedKernelEvent[] = []
     let ordinal = 0
-    const visibleOutcomesForReduce = buildVisibleOutcomes()
     const visibleTopicLastOpsForReduce = buildVisibleTopicLastOpIds()
 
     for (const update of core.updates) {
@@ -1031,9 +1179,10 @@ export class TopicKernel {
             authorTimestampMs: Number(core.authorTimestampMs),
             operationId: core.operationId,
           },
-          opOutcomes: visibleOutcomesForReduce,
+          opOutcome: visibleOutcome,
           topicLastOpIds: visibleTopicLastOpsForReduce,
           topics: visibleTopics,
+          topicHash,
           ...(binding.config === undefined ? {} : { config: binding.config }),
           cas: this.cas,
           casPartition,
@@ -1048,57 +1197,47 @@ export class TopicKernel {
       }
 
       if (!res.ok) {
-        work.seenOps.add(dedupKey)
-        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
-        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+        work.seen.add(dedupKey, true)
         return makeRejected(res.code, res.detail)
       }
 
       const outObj = res.value
       if (outObj === null || typeof outObj !== 'object' || Array.isArray(outObj)) {
-        work.seenOps.add(dedupKey)
-        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
-        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+        work.seen.add(dedupKey, true)
         return makeRejected('vm:invalid_reducer_return')
       }
       const outRec = outObj as Readonly<Record<string, JsonValue>>
       if (typeof outRec.ok !== 'boolean') {
-        work.seenOps.add(dedupKey)
-        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
-        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+        work.seen.add(dedupKey, true)
         return makeRejected('vm:invalid_reducer_return')
       }
 
       if (!outRec.ok) {
         const rejCode = typeof outRec.code === 'string' && outRec.code.length > 0 ? outRec.code : 'reducer:rejected'
         const rejDetail = typeof outRec.detail === 'string' ? outRec.detail : undefined
-        work.seenOps.add(dedupKey)
-        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
-        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+        work.seen.add(dedupKey, true)
         return makeRejected(rejCode, rejDetail)
       }
 
       const nextTopicState: JsonValue = outRec.state === undefined ? null : outRec.state
       const encodedTopic = encodeCanonicalJsonCbor(nextTopicState)
       if (encodedTopic.length > this.genesis.limits.maxTopicStateBytes) {
-        work.seenOps.add(dedupKey)
-        work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
-        work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+        work.seen.add(dedupKey, true)
         return makeRejected('limit:max_topic_state_bytes')
       }
 
-      // If updating $reducers, validate new config shape immediately!
+      // If updating $reducers, validate new config shape immediately and pin its module hashes!
       if (update.topic === '$reducers') {
         try { assertValidReducersConfig(nextTopicState) }
         catch (err) {
-          work.seenOps.add(dedupKey)
-          work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
-          work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+          work.seen.add(dedupKey, true)
           return makeRejected('reducers_config_invalid', err instanceof Error ? err.message : String(err))
         }
+        extractCasHashes(nextTopicState, this.#historicalReducerRoots)
       }
 
       workingTopics[update.topic] = nextTopicState
+      workingHashes.set(update.topic, hashTopicBytes(encodedTopic))
 
       if (Array.isArray(outRec.events)) {
         for (const rawEv of outRec.events as readonly JsonValue[]) {
@@ -1121,14 +1260,14 @@ export class TopicKernel {
     }
 
     // Atomic commit of all topic updates in this op
-    work.seenOps.add(dedupKey)
-    work.seenOpsRoot = hashSeenOpsSet(work.seenOps, this.cas, casPartition)
+    work.seen.add(dedupKey, true)
     work.topics = workingTopics
-    work.opOutcomes.set(opIdHex, { outcome: 'accepted', visibility: core.visibility })
+    for (const [name, hash] of workingHashes) work.topicHashes.set(name, hash)
+    work.outcomes.add(opIdHex, { outcome: 'accepted', visibility: core.visibility })
     for (const u of core.updates) {
       work.topicLastOpIds.set(u.topic, opIdHex)
     }
-    work.stateRoot = computeStateRoot(work.topics, work.seenOpsRoot)
+    work.stateRoot = stateRootFromHashes(work.topicHashes)
     work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'accepted', null, emitted)
 
     return {
@@ -1152,11 +1291,7 @@ export class TopicKernel {
     const normalizedInput = normalizeJsonValue(input)
     let cacheKey: string | null = null
     if (topicsOverride === undefined) {
-      if (this.#queryCacheStateRoot !== this.#stateRoot) {
-        this.#queryCache.clear()
-        this.#queryCacheStateRoot = this.#stateRoot
-      }
-      cacheKey = `${topic}\0${bytesToHex(encodeCanonicalJsonCbor(normalizedInput))}`
+      cacheKey = `${topic}\0${this.#queryScope(topic)}\0${bytesToHex(encodeCanonicalJsonCbor(normalizedInput))}`
       const hit = this.#queryCache.get(cacheKey)
       if (hit !== undefined) {
         // Refresh LRU order and return a defensive clone so callers cannot mutate cached snapshots.
@@ -1183,6 +1318,7 @@ export class TopicKernel {
       state,
       payload: normalizedInput,
       topics: visibleTopics,
+      ...(topicsOverride === undefined ? { topicHash: (name: string) => this.#topicHashes.get(name) } : {}),
       ...(binding.config === undefined ? {} : { config: binding.config }),
       cas: this.cas,
       casPartition,
@@ -1193,9 +1329,9 @@ export class TopicKernel {
       if (res.code === 'vm:missing_method:query') return structuredClone(state)
       throw new Error(`KERNEL_QUERY_FAILED:${res.code}:${res.detail ?? ''}`)
     }
-    if (cacheKey !== null && this.#queryCacheStateRoot === this.#stateRoot) {
+    if (cacheKey !== null && this.#topics === sourceTopics) {
       this.#queryCache.set(cacheKey, structuredClone(res.value))
-      if (this.#queryCache.size > 128) {
+      if (this.#queryCache.size > 256) {
         const oldest = this.#queryCache.keys().next().value
         if (oldest !== undefined) this.#queryCache.delete(oldest)
       }
@@ -1235,12 +1371,13 @@ export class TopicKernel {
       if (idx <= targetLen && idx > snapIndex) snapIndex = idx
     }
     const snap = this.#snapshots.get(snapIndex)!
+    if (this.#logsDirty) throw new Error('KERNEL_REPLAY_IN_PROGRESS')
     const work: KernelMutableState = {
-      topics: structuredClone(snap.topics),
-      seenOps: new Set(snap.seenOps),
-      opOutcomes: new Map(snap.opOutcomes),
+      topics: { ...snap.topics },
+      topicHashes: new Map(snap.topicHashes),
+      seen: this.#seen.clone(snap.seenLength),
+      outcomes: this.#outcomeLog.clone(snapIndex),
       topicLastOpIds: new Map(snap.topicLastOpIds),
-      seenOpsRoot: snap.seenOpsRoot,
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
     }
@@ -1295,13 +1432,18 @@ export class TopicKernel {
 
   /** Collect exported command/query descriptions across all bound topics (for MCP & scoped tools). */
   async describe(): Promise<Readonly<Record<string, JsonValue>>> {
-    if (this.#cachedDescribe !== null && this.#cachedDescribe.stateRoot === this.#stateRoot) {
-      return structuredClone(this.#cachedDescribe.value)
-    }
     const reducersConfig = assertValidReducersConfig(this.#topics.$reducers)
     const out: Record<string, JsonValue> = {}
+    const liveKeys = new Set<string>()
     for (const [topic, binding] of Object.entries(reducersConfig.topics)) {
       if (this.blindHostMode && this.genesis.privateLog && !isControlTopic(topic)) continue
+      const key = `${topic}\0${this.#queryScope(topic)}`
+      liveKeys.add(key)
+      if (this.#describeCache.has(key)) {
+        const hit = this.#describeCache.get(key)
+        if (hit !== undefined) out[topic] = structuredClone(hit)
+        continue
+      }
       const state = Object.hasOwn(this.#topics, topic) ? this.#topics[topic]! : null
       const casPartition: CasPartition = (this.genesis.privateLog && isControlTopic(topic)) ? 'public' : 'private'
       const res = await this.sandbox.invoke({
@@ -1321,9 +1463,23 @@ export class TopicKernel {
         maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
       })
       if (res.ok) out[topic] = res.value
+      this.#describeCache.set(key, res.ok ? structuredClone(res.value) : undefined)
     }
-    this.#cachedDescribe = { stateRoot: this.#stateRoot, value: structuredClone(out) }
+    for (const key of [...this.#describeCache.keys()]) if (!liveKeys.has(key)) this.#describeCache.delete(key)
     return out
+  }
+
+  /**
+   * Cache scope for read-only calls on `topic`: everything such a call can observe. Control topics on
+   * private logs can only observe control topics (partition rule), so app writes never invalidate them.
+   */
+  #queryScope(topic: string): string {
+    if (this.genesis.privateLog && isControlTopic(topic)) {
+      let scope = ''
+      for (const [name, hash] of this.#topicHashes) if (isControlTopic(name)) scope += `${name}=${hash};`
+      return scope
+    }
+    return this.#stateRoot
   }
 
   /** Evaluate signal authorization policy for the current stateRoot (cached by caller per stateRoot). */

@@ -1,17 +1,19 @@
-import type { ApplicationSession, SessionCasNode, SessionFacts } from './session.js'
+import type { ApplicationSession, FactScope, FactsDelta, SessionCasNode } from './session.js'
 import type { FramedPeerConnection } from '@chronolog/records'
 import type {
   InBandSignalingHandle, InBandSignalingOptions, PeerMediaController,
   PeerStreamsController, RtcSignalMessage, WebRtcSession,
 } from '@chronolog/transport-webrtc'
-import { bytesToHex, sha256Sync } from '@chronolog/canonical'
-import { decodeOperationCore, decodeSignedOperation, encryptedEnvelopeDigest, operationIdDigest } from '@chronolog/protocol'
+import { bytesToHex } from '@chronolog/canonical'
+import { decodeEncryptedEnvelope, decodeSignedOperation, operationIdDigest } from '@chronolog/protocol'
 import { check, signRecord, verifyRecord, type Signed } from '@chronolog/authority'
+import type { FinalityCheckpoint } from '@chronolog/authority'
+import type { RetentionEvidence } from './operation.js'
+import { reconcileRanges, type ReconcileRange } from './reconcile.js'
 import { createNetworkContent, type ContentWireMessage } from './network-content.js'
 import { ApplicationSecureChannel, type ApplicationChannelHello } from './secure-channel.js'
 import type { SignalRoute, SignalReceiveDiagnostics } from '@chronolog/signals'
-import { APPLICATION_NETWORK_LIMITS, ApplicationMessageWire } from './network-wire.js'
-import { PeerFactKnowledge } from './network-facts.js'
+import { APPLICATION_NETWORK_LIMITS, ApplicationMessageWire, interruptible as interruptibleWait } from './network-wire.js'
 
 export interface PeerLinkTransportCapabilities {
   readonly session?: WebRtcSession
@@ -99,11 +101,10 @@ const unavailableStreams: PeerStreamsController = Object.freeze({
   onStream() { return () => {} },
 })
 
+/** Sync v3 hello: identity, freshness and key share only — facts move by reconciliation. */
 interface Hello {
   readonly applicationId: string
   readonly nonce: string
-  readonly publicOps: readonly Uint8Array[]
-  readonly casNodes: readonly SessionCasNode[]
   readonly channel: ApplicationChannelHello
 }
 interface Proof {
@@ -112,10 +113,27 @@ interface Proof {
   readonly peerNonce: string
   readonly encapsulatedKey: string
 }
+interface WireFacts {
+  readonly publicOps: readonly Uint8Array[]
+  readonly encryptedEnvelopes: readonly Uint8Array[]
+  readonly checkpoints: readonly FinalityCheckpoint[]
+}
 type Message =
   | { readonly kind: 'hello'; readonly value: Signed<Hello> }
   | { readonly kind: 'proof'; readonly value: Signed<Proof> }
-  | { readonly kind: 'facts'; readonly requestId: string; readonly facts: SessionFacts }
+  /** Reconciliation step of round `round` (owned by the side that started it). */
+  | { readonly kind: 'recon'; readonly round: string; readonly scope: FactScope; readonly owner: boolean; readonly ranges: readonly ReconcileRange[] }
+  /** Owner finished round `round`; the peer acks once everything sent before it is merged. */
+  | { readonly kind: 'recon-end'; readonly round: string; readonly scope: FactScope }
+  /** Initial reconciliation done (sent by the initiator). */
+  | { readonly kind: 'ready' }
+  | { readonly kind: 'want'; readonly requestId: string; readonly scope: FactScope; readonly ids: readonly string[] }
+  /** Facts batch; a non-empty requestId answers a `want` (sent once, on the final batch). */
+  | { readonly kind: 'facts'; readonly requestId: string; readonly facts: WireFacts }
+  | { readonly kind: 'cas-want'; readonly requestId: string; readonly hashes: readonly string[] }
+  | { readonly kind: 'cas'; readonly requestId: string; readonly nodes: readonly SessionCasNode[] }
+  /** Batched, signed retention receipt for facts this peer received from us. */
+  | { readonly kind: 'receipt'; readonly evidence: RetentionEvidence }
   | { readonly kind: 'ack'; readonly requestId: string }
   | { readonly kind: 'content'; readonly message: ContentWireMessage }
   | { readonly kind: 'rtc'; readonly message: RtcSignalMessage }
@@ -141,13 +159,10 @@ export async function connectApplicationPeer(session: ApplicationSession, option
   let sentLiveBytes = 0, receivedLiveBytes = 0
   const liveDiagnostics = (): Partial<ApplicationPeerLiveDiagnostics> =>
     signalRoute === undefined ? {} : { sentLiveBytes, receivedLiveBytes, signalRejections: signalRoute.diagnostics }
-  const pending = new Map<string, { resolve(): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout> }>()
 
   const close = (): Promise<void> => stopping ??= (async () => {
     lifetime.abort(new Error('PEER_CLOSED'))
     stopFacts?.(); signalRoute?.close(); contentLink?.close(); inBandRtc?.close(); secure.clear()
-    for (const value of pending.values()) { clearTimeout(value.timer); value.reject(signal.reason) }
-    pending.clear()
     if (authenticated) {
       authenticated = false
       tracked.get(session)?.delete(connectionId)
@@ -167,14 +182,11 @@ export async function connectApplicationPeer(session: ApplicationSession, option
   signal.addEventListener('abort', () => { void close().catch(() => undefined) }, { once: true })
 
   try {
-    const publicControl = await session.exportPublicControlFacts()
     await wire.send({
       kind: 'hello',
       value: await signRecord('peer-hello', {
         applicationId: session.applicationId,
         nonce: localNonce,
-        publicOps: publicControl.publicOps,
-        casNodes: publicControl.casNodes,
         channel: await secure.hello(),
       }, session.device.identity),
     } satisfies Message)
@@ -190,15 +202,8 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       'PEER_SCOPE_MISMATCH',
     )
 
-    // Merge peer's public control facts so membership updates (admissions/revocations) apply before gating
-    await session.mergeFacts({
-      publicOps: hello.value.payload.publicOps,
-      encryptedEnvelopes: [],
-      casNodes: hello.value.payload.casNodes.filter(n => n.partition === 'public'),
-      retentions: [],
-      checkpoints: [],
-    })
-    check(session.isMember(hello.value.signer), 'PEER_MEMBER_REQUIRED')
+    // Membership is gated after the public reconciliation round (so in-flight admissions apply first);
+    // until then only public facts flow on this link.
 
     const localContext = { applicationId: session.applicationId, identity: session.device.identity.publicKey, nonce: localNonce }
     const peerContext = { applicationId: session.applicationId, identity: hello.value.signer, nonce: hello.value.payload.nonce }
@@ -285,89 +290,271 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       ),
     })
 
-    const knowledge = new PeerFactKnowledge()
-
-    const retainIncoming = async (facts: SessionFacts): Promise<void> => {
-      const batch: { readonly proposalId: string; readonly author: string; readonly envelopeDigest: string }[] = []
-      for (const raw of facts.publicOps) {
-        try {
-          const signed = decodeSignedOperation(raw)
-          const core = decodeOperationCore(signed.coreBytes)
-          const proposalId = bytesToHex(operationIdDigest(signed.coreBytes))
-          batch.push({
-            proposalId,
-            author: bytesToHex(core.author),
-            envelopeDigest: bytesToHex(sha256Sync(raw)),
-          })
-        } catch { /* ignore invalid */ }
-      }
-      for (const raw of facts.encryptedEnvelopes) {
-        try {
-          const envDigest = bytesToHex(encryptedEnvelopeDigest(raw))
-          const inspected = session.inspectOperation(envDigest)
-          if (inspected.stored) {
-            batch.push({ proposalId: inspected.proposalId, author: inspected.author, envelopeDigest: envDigest })
-          }
-        } catch { /* ignore */ }
-      }
-      if (batch.length > 0) await session.retainMany(batch)
-    }
-
-    let sendTail: Promise<void> = Promise.resolve()
-    const sendFacts = (requestId = ''): Promise<void> => {
-      const task = sendTail.then(async () => {
-        signal.throwIfAborted()
-        const allFacts = await session.exportFacts({ includePrivateCas: session.isReader(peerId) })
-        const facts = await knowledge.missing(allFacts)
-        const count = facts.publicOps.length + facts.encryptedEnvelopes.length + facts.casNodes.length + facts.retentions.length + facts.checkpoints.length
-        if (requestId === '' && count === 0) return
-        await wire.send({ kind: 'facts', requestId, facts } satisfies Message)
-        await knowledge.remember(facts)
-      })
-      sendTail = task.catch(() => undefined)
+    const self = session.device.identity.publicKey
+    const initiator = self < peerId
+    // Ordered outbox: the receive loop never awaits transmission, so two peers bulk-pushing to each
+    // other cannot deadlock on full transport buffers. Wire order == post order.
+    let outTail: Promise<void> = Promise.resolve()
+    const post = (message: Message): Promise<void> => {
+      const task = outTail.then(() => wire.send(message))
+      outTail = task.catch(() => undefined)
+      task.catch(() => { void close() })
       return task
     }
-
-    let flushing: Promise<void> | undefined, dirty = false
-    const publish = (): Promise<void> => {
-      dirty = true
-      return flushing ??= (async () => {
-        try { while (dirty && !signal.aborted) { dirty = false; await sendFacts() } }
-        finally { flushing = undefined }
-      })()
+    let memberVerified = false
+    let markMember!: () => void
+    const memberReady = new Promise<void>(resolve => { markMember = resolve })
+    const privateAllowed = (): boolean => memberVerified && session.isReader(peerId) && session.isReader(self)
+    const verifyMember = (): void => {
+      if (memberVerified) return
+      check(session.isMember(peerId), 'PEER_MEMBER_REQUIRED')
+      memberVerified = true
+      markMember()
     }
-    stopFacts = session.onFacts(() => { void publish().catch(() => close()) })
 
+    // ---- outgoing facts (batched, size-bounded) ----
+    const FACT_BATCH_BYTES = 512 * 1024
+    const sendFactBatches = async (facts: WireFacts, requestId = ''): Promise<void> => {
+      const batches: { publicOps: Uint8Array[]; encryptedEnvelopes: Uint8Array[]; checkpoints: FinalityCheckpoint[] }[] = []
+      let current = { publicOps: [] as Uint8Array[], encryptedEnvelopes: [] as Uint8Array[], checkpoints: [] as FinalityCheckpoint[] }, size = 0
+      const roll = (bytes: number): void => {
+        if (size + bytes > FACT_BATCH_BYTES && size > 0) { batches.push(current); current = { publicOps: [], encryptedEnvelopes: [], checkpoints: [] }; size = 0 }
+        size += bytes
+      }
+      for (const raw of facts.publicOps) { roll(raw.length); current.publicOps.push(raw) }
+      for (const raw of facts.encryptedEnvelopes) { if (!privateAllowed()) break; roll(raw.length); current.encryptedEnvelopes.push(raw) }
+      for (const cp of facts.checkpoints) { roll(4096); current.checkpoints.push(cp) }
+      batches.push(current)
+      let sent: Promise<void> = Promise.resolve()
+      for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i]!, last = i === batches.length - 1
+        if (!last && batch.publicOps.length + batch.encryptedEnvelopes.length + batch.checkpoints.length === 0) continue
+        if (last && requestId === '' && batch.publicOps.length + batch.encryptedEnvelopes.length + batch.checkpoints.length === 0) continue
+        sent = post({ kind: 'facts', requestId: last ? requestId : '', facts: batch })
+      }
+      await sent
+    }
+    const pushIds = (scope: FactScope, ids: readonly string[]): Promise<void> => {
+      if (ids.length === 0 || (scope === 'private' && !privateAllowed())) return Promise.resolve()
+      return sendFactBatches(session.exportFactsById(scope, ids))
+    }
+
+    // ---- live push of new facts (never echo facts back to the link that delivered them) ----
+    const livePending: { scope: FactScope; id: string }[] = []
+    let liveFlush: Promise<void> | undefined
+    const flushLive = (): Promise<void> => liveFlush ??= (async () => {
+      try {
+        while (livePending.length > 0 && !signal.aborted) {
+          const items = livePending.splice(0)
+          await pushIds('public', items.filter(item => item.scope === 'public').map(item => item.id))
+          await pushIds('private', items.filter(item => item.scope === 'private').map(item => item.id))
+        }
+      } finally { liveFlush = undefined }
+    })()
+    stopFacts = session.onFacts((delta: FactsDelta) => {
+      for (const item of delta.items) {
+        if (item.source === connectionId) continue
+        if (item.scope === 'private' && !privateAllowed()) continue
+        livePending.push({ scope: item.scope, id: item.id })
+      }
+      if (livePending.length > 0) void flushLive().catch(() => close())
+    })
+
+    // ---- retention receipts (one signature per debounced batch) ----
+    let receiptItems: { proposalId: string }[] = []
+    let receiptTimer: ReturnType<typeof setTimeout> | undefined
+    const flushReceipts = async (): Promise<void> => {
+      receiptTimer = undefined
+      const items = receiptItems; receiptItems = []
+      if (items.length === 0 || signal.aborted) return
+      const evidence = await session.retainMany(items)
+      const own = evidence.find(ev => ev.signer === self)
+      if (own !== undefined) void post({ kind: 'receipt', evidence: own })
+    }
+    const queueReceipts = (facts: WireFacts): void => {
+      for (const raw of facts.publicOps) {
+        try { receiptItems.push({ proposalId: bytesToHex(operationIdDigest(decodeSignedOperation(raw).coreBytes)) }) } catch { /* rejected by merge */ }
+      }
+      for (const raw of facts.encryptedEnvelopes) {
+        try { receiptItems.push({ proposalId: bytesToHex(decodeEncryptedEnvelope(raw).opId) }) } catch { /* ignore */ }
+      }
+      if (receiptItems.length > 0 && receiptTimer === undefined) {
+        receiptTimer = setTimeout(() => { void flushReceipts().catch(() => undefined) }, 25)
+      }
+    }
+
+    // ---- on-demand CAS pull (modules, reducer-read nodes, SQLite pages); derived CAS is never pushed ----
+    const casRequests = new Map<string, { resolve(): void; reject(error: unknown): void }>()
+    const requestedCas = new Set<string>()
+    const pullMissingCas = async (): Promise<void> => {
+      for (let attempt = 0; attempt < 8 && !signal.aborted; attempt++) {
+        const missing = session.missingCasDependencies().filter(hash => !requestedCas.has(hash))
+        if (missing.length === 0) return
+        for (const hash of missing) requestedCas.add(hash)
+        const requestId = crypto.randomUUID()
+        const done = new Promise<void>((resolve, reject) => casRequests.set(requestId, { resolve, reject }))
+        void post({ kind: 'cas-want', requestId, hashes: missing.slice(0, 1024) })
+        await done
+      }
+    }
+
+    // ---- reconciliation rounds ----
+    interface Round { readonly scope: FactScope; outstanding: number; readonly wants: Set<string>; ended: boolean; resolve(): void; reject(error: unknown): void }
+    const rounds = new Map<string, Round>()
+    const wantRequests = new Map<string, string>() // want requestId -> round id
+    const maybeFinishRound = async (id: string): Promise<void> => {
+      const round = rounds.get(id)
+      if (round === undefined || round.ended || round.outstanding > 0 || round.wants.size > 0) return
+      round.ended = true
+      await pullMissingCas()
+      void post({ kind: 'recon-end', round: id, scope: round.scope })
+    }
+    const applyStep = async (roundId: string, scope: FactScope, ranges: readonly ReconcileRange[], owner: boolean): Promise<void> => {
+      const allowed = scope === 'public' || privateAllowed()
+      const local = allowed ? session.factIds(scope) : undefined
+      const step = local === undefined ? { reply: ranges.filter(r => !('ids' in r)).map(r => ({ prefix: r.prefix, ids: [] })), push: [], want: [] } : reconcileRanges(local, ranges)
+      if (allowed) void pushIds(scope, step.push)
+      if (allowed && step.want.length > 0) {
+        const requestId = crypto.randomUUID()
+        if (owner) { wantRequests.set(requestId, roundId); for (const want of step.want) rounds.get(roundId)?.wants.add(want) }
+        void post({ kind: 'want', requestId, scope, ids: step.want })
+      }
+      if (owner) {
+        // Our round: continue while summaries need answers; id lists still get one (empty) reply.
+        const round = rounds.get(roundId)
+        if (round === undefined) return
+        if (step.reply.length > 0) {
+          round.outstanding++
+          void post({ kind: 'recon', round: roundId, scope, owner: true, ranges: step.reply })
+        }
+        await maybeFinishRound(roundId)
+      } else {
+        // Peer's round: always answer so the owner can count outstanding exchanges.
+        void post({ kind: 'recon', round: roundId, scope, owner: false, ranges: step.reply })
+      }
+    }
+    const runRound = (scope: FactScope): Promise<void> => {
+      check(!signal.aborted && rounds.size < 8, 'PEER_REQUEST_LIMIT')
+      const id = crypto.randomUUID()
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { rounds.delete(id); reject(new Error('PEER_SYNC_TIMEOUT')); void close() }, 60_000)
+        rounds.set(id, {
+          scope, outstanding: 1, wants: new Set(), ended: false,
+          resolve: () => { clearTimeout(timer); rounds.delete(id); resolve() },
+          reject: (error) => { clearTimeout(timer); rounds.delete(id); reject(error) },
+        })
+        const local = scope === 'private' && !privateAllowed() ? undefined : session.factIds(scope)
+        const root: ReconcileRange = local === undefined ? { prefix: '', count: 0, fp: new Uint8Array(16) } : local.summary('')
+        void wire.send({ kind: 'recon', round: id, scope, owner: false, ranges: [root] })
+          .catch(error => { rounds.get(id)?.reject(error) })
+      })
+    }
+
+    let markReady!: () => void
+    const initialSync = new Promise<void>(resolve => { markReady = resolve })
+    void initialSync.catch(() => undefined)
+    const runInitialSync = async (): Promise<void> => {
+      await runRound('public')
+      verifyMember()
+      await runRound('private')
+      void post({ kind: 'ready' })
+      markReady()
+    }
+
+    let contentTail: Promise<void> = Promise.resolve()
     void (async () => {
       try {
         while (!signal.aborted) {
           const incoming = await iterator.next(); if (incoming.done) break
           const message = incoming.value as Message
-          check(session.isMember(peerId), 'PEER_REVOKED')
-          if (message.kind === 'facts') {
-            check(typeof message.requestId === 'string' && message.requestId.length <= 128, 'PEER_REQUEST_INVALID')
-            await session.mergeFacts(message.facts)
-            await knowledge.remember(message.facts)
-            await retainIncoming(message.facts)
-            if (message.requestId !== '') await wire.send({ kind: 'ack', requestId: message.requestId } satisfies Message)
-          } else if (message.kind === 'content') {
-            await contentLink.handle(message.message)
-          } else if (message.kind === 'rtc') {
-            if (inBandRtc !== undefined && session.isReader(peerId)) {
-              void inBandRtc.receive(message.message).catch(() => undefined)
+          if (memberVerified) check(session.isMember(peerId), 'PEER_REVOKED')
+          switch (message.kind) {
+            case 'recon': {
+              check(typeof message.round === 'string' && message.round.length <= 64 && Array.isArray(message.ranges) && message.ranges.length <= 4096, 'PEER_REQUEST_INVALID')
+              check(message.scope === 'public' || message.scope === 'private', 'PEER_REQUEST_INVALID')
+              const round = rounds.get(message.round)
+              // A message flagged owner:false addressed to one of OUR rounds is the peer's reply.
+              if (round !== undefined && !message.owner) {
+                round.outstanding--
+                await applyStep(message.round, message.scope, message.ranges, true)
+              } else {
+                await applyStep(message.round, message.scope, message.ranges, false)
+              }
+              break
             }
-          } else if (message.kind === 'ack') {
-            const waiter = pending.get(message.requestId)
-            if (waiter !== undefined) { pending.delete(message.requestId); clearTimeout(waiter.timer); waiter.resolve() }
-          } else {
-            throw new Error('PEER_MESSAGE_INVALID')
+            case 'recon-end': {
+              if (message.scope === 'public') verifyMember()
+              void post({ kind: 'ack', requestId: message.round })
+              break
+            }
+            case 'ready': markReady(); break
+            case 'want': {
+              check(Array.isArray(message.ids) && message.ids.length <= 100_000, 'PEER_REQUEST_INVALID')
+              const allowed = message.scope === 'public' || privateAllowed()
+              void sendFactBatches(allowed ? session.exportFactsById(message.scope, message.ids) : { publicOps: [], encryptedEnvelopes: [], checkpoints: [] }, message.requestId)
+              break
+            }
+            case 'facts': {
+              check(typeof message.requestId === 'string' && message.requestId.length <= 128, 'PEER_REQUEST_INVALID')
+              const facts = message.facts
+              const encryptedEnvelopes = privateAllowed() ? facts.encryptedEnvelopes : []
+              await session.mergeFacts({ publicOps: facts.publicOps, encryptedEnvelopes, casNodes: [], retentions: [], checkpoints: facts.checkpoints }, { source: connectionId })
+              queueReceipts({ publicOps: facts.publicOps, encryptedEnvelopes, checkpoints: [] })
+              if (message.requestId !== '') {
+                const roundId = wantRequests.get(message.requestId)
+                wantRequests.delete(message.requestId)
+                const round = roundId === undefined ? undefined : rounds.get(roundId)
+                if (round !== undefined) { round.wants.clear(); await maybeFinishRound(roundId!) }
+              }
+              if (session.missingCasDependencies().length > 0) void pullMissingCas().catch(() => undefined)
+              break
+            }
+            case 'cas-want': {
+              check(Array.isArray(message.hashes) && message.hashes.length <= 1024, 'PEER_REQUEST_INVALID')
+              const nodes = await session.exportCasNodes(message.hashes.filter((h: unknown): h is string => typeof h === 'string' && /^[0-9a-f]{64}$/u.test(h)), privateAllowed())
+              void post({ kind: 'cas', requestId: message.requestId, nodes })
+              break
+            }
+            case 'cas': {
+              const nodes = message.nodes.filter(node => node.partition === 'public' || privateAllowed())
+              if (nodes.length > 0) await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: nodes, retentions: [], checkpoints: [] }, { source: connectionId })
+              const waiter = casRequests.get(message.requestId)
+              casRequests.delete(message.requestId); waiter?.resolve()
+              break
+            }
+            case 'receipt': {
+              await session.mergeFacts({ publicOps: [], encryptedEnvelopes: [], casNodes: [], retentions: [message.evidence], checkpoints: [] }, { source: connectionId })
+              break
+            }
+            case 'content': {
+              const content = message.message
+              if (memberVerified) await contentLink.handle(content)
+              else contentTail = contentTail.then(() => memberReady).then(() => contentLink!.handle(content)).catch(() => undefined)
+              break
+            }
+            case 'rtc':
+              if (memberVerified && inBandRtc !== undefined && session.isReader(peerId)) {
+                void inBandRtc.receive(message.message).catch(() => undefined)
+              }
+              break
+            case 'ack': {
+              const round = rounds.get(message.requestId)
+              if (round !== undefined) round.resolve()
+              break
+            }
+            default: throw new Error('PEER_MESSAGE_INVALID')
           }
         }
       } catch (error) { lifetime.abort(error) }
-      finally { await close() }
+      finally {
+        for (const round of rounds.values()) round.reject(signal.reason ?? new Error('PEER_CLOSED'))
+        for (const waiter of casRequests.values()) waiter.reject(signal.reason ?? new Error('PEER_CLOSED'))
+        if (receiptTimer !== undefined) clearTimeout(receiptTimer)
+        await close()
+      }
     })()
 
-    await publish()
+    if (initiator) void runInitialSync().catch(error => { lifetime.abort(error) })
     const completion = signal.aborted ? Promise.resolve() : new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
     const link: ApplicationPeerLink = {
       peerIdentity: peerId,
@@ -378,14 +565,11 @@ export async function connectApplicationPeer(session: ApplicationSession, option
       completion,
       get stats() { return { ...wire.stats, ...liveDiagnostics() } },
       close,
-      synchronize() {
-        check(!signal.aborted && pending.size < 4, 'PEER_REQUEST_LIMIT')
-        const requestId = crypto.randomUUID()
-        return new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('PEER_SYNC_TIMEOUT')); void close() }, 30_000)
-          pending.set(requestId, { resolve, reject, timer })
-          void sendFacts(requestId).catch(error => { clearTimeout(timer); pending.delete(requestId); reject(error); void close() })
-        })
+      async synchronize() {
+        check(!signal.aborted, 'PEER_REQUEST_LIMIT')
+        await interruptibleWait(initialSync, signal)
+        await runRound('public')
+        await runRound('private')
       },
     }
     createdLink = link

@@ -351,12 +351,12 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
 
     // Capture checkpoint at op2Fail and copy CAS chunks to cas2
     const cpRev = full.revision('local')
+    const cpSeenOpsRoot = full.seenOpsRoot // committed lazily; included in gcRoots() once computed
     for (const h of full.gcRoots()) {
       const raw = await cas1.getRaw(h, 'any')
       if (raw !== null) await cas2.putRaw(h, raw, 'public')
     }
     const cpTopics = full.topics
-    const cpSeenOpsRoot = [...full.gcRoots()][0]! // first root in gcRoots() is current seenOpsRoot
 
     // Now advance full replica through op3Reuse + op4Ok
     const fullFinal = await full.materialize([op1, op2Fail, op3Reuse, op4Ok])

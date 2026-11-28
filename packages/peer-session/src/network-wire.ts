@@ -1,6 +1,6 @@
-import { assertCanonicalCbor, encodeCanonicalCbor } from '@chronolog/protocol'
-import { decodeRecord, encodeRecord } from '@chronolog/authority'
 import type { FramedPeerConnection } from '@chronolog/records'
+import { perfCount } from '@chronolog/canonical'
+import { decodeWireValue, encodeWireValue } from './wire-codec.js'
 export type { FramedPeerConnection, PeerLiveLane } from '@chronolog/records'
 export const APPLICATION_NETWORK_LIMITS = Object.freeze({
   messageBytes: 32 * 1024 * 1024, fragmentBytes: 48 * 1024, queuedMessages: 8,
@@ -32,6 +32,24 @@ export function timeout(milliseconds: number, message: string): { signal: AbortS
 }
 
 /** One bounded assembly and one serialized writer; no JSON-sized RTC frame. */
+const FRAGMENT_VERSION = 2
+const FRAGMENT_HEADER = 13
+
+/** Fragment frame: [version u8][message id u32][offset u32][total u32][fragment bytes]. */
+function encodeFragment(id: number, offset: number, total: number, fragment: Uint8Array): Uint8Array {
+  const frame = new Uint8Array(FRAGMENT_HEADER + fragment.length), view = new DataView(frame.buffer)
+  frame[0] = FRAGMENT_VERSION
+  view.setUint32(1, id); view.setUint32(5, offset); view.setUint32(9, total)
+  frame.set(fragment, FRAGMENT_HEADER)
+  return frame
+}
+
+function decodeFragment(frame: Uint8Array): { id: number; position: number; total: number; chunk: Uint8Array } {
+  requireNetwork(frame.length > FRAGMENT_HEADER && frame[0] === FRAGMENT_VERSION, 'APPLICATION_NETWORK_FRAME_INVALID')
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength)
+  return { id: view.getUint32(1), position: view.getUint32(5), total: view.getUint32(9), chunk: frame.subarray(FRAGMENT_HEADER) }
+}
+
 export class ApplicationMessageWire {
   readonly #connection: FramedPeerConnection
   readonly #signal: AbortSignal
@@ -53,7 +71,9 @@ export class ApplicationMessageWire {
   send(value: unknown, authorize?: () => void): Promise<void> {
     this.#signal.throwIfAborted()
     requireNetwork(this.#pending < APPLICATION_NETWORK_LIMITS.queuedMessages, 'APPLICATION_NETWORK_BACKPRESSURE')
-    const bytes = encodeRecord(value)
+    const bytes = encodeWireValue(value)
+    const kind = typeof (value as { kind?: unknown } | null)?.kind === 'string' ? (value as { kind: string }).kind : 'unknown'
+    perfCount(`wire.send.${kind}`); perfCount(`wire.send.${kind}.bytes`, bytes.length)
     requireNetwork(bytes.length > 0 && bytes.length <= APPLICATION_NETWORK_LIMITS.messageBytes &&
       this.#pendingBytes + bytes.length <= APPLICATION_NETWORK_LIMITS.queuedBytes, 'APPLICATION_NETWORK_BACKPRESSURE')
     this.#pending++; this.#pendingBytes += bytes.length
@@ -61,12 +81,12 @@ export class ApplicationMessageWire {
     const signal = AbortSignal.any([this.#signal, queued.signal])
     const task = this.#tail.then(async () => {
       signal.throwIfAborted(); authorize?.()
-      requireNetwork(this.#outgoing < Number.MAX_SAFE_INTEGER, 'APPLICATION_NETWORK_SEQUENCE_EXHAUSTED')
+      requireNetwork(this.#outgoing < 0xffff_ffff, 'APPLICATION_NETWORK_SEQUENCE_EXHAUSTED')
       const id = ++this.#outgoing
       for (let offset = 0; offset < bytes.length; offset += APPLICATION_NETWORK_LIMITS.fragmentBytes) {
         signal.throwIfAborted(); this.#authorize(); authorize?.()
         const fragment = bytes.subarray(offset, offset + APPLICATION_NETWORK_LIMITS.fragmentBytes)
-        const frame = encodeCanonicalCbor([1n, BigInt(id), BigInt(offset), BigInt(bytes.length), fragment])
+        const frame = encodeFragment(id, offset, bytes.length, fragment)
         await interruptible(this.#connection.send(frame, { signal }), signal)
         this.#sentBytes += frame.length
       }
@@ -90,10 +110,7 @@ export class ApplicationMessageWire {
         requireNetwork(bytes instanceof Uint8Array && bytes.length > 0 && bytes.length <= APPLICATION_NETWORK_LIMITS.fragmentBytes + 128,
           'APPLICATION_NETWORK_FRAME_LIMIT')
         this.#receivedBytes += bytes.length
-        const frame = assertCanonicalCbor(bytes)
-        requireNetwork(Array.isArray(frame) && frame.length === 5 && frame[0] === 1n && typeof frame[1] === 'bigint' &&
-          typeof frame[2] === 'bigint' && typeof frame[3] === 'bigint' && frame[4] instanceof Uint8Array, 'APPLICATION_NETWORK_FRAME_INVALID')
-        const [id, position, total] = [Number(frame[1]), Number(frame[2]), Number(frame[3])], chunk = frame[4]
+        const { id, position, total, chunk } = decodeFragment(bytes)
         requireNetwork(Number.isSafeInteger(id) && id === this.#incoming + 1 && Number.isSafeInteger(position) && position === offset &&
           Number.isSafeInteger(total) && total > 0 && total <= APPLICATION_NETWORK_LIMITS.messageBytes &&
           chunk.length > 0 && chunk.length <= APPLICATION_NETWORK_LIMITS.fragmentBytes && offset + chunk.length <= total,
@@ -104,7 +121,10 @@ export class ApplicationMessageWire {
         if (offset === total) {
           const complete = body; body = null; offset = 0; this.#incoming++
           assembly?.cancel(); assembly = undefined
-          yield decodeRecord<unknown>(complete)
+          let message: unknown
+          try { message = decodeWireValue(complete) } catch { throw networkError('APPLICATION_NETWORK_MESSAGE_INVALID') }
+          perfCount('wire.recv'); perfCount('wire.recv.bytes', complete.length)
+          yield message
         }
       }
     } finally {
