@@ -168,45 +168,53 @@ export async function extractControlPermissions(
     }
   } catch { /* custom reducer without summary query */ }
 
-  const queryList = async (role: string): Promise<string[] | null> => {
+  const queryList = async (role: string): Promise<readonly unknown[] | null> => {
     try {
-      const q = await kernel.query('$permissions', { list: role })
-      if (Array.isArray(q)) return stringList(q)
+      const q: unknown = await kernel.query('$permissions', { list: role })
+      if (Array.isArray(q)) return q as readonly unknown[]
     } catch { /* ignore */ }
     return null
   }
 
-  const rawMembers = Array.isArray(rawObj.members)
-    ? rawObj.members.filter((m): m is Record<string, JsonValue> => m !== null && typeof m === 'object' && !Array.isArray(m))
-    : []
+  const rawMembers = Array.isArray(summary?.members)
+    ? summary.members.filter((m): m is Record<string, JsonValue> => m !== null && typeof m === 'object' && !Array.isArray(m))
+    : Array.isArray(rawObj.members)
+      ? rawObj.members.filter((m): m is Record<string, JsonValue> => m !== null && typeof m === 'object' && !Array.isArray(m))
+      : []
 
-  const readers = summary !== null && Array.isArray(summary.readers)
-    ? stringList(summary.readers)
-    : (await queryList('readers')) ?? stringList(rawMembers.filter(m => m.reader === true).map(m => m.publicKey))
-  const writers = summary !== null && Array.isArray(summary.writers)
-    ? stringList(summary.writers)
-    : (await queryList('writers')) ?? stringList(rawMembers.filter(m => m.writer === true || m.administrator === true).map(m => m.publicKey))
+  const hasWildcard = (v: unknown): boolean => Array.isArray(v) && v.includes('*')
+  const rawReadersList = summary !== null && Array.isArray(summary.readers) ? summary.readers : await queryList('readers')
+  const rawWritersList = summary !== null && Array.isArray(summary.writers) ? summary.writers : await queryList('writers')
+
+  const readers = rawReadersList !== null
+    ? stringList(rawReadersList)
+    : stringList(rawMembers.filter(m => m.reader === true).map(m => m.publicKey))
+  const writers = rawWritersList !== null
+    ? stringList(rawWritersList)
+    : stringList(rawMembers.filter(m => m.writer === true || m.administrator === true).map(m => m.publicKey))
   const administrators = summary !== null && Array.isArray(summary.administrators)
     ? stringList(summary.administrators)
-    : (await queryList('administrators')) ?? stringList(rawMembers.filter(m => m.administrator === true).map(m => m.publicKey))
+    : stringList(await queryList('administrators') ?? rawMembers.filter(m => m.administrator === true).map(m => m.publicKey))
   const publishers = summary !== null && Array.isArray(summary.publishers)
     ? stringList(summary.publishers)
-    : (await queryList('publishers')) ?? stringList(rawMembers.filter(m => m.publisher === true || m.administrator === true).map(m => m.publicKey))
+    : stringList(await queryList('publishers') ?? rawMembers.filter(m => m.publisher === true || m.administrator === true).map(m => m.publicKey))
   const finalizers = summary !== null && Array.isArray(summary.finalizers)
     ? stringList(summary.finalizers)
-    : (await queryList('finalizers')) ?? stringList(rawMembers.filter(m => m.finalizer === true).map(m => m.publicKey))
+    : stringList(await queryList('finalizers') ?? rawMembers.filter(m => m.finalizer === true).map(m => m.publicKey))
 
-  const admission = rawObj.admission ?? null
+  const admission = (summary !== null && summary.admission !== undefined ? summary.admission as JsonValue : rawObj.admission) ?? null
   const admissionObj = admission !== null && typeof admission === 'object' && !Array.isArray(admission)
     ? admission as Record<string, JsonValue>
     : null
   const removedMembers = stringList(admissionObj?.removed)
   const blockedAuthors = stringList(summary?.blockedAuthors ?? rawObj.blockedAuthors)
-  const openRead = summary?.openRead === true || rawObj.openRead === true
-  const openWrite = summary?.openWrite === true || rawObj.openWrite === true
+  const openRead = summary?.openReaders === true || summary?.openRead === true || hasWildcard(rawReadersList) || rawObj.openRead === true
+  const openWrite = summary?.openWriters === true || summary?.openWrite === true || hasWildcard(rawWritersList) || rawObj.openWrite === true
 
   let mode: ControlPermissionsSummary['mode'] = 'custom'
-  if (openRead || openWrite || rawObj.openRead !== undefined) mode = 'open'
+  if (summary?.mode === 'open' || summary?.mode === 'multisig' || summary?.mode === 'attested') {
+    mode = summary.mode
+  } else if (openRead || openWrite || rawObj.openRead !== undefined) mode = 'open'
   else if (typeof rawObj.threshold === 'number' || Array.isArray(rawObj.proposals)) mode = 'multisig'
   else if (Array.isArray(rawObj.members)) mode = 'attested'
 
@@ -244,6 +252,7 @@ export interface BlindHostControlResult {
   readonly outcomes: readonly KernelOperationOutcome[]
   readonly pendingDependencies: readonly string[]
   readonly permissions: ControlPermissionsSummary
+  readonly initialPermissions: ControlPermissionsSummary
   readonly finality: VerifiedFinalityV2
   readonly finalizedTopics: Readonly<Record<string, JsonValue>> | null
   readonly referencedCasHashes: ReadonlySet<string>
@@ -273,6 +282,7 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
     ...(options.wasmModule === undefined ? {} : { sandboxOptions: { wasmModule: options.wasmModule } }),
   })
   try {
+    const initialPermissions = await extractControlPermissions(kernel, options.genesis.initialTopics.$permissions)
     const result = await kernel.materialize(options.publicOps)
     const snap = kernel.snapshot()
     const permissions = await extractControlPermissions(kernel, snap.topics.$permissions)
@@ -322,6 +332,7 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
       outcomes: result.outcomes,
       pendingDependencies: result.pendingDependencies,
       permissions,
+      initialPermissions,
       finality,
       finalizedTopics,
       referencedCasHashes,
