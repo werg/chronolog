@@ -81,10 +81,10 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
             counter: { module: '@app/counter' },
           },
         },
-        $admission: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }] },
+        $admission: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true }] },
         counter: 0,
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(1),
     }
     const frozenKernel = new TopicKernel({ genesis: frozenGenesis, cas })
@@ -111,8 +111,8 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         },
         $admission: {
           members: [
-            { publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true },
-            { publicKey: bobHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
+            { publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true },
+            { publicKey: bobHex, reader: true, writer: true, administrator: false, publisher: false },
           ],
         },
       },
@@ -161,7 +161,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         },
         leaky: 0,
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(3),
     }
     const kernel = new TopicKernel({ genesis, cas })
@@ -207,7 +207,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         },
         sneaky: null,
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(4),
     }
     const kernel = new TopicKernel({ genesis, cas })
@@ -257,12 +257,12 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
             priv: { module: '@app/priv' },
           },
         },
-        $admission: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }] },
+        $admission: { members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true }] },
         $keys: { currentEpoch: -1, epochs: {} },
         $publications: { revision: 0, current: null, history: [] },
         priv: 0,
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(5),
     }
 
@@ -273,7 +273,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
     const encOp = makeOp(full.logId, admin.publicKeyBytes, 'shared-id', 10n, 'encrypted', [{ topic: 'priv', input: null }], 1)
     // 2. Later public op reuses operationId="shared-id" (cross-partition collision must NOT suppress public op!)
     const pubGrant = makeOp(full.logId, admin.publicKeyBytes, 'shared-id', 20n, 'public', [
-      { topic: '$admission', input: { action: 'setMember', member: { publicKey: userHex, reader: true, writer: true, administrator: false, publisher: true, finalizer: false } } },
+      { topic: '$admission', input: { action: 'setMember', member: { publicKey: userHex, reader: true, writer: true, administrator: false, publisher: true } } },
     ], 2)
     // 3. Adversarial encrypted op trying to mutate $admission (must reject on full replica!)
     const badEncControl = makeOp(full.logId, admin.publicKeyBytes, 'bad-enc', 30n, 'encrypted', [
@@ -329,7 +329,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         a: 0,
         b: 0,
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(6),
     }
 
@@ -401,24 +401,23 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
           topics: { $admission: { module: 'chronolog/admission', export: 'attestedAdmission' } },
         },
         $admission: {
-          members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true }],
+          members: [{ publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true }],
           admission: { hostKey: hostHex },
         },
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(7),
     }
 
-    const attPayload = { publicKey: newcomerHex, accountId: 'acct-1' }
-    const msg = utf8(canonicalEventPayload(['chronolog/host-attestation/v1', attPayload]))
-    const sigBytes = new Uint8Array(await crypto.subtle.sign('Ed25519', host.privateKey, Uint8Array.from(msg).buffer))
-
     const kernel = new TopicKernel({ genesis, cas })
+    const attPayload = { logId: bytesToHex(kernel.logId), publicKey: newcomerHex, accountId: 'acct-1', expiresAtMs: 1_000_000 }
+    const msg = utf8(canonicalEventPayload(['chronolog/host-attestation/v2', attPayload]))
+    const sigBytes = new Uint8Array(await crypto.subtle.sign('Ed25519', host.privateKey, Uint8Array.from(msg).buffer))
     const opGood = makeOp(kernel.logId, admin.publicKeyBytes, 'admit-1', 10n, 'public', [{
       topic: '$admission',
       input: {
         action: 'setMember',
-        member: { publicKey: newcomerHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
+        member: { publicKey: newcomerHex, reader: true, writer: true, administrator: false, publisher: false },
         attestation: { payload: attPayload, signature: bytesToHex(sigBytes) },
       },
     }])
@@ -484,7 +483,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         },
         secret: 'TOP_SECRET',
       },
-      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(11),
     }
 
@@ -500,7 +499,7 @@ describe('Chronolog v2 TopicKernel (Phase 1 Gate 1)', () => {
         action: 'propose',
         id: 'admit-guest',
         kind: 'setMember',
-        member: { publicKey: guestHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
+        member: { publicKey: guestHex, reader: true, writer: true, administrator: false, publisher: false },
       },
     }])
     // 3. Second signer approves -> executes atomically!

@@ -1,7 +1,7 @@
 import { MessageChannel } from 'node:worker_threads'
 import { afterEach, expect, it } from 'vitest'
 import { createApplicationOwner } from './session-owner.js'
-import { connectApplicationOwner } from './worker-application.js'
+import { connectApplicationOwner, WorkerApplicationOperation } from './worker-application.js'
 import { sessionFixture } from './test-fixture.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
 import type { ApplicationAttachmentPolicy, ApplicationOwnerOptions } from './owner-types.js'
@@ -145,7 +145,7 @@ it('live signals cross bounded facade subscriptions with authenticated endpoint 
   expect((await f.client.readEvents()).events).toHaveLength(0)
 })
 
-it('diagnostic-only attachments cannot exercise owner finalizer or extension authority', async () => {
+it('diagnostic-only attachments cannot exercise owner admission or extension authority', async () => {
   const f = await fixture({ capabilities: ['diagnostics'] })
   expect(f.client.status.canAuthor).toBe(false)
   expect(await f.client.diagnostics()).toEqual([])
@@ -180,18 +180,18 @@ it('owner extensions are capability-scoped named actions with owner notices, ind
     closes.push(() => client.detach())
     return client
   }
-  const finalizer = await attach(['admission']), extended = await attach(['extensions'])
-  const operation = await session.command('say', 'eligible finalizer', { authorTimestampMs: 1n })
+  const admitter = await attach(['admission']), extended = await attach(['extensions'])
+  const operation = await session.command('say', 'eligible checkpoint', { authorTimestampMs: 1n })
   await operation.materialized()
-  const cp = await finalizer.admission.createCheckpoint({ throughMs: 2n })
+  const cp = await admitter.admission.createCheckpoint({ throughMs: 2n })
   expect((cp.evidence.payload as { readonly closedThroughMs: bigint }).closedThroughMs).toBe(2n)
   expect(operation.inspect().finalized).toBe(true)
-  await expect(finalizer.extensions.call('admission.state')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
+  await expect(admitter.extensions.call('admission.state')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   await expect(extended.admission.createCheckpoint({ throughMs: 3n })).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
   const notices: unknown[] = []
   const heard = new Promise<void>(resolve => { extended.extensions.subscribe(value => { notices.push(value); resolve() }) })
   const muted: unknown[] = []
-  finalizer.extensions.subscribe(value => muted.push(value))
+  admitter.extensions.subscribe(value => muted.push(value))
   expect(await extended.extensions.call('admission.state', [1])).toEqual({ ok: 'admission.state' })
   await heard
   expect(notices).toEqual([{ name: 'admission.state' }])
@@ -225,4 +225,35 @@ it('replication capability exchanges authenticated operation-set facts with an o
   await expect.poll(() => read(replica)).toEqual(['from replica', 'from owner'])
   await client.mergeFacts(await replica.exportFacts())
   expect((await client.exportFacts()).encryptedEnvelopes).toHaveLength(2)
+})
+
+it('forwards every declared owner method and rebuilds operation handles', async () => {
+  const { OWNER_FORWARDED_METHODS } = await import('./owner-methods.js')
+  const f = await fixture()
+  for (const method of Object.keys(OWNER_FORWARDED_METHODS)) {
+    const [head, tail] = method.split('.') as [string, string | undefined]
+    const target = (tail === undefined ? f.session : (f.session as unknown as Record<string, unknown>)[head]) as Record<string, unknown>
+    expect(typeof target[tail ?? head], method).toBe('function')
+    const remote = (tail === undefined ? f.client : (f.client as unknown as Record<string, unknown>)[head]) as Record<string, unknown>
+    expect(typeof remote[tail ?? head], method).toBe('function')
+  }
+  expect((await f.client.permissions()).members.length).toBeGreaterThan(0)
+  expect(await f.client.keysNeedsRotation()).toMatchObject({ needsRotation: false })
+  const rotated = await f.client.rotateEpoch()
+  expect(typeof rotated.epoch).toBe('number')
+  expect(rotated.operation).toBeInstanceOf(WorkerApplicationOperation)
+  expect((await rotated.operation.inspect()).operationId).toBe(rotated.operation.operationId)
+  const sealed = await f.client.seal({})
+  expect(sealed).toBeInstanceOf(WorkerApplicationOperation)
+  expect(await f.client.vaults.hasKey('missing')).toBe(false)
+  expect(Array.isArray((await f.client.admission.status()).schedule)).toBe(true)
+})
+
+it('named-command attachments cannot author raw operations through forwarded methods', async () => {
+  const f = await fixture({ commands: ['say'] })
+  await expect(f.client.rotateEpoch()).rejects.toThrow('ENDPOINT_RAW_SUBMIT_FORBIDDEN')
+  await expect(f.client.updateReducers({ topics: {} })).rejects.toThrow('ENDPOINT_RAW_SUBMIT_FORBIDDEN')
+  await expect(f.client.admitMember({ publicKey: 'x'.repeat(64) })).rejects.toThrow('ENDPOINT_RAW_SUBMIT_FORBIDDEN')
+  const queriesOnly = await fixture({ capabilities: ['queries'] })
+  await expect(queriesOnly.client.vaults.create('v')).rejects.toThrow('ENDPOINT_CAPABILITY_FORBIDDEN')
 })

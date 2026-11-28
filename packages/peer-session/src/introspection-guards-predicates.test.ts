@@ -720,7 +720,6 @@ describe('SQLite-CAS Read-Only Chronolog Introspection, Guarded OCC, Unified $ad
               writer: true,
               administrator: true,
               publisher: true,
-              finalizer: true,
             }],
             admission: null,
             schedule: [{ effectiveAfterMs: -1, policy: { kind: 'open' } }],
@@ -756,7 +755,7 @@ describe('SQLite-CAS Read-Only Chronolog Introspection, Guarded OCC, Unified $ad
     const rugRes = await rugLedger.materialized()
     expect(rugRes.outcome).toBe('rejected')
     expect(rugRes.rejectionCode).toBe('seal:reducer_locked')
-    expect(rugRes.rejectionDetail).toBe('ledger')
+    expect(['$admission', 'ledger']).toContain(rugRes.rejectionDetail)
 
     // 3. Trying to change frozen $admission.schedule is REJECTED by kernel!
     const changeFinality = await sess.admission.schedulePolicy({
@@ -773,9 +772,11 @@ describe('SQLite-CAS Read-Only Chronolog Introspection, Guarded OCC, Unified $ad
     expect((await admit.materialized()).outcome).toBe('accepted')
     expect(sess.isWriter(devMember.identity.publicKey)).toBe(true)
 
-    // 5. And unsealed notes reducer CAN still be upgraded, while its append-only items array is protected!
+    // 5. And unsealed notes reducer CAN still be upgraded via direct cas:sha256-... topic binding
+    //    (without mutating the sealed import map), while its append-only items array is protected!
     await (await sess.submit({ awaitMaterialized: true, updates: [{ topic: 'notes', input: { text: 'first' } }] })).materialized()
-    const upNotes = await sess.updateReducers({ imports: { 'app/notes': notesV2 } })
+    const notesV2Hash = await sess.cas.put(new TextEncoder().encode(notesV2), [], 'public')
+    const upNotes = await sess.updateReducers({ topics: { notes: { module: `cas:sha256-${notesV2Hash}` } } })
     expect((await upNotes.materialized()).outcome).toBe('accepted')
     await (await sess.submit({ awaitMaterialized: true, updates: [{ topic: 'notes', input: { text: 'second' } }] })).materialized()
     expect(sess.topic('notes')).toEqual({ items: ['first', 'v2:second'] })

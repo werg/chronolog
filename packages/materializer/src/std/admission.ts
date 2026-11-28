@@ -1,17 +1,29 @@
 /**
- * Unified `chronolog/admission` standard module:
- * Replaces separate `$permissions`, `$finality`, `$signal_policy`, and hardcoded finality kinds
- * with ONE state-defined `$admission` topic combining:
- * - `reduce(state, tx, ctx)`: membership/roles/invites/guardians/multisig/open-mode,
+ * Unified `chronolog/admission` standard module: ONE state-defined `$admission` topic combining
+ * - `reduce(state, tx, ctx)`: membership/roles/scopes/invites/guardians/multisig/open-mode,
  *   time-scoped history admission rules (`open`, `signed-frontier`, `threshold-quorum`,
- *   `member-quorum`, `optimistic-challenge`, `merkle-anchor`, `pinned-checkpoint`, custom `module`),
+ *   `member-quorum`, `optimistic-challenge`, `merkle-anchor`, `pinned-checkpoint`),
  *   signal/relay rules, and per-topic access declarations.
  * - `authorize(state, tx, ctx)`: kernel-enforced fail-closed global authorization gate
  *   (local topic reducers can only monotonically tighten, never weaken).
  * - `admit(state, { logId, ops, evidence, pinnedFrontier }, ctx)`: pure read-only history
  *   admission over candidate operations and external evidence (checkpoints, quorum seals,
  *   fraud proofs, Merkle/L1 anchors, surgical descent checkpoints).
- * - `query(state, input, ctx)`: universal `{ kind: 'can' | 'roster' | 'signals' | 'schedule' }` API.
+ * - `query(state, input, ctx)`: universal `{ kind: 'can' | 'roster' | 'signals' | 'schedule' | 'guardians' }` API.
+ *
+ * All three presets (`attestedAdmission`, `openAdmission`, `multisigAdmission`) are built by
+ * `defineAdmission(model)` from one shared core (rotateWrapKey, common admin control actions,
+ * authorize, admit, roster/query). `createAdmission({ base, ... })` overlays custom hooks on any preset.
+ *
+ * Security rules enforced here:
+ * - Host attestations (`setMember` + `attestation`) are `chronolog/host-attestation/v2` signatures over
+ *   a payload whose `logId` must equal `ctx.logId` and whose `expiresAtMs` must exceed the admitting
+ *   operation's `authorTimestampMs`; attested `wrapKey` / `pqWrapKey` must match the member record.
+ * - Every admitted member records `admittedBy` (the admitting operation's author), which
+ *   `chronolog/keys` uses to restrict who may write the member's write-once lockboxes.
+ * - With `$keys.policy.rotateOnRemove` (default), removing a reader (or revoking its `reader` flag)
+ *   is rejected unless an earlier update of the same operation already rotated every `$keys` ring
+ *   whose latest epoch the member holds (`rotation_required`).
  */
 export const STD_ADMISSION_SOURCE = `
 import { verifyEd25519, canonicalJson, sha256 } from 'chronolog:crypto';
@@ -19,9 +31,14 @@ import { verifyEd25519, canonicalJson, sha256 } from 'chronolog:crypto';
 const HEX32 = /^[0-9a-f]{64}$/;
 const HEX64 = /^[0-9a-f]{128}$/;
 const HEX_XWING = /^[0-9a-f]{2432}$/;
+const HOST_ATTESTATION_DOMAIN = 'chronolog/host-attestation/v2';
 
 function sortedKeys(list) {
   return Array.from(new Set(list)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function byPublicKey(a, b) {
+  return a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0;
 }
 
 function normalizeMember(m) {
@@ -44,11 +61,11 @@ function normalizeMember(m) {
     ...(typeof m.subject === 'string' && m.subject.length > 0 ? { subject: m.subject } : {}),
     ...(scopes && scopes.length > 0 ? { scopes } : {}),
     ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+    ...(typeof m.admittedBy === 'string' && HEX32.test(m.admittedBy) ? { admittedBy: m.admittedBy } : {}),
     reader: Boolean(m.reader),
     writer: Boolean(m.writer),
     administrator: Boolean(m.administrator),
     publisher: Boolean(m.publisher),
-    finalizer: Boolean(m.finalizer),
   };
 }
 
@@ -64,7 +81,6 @@ function queryMembersList(members, role) {
   if (role === 'writers') return sortedKeys(members.filter(m => m.writer === true || m.administrator === true).map(m => m.publicKey));
   if (role === 'administrators') return sortedKeys(members.filter(m => m.administrator === true).map(m => m.publicKey));
   if (role === 'publishers') return sortedKeys(members.filter(m => m.publisher === true || m.administrator === true).map(m => m.publicKey));
-  if (role === 'finalizers') return sortedKeys(members.filter(m => m.finalizer === true).map(m => m.publicKey));
   return [];
 }
 
@@ -83,7 +99,6 @@ function checkMembersCapability(members, capability, actor, options) {
   if (capability === 'writer') return m.writer === true || m.administrator === true;
   if (capability === 'administrator') return m.administrator === true;
   if (capability === 'publisher') return m.publisher === true || m.administrator === true;
-  if (capability === 'finalizer') return m.finalizer === true;
   if (capability === 'member') return true;
   return false;
 }
@@ -112,8 +127,9 @@ function validHistoryPolicy(policy) {
     return false;
   }
   if (policy.kind === 'member-quorum') {
-    const role = policy.role || 'administrator';
-    return (role === 'administrator' || role === 'finalizer' || role === 'member') &&
+    // Signers: administrators, or (with a scope) members holding that scope (administrators hold every scope).
+    return policy.role === undefined &&
+      (policy.scope === undefined || (typeof policy.scope === 'string' && policy.scope.length > 0 && policy.scope.length <= 128)) &&
       Number.isSafeInteger(policy.threshold) && policy.threshold >= 1;
   }
   if (policy.kind === 'optimistic-challenge') {
@@ -186,11 +202,10 @@ function verifyEvidenceForRule(rule, ev, members) {
   }
 
   if (rule.kind === 'member-quorum') {
-    const role = rule.role || 'administrator';
     const eligible = new Set(
-      role === 'member'
-        ? members.map(m => m.publicKey)
-        : queryMembersList(members, role === 'administrator' ? 'administrators' : 'finalizers'),
+      typeof rule.scope === 'string'
+        ? members.filter(m => checkMembersCapability(members, 'scope', m.publicKey, { scope: rule.scope })).map(m => m.publicKey)
+        : queryMembersList(members, 'administrators'),
     );
     const sigs = Array.isArray(data.signatures) ? data.signatures : [];
     const seen = new Set();
@@ -307,10 +322,10 @@ function evaluateHistoryAdmission(schedule, members, input) {
     if (!scope || !scope.entry.policy || scope.entry.policy.kind === 'open') continue;
     if (item.closedMs < scope.entry.effectiveAfterMs) continue;
 
-    // Enforce monotonic P_{i-1} -> P_i handoff
+    // Enforce monotonic P_{i-1} -> P_i handoff (skip static open & pinned-checkpoint anchors)
     if (scope.index > 0) {
       const prev = entries[scope.index - 1];
-      if (prev && prev.entry.policy && prev.entry.policy.kind !== 'open') {
+      if (prev && prev.entry.policy && prev.entry.policy.kind !== 'open' && prev.entry.policy.kind !== 'pinned-checkpoint') {
         const prevClosed = closedByScopeIndex.get(prev.index);
         if (prevClosed === undefined || prevClosed < scope.entry.effectiveAfterMs) continue;
       }
@@ -373,7 +388,7 @@ function evaluateHistoryAdmission(schedule, members, input) {
       for (let j = i + 1; j < list.length; j++) {
         const b = list[j].ev.payload;
         if (a.closedThroughMs === b.closedThroughMs) {
-          if (a.includedSetDigest !== b.includedSetDigest || a.stateRoot !== b.stateRoot || a.historyDigest !== b.historyDigest) {
+          if (a.includedSetDigest !== b.includedSetDigest || a.stateRoot !== b.stateRoot || a.historyDigest !== b.historyDigest || a.seenOpsRoot !== b.seenOpsRoot) {
             equivocations.push({ signer, scopeId, reason: 'conflicting_checkpoint_at_frontier' });
           }
         } else {
@@ -548,7 +563,7 @@ function attestedMatchesPolicy(cur, attPayload, member) {
   const accountOk = accounts.includes(attPayload.accountId) || (email !== null && accounts.includes('email:' + email));
   if (accountOk) {
     if (attPayload.subject === 'agent') {
-      return member.administrator !== true && member.finalizer !== true;
+      return member.administrator !== true;
     }
     const grant = adm.grant || { reader: true, writer: true, administrator: true };
     return Boolean(member.reader) === Boolean(grant.reader) &&
@@ -571,61 +586,256 @@ function attestedMatchesPolicy(cur, attPayload, member) {
   return false;
 }
 
-export const attestedAdmission = {
-  reduce(state, tx) {
-    const cur = state && typeof state === 'object' ? state : { members: [], admission: null };
-    const membersList = Array.isArray(cur.members) ? cur.members : [];
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-    const atMs = Number(tx.authorTimestampMs || 0);
-    const authorIsAdmin = checkMembersCapability(membersList, 'administrator', tx.author, { atMs });
-    const authorIsReader = checkMembersCapability(membersList, 'reader', tx.author, { atMs });
+/**
+ * Verify a host attestation bound to this log and to the admitting operation's time.
+ * Returns null when valid, otherwise a rejection.
+ */
+function verifyHostAttestation(cur, att, member, tx, ctx) {
+  const hostKey = cur.admission && cur.admission.hostKey;
+  if (!hostKey || !HEX32.test(hostKey) || !att || typeof att !== 'object' || !HEX64.test(att.signature || '')) {
+    return { ok: false, code: 'attestation_invalid' };
+  }
+  const p = att.payload;
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return { ok: false, code: 'attestation_invalid' };
+  if (typeof ctx.logId !== 'string' || !HEX32.test(ctx.logId) || p.logId !== ctx.logId) {
+    return { ok: false, code: 'attestation_log_mismatch' };
+  }
+  if (!Number.isSafeInteger(p.expiresAtMs) || !(p.expiresAtMs > Number(tx.authorTimestampMs))) {
+    return { ok: false, code: 'attestation_expired' };
+  }
+  if (!verifyEd25519(hostKey, canonicalJson([HOST_ATTESTATION_DOMAIN, p]), att.signature)) {
+    return { ok: false, code: 'attestation_signature_invalid' };
+  }
+  if (!member || p.publicKey !== member.publicKey) return { ok: false, code: 'attestation_subject_mismatch' };
+  if (p.wrapKey !== undefined && p.wrapKey !== null && p.wrapKey !== member.wrapKey) {
+    return { ok: false, code: 'attestation_wrap_key_mismatch' };
+  }
+  if (p.pqWrapKey !== undefined && p.pqWrapKey !== null && p.pqWrapKey !== member.pqWrapKey) {
+    return { ok: false, code: 'attestation_wrap_key_mismatch' };
+  }
+  return null;
+}
 
-    if (input.action === 'rotateWrapKey') {
-      const existing = membersList.find(m => m.publicKey === tx.author);
-      if (!existing) return { ok: false, code: 'member_required' };
-      if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
-      if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
-      if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
-      const updated = normalizeMember({
-        ...existing,
-        ...(input.wrapKey !== undefined ? { wrapKey: input.wrapKey } : {}),
-        ...(input.pqWrapKey !== undefined ? { pqWrapKey: input.pqWrapKey } : {}),
-      });
-      const members = membersList.filter(m => m.publicKey !== tx.author).concat([updated]);
-      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-      return { ok: true, state: { ...cur, members }, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
+function epochHolds(entry, pk) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.boxes && typeof entry.boxes === 'object' && Object.prototype.hasOwnProperty.call(entry.boxes, pk)) return true;
+  return Array.isArray(entry.activeMembers) && entry.activeMembers.includes(pk);
+}
+
+/**
+ * $keys.policy.rotateOnRemove: a reader may only lose read access in an operation whose earlier
+ * updates already rotated every key ring (default + compartments) whose latest epoch it holds.
+ */
+function rotationRequired(ctx, pk) {
+  const keys = ctx.topic('$keys');
+  if (!keys || typeof keys !== 'object') return null;
+  if (keys.policy && keys.policy.rotateOnRemove === false) return null;
+  const latestOf = ring => (ring && Number.isSafeInteger(ring.currentEpoch) && ring.currentEpoch >= 0 && ring.epochs
+    ? ring.epochs[String(ring.currentEpoch)]
+    : null);
+  if (epochHolds(latestOf(keys), pk)) return { ok: false, code: 'rotation_required', detail: 'default' };
+  for (const [ringName, ring] of Object.entries(keys.rings || {})) {
+    if (epochHolds(latestOf(ring), pk)) return { ok: false, code: 'rotation_required', detail: ringName };
+  }
+  return null;
+}
+
+/** Reject losing read access (removal or reader -> non-reader) without the required rotation. */
+function checkReaderLoss(ctx, before, after, pk) {
+  if (!before || before.reader !== true) return null;
+  if (after && after.reader === true) return null;
+  return rotationRequired(ctx, pk);
+}
+
+function validWrapKeyInput(input) {
+  if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
+  if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
+  if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
+  return null;
+}
+
+function emptyRoster(mode) {
+  return {
+    mode,
+    members: [],
+    readers: [],
+    writers: [],
+    administrators: [],
+    publishers: [],
+    openReaders: false,
+    openWriters: false,
+    blockedAuthors: [],
+    removedMembers: [],
+    admission: null,
+    guardians: null,
+    recoveryRequests: {},
+    multisig: null,
+  };
+}
+
+/**
+ * Build a complete $admission module from a preset model:
+ * - normalize(state) -> cur
+ * - members(cur) -> normalized member records (sorted by publicKey)
+ * - can?(cur, members, capability, actor, opts) -> boolean (default: guardians + member capabilities)
+ * - setWrapKeys(cur, author, keys, atMs) -> next state | null (author may not rotate)
+ * - reduce?(env) -> result | null: preset actions with their own authorization (before the control gate)
+ * - controls(env) -> boolean: may the author run common admin control actions / control()
+ * - control?(env) -> result | null: preset admin-only actions (after the control gate)
+ * - roster?(cur, members) -> roster field overrides
+ */
+export function defineAdmission(model) {
+  const canOf = (cur, members, capability, actor, opts) => {
+    if (typeof model.can === 'function') return model.can(cur, members, capability, actor, opts || {}) === true;
+    if (capability === 'guardian') {
+      return Boolean(cur.guardians && Array.isArray(cur.guardians.members) && cur.guardians.members.some(g => g.publicKey === actor));
     }
+    return checkMembersCapability(members, capability, actor, opts || {});
+  };
+  const rosterOf = (cur, members) => {
+    const base = emptyRoster(model.mode);
+    return {
+      ...base,
+      members,
+      readers: queryMembersList(members, 'readers'),
+      writers: queryMembersList(members, 'writers'),
+      administrators: queryMembersList(members, 'administrators'),
+      publishers: queryMembersList(members, 'publishers'),
+      ...(typeof model.roster === 'function' ? model.roster(cur, members) : {}),
+    };
+  };
+
+  return {
+    reduce(state, tx, ctx) {
+      const cur = model.normalize(state);
+      const input = tx.payload;
+      if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
+      const atMs = Number(tx.authorTimestampMs || 0);
+      const members = model.members(cur);
+      const env = {
+        cur,
+        input,
+        tx,
+        ctx,
+        members,
+        atMs,
+        can: (capability, actor, opts) => canOf(cur, members, capability, actor, { atMs, ...(opts || {}) }),
+      };
+
+      if (input.action === 'rotateWrapKey') {
+        const invalid = validWrapKeyInput(input);
+        if (invalid) return invalid;
+        const keys = {
+          ...(input.wrapKey !== undefined ? { wrapKey: input.wrapKey } : {}),
+          ...(input.pqWrapKey !== undefined ? { pqWrapKey: input.pqWrapKey } : {}),
+        };
+        const next = model.setWrapKeys(cur, tx.author, keys, atMs);
+        if (!next) return { ok: false, code: 'member_required' };
+        return { ok: true, state: next, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
+      }
+
+      if (typeof model.reduce === 'function') {
+        const own = model.reduce(env);
+        if (own) return own;
+      }
+      if (!model.controls(env)) return { ok: false, code: model.controlDeniedCode || 'admin_required' };
+      const common = applyCommonAdminControlActions(cur, input, tx);
+      if (common !== null) return common;
+      if (typeof model.control === 'function') {
+        const own = model.control(env);
+        if (own) return own;
+      }
+      return { ok: false, code: 'unknown_action' };
+    },
+
+    authorize(state, tx) {
+      const cur = model.normalize(state);
+      const members = model.members(cur);
+      return defaultAuthorizeOp((capability, actor, opts) => canOf(cur, members, capability, actor, opts), cur, tx);
+    },
+
+    admit(state, input) {
+      const cur = model.normalize(state);
+      return evaluateHistoryAdmission(cur.schedule, model.members(cur), input);
+    },
+
+    query(state, input) {
+      const cur = model.normalize(state);
+      const members = model.members(cur);
+      if (input && typeof input === 'object') {
+        if (input.kind === 'can') return canOf(cur, members, input.capability, input.actor, input);
+        if (input.kind === 'roster') {
+          const roster = rosterOf(cur, members);
+          if (typeof input.role === 'string') {
+            if (input.role === 'guardians') return roster.guardians && Array.isArray(roster.guardians.members) ? roster.guardians.members.map(g => g.publicKey) : [];
+            const value = Object.prototype.hasOwnProperty.call(roster, input.role) ? roster[input.role] : null;
+            return Array.isArray(value) ? value : [];
+          }
+          return roster;
+        }
+        if (input.kind === 'signals') return resolveSignals(cur, rosterOf(cur, members).readers);
+        if (input.kind === 'schedule') return normalizeSchedule(cur.schedule);
+        if (input.kind === 'guardians') return { guardians: cur.guardians ?? null, recoveryRequests: cur.recoveryRequests ?? {} };
+        if (input.publicKey) return members.find(m => m.publicKey === input.publicKey) || null;
+      }
+      return cur;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// attested: explicit member list, host-attested auto-admission by readers, guardians, invites.
+// ---------------------------------------------------------------------------------------------
+
+function normalizeAttested(state) {
+  const s = state && typeof state === 'object' ? state : {};
+  return { ...s, members: Array.isArray(s.members) ? s.members : [], admission: s.admission ?? null };
+}
+
+function upsertMember(list, record) {
+  return list.filter(m => m.publicKey !== record.publicKey).concat([record]).sort(byPublicKey);
+}
+
+export const attestedAdmission = defineAdmission({
+  mode: 'attested',
+  normalize: normalizeAttested,
+  members: cur => cur.members,
+  setWrapKeys(cur, author, keys, atMs) {
+    const existing = cur.members.find(m => m.publicKey === author);
+    if (!existing || isMemberExpired(existing, atMs)) return null;
+    return { ...cur, members: upsertMember(cur.members, normalizeMember({ ...existing, ...keys })) };
+  },
+  roster: cur => ({
+    removedMembers: cur.admission && Array.isArray(cur.admission.removed) ? cur.admission.removed : [],
+    admission: cur.admission ?? null,
+    guardians: cur.guardians ?? null,
+    recoveryRequests: cur.recoveryRequests ?? {},
+  }),
+  controls: env => env.can('administrator', env.tx.author),
+
+  reduce(env) {
+    const { cur, input, tx, ctx, atMs } = env;
+    const authorIsAdmin = env.can('administrator', tx.author);
 
     if (input.action === 'setMember') {
-      if (!authorIsAdmin) {
-        if (!authorIsReader || !input.attestation) return { ok: false, code: 'admin_required' };
-      }
+      if (!authorIsAdmin && (!env.can('reader', tx.author) || !input.attestation)) return { ok: false, code: 'admin_required' };
+      if (!input.member || typeof input.member !== 'object') return { ok: false, code: 'invalid_member' };
       if (input.attestation) {
-        const att = input.attestation;
-        const hostKey = cur.admission && cur.admission.hostKey;
-        if (!hostKey || !HEX32.test(hostKey) || !HEX64.test(att.signature || '')) {
-          return { ok: false, code: 'attestation_invalid' };
-        }
-        const msg = canonicalJson(['chronolog/host-attestation/v1', att.payload]);
-        if (!verifyEd25519(hostKey, msg, att.signature)) {
-          return { ok: false, code: 'attestation_signature_invalid' };
-        }
-        if (att.payload.publicKey !== input.member.publicKey) {
-          return { ok: false, code: 'attestation_subject_mismatch' };
-        }
-        if (!authorIsAdmin && !attestedMatchesPolicy(cur, att.payload, input.member)) {
+        const rejected = verifyHostAttestation(cur, input.attestation, input.member, tx, ctx);
+        if (rejected) return rejected;
+        if (!authorIsAdmin && !attestedMatchesPolicy(cur, input.attestation.payload, input.member)) {
           return { ok: false, code: 'admin_required' };
         }
       }
-      const next = normalizeMember(input.member);
-      const members = membersList.filter(m => m.publicKey !== next.publicKey).concat([next]);
-      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+      const next = normalizeMember({ ...input.member, admittedBy: tx.author });
+      const prev = cur.members.find(m => m.publicKey === next.publicKey);
+      const lost = checkReaderLoss(ctx, prev, next, next.publicKey);
+      if (lost) return lost;
       let admission = cur.admission;
       if (authorIsAdmin && admission && Array.isArray(admission.removed) && admission.removed.includes(next.publicKey)) {
         admission = { ...admission, removed: admission.removed.filter(k => k !== next.publicKey) };
       }
-      return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$admission.member', payload: { publicKey: next.publicKey } }] };
+      return { ok: true, state: { ...cur, members: upsertMember(cur.members, next), admission }, events: [{ topic: '$admission.member', payload: { publicKey: next.publicKey } }] };
     }
 
     if (input.action === 'requestRecovery') {
@@ -633,18 +843,20 @@ export const attestedAdmission = {
       if (!guardians || !Array.isArray(guardians.members) || guardians.members.length === 0) {
         return { ok: false, code: 'guardians_not_configured' };
       }
-      if (!HEX32.test(input.newPublicKey || '') || !HEX32.test(input.newWrapKey || '')) {
-        return { ok: false, code: 'invalid_recovery_key' };
-      }
-      if (tx.author !== input.newPublicKey && !authorIsAdmin) {
-        return { ok: false, code: 'recovery_author_mismatch' };
-      }
+      if (!HEX32.test(input.newPublicKey || '')) return { ok: false, code: 'invalid_recovery_key' };
+      const hasX25519 = typeof input.newWrapKey === 'string' && HEX32.test(input.newWrapKey);
+      const hasPq = typeof input.newPqWrapKey === 'string' && HEX_XWING.test(input.newPqWrapKey);
+      if (!hasX25519 && !hasPq) return { ok: false, code: 'invalid_recovery_key' };
+      if (input.newWrapKey !== undefined && input.newWrapKey !== null && !hasX25519) return { ok: false, code: 'invalid_recovery_key' };
+      if (input.newPqWrapKey !== undefined && input.newPqWrapKey !== null && !hasPq) return { ok: false, code: 'invalid_recovery_key' };
+      if (tx.author !== input.newPublicKey && !authorIsAdmin) return { ok: false, code: 'recovery_author_mismatch' };
       const requestId = typeof input.requestId === 'string' && input.requestId.length > 0 ? input.requestId : tx.opId;
       const requests = { ...(cur.recoveryRequests || {}) };
       requests[requestId] = {
         requestId,
         newPublicKey: input.newPublicKey,
-        newWrapKey: input.newWrapKey,
+        ...(hasX25519 ? { newWrapKey: input.newWrapKey } : {}),
+        ...(hasPq ? { newPqWrapKey: input.newPqWrapKey } : {}),
         label: typeof input.label === 'string' ? input.label.slice(0, 80) : 'Recovered device',
         verificationCode: typeof input.verificationCode === 'string' ? input.verificationCode.slice(0, 32) : '',
         approvals: [],
@@ -669,20 +881,19 @@ export const attestedAdmission = {
       const approvals = sortedKeys((req.approvals || []).concat([tx.author]));
       const completed = approvals.length >= guardians.threshold;
       requests[input.requestId] = { ...req, approvals, status: completed ? 'completed' : 'pending' };
-      let members = membersList;
+      let members = cur.members;
       if (completed) {
-        const promoted = normalizeMember({
+        members = upsertMember(cur.members, normalizeMember({
           publicKey: req.newPublicKey,
-          wrapKey: req.newWrapKey,
+          ...(req.newWrapKey ? { wrapKey: req.newWrapKey } : {}),
+          ...(req.newPqWrapKey ? { pqWrapKey: req.newPqWrapKey } : {}),
           label: req.label,
+          admittedBy: tx.author,
           reader: true,
           writer: true,
           administrator: true,
           publisher: true,
-          finalizer: false,
-        });
-        members = membersList.filter(m => m.publicKey !== promoted.publicKey).concat([promoted]);
-        members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+        }));
       }
       return {
         ok: true,
@@ -691,10 +902,11 @@ export const attestedAdmission = {
       };
     }
 
-    if (!authorIsAdmin) return { ok: false, code: 'admin_required' };
+    return null;
+  },
 
-    const common = applyCommonAdminControlActions(cur, input, tx);
-    if (common !== null) return common;
+  control(env) {
+    const { cur, input, ctx } = env;
 
     if (input.action === 'setGuardians') {
       if (input.guardians === null) {
@@ -707,17 +919,27 @@ export const attestedAdmission = {
       const cleaned = [];
       const seen = new Set();
       for (const item of g.members) {
-        if (!item || !HEX32.test(item.publicKey || '') || !HEX32.test(item.wrapKey || '') || seen.has(item.publicKey)) {
+        const hasX = typeof item?.wrapKey === 'string' && HEX32.test(item.wrapKey);
+        const hasP = typeof item?.pqWrapKey === 'string' && HEX_XWING.test(item.pqWrapKey);
+        if (
+          !item ||
+          !HEX32.test(item.publicKey || '') ||
+          (!hasX && !hasP) ||
+          (item.wrapKey !== undefined && item.wrapKey !== null && !hasX) ||
+          (item.pqWrapKey !== undefined && item.pqWrapKey !== null && !hasP) ||
+          seen.has(item.publicKey)
+        ) {
           return { ok: false, code: 'invalid_guardian' };
         }
         seen.add(item.publicKey);
         cleaned.push({
           publicKey: item.publicKey,
-          wrapKey: item.wrapKey,
+          ...(hasX ? { wrapKey: item.wrapKey } : {}),
+          ...(hasP ? { pqWrapKey: item.pqWrapKey } : {}),
           ...(typeof item.label === 'string' && item.label.length > 0 ? { label: item.label.slice(0, 80) } : {}),
         });
       }
-      cleaned.sort((a, b) => (a.publicKey < b.publicKey ? -1 : 1));
+      cleaned.sort(byPublicKey);
       const threshold = Number(g.threshold);
       if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > cleaned.length) {
         return { ok: false, code: 'invalid_guardian_threshold' };
@@ -731,13 +953,14 @@ export const attestedAdmission = {
 
     if (input.action === 'removeMember') {
       if (!HEX32.test(input.publicKey || '')) return { ok: false, code: 'invalid_member' };
-      const members = membersList.filter(m => m.publicKey !== input.publicKey);
+      const members = cur.members.filter(m => m.publicKey !== input.publicKey);
       if (!members.some(m => m.administrator)) return { ok: false, code: 'last_admin_required' };
+      const lost = checkReaderLoss(ctx, cur.members.find(m => m.publicKey === input.publicKey), null, input.publicKey);
+      if (lost) return lost;
       let admission = cur.admission;
       if (admission && typeof admission === 'object') {
         const prevRemoved = Array.isArray(admission.removed) ? admission.removed : [];
-        const removed = sortedKeys(prevRemoved.concat([input.publicKey])).slice(-512);
-        admission = { ...admission, removed };
+        admission = { ...admission, removed: sortedKeys(prevRemoved.concat([input.publicKey])).slice(-512) };
       }
       return { ok: true, state: { ...cur, members, admission }, events: [{ topic: '$admission.removed', payload: { publicKey: input.publicKey } }] };
     }
@@ -783,97 +1006,93 @@ export const attestedAdmission = {
       return { ok: true, state: { ...cur, admission: input.admission ?? null } };
     }
 
-    return { ok: false, code: 'unknown_action' };
+    return null;
   },
+});
 
-  authorize(state, tx) {
-    const cur = state && typeof state === 'object' ? state : { members: [] };
-    const members = Array.isArray(cur.members) ? cur.members : [];
-    const canFn = (capability, actor, opts) => {
-      if (capability === 'guardian') {
-        return Boolean(cur.guardians && Array.isArray(cur.guardians.members) && cur.guardians.members.some(g => g.publicKey === actor));
-      }
-      return checkMembersCapability(members, capability, actor, opts);
-    };
-    return defaultAuthorizeOp(canFn, cur, tx);
-  },
+// ---------------------------------------------------------------------------------------------
+// open: zero-OAuth public pages (open read/write unless blocked; optional vouching).
+// ---------------------------------------------------------------------------------------------
 
-  admit(state, input) {
-    const cur = state && typeof state === 'object' ? state : {};
-    const members = Array.isArray(cur.members) ? cur.members : [];
-    return evaluateHistoryAdmission(cur.schedule, members, input);
-  },
+function normalizeOpen(state) {
+  const s = state && typeof state === 'object' ? state : {};
+  return {
+    admins: Array.isArray(s.admins) ? sortedKeys(s.admins.filter(k => HEX32.test(k || ''))) : [],
+    members: Array.isArray(s.members) ? s.members : [],
+    openRead: s.openRead !== false,
+    openWrite: s.openWrite !== false,
+    blockedAuthors: Array.isArray(s.blockedAuthors) ? sortedKeys(s.blockedAuthors.filter(k => HEX32.test(k || ''))) : [],
+    vouchedAuthors: Array.isArray(s.vouchedAuthors) ? sortedKeys(s.vouchedAuthors.filter(k => HEX32.test(k || ''))) : [],
+    antiSpam: s.antiSpam && typeof s.antiSpam === 'object' ? s.antiSpam : null,
+    admission: s.admission ?? null,
+    ...(s.schedule === undefined ? {} : { schedule: s.schedule }),
+    ...(s.signals === undefined ? {} : { signals: s.signals }),
+    ...(s.topicAccess === undefined ? {} : { topicAccess: s.topicAccess }),
+  };
+}
 
-  query(state, input) {
-    const cur = state && typeof state === 'object' ? state : { members: [], admission: null };
-    const members = Array.isArray(cur.members) ? cur.members : [];
-    if (input && typeof input === 'object') {
-      if (input.kind === 'can') {
-        if (input.capability === 'guardian') {
-          return Boolean(cur.guardians && Array.isArray(cur.guardians.members) && cur.guardians.members.some(g => g.publicKey === input.actor));
-        }
-        return checkMembersCapability(members, input.capability, input.actor, input);
-      }
-      if (input.kind === 'roster') {
-        if (typeof input.role === 'string') {
-          if (input.role === 'guardians') return cur.guardians && Array.isArray(cur.guardians.members) ? cur.guardians.members.map(g => g.publicKey) : [];
-          return queryMembersList(members, input.role);
-        }
-        return {
-          mode: 'attested',
-          members,
-          readers: queryMembersList(members, 'readers'),
-          writers: queryMembersList(members, 'writers'),
-          administrators: queryMembersList(members, 'administrators'),
-          publishers: queryMembersList(members, 'publishers'),
-          finalizers: queryMembersList(members, 'finalizers'),
-          openReaders: false,
-          openWriters: false,
-          blockedAuthors: [],
-          removedMembers: cur.admission && Array.isArray(cur.admission.removed) ? cur.admission.removed : [],
-          admission: cur.admission ?? null,
-          guardians: cur.guardians ?? null,
-          recoveryRequests: cur.recoveryRequests ?? {},
-          multisig: null,
-        };
-      }
-      if (input.kind === 'signals') {
-        return resolveSignals(cur, queryMembersList(members, 'readers'));
-      }
-      if (input.kind === 'schedule') {
-        return normalizeSchedule(cur.schedule);
-      }
-      if (input.kind === 'guardians') {
-        return { guardians: cur.guardians ?? null, recoveryRequests: cur.recoveryRequests ?? {} };
-      }
-      if (input.publicKey) {
-        return members.find(m => m.publicKey === input.publicKey) || null;
-      }
+/** Explicit members plus synthesized full-power records for every admin. */
+function openMembers(cur) {
+  const byKey = new Map();
+  for (const m of cur.members) byKey.set(m.publicKey, m);
+  for (const a of cur.admins) {
+    const existing = byKey.get(a);
+    byKey.set(a, {
+      publicKey: a,
+      ...(existing && existing.wrapKey ? { wrapKey: existing.wrapKey } : {}),
+      ...(existing && existing.pqWrapKey ? { pqWrapKey: existing.pqWrapKey } : {}),
+      ...(existing && existing.admittedBy ? { admittedBy: existing.admittedBy } : {}),
+      reader: true,
+      writer: true,
+      administrator: true,
+      publisher: true,
+    });
+  }
+  return Array.from(byKey.values()).sort(byPublicKey);
+}
+
+export const openAdmission = defineAdmission({
+  mode: 'open',
+  normalize: normalizeOpen,
+  members: openMembers,
+  can(cur, members, capability, actor, opts) {
+    if (!HEX32.test(actor || '')) return false;
+    const admin = cur.admins.includes(actor);
+    const blocked = cur.blockedAuthors.includes(actor);
+    if (capability === 'blocked') return blocked;
+    if (capability === 'administrator') return admin;
+    if (capability === 'publisher') return admin || checkMembersCapability(members, 'publisher', actor, opts);
+    if (capability === 'writer') {
+      if (blocked) return false;
+      if (admin || checkMembersCapability(members, 'writer', actor, opts)) return true;
+      if (!cur.openWrite) return false;
+      if (cur.antiSpam && cur.antiSpam.requireVouch === true) return cur.vouchedAuthors.includes(actor);
+      return true;
     }
-    return cur;
+    if (capability === 'reader') return cur.openRead || admin || checkMembersCapability(members, 'reader', actor, opts);
+    if (capability === 'member') return cur.openWrite || cur.openRead || admin || checkMembersCapability(members, 'member', actor, opts);
+    return checkMembersCapability(members, capability, actor, opts);
   },
-};
+  setWrapKeys(cur, author, keys, atMs) {
+    const existing = cur.members.find(m => m.publicKey === author);
+    const isAdmin = cur.admins.includes(author);
+    if ((!existing || isMemberExpired(existing, atMs)) && !isAdmin) return null;
+    const base = existing || { publicKey: author, reader: true, writer: true, administrator: isAdmin, publisher: isAdmin };
+    return { ...cur, members: upsertMember(cur.members, normalizeMember({ ...base, ...keys })) };
+  },
+  roster: (cur, members) => ({
+    readers: cur.openRead ? ['*'] : queryMembersList(members, 'readers'),
+    writers: cur.openWrite ? ['*'] : queryMembersList(members, 'writers'),
+    administrators: cur.admins,
+    openReaders: cur.openRead,
+    openWriters: cur.openWrite,
+    blockedAuthors: cur.blockedAuthors,
+    admission: cur.admission,
+  }),
+  controls: env => env.cur.admins.includes(env.tx.author),
 
-export const openAdmission = {
-  reduce(state, tx) {
-    const cur = state && typeof state === 'object'
-      ? {
-          admins: Array.isArray(state.admins) ? state.admins : [],
-          members: Array.isArray(state.members) ? state.members : [],
-          openRead: state.openRead !== false,
-          openWrite: state.openWrite !== false,
-          blockedAuthors: Array.isArray(state.blockedAuthors) ? state.blockedAuthors : [],
-          vouchedAuthors: Array.isArray(state.vouchedAuthors) ? state.vouchedAuthors : [],
-          antiSpam: state.antiSpam && typeof state.antiSpam === 'object' ? state.antiSpam : null,
-          admission: state.admission ?? null,
-          schedule: state.schedule,
-          signals: state.signals,
-          topicAccess: state.topicAccess,
-        }
-      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], vouchedAuthors: [], antiSpam: null, admission: null };
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-
+  reduce(env) {
+    const { cur, input, tx } = env;
     if (input.action === 'vouchAuthor') {
       const canVouch = cur.admins.includes(tx.author) || cur.vouchedAuthors.includes(tx.author);
       if (!canVouch) return { ok: false, code: 'vouch_permission_required' };
@@ -882,29 +1101,11 @@ export const openAdmission = {
       const vouchedAuthors = sortedKeys(cur.vouchedAuthors.concat([input.publicKey])).slice(-4096);
       return { ok: true, state: { ...cur, vouchedAuthors }, events: [{ topic: '$admission.author_vouched', payload: { publicKey: input.publicKey, by: tx.author } }] };
     }
+    return null;
+  },
 
-    if (input.action === 'rotateWrapKey') {
-      const existing = cur.members.find(m => m.publicKey === tx.author);
-      const isAdmin = cur.admins.includes(tx.author);
-      if (!existing && !isAdmin) return { ok: false, code: 'member_required' };
-      if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
-      if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
-      if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
-      const base = existing || { publicKey: tx.author, reader: true, writer: true, administrator: isAdmin, publisher: isAdmin, finalizer: false };
-      const updated = normalizeMember({
-        ...base,
-        ...(input.wrapKey !== undefined ? { wrapKey: input.wrapKey } : {}),
-        ...(input.pqWrapKey !== undefined ? { pqWrapKey: input.pqWrapKey } : {}),
-      });
-      const members = cur.members.filter(m => m.publicKey !== tx.author).concat([updated]);
-      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-      return { ok: true, state: { ...cur, members }, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
-    }
-
-    if (!cur.admins.includes(tx.author)) return { ok: false, code: 'admin_required' };
-
-    const common = applyCommonAdminControlActions(cur, input, tx);
-    if (common !== null) return common;
+  control(env) {
+    const { cur, input, tx, ctx } = env;
 
     if (input.action === 'setAntiSpam') {
       if (input.antiSpam === null) return { ok: true, state: { ...cur, antiSpam: null } };
@@ -955,119 +1156,22 @@ export const openAdmission = {
     }
 
     if (input.action === 'setMember') {
-      const next = normalizeMember(input.member);
-      const members = cur.members.filter(m => m.publicKey !== next.publicKey).concat([next]);
-      members.sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+      if (!input.member || typeof input.member !== 'object') return { ok: false, code: 'invalid_member' };
+      const next = normalizeMember({ ...input.member, admittedBy: tx.author });
+      const lost = checkReaderLoss(ctx, cur.members.find(m => m.publicKey === next.publicKey), next, next.publicKey);
+      if (lost) return lost;
       const admins = next.administrator ? sortedKeys(cur.admins.concat([next.publicKey])) : cur.admins;
       const blockedAuthors = next.administrator ? cur.blockedAuthors.filter(k => k !== next.publicKey) : cur.blockedAuthors;
-      return { ok: true, state: { ...cur, admins, members, blockedAuthors }, events: [{ topic: '$admission.member', payload: { publicKey: next.publicKey } }] };
+      return { ok: true, state: { ...cur, admins, members: upsertMember(cur.members, next), blockedAuthors }, events: [{ topic: '$admission.member', payload: { publicKey: next.publicKey } }] };
     }
 
-    return { ok: false, code: 'unknown_action' };
+    return null;
   },
+});
 
-  authorize(state, tx) {
-    const canFn = (capability, actor, opts) => openAdmission.query(state, { kind: 'can', capability, actor, ...(opts || {}) }) === true;
-    return defaultAuthorizeOp(canFn, state, tx);
-  },
-
-  admit(state, input) {
-    const roster = openAdmission.query(state, { kind: 'roster' });
-    return evaluateHistoryAdmission(state && state.schedule, roster.members, input);
-  },
-
-  query(state, input) {
-    const cur = state && typeof state === 'object'
-      ? {
-          admins: Array.isArray(state.admins) ? state.admins : [],
-          members: Array.isArray(state.members) ? state.members : [],
-          openRead: state.openRead !== false,
-          openWrite: state.openWrite !== false,
-          blockedAuthors: Array.isArray(state.blockedAuthors) ? sortedKeys(state.blockedAuthors.filter(k => HEX32.test(k || ''))) : [],
-          vouchedAuthors: Array.isArray(state.vouchedAuthors) ? sortedKeys(state.vouchedAuthors.filter(k => HEX32.test(k || ''))) : [],
-          antiSpam: state.antiSpam && typeof state.antiSpam === 'object' ? state.antiSpam : null,
-          admission: state.admission ?? null,
-          schedule: state.schedule,
-          signals: state.signals,
-        }
-      : { admins: [], members: [], openRead: true, openWrite: true, blockedAuthors: [], vouchedAuthors: [], antiSpam: null, admission: null };
-
-    const adminSet = new Set(cur.admins);
-    const blockedSet = new Set(cur.blockedAuthors);
-    const vouchedSet = new Set(cur.vouchedAuthors);
-    const synthesizedMap = new Map();
-    for (const m of cur.members) synthesizedMap.set(m.publicKey, m);
-    for (const a of cur.admins) {
-      const existing = synthesizedMap.get(a);
-      synthesizedMap.set(a, {
-        publicKey: a,
-        ...(existing && existing.wrapKey ? { wrapKey: existing.wrapKey } : {}),
-        ...(existing && existing.pqWrapKey ? { pqWrapKey: existing.pqWrapKey } : {}),
-        reader: true,
-        writer: true,
-        administrator: true,
-        publisher: true,
-        finalizer: Boolean(existing && existing.finalizer),
-      });
-    }
-    const members = Array.from(synthesizedMap.values()).sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
-
-    if (input && typeof input === 'object') {
-      if (input.kind === 'can') {
-        if (!HEX32.test(input.actor || '')) return false;
-        if (input.capability === 'blocked') return blockedSet.has(input.actor);
-        if (input.capability === 'administrator') return adminSet.has(input.actor);
-        if (input.capability === 'publisher') return adminSet.has(input.actor) || checkMembersCapability(members, 'publisher', input.actor, input);
-        if (input.capability === 'writer') {
-          if (blockedSet.has(input.actor)) return false;
-          if (adminSet.has(input.actor)) return true;
-          if (checkMembersCapability(members, 'writer', input.actor, input)) return true;
-          if (!cur.openWrite) return false;
-          if (cur.antiSpam && cur.antiSpam.requireVouch === true) return vouchedSet.has(input.actor);
-          return true;
-        }
-        if (input.capability === 'reader') return cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'reader', input.actor, input);
-        if (input.capability === 'member') return cur.openWrite || cur.openRead || adminSet.has(input.actor) || checkMembersCapability(members, 'member', input.actor, input);
-        return checkMembersCapability(members, input.capability, input.actor, input);
-      }
-      if (input.kind === 'roster') {
-        if (typeof input.role === 'string') {
-          if (input.role === 'blockedAuthors') return cur.blockedAuthors;
-          if (input.role === 'readers' && cur.openRead) return ['*'];
-          if (input.role === 'writers' && cur.openWrite) return ['*'];
-          return queryMembersList(members, input.role);
-        }
-        return {
-          mode: 'open',
-          members,
-          readers: cur.openRead ? ['*'] : queryMembersList(members, 'readers'),
-          writers: cur.openWrite ? ['*'] : queryMembersList(members, 'writers'),
-          administrators: sortedKeys(cur.admins),
-          publishers: queryMembersList(members, 'publishers'),
-          finalizers: queryMembersList(members, 'finalizers'),
-          openReaders: cur.openRead,
-          openWriters: cur.openWrite,
-          blockedAuthors: cur.blockedAuthors,
-          removedMembers: [],
-          admission: cur.admission,
-          guardians: null,
-          recoveryRequests: {},
-          multisig: null,
-        };
-      }
-      if (input.kind === 'signals') {
-        return resolveSignals(cur, cur.openRead ? ['*'] : queryMembersList(members, 'readers'));
-      }
-      if (input.kind === 'schedule') {
-        return normalizeSchedule(cur.schedule);
-      }
-      if (input.publicKey) {
-        return members.find(m => m.publicKey === input.publicKey) || null;
-      }
-    }
-    return cur;
-  },
-};
+// ---------------------------------------------------------------------------------------------
+// multisig: M-of-N signers approve every membership/policy change via proposals.
+// ---------------------------------------------------------------------------------------------
 
 function normalizeMultisigState(state) {
   const s = state && typeof state === 'object' ? state : {};
@@ -1080,6 +1184,7 @@ function normalizeMultisigState(state) {
     signers,
     members,
     proposals,
+    ...(s.admission === undefined ? {} : { admission: s.admission }),
     ...(s.schedule === undefined ? {} : { schedule: s.schedule }),
     ...(s.signals === undefined ? {} : { signals: s.signals }),
     ...(s.topicAccess === undefined ? {} : { topicAccess: s.topicAccess }),
@@ -1094,33 +1199,42 @@ function multisigMemberRecords(cur) {
       publicKey: pk,
       ...(entry.wrapKey ? { wrapKey: entry.wrapKey } : {}),
       ...(entry.pqWrapKey ? { pqWrapKey: entry.pqWrapKey } : {}),
+      ...(Array.isArray(entry.scopes) && entry.scopes.length > 0 ? { scopes: entry.scopes } : {}),
       reader: Boolean(entry.reader),
       writer: Boolean(entry.writer),
       administrator: cur.signers.includes(pk),
       publisher: Boolean(entry.publisher) || cur.signers.includes(pk),
-      finalizer: Boolean(entry.finalizer),
     });
   }
   for (const pk of cur.signers) {
     if (!byKey.has(pk)) {
-      byKey.set(pk, { publicKey: pk, reader: true, writer: true, administrator: true, publisher: true, finalizer: false });
+      byKey.set(pk, { publicKey: pk, reader: true, writer: true, administrator: true, publisher: true });
     }
   }
-  return Array.from(byKey.values()).sort((a, b) => (a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0));
+  return Array.from(byKey.values()).sort(byPublicKey);
 }
 
-function applyMultisigProposal(cur, prop, tx) {
+function viaCommon(cur, action, tx, fallbackCode) {
+  const res = applyCommonAdminControlActions(cur, action, tx);
+  if (!res || !res.ok) return res || { ok: false, code: fallbackCode };
+  return { ok: true, state: res.state, event: res.events[0] };
+}
+
+function applyMultisigProposal(cur, prop, tx, ctx) {
+  const records = multisigMemberRecords(cur);
   if (prop.kind === 'setMember') {
     const m = normalizeMember(prop.member);
+    const lost = checkReaderLoss(ctx, records.find(r => r.publicKey === m.publicKey), m, m.publicKey);
+    if (lost) return lost;
     const nextMembers = {
       ...cur.members,
       [m.publicKey]: {
         ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
         ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
+        ...(m.scopes ? { scopes: m.scopes } : {}),
         reader: m.reader,
         writer: m.writer,
         publisher: m.publisher,
-        finalizer: m.finalizer,
       },
     };
     const nextSigners = m.administrator
@@ -1131,6 +1245,8 @@ function applyMultisigProposal(cur, prop, tx) {
   }
   if (prop.kind === 'removeMember') {
     if (!HEX32.test(prop.publicKey || '')) return { ok: false, code: 'invalid_member' };
+    const lost = checkReaderLoss(ctx, records.find(r => r.publicKey === prop.publicKey), null, prop.publicKey);
+    if (lost) return lost;
     const nextMembers = { ...cur.members };
     delete nextMembers[prop.publicKey];
     const nextSigners = cur.signers.filter(k => k !== prop.publicKey);
@@ -1143,51 +1259,83 @@ function applyMultisigProposal(cur, prop, tx) {
     return { ok: true, state: { ...cur, threshold: t }, event: { topic: '$admission.threshold', payload: { threshold: t } } };
   }
   if (prop.kind === 'schedulePolicy') {
-    const res = applyCommonAdminControlActions(cur, { action: 'schedulePolicy', effectiveAfterMs: prop.effectiveAfterMs, policy: prop.policy }, tx);
-    if (!res || !res.ok) return res || { ok: false, code: 'invalid_admission_policy' };
-    return { ok: true, state: res.state, event: res.events[0] };
+    return viaCommon(cur, { action: 'schedulePolicy', effectiveAfterMs: prop.effectiveAfterMs, policy: prop.policy }, tx, 'invalid_admission_policy');
+  }
+  if (prop.kind === 'pinCheckpoint') {
+    return viaCommon(cur, {
+      action: 'pinCheckpoint',
+      closedThroughMs: prop.closedThroughMs,
+      stateRoot: prop.stateRoot,
+      historyDigest: prop.historyDigest,
+      includedOpIds: prop.includedOpIds,
+    }, tx, 'invalid_checkpoint_pin');
+  }
+  if (prop.kind === 'setSignalPolicy') {
+    return viaCommon(cur, { action: 'setSignalPolicy', rules: prop.rules }, tx, 'invalid_signal_policy');
+  }
+  if (prop.kind === 'setTopicAccess') {
+    return viaCommon(cur, { action: 'setTopicAccess', topic: prop.topic, rule: prop.rule }, tx, 'invalid_topic_access');
+  }
+  if (prop.kind === 'setGroupPolicy') {
+    const gp = prop.groupPolicy;
+    if (gp !== null && (!gp || typeof gp !== 'object' || !Array.isArray(gp.rules) || gp.rules.length > 32)) {
+      return { ok: false, code: 'invalid_group_policy' };
+    }
+    const admission = cur.admission && typeof cur.admission === 'object' ? cur.admission : { mode: 'multisig' };
+    return {
+      ok: true,
+      state: { ...cur, admission: { ...admission, groupPolicy: gp } },
+      event: { topic: '$admission.group_policy_updated', payload: { rules: gp ? gp.rules.length : 0 } },
+    };
   }
   return { ok: false, code: 'unknown_proposal_kind' };
 }
 
-export const multisigAdmission = {
-  reduce(state, tx) {
-    const cur = normalizeMultisigState(state);
-    const input = tx.payload;
-    if (!input || typeof input !== 'object') return { ok: false, code: 'invalid_input' };
-    if (input.action === 'rotateWrapKey') {
-      if (!cur.members[tx.author] && !cur.signers.includes(tx.author)) return { ok: false, code: 'member_required' };
-      if (input.wrapKey !== undefined && input.wrapKey !== null && !HEX32.test(input.wrapKey)) return { ok: false, code: 'invalid_wrap_key' };
-      if (input.pqWrapKey !== undefined && input.pqWrapKey !== null && !HEX_XWING.test(input.pqWrapKey)) return { ok: false, code: 'invalid_pq_wrap_key' };
-      if (input.wrapKey === undefined && input.pqWrapKey === undefined) return { ok: false, code: 'invalid_wrap_key' };
-      const prev = cur.members[tx.author] || { reader: true, writer: true, publisher: true, finalizer: false };
-      const nextMembers = {
-        ...cur.members,
-        [tx.author]: {
-          ...prev,
-          ...(input.wrapKey ? { wrapKey: input.wrapKey } : {}),
-          ...(input.pqWrapKey ? { pqWrapKey: input.pqWrapKey } : {}),
-        },
-      };
-      return { ok: true, state: { ...cur, members: nextMembers }, events: [{ topic: '$admission.wrap_key_rotated', payload: { publicKey: tx.author } }] };
-    }
+const PROPOSAL_FIELDS = [
+  'member', 'publicKey', 'threshold', 'effectiveAfterMs', 'policy', 'closedThroughMs', 'stateRoot',
+  'historyDigest', 'includedOpIds', 'rules', 'topic', 'rule', 'groupPolicy',
+];
 
+export const multisigAdmission = defineAdmission({
+  mode: 'multisig',
+  normalize: normalizeMultisigState,
+  members: multisigMemberRecords,
+  setWrapKeys(cur, author, keys) {
+    if (!cur.members[author] && !cur.signers.includes(author)) return null;
+    const prev = cur.members[author] || { reader: true, writer: true, publisher: true };
+    return {
+      ...cur,
+      members: {
+        ...cur.members,
+        [author]: {
+          ...prev,
+          ...(keys.wrapKey ? { wrapKey: keys.wrapKey } : {}),
+          ...(keys.pqWrapKey ? { pqWrapKey: keys.pqWrapKey } : {}),
+        },
+      },
+    };
+  },
+  roster: cur => ({
+    admission: cur.admission ?? null,
+    multisig: { threshold: cur.threshold, signers: cur.signers, proposals: cur.proposals },
+  }),
+  // Single-signer multisig may run common control actions directly; otherwise everything is a proposal.
+  controls: env => env.cur.threshold === 1 && env.cur.signers.includes(env.tx.author),
+  controlDeniedCode: 'unknown_action',
+
+  reduce(env) {
+    const { cur, input, tx, ctx } = env;
     if (!cur.signers.includes(tx.author)) return { ok: false, code: 'signer_required' };
 
     if (input.action === 'propose') {
       const id = typeof input.id === 'string' && input.id.length > 0 ? input.id : tx.opId;
       if (cur.proposals[id]) return { ok: false, code: 'proposal_exists' };
-      const prop = {
-        kind: input.kind,
-        ...(input.member !== undefined ? { member: input.member } : {}),
-        ...(input.publicKey !== undefined ? { publicKey: input.publicKey } : {}),
-        ...(input.threshold !== undefined ? { threshold: input.threshold } : {}),
-        ...(input.effectiveAfterMs !== undefined ? { effectiveAfterMs: input.effectiveAfterMs } : {}),
-        ...(input.policy !== undefined ? { policy: input.policy } : {}),
-        approvals: [tx.author],
-      };
+      const prop = { kind: input.kind, approvals: [tx.author] };
+      for (const field of PROPOSAL_FIELDS) {
+        if (input[field] !== undefined) prop[field] = input[field];
+      }
       if (prop.approvals.length >= cur.threshold) {
-        const applied = applyMultisigProposal(cur, prop, tx);
+        const applied = applyMultisigProposal(cur, prop, tx, ctx);
         if (!applied.ok) return applied;
         return { ok: true, state: applied.state, events: [applied.event] };
       }
@@ -1207,7 +1355,7 @@ export const multisigAdmission = {
       if (approvals.length >= cur.threshold) {
         const nextProposals = { ...cur.proposals };
         delete nextProposals[id];
-        const applied = applyMultisigProposal({ ...cur, proposals: nextProposals }, updated, tx);
+        const applied = applyMultisigProposal({ ...cur, proposals: nextProposals }, updated, tx, ctx);
         if (!applied.ok) return applied;
         return { ok: true, state: applied.state, events: [applied.event] };
       }
@@ -1226,70 +1374,14 @@ export const multisigAdmission = {
       return { ok: true, state: { ...cur, proposals: nextProposals }, events: [{ topic: '$admission.cancelled', payload: { id } }] };
     }
 
-    if (cur.threshold === 1) {
-      const common = applyCommonAdminControlActions(cur, input, tx);
-      if (common !== null) return common;
-    }
-
-    return { ok: false, code: 'unknown_action' };
+    return null;
   },
-
-  authorize(state, tx) {
-    const cur = normalizeMultisigState(state);
-    const members = multisigMemberRecords(cur);
-    const canFn = (capability, actor, opts) => checkMembersCapability(members, capability, actor, opts);
-    return defaultAuthorizeOp(canFn, cur, tx);
-  },
-
-  admit(state, input) {
-    const cur = normalizeMultisigState(state);
-    return evaluateHistoryAdmission(cur.schedule, multisigMemberRecords(cur), input);
-  },
-
-  query(state, input) {
-    const cur = normalizeMultisigState(state);
-    const members = multisigMemberRecords(cur);
-    if (input && typeof input === 'object') {
-      if (input.kind === 'can') {
-        return checkMembersCapability(members, input.capability, input.actor, input);
-      }
-      if (input.kind === 'roster') {
-        if (typeof input.role === 'string') return queryMembersList(members, input.role);
-        return {
-          mode: 'multisig',
-          members,
-          readers: queryMembersList(members, 'readers'),
-          writers: queryMembersList(members, 'writers'),
-          administrators: queryMembersList(members, 'administrators'),
-          publishers: queryMembersList(members, 'publishers'),
-          finalizers: queryMembersList(members, 'finalizers'),
-          openReaders: false,
-          openWriters: false,
-          blockedAuthors: [],
-          removedMembers: [],
-          admission: null,
-          guardians: null,
-          recoveryRequests: {},
-          multisig: { threshold: cur.threshold, signers: cur.signers, proposals: cur.proposals },
-        };
-      }
-      if (input.kind === 'signals') {
-        return resolveSignals(cur, queryMembersList(members, 'readers'));
-      }
-      if (input.kind === 'schedule') {
-        return normalizeSchedule(cur.schedule);
-      }
-      if (input.publicKey) {
-        return members.find(m => m.publicKey === input.publicKey) || null;
-      }
-    }
-    return cur;
-  },
-};
+});
 
 /**
- * Composable admission factory: build custom data-driven or callback-driven $admission modules
- * by overriding any subset of { base, reduce, authorize, verify, admit, query }.
+ * Composable admission overlay: build a custom $admission module on top of any preset by
+ * overriding any subset of { base, reduce, authorize, verify, admit, query }. Overlay \`authorize\`
+ * can only tighten the base decision.
  */
 export function createAdmission(options = {}) {
   const base = options.base || attestedAdmission;

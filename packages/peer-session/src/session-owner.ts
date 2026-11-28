@@ -1,7 +1,7 @@
-import { check, type AdmissionEvidence, type PinnedFrontier } from '@chronolog/authority'
+import { check } from '@chronolog/authority'
 import type { JsonValue } from '@chronolog/protocol'
 import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
-import type { ApplicationSession, SessionFacts } from './session.js'
+import type { ApplicationSession } from './session.js'
 import type { SqlBranch } from './sql-extensions.js'
 import { awaitOwnedTask } from './lifetime.js'
 import {
@@ -14,6 +14,7 @@ import {
   type ApplicationSessionOwner,
 } from './owner-types.js'
 import { APPLICATION_OWNER_PROTOCOL, type OwnerRequest } from './worker-application-protocol.js'
+import { OWNER_FORWARDED_MAX_ARGS, OWNER_FORWARDED_METHODS, invokeForwardedOwnerMethod, isForwardedOwnerMethod, type OwnerMethodSpec } from './owner-methods.js'
 import type { ApplicationReadView } from './session-types.js'
 import type { ContentUpload } from './content.js'
 import { CONTENT_CHUNK_BYTES, MAX_BLOB_BYTES, type BlobGetOptions } from './content-bytes.js'
@@ -154,16 +155,21 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         if (method === 'signals.close') { const id = String(args[0]), stream = streams.get(id); streams.delete(id); stream?.lifetime.abort(); await stream?.iterator.return?.(); return null }
         if (method === 'upload.discard') { const id = String(args[0]), upload = uploads.get(id) ?? completedUploads.get(id); uploads.delete(id); completedUploads.delete(id); await upload?.discard(); return null }
         check(!suspended, 'ENDPOINT_SUSPENDED')
+        const raw = (): void => check(effective.rawSubmit ?? effective.commands === undefined, 'ENDPOINT_RAW_SUBMIT_FORBIDDEN')
+
+        if (isForwardedOwnerMethod(method)) {
+          const spec: OwnerMethodSpec = OWNER_FORWARDED_METHODS[method]
+          allow(spec.capability); if (spec.raw === true) raw()
+          check(args.length <= OWNER_FORWARDED_MAX_ARGS, 'ENDPOINT_REQUEST_INVALID')
+          active(request)
+          return invokeForwardedOwnerMethod(session, method, args)
+        }
 
         if (method === 'submit') {
-          allow('commands'); check(effective.rawSubmit ?? effective.commands === undefined, 'ENDPOINT_RAW_SUBMIT_FORBIDDEN')
+          allow('commands'); raw()
           active(request)
           const operation = await session.submit(args[0] as Parameters<ApplicationSession['submit']>[0])
           return { id: operation.id, operationId: operation.operationId }
-        }
-        if (method === 'simulate') {
-          allow('queries')
-          return session.simulate(args[0] as Parameters<ApplicationSession['simulate']>[0])
         }
         if (method === 'command') {
           allow('commands'); const name = String(args[0])
@@ -177,26 +183,6 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           allow('queries'); const name = String(args[0])
           check(effective.queries === undefined || effective.queries.includes(name), 'ENDPOINT_QUERY_FORBIDDEN')
           return session.query(name, args[1], { signal: request.signal })
-        }
-        if (method === 'topic') {
-          allow('queries')
-          return session.topic(String(args[0]))
-        }
-        if (method === 'queryAsOf') {
-          allow('queries')
-          return session.queryAsOf(String(args[0]), (args[1] ?? null) as JsonValue, args[2] as { readonly opId: string } | { readonly atTimestampMs: bigint })
-        }
-        if (method === 'opOutcome') {
-          allow('operations')
-          return session.opOutcome(String(args[0]))
-        }
-        if (method === 'topicLastOpId') {
-          allow('queries')
-          return session.topicLastOpId(String(args[0]))
-        }
-        if (method === 'permissions.summary') {
-          allow('queries')
-          return session.permissions()
         }
         if (method === 'sqlBranch.open') {
           allow('queries'); check(branches.size < 4, 'ENDPOINT_BRANCH_LIMIT')
@@ -213,34 +199,6 @@ export function createApplicationOwner(session: ApplicationSession, options: App
           if (method === 'sqlBranch.commit') return br.commitBranch()
           if (method === 'sqlBranch.diff') return br.diff()
           return br.toProposal(args[1] as Parameters<SqlBranch['toProposal']>[0])
-        }
-        if (method === 'compartment.create') {
-          allow('commands')
-          const res = await session.createCompartment(String(args[0]), args[1] as Parameters<ApplicationSession['createCompartment']>[1])
-          return { ring: res.ring, epoch: res.epoch, operation: { id: res.operation.id, operationId: res.operation.operationId } }
-        }
-        if (method === 'recovery.setup') {
-          allow('commands')
-          const op = await session.setupSocialRecovery(args[0] as Parameters<ApplicationSession['setupSocialRecovery']>[0])
-          return { id: op.id, operationId: op.operationId }
-        }
-        if (method === 'recovery.request') {
-          allow('commands')
-          const res = await session.requestSocialRecovery(args[0] as Parameters<ApplicationSession['requestSocialRecovery']>[0])
-          return { requestId: res.requestId, verificationCode: res.verificationCode, operation: { id: res.operation.id, operationId: res.operation.operationId } }
-        }
-        if (method === 'recovery.approve') {
-          allow('commands')
-          const op = await session.approveSocialRecovery(String(args[0]), args[1] as Parameters<ApplicationSession['approveSocialRecovery']>[1])
-          return { id: op.id, operationId: op.operationId }
-        }
-        if (method === 'recovery.complete') {
-          allow('commands')
-          return session.completeSocialRecovery()
-        }
-        if (method === 'readEvents') {
-          allow('events')
-          return session.readEvents(args[0] as Parameters<ApplicationSession['readEvents']>[0])
         }
         if (method === 'readView') {
           check(has('queries') || has('events'), 'ENDPOINT_CAPABILITY_FORBIDDEN')
@@ -275,22 +233,12 @@ export function createApplicationOwner(session: ApplicationSession, options: App
         }
         if (method === 'operation.retry') { allow('operations'); const operation = await session.operations.retry(String(args[0])); return { id: operation.id, operationId: operation.operationId } }
         if (method === 'operation.get') { allow('operations'); const operation = session.operations.get(String(args[0])); return operation === null ? null : { id: operation.id, operationId: operation.operationId, inspection: operation.inspect() } }
-        if (method === 'operation.inspect') { allow('operations'); return session.inspectOperation(String(args[0])) }
         if (method === 'operation.wait') {
           allow('operations'); const operation = session.operations.get(String(args[0])); check(operation !== null, 'OPERATION_UNKNOWN')
           const fact = args[1]; check(fact === 'materialized' || fact === 'retained' || fact === 'finalized', 'OPERATION_FACT_INVALID')
           return operation[fact]({ signal: request.signal, timeoutMs: Number(args[2] ?? 30_000) })
         }
-        if (method === 'diagnostics.peers') { allow('diagnostics'); return session.diagnostics() }
         if (method === 'endpoints.list') { allow('diagnostics'); return owner.endpoints() }
-        if (method === 'facts.export') { allow('replication'); return session.exportFacts(args[0] as Parameters<ApplicationSession['exportFacts']>[0]) }
-        if (method === 'facts.merge') { allow('replication'); return session.mergeFacts(args[0] as SessionFacts) }
-        if (method === 'admission.status') { allow('admission'); return session.admission.status() }
-        if (method === 'admission.opStatus') { allow('admission'); return session.admissionStatus(String(args[0])) }
-        if (method === 'admission.equivocations') { allow('admission'); return session.admission.equivocations() }
-        if (method === 'admission.createCheckpoint') { allow('admission'); return session.admission.createCheckpoint(args[0] as { throughMs: bigint }) }
-        if (method === 'admission.submitEvidence') { allow('admission'); return session.admission.submitEvidence(args[0] as readonly AdmissionEvidence[]) }
-        if (method === 'admission.pinFrontier') { allow('admission'); return session.admission.pinFrontier(args[0] as PinnedFrontier | null) }
         if (method === 'extension.call') {
           allow('extensions'); check(options.extensions !== undefined, 'ENDPOINT_METHOD_UNKNOWN')
           const name = args[0], input = args[1]

@@ -15,6 +15,7 @@
  * - Disabled random()/randomblob()
  * - Kernel-bound actor(), op_id(), op_time() SQL scalar functions
  * - Three-mode sqlite3_set_authorizer: admin (0), user (1), readonly (2)
+ * - Deterministic fuel via sqlite3_progress_handler (every 1000 VDBE opcodes)
  */
 
 /* Host JS callbacks installed on Module._casHooks */
@@ -29,6 +30,12 @@ EM_JS(int, js_cas_truncate, (double size), {
 });
 EM_JS(double, js_cas_filesize, (), {
   return Module._casHooks.filesize();
+});
+/* Deterministic fuel metering: invoked every CHRONOLOG_PROGRESS_OPS VDBE opcodes; nonzero aborts the
+ * statement with SQLITE_INTERRUPT (the host then reports vm:fuel_exhausted). */
+EM_JS(int, js_progress, (), {
+  const fn = Module._casHooks && Module._casHooks.progress;
+  return fn ? fn() : 0;
 });
 EM_JS(int, js_ddl_authorize, (int action, const char* arg1, const char* arg2), {
   return Module._casHooks.ddlAuthorize(action, arg1 ? UTF8ToString(arg1) : "", arg2 ? UTF8ToString(arg2) : "");
@@ -540,6 +547,11 @@ static int chronologAuthorizer(
   return SQLITE_DENY;
 }
 
+/* ── Deterministic fuel ───────────────────────────────────────────────────── */
+
+#define CHRONOLOG_PROGRESS_OPS 1000
+static int chronologProgress(void* arg) { (void)arg; return js_progress(); }
+
 /* ── Exported C API ───────────────────────────────────────────────────────── */
 
 EMSCRIPTEN_KEEPALIVE int chronolog_init(void) {
@@ -627,6 +639,7 @@ EMSCRIPTEN_KEEPALIVE sqlite3* chronolog_open(void) {
     return NULL;
   }
   sqlite3_set_authorizer(db, chronologAuthorizer, NULL);
+  sqlite3_progress_handler(db, CHRONOLOG_PROGRESS_OPS, chronologProgress, NULL);
   sqlite3_set_last_insert_rowid(db, 0);
   return db;
 }

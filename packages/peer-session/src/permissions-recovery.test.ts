@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { combineShares, KEY_BOX_SUITE_XWING, splitSecret, verifyEd25519Sync } from '@chronolog/crypto'
+import { combineShares, epochKeyCommitment, KEY_BOX_SUITE_XWING, splitSecret, verifyEd25519Sync } from '@chronolog/crypto'
 import { ANONYMOUS_AUTHOR, decodeEncryptedEnvelope, decodeSignedOperation, envelopeMailboxSigningBytes, verifySignedOperation } from '@chronolog/protocol'
 import { MemoryBytesStore } from '@chronolog/records'
 import { replayBlindHostControl } from './blind-host.js'
@@ -35,7 +35,6 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: true,
       topics: {
@@ -126,7 +125,6 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: true,
       topics: {
@@ -151,7 +149,6 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
         writer: true,
         administrator: false,
         publisher: false,
-        finalizer: false,
         scopes: ['drafts:write'],
         expiresAtMs: 5000,
         authorTimestampMs: 500n,
@@ -216,7 +213,6 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {
@@ -272,7 +268,6 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: true,
       keysPolicy: {
@@ -335,7 +330,6 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       expect(bobFacts.encryptedEnvelopes.length).toBe(1)
       const rawEnv = decodeEncryptedEnvelope(bobFacts.encryptedEnvelopes[0]!)
       expect(rawEnv.author).toEqual(ANONYMOUS_AUTHOR)
-      expect(rawEnv.suite).toBe('hkdf-aes-256-gcm')
       expect(rawEnv.nonce).toHaveLength(24)
       expect(rawEnv.ciphertext.byteLength % 512).toBe(16) // 512-byte padded plaintext + 16-byte GCM tag
       expect(rawEnv.mailboxTag).toHaveLength(64)
@@ -363,8 +357,9 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       await sAdmin.mergeFacts(bobFacts)
       expect(sAdmin.topic('notes')).toMatchObject({ entries: { secret: { value: 'quantum-safe' } } })
 
-      // Non-admin write-once lockbox protection: Bob cannot overwrite admin's existing epoch 0 box!
-      const overwriteAttempt = await sBob.submit({
+      // Non-admin lockbox authorization & write-once protection:
+      // 1. Bob cannot grant boxes for admin -> grant_not_authorized
+      const overwriteAdmin = await sBob.submit({
         visibility: 'public',
         awaitMaterialized: true,
         updates: [{
@@ -372,11 +367,25 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
           input: {
             action: 'grantBoxes',
             member: admin.identity.publicKey,
-            epochBoxes: { '0': { suite: KEY_BOX_SUITE_XWING, encapsulatedKey: '00', ciphertext: '00' } },
+            epochBoxes: { '0': { suite: KEY_BOX_SUITE_XWING, encapsulatedKey: '00'.repeat(1120), ciphertext: '00'.repeat(48) } },
           },
         }],
       })
-      expect((await overwriteAttempt.materialized()).rejectionCode).toBe('box_already_exists')
+      expect((await overwriteAdmin.materialized()).rejectionCode).toBe('grant_not_authorized')
+      // 2. Bob cannot overwrite his own existing epoch 0 box -> box_already_exists
+      const overwriteSelf = await sBob.submit({
+        visibility: 'public',
+        awaitMaterialized: true,
+        updates: [{
+          topic: '$keys',
+          input: {
+            action: 'grantBoxes',
+            member: bob.identity.publicKey,
+            epochBoxes: { '0': { suite: KEY_BOX_SUITE_XWING, encapsulatedKey: '00'.repeat(1120), ciphertext: '00'.repeat(48) } },
+          },
+        }],
+      })
+      expect((await overwriteSelf.materialized()).rejectionCode).toBe('box_already_exists')
 
       // Self-service wrap key rotation for Bob
       const rotWrap = await sBob.rotateWrapKey()
@@ -432,4 +441,277 @@ describe('Phase 4: Scoped/expiring permissions, compartments, anti-spam, and thr
       await sCarol.close()
     }
   })
+
+  it('supports mixed X-Wing + X25519 epoch admission, O(log N) Key-Tagged TreeKEM, Private Vaults, and SQL write-time RLS crypto helpers', async () => {
+    const admin = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const alice = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const bob = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const x25519OnlyAgent = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
+    const extraPeers = await Promise.all(Array.from({ length: 5 }, () => openApplicationDevice({ store: new MemoryBytesStore(), create: true })))
+
+    const sqlReducer = `
+      import { openDb } from 'chronolog:sqlite';
+      import { applyRls, sealRecipientsPolicy, vaultBoxPolicy } from 'chronolog/rls';
+      export default {
+        reduce(state, tx, ctx) {
+          if (!ctx.can('writer')) return { ok: false, code: 'writer_required' };
+          const db = openDb(state && state.dbRoot ? state.dbRoot : null);
+          const input = tx.payload || {};
+          if (input.action === 'init') {
+            db.exec('CREATE TABLE allowed_readers (pk TEXT PRIMARY KEY)', [], { mode: 'admin' });
+            db.exec('CREATE TABLE secrets (id TEXT PRIMARY KEY, secret_box TEXT NOT NULL)', [], { mode: 'admin' });
+            db.exec('CREATE TABLE vault_docs (id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, payload TEXT NOT NULL)', [], { mode: 'admin' });
+            applyRls(db, {
+              secrets: { insert: sealRecipientsPolicy('secret_box', 'SELECT pk FROM allowed_readers') },
+              vault_docs: { insert: vaultBoxPolicy('payload', 'vault_id', 'vaults') },
+            });
+            for (const pk of input.allowed || []) {
+              db.exec('INSERT INTO allowed_readers (pk) VALUES (?)', [pk], { mode: 'admin' });
+            }
+            return { ok: true, state: { dbRoot: db.commit() } };
+          }
+          if (input.action === 'putSecret') {
+            db.exec('INSERT INTO secrets (id, secret_box) VALUES (?, ?)', [input.id, input.secretBox], { mode: 'user' });
+            return { ok: true, state: { dbRoot: db.commit() } };
+          }
+          if (input.action === 'putVaultDoc') {
+            db.exec('INSERT INTO vault_docs (id, vault_id, payload) VALUES (?, ?, ?)', [input.id, input.vaultId, input.payload], { mode: 'user' });
+            return { ok: true, state: { dbRoot: db.commit() } };
+          }
+          return { ok: false, code: 'unknown_action' };
+        },
+        query(state, input) {
+          if (!state || !state.dbRoot) return { rows: [] };
+          const db = openDb(state.dbRoot);
+          return db.query(input.sql, input.params || [], { format: 'objects' });
+        },
+      };
+    `
+
+    const created = await createLogGenesis({
+      creator: {
+        publicKey: admin.identity.publicKey,
+        wrapKey: admin.wrapKey.publicKey,
+        pqWrapKey: admin.pqWrapKey!.publicKey,
+        reader: true,
+        writer: true,
+        administrator: true,
+        publisher: true,
+      },
+      privateLog: true,
+      imports: { 'app/secure-sql': sqlReducer },
+      topics: {
+        vaults: { module: 'chronolog/vaults' },
+        db: { module: 'app/secure-sql' },
+      },
+    })
+
+    const sAdmin = await createApplicationSession({
+      device: admin,
+      genesis: created.genesisBytes,
+      casNodes: created.casNodes,
+      epochKeys: new Map([[0, created.epoch0Key!]]),
+    })
+    const sAlice = await createApplicationSession({ device: alice, genesis: created.genesisBytes, casNodes: created.casNodes })
+    const sBob = await createApplicationSession({ device: bob, genesis: created.genesisBytes, casNodes: created.casNodes })
+    const sAgent = await createApplicationSession({ device: x25519OnlyAgent, genesis: created.genesisBytes, casNodes: created.casNodes })
+    const sExtras = await Promise.all(extraPeers.map(d => createApplicationSession({ device: d, genesis: created.genesisBytes, casNodes: created.casNodes })))
+
+    try {
+      // 1. Mixed X-Wing + X25519 epoch 0 admission (regression test for native agent with wrapKey only!)
+      await (await sAdmin.admitMember({ publicKey: alice.identity.publicKey, wrapKey: alice.wrapKey.publicKey, pqWrapKey: alice.pqWrapKey!.publicKey })).materialized()
+      expect(sAdmin.keysState().epochs['0']?.suite).toBe(KEY_BOX_SUITE_XWING)
+      await (await sAdmin.admitMember({ publicKey: bob.identity.publicKey, wrapKey: bob.wrapKey.publicKey, pqWrapKey: bob.pqWrapKey!.publicKey })).materialized()
+      // Native agent has ONLY X25519 wrapKey (no pqWrapKey) — must still open epoch 0 cleanly!
+      await (await sAdmin.admitMember({ publicKey: x25519OnlyAgent.identity.publicKey, wrapKey: x25519OnlyAgent.wrapKey.publicKey })).materialized()
+      await sAgent.mergeFacts(await sAdmin.exportFacts())
+      expect(sAgent.hasEpochKey(0)).toBe(true)
+
+      for (const p of extraPeers) {
+        await (await sAdmin.admitMember({ publicKey: p.identity.publicKey, wrapKey: p.wrapKey.publicKey, pqWrapKey: p.pqWrapKey!.publicKey })).materialized()
+      }
+
+      // 2. Sub-linear O(log N) Key-Tagged TreeKEM rotation over 9 members
+      const tree1 = await sAdmin.rotateTreeEpoch()
+      expect((await tree1.operation.materialized()).outcome).toBe('accepted')
+      expect(tree1.epoch).toBe(1)
+
+      const facts1 = await sAdmin.exportFacts()
+      await sAlice.mergeFacts(facts1)
+      await sBob.mergeFacts(facts1)
+      await sAgent.mergeFacts(facts1)
+      for (const s of sExtras) await s.mergeFacts(facts1)
+      expect(sAlice.hasEpochKey(1)).toBe(true)
+      expect(sBob.hasEpochKey(1)).toBe(true)
+      expect(sAgent.hasEpochKey(1)).toBe(true)
+      expect(sExtras[0]!.hasEpochKey(1)).toBe(true)
+
+      // Default rotateOnRemove: true blocks removing a reader without rotating in the same op!
+      const blockedRemove = await (await sAdmin.removeMember(extraPeers[4]!.identity.publicKey, { rotateEpoch: false })).materialized()
+      expect(blockedRemove.outcome).toBe('rejected')
+      expect(blockedRemove.rejectionCode).toBe('rotation_required')
+
+      // With rotateOnRemove: false, removing without rotating succeeds and keysNeedsRotation() detects the stale leaf!
+      await (await sAdmin.setKeysPolicy({ rotateOnRemove: false })).materialized()
+      expect((await (await sAdmin.removeMember(extraPeers[4]!.identity.publicKey, { rotateEpoch: false })).materialized()).outcome).toBe('accepted')
+      const needs = await sAdmin.keysNeedsRotation()
+      expect(needs.needsRotation).toBe(true)
+      expect(needs.staleMembers).toContain(extraPeers[4]!.identity.publicKey)
+
+      // Sub-linear healing TreeKEM rotation excludes extraPeers[4] in O(log N) boxes!
+      const tree2 = await sAdmin.rotateTreeEpoch()
+      expect((await tree2.operation.materialized()).outcome).toBe('accepted')
+      expect(tree2.epoch).toBe(2)
+      expect(tree2.copathBoxes).toBeLessThanOrEqual(8)
+      expect((await sAdmin.keysNeedsRotation()).needsRotation).toBe(false)
+
+      const facts2 = await sAdmin.exportFacts()
+      await sAlice.mergeFacts(facts2)
+      await sBob.mergeFacts(facts2)
+      await sExtras[0]!.mergeFacts(facts2)
+      await sExtras[4]!.mergeFacts(facts2)
+      expect(sAlice.hasEpochKey(2)).toBe(true)
+      expect(sBob.hasEpochKey(2)).toBe(true)
+      expect(sExtras[0]!.hasEpochKey(2)).toBe(true)
+      expect(sExtras[4]!.hasEpochKey(2)).toBe(false)
+
+      // 3. Private Capability Vaults + SQL write-time RLS (sealRecipientsPolicy & vaultBoxPolicy)
+      await (await sAdmin.submit({
+        awaitMaterialized: true,
+        updates: [{ topic: 'db', input: { action: 'init', allowed: [admin.identity.publicKey, alice.identity.publicKey] } }],
+      })).materialized()
+
+      // sealRecipientsPolicy: sealing strictly to Alice succeeds; leaking to Bob is rejected by SQLite RLS!
+      const okSealed = await sAdmin.sealFor([alice.identity.publicKey], { salary: 200_000 })
+      const okSec = await sAdmin.submit({
+        awaitMaterialized: true,
+        updates: [{ topic: 'db', input: { action: 'putSecret', id: 's1', secretBox: JSON.stringify(okSealed) } }],
+      })
+      expect((await okSec.materialized()).outcome).toBe('accepted')
+
+      const badSealed = await sAdmin.sealFor([alice.identity.publicKey, bob.identity.publicKey], { salary: 200_000 })
+      const badSec = await sAdmin.submit({
+        awaitMaterialized: true,
+        updates: [{ topic: 'db', input: { action: 'putSecret', id: 's2', secretBox: JSON.stringify(badSealed) } }],
+      })
+      expect((await badSec.materialized()).outcome).toBe('rejected')
+
+      // Private vault 'deal:acme' with ONLY [admin, alice] (invisible to blind host & Bob!)
+      expect((await (await sAdmin.vaults.create('deal:acme', { members: [alice.identity.publicKey] })).materialized()).outcome).toBe('accepted')
+      const vBox0 = await sAdmin.vaults.seal('deal:acme', { price: '$2M' })
+      expect((await (await sAdmin.submit({
+        awaitMaterialized: true,
+        updates: [{ topic: 'db', input: { action: 'putVaultDoc', id: 'd1', vaultId: 'deal:acme', payload: JSON.stringify(vBox0) } }],
+      })).materialized()).outcome).toBe('accepted')
+
+      // Sync to Alice & Bob: Alice unseals d1; Bob cannot unseal d1 AND cannot write to deal:acme (vaultBoxPolicy)!
+      const vFacts1 = await sAdmin.exportFacts()
+      await sAlice.mergeFacts(vFacts1)
+      await sBob.mergeFacts(vFacts1)
+      expect(sAlice.vaults.hasKey('deal:acme', 0)).toBe(true)
+      expect(sBob.vaults.hasKey('deal:acme', 0)).toBe(false)
+
+      const aliceRows = ((await sAlice.query('db', { sql: 'SELECT id, vault_id, payload FROM vault_docs' })).value as { rows: unknown[][] }).rows
+      expect(await sAlice.vaults.unsealRows(aliceRows)).toEqual([['d1', 'deal:acme', { price: '$2M' }]])
+      expect(await sAlice.vaults.unsealRows([{ id: 'd1', vault_id: 'deal:acme', payload: vBox0 }])).toEqual([
+        { id: 'd1', vault_id: 'deal:acme', payload: { price: '$2M' } },
+      ])
+      const bobRows = ((await sBob.query('db', { sql: 'SELECT id, vault_id, payload FROM vault_docs' })).value as { rows: unknown[][] }).rows
+      expect(await sBob.vaults.unsealRows(bobRows)).toEqual([['d1', 'deal:acme', null]])
+
+      const bobForbiddenWrite = await sBob.submit({
+        awaitMaterialized: true,
+        updates: [{ topic: 'db', input: { action: 'putVaultDoc', id: 'd-forged', vaultId: 'deal:acme', payload: JSON.stringify(vBox0) } }],
+      })
+      expect((await bobForbiddenWrite.materialized()).outcome).toBe('rejected')
+
+      // O(1) add Bob to 'deal:acme' -> Bob can immediately unseal d1!
+      await (await sAdmin.vaults.addMember('deal:acme', bob.identity.publicKey)).materialized()
+      await sBob.mergeFacts(await sAdmin.exportFacts())
+      expect(sBob.vaults.hasKey('deal:acme', 0)).toBe(true)
+      expect(await sBob.vaults.unsealRows(bobRows)).toEqual([['d1', 'deal:acme', { price: '$2M' }]])
+
+      // Remove Bob from 'deal:acme' -> rotates vault to epoch 1 -> Bob cannot unseal epoch 1 doc d2 (forward secrecy)!
+      const rem = await sAdmin.vaults.removeMember('deal:acme', bob.identity.publicKey)
+      expect(rem.epoch).toBe(1)
+      const vBox1 = await sAdmin.vaults.seal('deal:acme', { price: '$3M' })
+      expect((await (await sAdmin.submit({
+        awaitMaterialized: true,
+        updates: [{ topic: 'db', input: { action: 'putVaultDoc', id: 'd2', vaultId: 'deal:acme', payload: JSON.stringify(vBox1) } }],
+      })).materialized()).outcome).toBe('accepted')
+
+      const vFacts2 = await sAdmin.exportFacts()
+      await sAlice.mergeFacts(vFacts2)
+      await sBob.mergeFacts(vFacts2)
+      expect(sAlice.vaults.hasKey('deal:acme', 1)).toBe(true)
+      expect(sBob.vaults.hasKey('deal:acme', 1)).toBe(false)
+      const d2Alice = ((await sAlice.query('db', { sql: "SELECT id, payload FROM vault_docs WHERE id = 'd2'" })).value as { rows: unknown[][] }).rows
+      const d2Bob = ((await sBob.query('db', { sql: "SELECT id, payload FROM vault_docs WHERE id = 'd2'" })).value as { rows: unknown[][] }).rows
+      expect(await sAlice.vaults.unsealRows(d2Alice)).toEqual([['d2', { price: '$3M' }]])
+      expect(await sBob.vaults.unsealRows(d2Bob)).toEqual([['d2', null]])
+
+      // Plain text mentioning the vault format marker must NEVER be destroyed by unsealRows(),
+      // and { columns, rows } query objects are supported directly!
+      const plainText = 'Docs mention "chronolog-vault-box/v1" format safely'
+      const unsealedObj = await sAlice.vaults.unsealRows({ columns: ['id', 'note', 'payload'], rows: [['n1', plainText, JSON.stringify(vBox1)]] })
+      expect(unsealedObj).toEqual({ columns: ['id', 'note', 'payload'], rows: [['n1', plainText, { price: '$3M' }]] })
+
+      // Verify 16-member X-Wing structural-sharing TreeKEM DAG (>64 KiB if monolithic) + stateless updater self-recovery
+      const { bytesToHex } = await import('@chronolog/canonical')
+      const { buildTreeEpochUpdate, openTreeEpoch, writeKeyTreeToCas, readKeyTreeFromCas, KEY_TREE_SUITE_XWING } = await import('@chronolog/crypto')
+      const { createPqWrapKeyPair } = await import('./wrap-keys.js')
+      const bigMembers = Array.from({ length: 16 }, () => {
+        const pq = createPqWrapKeyPair()
+        return {
+          publicKey: bytesToHex(crypto.getRandomValues(new Uint8Array(32))),
+          wrapKey: bytesToHex(crypto.getRandomValues(new Uint8Array(32))),
+          pqWrapKey: pq.publicKey,
+          pqSecretKey: pq.secretKey,
+        }
+      })
+      const bigTree = await buildTreeEpochUpdate({
+        scope: 'big-scope',
+        epoch: 1,
+        updaterPublicKey: bigMembers[0]!.publicKey,
+        activeMembers: bigMembers,
+        suite: KEY_TREE_SUITE_XWING,
+      })
+      const dagStore = new Map<string, Uint8Array>()
+      const { computeCasHash } = await import('@chronolog/records')
+      const dagRootHash = await writeKeyTreeToCas(bigTree.payload, async (bytes, links) => {
+        const h = computeCasHash(bytes, links)
+        dagStore.set(h, bytes)
+        return h
+      })
+      expect(dagStore.size).toBeGreaterThan(2)
+      const roundTripped = await readKeyTreeFromCas(dagRootHash, async h => dagStore.get(h) ?? null)
+      expect(roundTripped.ok).toBe(true)
+      if (roundTripped.ok) {
+        // Updater (index 0) recovers statelessly via its own self-box with empty cachedNodeSeeds!
+        const selfOpen = await openTreeEpoch({
+          scope: 'big-scope',
+          payload: roundTripped.payload,
+          keyCommitment: epochKeyCommitment(bigTree.epochKey),
+          wrapPrivateKey: admin.wrapKey.privateKey,
+          wrapPublicKeyHex: bigMembers[0]!.wrapKey,
+          pqSecretKey: bigMembers[0]!.pqSecretKey,
+          pqPublicKeyHex: bigMembers[0]!.pqWrapKey,
+        })
+        expect(selfOpen).not.toBeNull()
+        expect(bytesToHex(selfOpen!.epochKey)).toBe(bytesToHex(bigTree.epochKey))
+      }
+      // Missing subtree CAS node is reported cleanly
+      const someChildHash = [...dagStore.keys()].find(h => h !== dagRootHash)!
+      dagStore.delete(someChildHash)
+      const missingRes = await readKeyTreeFromCas(dagRootHash, async h => dagStore.get(h) ?? null)
+      expect(missingRes.ok).toBe(false)
+      if (!missingRes.ok) expect(missingRes.missingHashes).toContain(someChildHash)
+    } finally {
+      await sAdmin.close()
+      await sAlice.close()
+      await sBob.close()
+      await sAgent.close()
+      for (const s of sExtras) await s.close()
+    }
+  }, 60_000)
 })

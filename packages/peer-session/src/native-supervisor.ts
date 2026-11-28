@@ -1,6 +1,6 @@
-import { chmodSync, mkdirSync, openSync, closeSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, rmSync } from 'node:fs'
 import { createServer, connect, type Server, type Socket } from 'node:net'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 /** Create a private directory (0700 on POSIX). */
@@ -9,68 +9,29 @@ export function ensurePrivateDirectory(dir: string): void {
   try { chmodSync(dir, 0o700) } catch { /* Windows */ }
 }
 
-function isPidAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (err) {
-    return (err as { code?: string }).code === 'EPERM'
-  }
-}
-
-export interface AtomicLockHandle {
-  readonly path: string
-  release(): void
-}
-
 /**
- * Acquire an exclusive atomic lockfile inside `dir` (with stale dead-PID recovery).
- * Throws `OWNER_BUSY` if another live process holds the lock.
+ * The single owner fence: an OS-level exclusive SQLite lock held for as long as the handle is open.
+ * The kernel releases it when the process dies, so there is no stale-lock recovery, no PID reuse
+ * hazard, and no read-then-delete race.
  */
-export function acquireAtomicLock(dir: string, filename = 'owner.lock'): AtomicLockHandle {
-  ensurePrivateDirectory(dir)
-  const lockPath = join(dir, filename)
-  const payload = JSON.stringify({ pid: process.pid, startedAt: Date.now() }) + '\n'
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(lockPath, 'wx', 0o600)
-      try { writeFileSync(fd, payload) } finally { closeSync(fd) }
-      let released = false
-      return {
-        path: lockPath,
-        release() {
-          if (released) return
-          released = true
-          try { unlinkSync(lockPath) } catch { /* ignore */ }
-        },
-      }
-    } catch (err) {
-      if ((err as { code?: string }).code !== 'EEXIST') throw err
-      try {
-        const existing = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: number }
-        if (typeof existing.pid === 'number' && isPidAlive(existing.pid)) {
-          throw Object.assign(new Error(`Owner lock held by active PID ${existing.pid}`), { code: 'OWNER_BUSY' })
-        }
-        rmSync(lockPath, { force: true })
-      } catch (readErr) {
-        if ((readErr as { code?: string }).code === 'OWNER_BUSY') throw readErr
-        rmSync(lockPath, { force: true })
-      }
-    }
-  }
-  throw Object.assign(new Error('Failed to acquire atomic owner lock'), { code: 'OWNER_BUSY' })
-}
-
 export interface ExclusiveSqliteFence {
   readonly path: string
+  /** True until `close()`; proof that this process still holds the fence. */
+  readonly held: boolean
   close(): void
+}
+
+function isSqliteBusy(err: unknown): boolean {
+  const { errcode, message } = err as { errcode?: unknown; message?: unknown }
+  if (typeof errcode === 'number') return (errcode & 0xff) === 5 || (errcode & 0xff) === 6
+  return typeof message === 'string' && /database (?:table )?is (?:locked|busy)/iu.test(message)
 }
 
 /**
  * Acquire an OS-level exclusive SQLite fence (`PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE`)
- * using Node's built-in `node:sqlite` (`DatabaseSync`) so two processes can never sign concurrently.
+ * using Node's built-in `node:sqlite` (`DatabaseSync`) so two processes can never own the same
+ * state directory (and so never sign concurrently or race on its IPC socket).
+ * Throws `OWNER_BUSY` when another process holds it; any other failure is rethrown unchanged.
  */
 export function openExclusiveSqliteFence(dbPath: string): ExclusiveSqliteFence {
   ensurePrivateDirectory(dirname(dbPath))
@@ -78,19 +39,22 @@ export function openExclusiveSqliteFence(dbPath: string): ExclusiveSqliteFence {
   try {
     db = new DatabaseSync(dbPath)
     db.exec('PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS owner_fence(id INTEGER PRIMARY KEY);')
-    let closed = false
-    return {
-      path: dbPath,
-      close() {
-        if (closed) return
-        closed = true
-        try { db?.exec('ROLLBACK') } catch { /* ignore */ }
-        try { db?.close() } catch { /* ignore */ }
-      },
-    }
   } catch (err) {
     try { db?.close() } catch { /* ignore */ }
+    if (!isSqliteBusy(err)) throw err
     throw Object.assign(new Error(`Exclusive SQLite fence busy: ${dbPath}`), { code: 'OWNER_BUSY', cause: err })
+  }
+  const handle = db
+  let closed = false
+  return {
+    path: dbPath,
+    get held() { return !closed },
+    close() {
+      if (closed) return
+      closed = true
+      try { handle.exec('ROLLBACK') } catch { /* ignore */ }
+      try { handle.close() } catch { /* ignore */ }
+    },
   }
 }
 
@@ -146,16 +110,28 @@ function wrapLengthPrefixedSocket(socket: Socket, maxFrameBytes = 16 * 1024 * 10
   }
 }
 
-/** Start a length-prefixed local IPC server over a Unix domain socket or Windows named pipe. */
+/**
+ * Start a length-prefixed local IPC server over a Unix domain socket or Windows named pipe.
+ * Requires the caller's held `ExclusiveSqliteFence`: only the fence holder may replace a stale
+ * socket file, and only a leftover socket (never a regular file) is unlinked.
+ */
 export async function startNativeIpcServer(options: {
   readonly socketPath: string
+  /** The held owner fence; a socket is only created (and any stale one unlinked) while it is held. */
+  readonly fence: ExclusiveSqliteFence
   readonly maxFrameBytes?: number
   readonly onConnection: (conn: NativeIpcConnection) => void
 }): Promise<{ readonly socketPath: string; close(): Promise<void> }> {
+  if (!options.fence.held) throw Object.assign(new Error('startNativeIpcServer requires a held owner fence'), { code: 'OWNER_FENCE_NOT_HELD' })
   const isPipe = options.socketPath.startsWith('\\\\.\\pipe\\')
   if (!isPipe) {
     ensurePrivateDirectory(dirname(options.socketPath))
-    rmSync(options.socketPath, { force: true })
+    let stale: ReturnType<typeof lstatSync> | undefined
+    try { stale = lstatSync(options.socketPath) } catch (err) { if ((err as { code?: string }).code !== 'ENOENT') throw err }
+    if (stale !== undefined) {
+      if (!stale.isSocket()) throw Object.assign(new Error(`Refusing to replace non-socket file at ${options.socketPath}`), { code: 'EEXIST' })
+      rmSync(options.socketPath, { force: true })
+    }
   }
   const server: Server = createServer(socket => {
     options.onConnection(wrapLengthPrefixedSocket(socket, options.maxFrameBytes))

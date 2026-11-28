@@ -11,7 +11,7 @@ import {
   type BlobDagLeaf,
   type BytesStore,
 } from '@chronolog/records'
-import { encryptEpochPayload, decryptEpochPayload, type EncryptedEpochPayload } from '@chronolog/crypto'
+import { EPOCH_PAYLOAD_SALT_BYTES, encryptEpochPayload, decryptEpochPayload, type EncryptedEpochPayload } from '@chronolog/crypto'
 import { bytesToHex, concatBytes, equalBytes, sha256, utf8 } from '@chronolog/canonical'
 import { check, decodeRecord, encodeRecord, equalRecord, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from '@chronolog/authority'
 import {
@@ -42,12 +42,13 @@ export interface ContentAuthority {
 
 export const MAX_CONTENT_CHUNKS = MAX_CONTENT_BYTES / CONTENT_CHUNK_BYTES
 /**
- * Binary encrypted chunk (stored and sent as-is): [format u8 = 1][epoch u64 BE][nonce 12][AES-GCM ciphertext+tag].
- * Exactly `CONTENT_CHUNK_HEADER_BYTES + plaintext + 16` bytes; no hex, JSON or base64 anywhere.
+ * Binary encrypted chunk (stored and sent as-is): [format u8 = 1][epoch u64 BE][salt 24][AES-GCM ciphertext+tag].
+ * Exactly `CONTENT_CHUNK_HEADER_BYTES + plaintext + CONTENT_CHUNK_OVERHEAD_BYTES` bytes (1-byte pad tag + 16-byte GCM tag); no hex, JSON or base64 anywhere.
  */
-export const CONTENT_CHUNK_HEADER_BYTES = 21
-const CONTENT_CHUNK_FORMAT = 1, AES_GCM_TAG_BYTES = 16
-export const MAX_CONTENT_ENCRYPTED_CHUNK_BYTES = CONTENT_CHUNK_BYTES + CONTENT_CHUNK_HEADER_BYTES + AES_GCM_TAG_BYTES
+export const CONTENT_CHUNK_HEADER_BYTES = 1 + 8 + EPOCH_PAYLOAD_SALT_BYTES
+const CONTENT_CHUNK_FORMAT = 1
+export const CONTENT_CHUNK_OVERHEAD_BYTES = 1 + 16
+export const MAX_CONTENT_ENCRYPTED_CHUNK_BYTES = CONTENT_CHUNK_BYTES + CONTENT_CHUNK_HEADER_BYTES + CONTENT_CHUNK_OVERHEAD_BYTES
 export const MAX_CONTENT_MANIFEST_BYTES = 256 * 1024
 /** Bytes a single lazy pull keeps in flight ahead of its consumer (sliding window over all sources). */
 export const CONTENT_FETCH_WINDOW_BYTES = 4 * 1024 * 1024
@@ -120,6 +121,7 @@ export function assertBlobInfo(value: unknown): asserts value is BlobInfo {
 }
 function body(reference: ContentReference): Omit<ContentReference, 'id'> { const { id: _id, ...rest } = reference; return rest }
 function encodeChunk(payload: EncryptedEpochPayload): Uint8Array {
+  check(payload.nonce.length === EPOCH_PAYLOAD_SALT_BYTES, 'CONTENT_CHUNK_INVALID')
   const out = new Uint8Array(CONTENT_CHUNK_HEADER_BYTES + payload.ciphertext.length)
   out[0] = CONTENT_CHUNK_FORMAT
   new DataView(out.buffer).setBigUint64(1, payload.epoch)
@@ -128,7 +130,7 @@ function encodeChunk(payload: EncryptedEpochPayload): Uint8Array {
 }
 /** Parse a binary encrypted chunk as zero-copy views; the exact length binds it to its plaintext size. */
 function envelope(bytes: Uint8Array, epoch: number, plaintextBytes: number): EncryptedEpochPayload {
-  check(bytes instanceof Uint8Array && bytes.length === CONTENT_CHUNK_HEADER_BYTES + plaintextBytes + AES_GCM_TAG_BYTES && bytes[0] === CONTENT_CHUNK_FORMAT, 'CONTENT_CHUNK_INVALID')
+  check(bytes instanceof Uint8Array && bytes.length === CONTENT_CHUNK_HEADER_BYTES + plaintextBytes + CONTENT_CHUNK_OVERHEAD_BYTES && bytes[0] === CONTENT_CHUNK_FORMAT, 'CONTENT_CHUNK_INVALID')
   const value = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(1)
   check(value === BigInt(epoch), 'CONTENT_CHUNK_INVALID')
   return { epoch: value, nonce: bytes.subarray(9, CONTENT_CHUNK_HEADER_BYTES), ciphertext: bytes.subarray(CONTENT_CHUNK_HEADER_BYTES) }
@@ -810,7 +812,7 @@ export class ApplicationContent {
         sha256(concatBytes(utf8('chronolog/convergent-nonce/v2:'), epochKey, utf8(this.#prefix), plainDigest, utf8(`:${index}`))),
       )
       const encrypted = encodeChunk(await awaitOwnedTask(signal, () =>
-        encryptEpochPayload(epochKey, BigInt(epoch), plainChunk, encodeRecord([this.#prefix, id, index]), nonceDigest.subarray(0, 12)),
+        encryptEpochPayload(epochKey, BigInt(epoch), plainChunk, encodeRecord([this.#prefix, id, index]), nonceDigest.subarray(0, EPOCH_PAYLOAD_SALT_BYTES)),
       ))
       const hash = computeCasHash(encrypted, [])
       encryptedChunks.push({ hash, bytes: encrypted })

@@ -8,11 +8,16 @@ import { protocolInvariant, utf8 } from '@chronolog/protocol'
 
 ed.hashes.sha512 = (message: Uint8Array) => sha512(message) as Uint8Array<ArrayBuffer>
 
-/** Synchronous Ed25519 verification for pure deterministic QuickJS reducers and blind hosts. */
+/**
+ * Chronolog's single Ed25519 verification rule set (RFC 8032 / FIPS 186-5 strict, noble `zip215: false`):
+ * canonical `A` and `R` encodings (`y < p`), `S < L`, small-order public keys rejected, cofactored
+ * group equation. Every replica, reducer (`chronolog:crypto`), and blind host must verify with exactly
+ * this function so signature acceptance is a deterministic function of the bytes.
+ */
 export function verifyEd25519Sync(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
   if (publicKey.length !== 32 || signature.length !== 64) return false
   try {
-    return ed.verify(signature, message, publicKey)
+    return ed.verify(signature, message, publicKey, { zip215: false })
   } catch {
     return false
   }
@@ -35,16 +40,33 @@ export function hmacSha256Sync(key: Uint8Array, message: Uint8Array): Uint8Array
   return Uint8Array.from(hmac(sha256, key, message))
 }
 
+/** Wire format of an ECDSA P-256 signature: ASN.1 DER (WebAuthn / ES256 attestations) or 64-byte IEEE P1363 `r || s`. */
+export type P256SignatureFormat = 'der' | 'compact'
+
 /**
- * Synchronous ECDSA P-256 (ES256 / WebAuthn Passkey) verification.
- * Accepts 33-byte compressed or 65-byte uncompressed SEC1 public keys, and either
- * 64-byte IEEE P1363 raw (r||s) signatures or ASN.1 DER signatures (WebAuthn standard).
+ * Synchronous ECDSA P-256 (ES256 / WebAuthn passkey) verification with an explicit signature format.
+ * Accepts 33-byte compressed or 65-byte uncompressed SEC1 public keys. `compact` requires exactly
+ * 64 bytes; `der` requires a strictly parsed ASN.1 DER `SEQUENCE { r, s }` (8..72 bytes).
+ *
+ * High-S signatures are accepted because WebAuthn authenticators are not required to normalize S.
+ * ECDSA signatures are therefore malleable: never use P-256 signature bytes as an identifier or
+ * deduplication key.
  */
-export function verifyP256Sync(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
+export function verifyP256Sync(
+  publicKey: Uint8Array,
+  message: Uint8Array,
+  signature: Uint8Array,
+  format: P256SignatureFormat,
+): boolean {
   if (publicKey.length !== 33 && publicKey.length !== 65) return false
-  if (signature.length < 64 || signature.length > 72) return false
+  if (format === 'compact') {
+    if (signature.length !== 64) return false
+  } else if (format === 'der') {
+    if (signature.length < 8 || signature.length > 72 || signature[0] !== 0x30) return false
+  } else {
+    return false
+  }
   try {
-    const format = signature.length === 64 && signature[0] !== 0x30 ? 'compact' : 'der'
     return p256.verify(signature, message, publicKey, { format, lowS: false })
   } catch {
     return false

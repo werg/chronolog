@@ -31,7 +31,7 @@ it('sorts readback independently of adapter iteration order',async()=>{
 })
 it('invalid headers and ciphertext cannot write the target',async()=>{
  const source=new MemoryBytesStore(),secret=generateCheckpointKey(),cp=await exportDeviceCheckpoint(source,{secret,retireSource:false})
- for(const mutate of [(b:Uint8Array)=>{b[5]=128},(b:Uint8Array)=>{b[6]=1},(b:Uint8Array)=>{b[b.length-1]!^=1}]){
+ for(const mutate of [(b:Uint8Array)=>{b[5]=128},(b:Uint8Array)=>{b[6]=2},(b:Uint8Array)=>{b[b.length-1]!^=1}]){
   const bytes=cp.bytes.slice();mutate(bytes);const target=new MemoryBytesStore();await expect(restoreDeviceCheckpoint(target,bytes,{secret})).rejects.toBeInstanceOf(Error);expect(await target.entries()).toEqual([])
  }
 })
@@ -73,7 +73,7 @@ it('authenticates bounded passphrase KDF parameters and rejects wrong passphrase
   const store = new MemoryBytesStore(), secret = 'a sufficiently long passphrase'
   await store.put('key', Uint8Array.of(7))
   const checkpoint = await exportDeviceCheckpoint(store, { secret, retireSource: false })
-  expect(checkpoint.bytes[5]).toBe(2)
+  expect(checkpoint.bytes[5]).toBe(0) // passphrase-derived key (1 = raw key)
   expect(checkpoint.bytes[6]).toBe(1)
   expect(new DataView(checkpoint.bytes.buffer).getUint32(7)).toBe(600_000)
   const target = new MemoryBytesStore()

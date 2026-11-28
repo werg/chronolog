@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { PEER_MESSAGE_LIMITS, PEER_LIVE_MESSAGE_LIMITS } from '@chronolog/records'
+import * as transport from './index.js'
 import { frameWebSocketPeerConnection, type PeerWebSocket, type WebSocketPeerOptions } from './index.js'
 
 class Socket extends EventTarget implements PeerWebSocket {
@@ -38,6 +39,11 @@ function pair(options: WebSocketPeerOptions = {}) {
 }
 
 describe('WebSocket byte adapter using shared message framing', () => {
+  it('exposes exactly one framing: one socket per lane, no single-socket lane mux', () => {
+    // A shared-socket mux put both lanes on one bufferedAmount (live head-of-line blocked behind reliable).
+    expect(Object.keys(transport).sort()).toEqual(['frameWebSocketPeerConnection', 'openWebSocketConnection'])
+  })
+
   it('installs readers before admission and uses identical bounded packets in both directions', async () => {
     const admission = admissionGate(), value = pair({ ready: admission.promise })
     try {

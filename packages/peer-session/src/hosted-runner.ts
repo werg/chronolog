@@ -1,16 +1,12 @@
 import { bytesToHex } from '@chronolog/canonical'
 import type { AdmissionEvidence, SigningIdentity } from '@chronolog/authority'
 import type { QuickJsSandboxOptions } from '@chronolog/materializer'
-import {
-  decodeEncryptedEnvelope,
-  decodeSignedOperation,
-  encryptedEnvelopeDigest,
-  operationIdDigest,
-} from '@chronolog/protocol'
+import { decodeEncryptedEnvelope, encryptedEnvelopeDigest } from '@chronolog/protocol'
 import { MemoryBytesStore } from '@chronolog/records'
 import { openApplicationDevice } from './device.js'
 import { createApplicationSession } from './runtime.js'
 import type { ApplicationSession, SessionCasNode } from './session.js'
+import { standardModuleHashes } from './standard-modules.js'
 
 export interface HostedEncryptedEnvelopeExport {
   readonly digest: string
@@ -45,6 +41,7 @@ export interface RunEphemeralHostedSessionOptions {
 export interface EphemeralHostedSessionDelta {
   readonly newEnvelopes: readonly HostedEncryptedEnvelopeExport[]
   readonly newPublicOps: readonly Uint8Array[]
+  readonly newPublicCasNodes: readonly { readonly hash: string; readonly bytes: Uint8Array }[]
   readonly newSealedPrivateCas: readonly HostedSealedCasItem[]
   readonly prunedPrivateCasHashes: readonly string[]
   readonly snapshot: Uint8Array | null
@@ -58,6 +55,10 @@ export interface EphemeralHostedSessionDelta {
  * RAM-only `signer` and `epochKeys`, executes `work(session)`, exports only encrypted
  * delta envelopes, newly sealed private CAS nodes, pruned private CAS hashes, and an
  * opaque epoch-AEAD materialized snapshot, and zeroes/discards RAM keys in `finally`.
+ *
+ * The delta is tracked from the session's `onFacts` notifications during `work` (no re-export of
+ * the whole log per request). `materializedSnapshot` must be a bundle this host produced itself
+ * (a previous run's `delta.snapshot`): it is adopted without replaying the history it covers.
  */
 export async function runEphemeralHostedSession<T>(
   options: RunEphemeralHostedSessionOptions,
@@ -73,6 +74,8 @@ export async function runEphemeralHostedSession<T>(
     create: true,
   })
 
+  const hydratedPubHashes = new Set<string>(standardModuleHashes())
+  for (const n of options.publicCasNodes) hydratedPubHashes.add(n.hash)
   const casNodes: SessionCasNode[] = options.publicCasNodes.map(n => ({
     hash: n.hash,
     bytes: n.bytes,
@@ -93,13 +96,6 @@ export async function runEphemeralHostedSession<T>(
   for (const raw of options.encryptedEnvelopes) {
     hydratedEnvDigests.add(bytesToHex(encryptedEnvelopeDigest(raw)))
   }
-  const existingPublicOpIds = new Set<string>()
-  for (const raw of options.publicOps) {
-    try {
-      const signed = decodeSignedOperation(raw)
-      existingPublicOpIds.add(bytesToHex(operationIdDigest(signed.coreBytes)))
-    } catch { /* ignore */ }
-  }
 
   const session = await createApplicationSession({
     device,
@@ -116,10 +112,14 @@ export async function runEphemeralHostedSession<T>(
   let value!: T
   const newEnvelopes: HostedEncryptedEnvelopeExport[] = []
   const newPublicOps: Uint8Array[] = []
+  const newPublicCasNodes: { readonly hash: string; readonly bytes: Uint8Array }[] = []
   const newSealedPrivateCas: HostedSealedCasItem[] = []
   const prunedPrivateCasHashes: string[] = []
   let snapshot: Uint8Array | null = null
 
+  // Facts the session learns after hydration (authored by `work`, rewrapped, or merged by it).
+  const touched = { public: new Set<string>(), private: new Set<string>() }
+  let stopTracking: (() => void) | undefined
   try {
     if (options.publicOps.length > 0 || options.encryptedEnvelopes.length > 0 || (options.evidence?.length ?? 0) > 0) {
       await session.mergeFacts({
@@ -130,42 +130,39 @@ export async function runEphemeralHostedSession<T>(
         evidence: [...(options.evidence ?? [])],
       })
     }
+    stopTracking = session.onFacts(delta => {
+      for (const item of delta.items) touched[item.scope].add(item.id)
+    })
     value = await work(session)
+    stopTracking()
+    stopTracking = undefined
 
-    const exported = await session.exportFacts()
-    for (const rawEnv of exported.encryptedEnvelopes) {
+    const privateFacts = session.exportFactsById('private', [...touched.private].filter(d => !hydratedEnvDigests.has(d)))
+    for (const rawEnv of privateFacts.encryptedEnvelopes) {
       const digest = bytesToHex(encryptedEnvelopeDigest(rawEnv))
-      if (!hydratedEnvDigests.has(digest)) {
-        const decoded = decodeEncryptedEnvelope(rawEnv)
-        newEnvelopes.push({
-          digest,
-          epoch: decoded.epoch,
-          author: bytesToHex(decoded.author),
-          raw: rawEnv,
-        })
-        hydratedEnvDigests.add(digest)
-      }
+      const decoded = decodeEncryptedEnvelope(rawEnv)
+      newEnvelopes.push({ digest, epoch: decoded.epoch, author: bytesToHex(decoded.author), raw: rawEnv })
+      hydratedEnvDigests.add(digest)
     }
-    for (const rawOp of exported.publicOps) {
-      try {
-        const signed = decodeSignedOperation(rawOp)
-        const opId = bytesToHex(operationIdDigest(signed.coreBytes))
-        if (!existingPublicOpIds.has(opId)) {
-          newPublicOps.push(rawOp)
-          existingPublicOpIds.add(opId)
-        }
-      } catch { /* ignore */ }
-    }
+    // Ids in the public scope are op ids and evidence digests; hydrated public ops were merged
+    // before tracking started, so every public op here is new.
+    newPublicOps.push(...session.exportFactsById('public', [...touched.public]).publicOps)
 
-    const activePrivHashes = new Set<string>()
-    for (const node of exported.casNodes) {
-      if (node.partition !== 'private') continue
-      activePrivHashes.add(node.hash)
-      if (!hydratedPrivHashes.has(node.hash) && options.sealPrivateCas !== undefined) {
-        const sealed = await options.sealPrivateCas(node.hash, node.bytes)
-        newSealedPrivateCas.push({ hash: node.hash, sealed })
-        hydratedPrivHashes.add(node.hash)
-      }
+    for (const hash of session.cas.listKnownHashes('public')) {
+      if (hydratedPubHashes.has(hash)) continue
+      const bytes = await session.cas.getRaw(hash, 'public')
+      if (bytes !== null) newPublicCasNodes.push({ hash, bytes })
+      hydratedPubHashes.add(hash)
+    }
+    // Private CAS is diffed against what the session's CAS still holds (not against an export,
+    // which omits private nodes for non-reader runners and would prune everything).
+    const activePrivHashes = new Set(session.cas.listKnownHashes('private'))
+    for (const hash of activePrivHashes) {
+      if (hydratedPrivHashes.has(hash) || options.sealPrivateCas === undefined) continue
+      const bytes = await session.cas.getRaw(hash, 'private')
+      if (bytes === null) continue
+      newSealedPrivateCas.push({ hash, sealed: await options.sealPrivateCas(hash, bytes) })
+      hydratedPrivHashes.add(hash)
     }
     for (const oldHash of hydratedPrivHashes) {
       if (!activePrivHashes.has(oldHash)) prunedPrivateCasHashes.push(oldHash)
@@ -176,7 +173,15 @@ export async function runEphemeralHostedSession<T>(
       snapshot = exportedSnap
     }
   } finally {
+    stopTracking?.()
+    // close() zeroes the session's in-memory keys; then drop every persisted copy (epoch, ring,
+    // vault keys, TreeKEM seeds, device wrap keys) from the RAM store before it is discarded.
     try { await session.close() } catch { /* ignore */ }
+    try {
+      const keys: string[] = []
+      for await (const entry of memStore.iterateEntries()) { entry.value.fill(0); keys.push(entry.key) }
+      await memStore.deleteMany(keys)
+    } catch { /* ignore */ }
     for (const key of epochKeys.values()) key.fill(0)
     epochKeys.clear()
   }
@@ -186,6 +191,7 @@ export async function runEphemeralHostedSession<T>(
     delta: {
       newEnvelopes,
       newPublicOps,
+      newPublicCasNodes,
       newSealedPrivateCas,
       prunedPrivateCasHashes,
       snapshot,

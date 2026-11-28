@@ -34,7 +34,7 @@ async function x25519(): Promise<boolean> {
 
 /**
  * Explicit scratch-only probe for an owning dedicated Worker.
- * Chronolog v2 uses multi-tab IndexedDB + WASM sqlite-cas (no OPFS sync handles or exclusive storage locks).
+ * Chronolog uses multi-tab IndexedDB + WASM sqlite-cas (no OPFS sync handles or exclusive storage locks).
  */
 export async function probeBrowserCapabilities(): Promise<BrowserCapabilityReport> {
   const secureContext = globalThis.isSecureContext === true

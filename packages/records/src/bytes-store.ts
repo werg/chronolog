@@ -37,7 +37,8 @@ export interface BytesStore {
   iteratePrefix?(prefix: string): AsyncIterable<BytesStoreEntry>
   /** Optional multi-tab delta changelog cursor. */
   latestChangeSeq?(): Promise<number>
-  readChangesSince?(afterSeq: number): Promise<{ readonly latestSeq: number; readonly changes: readonly BytesStoreChange[] }>
+  /** `reset: true`: the changelog was pruned below `afterSeq`; rescan the whole store, then resume at `latestSeq`. */
+  readChangesSince?(afterSeq: number): Promise<{ readonly latestSeq: number; readonly changes: readonly BytesStoreChange[]; readonly reset?: boolean }>
   /** Stage a stream and atomically publish only after it completes; false leaves an existing store untouched. */
   putStreamIfEmpty?(entries: AsyncIterable<BytesStoreEntry>): Promise<boolean>
   /** Atomically initialize an empty store; false leaves an existing store untouched. */

@@ -106,8 +106,12 @@ export interface GenesisLimits {
   readonly maxMemoryBytes: number
   readonly maxTopicStateBytes: number
   readonly maxUpdatesPerOp: number
-  /** Deterministic fuel (QuickJS interrupt ticks / WASM fuel units) per reducer call. */
-  readonly maxFuel?: number
+  /**
+   * Deterministic fuel budget per reducer call (shared by QuickJS interrupt ticks, metered WASM
+   * instructions, SQLite VM steps and host bridges). Part of the signed genesis: every replica
+   * enforces the exact same budget, so it has no implementation default.
+   */
+  readonly maxFuel: number
 }
 
 export interface LogGenesis {
@@ -153,7 +157,8 @@ export interface SignedOperation {
   readonly signature: Uint8Array
 }
 
-export type EnvelopeSuite = 'aes-256-gcm' | 'hkdf-aes-256-gcm'
+/** Envelope `nonce` length: the 192-bit HKDF salt of the single `hkdf-aes-256-gcm` payload suite. */
+export const ENVELOPE_NONCE_BYTES = 24
 
 export const ANONYMOUS_AUTHOR: Uint8Array = new Uint8Array(32)
 
@@ -167,8 +172,6 @@ export interface EncryptedOperationEnvelope {
   readonly ciphertext: Uint8Array
   /** Optional compartment key ring name; omitted when using the default log ring. */
   readonly ring?: string
-  /** Optional cipher suite ('aes-256-gcm' for 12-byte nonce, 'hkdf-aes-256-gcm' for 24-byte HKDF salt + framing). */
-  readonly suite?: EnvelopeSuite
   /** Optional 64-byte Ed25519 epoch mailbox tag authenticating anonymous-author envelopes to blind hosts. */
   readonly mailboxTag?: Uint8Array
 }
@@ -334,11 +337,8 @@ export function encodeLogGenesis(genesis: LogGenesis): Uint8Array {
   protocolInvariant(genesis.version === 1, 'UNSUPPORTED_VERSION', 'Genesis version must be 1')
   protocolInvariant(typeof genesis.privateLog === 'boolean', 'SCHEMA_INVALID', 'Genesis privateLog must be boolean')
   protocolInvariant(genesis.salt instanceof Uint8Array && genesis.salt.length >= 16 && genesis.salt.length <= 64, 'SCHEMA_INVALID', 'Genesis salt must be 16..64 bytes')
-  for (const n of [genesis.limits.maxMemoryBytes, genesis.limits.maxTopicStateBytes, genesis.limits.maxUpdatesPerOp]) {
+  for (const n of [genesis.limits.maxMemoryBytes, genesis.limits.maxTopicStateBytes, genesis.limits.maxUpdatesPerOp, genesis.limits.maxFuel]) {
     protocolInvariant(Number.isSafeInteger(n) && n > 0, 'SCHEMA_INVALID', 'Invalid genesis limits')
-  }
-  if (genesis.limits.maxFuel !== undefined) {
-    protocolInvariant(Number.isSafeInteger(genesis.limits.maxFuel) && genesis.limits.maxFuel > 0, 'SCHEMA_INVALID', 'Invalid genesis maxFuel')
   }
   protocolInvariant(Object.hasOwn(genesis.initialTopics, '$reducers'), 'SCHEMA_INVALID', 'Genesis must include $reducers topic')
   assertValidReducersConfig(genesis.initialTopics.$reducers)
@@ -354,10 +354,8 @@ export function encodeLogGenesis(genesis: LogGenesis): Uint8Array {
     [0n, BigInt(genesis.limits.maxMemoryBytes)],
     [1n, BigInt(genesis.limits.maxTopicStateBytes)],
     [2n, BigInt(genesis.limits.maxUpdatesPerOp)],
+    [3n, BigInt(genesis.limits.maxFuel)],
   ])
-  if (genesis.limits.maxFuel !== undefined) {
-    limitsCbor.set(3n, BigInt(genesis.limits.maxFuel))
-  }
   const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
     [1n, genesis.privateLog],
@@ -384,14 +382,12 @@ export function decodeLogGenesis(bytes: Uint8Array): LogGenesis {
     initialTopics[k] = cborToJson(v)
   }
   const limitsRaw = map.get(3n)
-  protocolInvariant(limitsRaw instanceof Map && (limitsRaw.size === 3 || (limitsRaw.size === 4 && limitsRaw.has(3n))), 'SCHEMA_INVALID', 'Invalid genesis limits')
+  protocolInvariant(limitsRaw instanceof Map && limitsRaw.size === 4, 'SCHEMA_INVALID', 'Invalid genesis limits')
   const limitsMap = limitsRaw as ReadonlyMap<CborMapKey, CborValue>
   const num = (v: CborValue | undefined): number => {
     protocolInvariant(typeof v === 'bigint' && v > 0n && v <= BigInt(Number.MAX_SAFE_INTEGER), 'SCHEMA_INVALID', 'Invalid limit')
     return Number(v)
   }
-  const rawMaxFuel = limitsMap.get(3n)
-  const maxFuel = rawMaxFuel === undefined ? undefined : num(rawMaxFuel)
   const salt = map.get(4n)
   protocolInvariant(salt instanceof Uint8Array && salt.length >= 16 && salt.length <= 64, 'SCHEMA_INVALID', 'Invalid genesis salt')
   const genesis: LogGenesis = {
@@ -402,7 +398,7 @@ export function decodeLogGenesis(bytes: Uint8Array): LogGenesis {
       maxMemoryBytes: num(limitsMap.get(0n)),
       maxTopicStateBytes: num(limitsMap.get(1n)),
       maxUpdatesPerOp: num(limitsMap.get(2n)),
-      ...(maxFuel === undefined ? {} : { maxFuel }),
+      maxFuel: num(limitsMap.get(3n)),
     },
     salt: salt.slice(),
   }
@@ -615,9 +611,7 @@ function buildEnvelopeBodyMap(env: EncryptedOperationEnvelope): Map<CborMapKey, 
   protocolInvariant(env.version === 1, 'UNSUPPORTED_VERSION', 'Envelope version must be 1')
   protocolInvariant(env.logId.length === 32 && env.opId.length === 32 && env.author.length === 32, 'SCHEMA_INVALID', 'Invalid envelope 32-byte field')
   protocolInvariant(Number.isSafeInteger(env.epoch) && env.epoch >= 0, 'SCHEMA_INVALID', 'Invalid epoch')
-  const suite: EnvelopeSuite = env.suite ?? (env.nonce.length === 24 ? 'hkdf-aes-256-gcm' : 'aes-256-gcm')
-  const expectedNonceLen = suite === 'hkdf-aes-256-gcm' ? 24 : 12
-  protocolInvariant(env.nonce.length === expectedNonceLen && env.ciphertext.length > 0, 'SCHEMA_INVALID', 'Invalid ciphertext/nonce')
+  protocolInvariant(env.nonce.length === ENVELOPE_NONCE_BYTES && env.ciphertext.length > 0, 'SCHEMA_INVALID', 'Invalid ciphertext/nonce')
   const map = new Map<CborMapKey, CborValue>([
     [0n, 1n],
     [1n, env.logId],
@@ -630,9 +624,6 @@ function buildEnvelopeBodyMap(env: EncryptedOperationEnvelope): Map<CborMapKey, 
   if (env.ring !== undefined && env.ring !== 'default') {
     protocolInvariant(typeof env.ring === 'string' && RING_NAME_RE.test(env.ring), 'SCHEMA_INVALID', 'Invalid envelope ring name')
     map.set(7n, env.ring)
-  }
-  if (suite === 'hkdf-aes-256-gcm') {
-    map.set(8n, suite)
   }
   return map
 }
@@ -649,7 +640,7 @@ export function encodeEncryptedEnvelope(env: EncryptedOperationEnvelope): Uint8A
   const map = buildEnvelopeBodyMap(env)
   if (env.mailboxTag !== undefined) {
     protocolInvariant(env.mailboxTag instanceof Uint8Array && env.mailboxTag.length === 64, 'SCHEMA_INVALID', 'Invalid envelope mailboxTag')
-    map.set(9n, env.mailboxTag)
+    map.set(8n, env.mailboxTag)
   }
   return encodeCanonicalCbor(map)
 }
@@ -659,27 +650,21 @@ export function decodeEncryptedEnvelope(bytes: Uint8Array): EncryptedOperationEn
 }
 
 function encryptedEnvelopeFields(raw: CborValue): EncryptedOperationEnvelope {
-  protocolInvariant(raw instanceof Map && raw.size >= 7 && raw.size <= 10, 'SCHEMA_INVALID', 'Invalid envelope')
+  protocolInvariant(raw instanceof Map && raw.size >= 7 && raw.size <= 9, 'SCHEMA_INVALID', 'Invalid envelope')
   const map = raw as ReadonlyMap<CborMapKey, CborValue>
   for (const k of map.keys()) {
-    protocolInvariant(typeof k === 'bigint' && k >= 0n && k <= 9n, 'SCHEMA_INVALID', 'Unexpected envelope field')
+    protocolInvariant(typeof k === 'bigint' && k >= 0n && k <= 8n, 'SCHEMA_INVALID', 'Unexpected envelope field')
   }
   protocolInvariant(map.get(0n) === 1n, 'SCHEMA_INVALID', 'Invalid envelope')
   const logId = map.get(1n), opId = map.get(2n), author = map.get(3n), epoch = map.get(4n), nonce = map.get(5n), ciphertext = map.get(6n)
   const rawRing = map.get(7n)
-  const rawSuite = map.get(8n)
-  const rawMailboxTag = map.get(9n)
-  const suite: EnvelopeSuite | undefined = rawSuite === undefined ? undefined : (rawSuite === 'hkdf-aes-256-gcm' ? 'hkdf-aes-256-gcm' : undefined)
-  if (rawSuite !== undefined) {
-    protocolInvariant(suite === 'hkdf-aes-256-gcm', 'SCHEMA_INVALID', 'Invalid envelope suite')
-  }
-  const expectedNonceLen = suite === 'hkdf-aes-256-gcm' ? 24 : 12
+  const rawMailboxTag = map.get(8n)
   protocolInvariant(
     logId instanceof Uint8Array && logId.length === 32 &&
       opId instanceof Uint8Array && opId.length === 32 &&
       author instanceof Uint8Array && author.length === 32 &&
       typeof epoch === 'bigint' && epoch >= 0n && epoch <= BigInt(Number.MAX_SAFE_INTEGER) &&
-      nonce instanceof Uint8Array && nonce.length === expectedNonceLen &&
+      nonce instanceof Uint8Array && nonce.length === ENVELOPE_NONCE_BYTES &&
       ciphertext instanceof Uint8Array && ciphertext.length > 0,
     'SCHEMA_INVALID',
     'Invalid envelope fields',
@@ -699,7 +684,6 @@ function encryptedEnvelopeFields(raw: CborValue): EncryptedOperationEnvelope {
     nonce: nonce.slice(),
     ciphertext: ciphertext.slice(),
     ...(rawRing === undefined ? {} : { ring: rawRing }),
-    ...(suite === undefined ? {} : { suite }),
     ...(rawMailboxTag === undefined ? {} : { mailboxTag: rawMailboxTag.slice() }),
   }
 }
@@ -710,8 +694,14 @@ export function encryptedEnvelopeDigest(env: EncryptedOperationEnvelope | Uint8A
   return hashDomainSync('envelope', bytes)
 }
 
-export function envelopeAad(logId: Uint8Array, opId: Uint8Array, author: Uint8Array): Uint8Array {
-  return encodeCanonicalCbor([logId, opId, author])
+/**
+ * Associated data authenticated by an envelope's epoch-key AEAD: binds the ciphertext to its log,
+ * operation, (possibly anonymous) author, and key ring so a payload cannot be replayed under another
+ * ring's envelope header. `ring` is the envelope ring name, `'default'` for the log ring.
+ */
+export function envelopeAad(logId: Uint8Array, opId: Uint8Array, author: Uint8Array, ring: string): Uint8Array {
+  protocolInvariant(ring === 'default' || RING_NAME_RE.test(ring), 'SCHEMA_INVALID', 'Invalid envelope ring name')
+  return encodeCanonicalCbor(['chronolog/envelope-aad/v1', logId, opId, author, ring])
 }
 
 export function compareOperationOrder(left: OperationOrderKey, right: OperationOrderKey): number {
@@ -731,7 +721,7 @@ export const DEFAULT_RUNTIME_MANIFEST: RuntimeManifest = Object.freeze({
   builtins: Object.freeze({
     'chronolog:crypto': 'crypto@2',
     'chronolog:cas': 'cas@1',
-    'chronolog:sqlite': 'sqlite-cas@1#sha256-c1e6ecad7402fc981728ff06143ba9b453724dc4faa144cacb085f60e18e280c',
+    'chronolog:sqlite': 'sqlite-cas@1#sha256-a01d70697dcf727d631ffe292979bc5c1c5c4ec4c9ba53fa1ed8400c51dbbee1',
     'chronolog:wasm': 'wasm@1',
   }),
 })

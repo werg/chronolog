@@ -30,7 +30,14 @@ export function defineReducer(spec) {
       const run = typeof entry === 'function' ? entry : entry.run;
       if (typeof run !== 'function') return { ok: false, code: 'unknown_action' };
       if (entry && entry.input) {
-        const v = validate(entry.input, input);
+        const schema =
+          entry.input &&
+          typeof entry.input === 'object' &&
+          entry.input.additionalProperties === false &&
+          !(entry.input.properties && Object.prototype.hasOwnProperty.call(entry.input.properties, 'action'))
+            ? { ...entry.input, properties: { action: { type: 'string' }, ...(entry.input.properties || {}) } }
+            : entry.input;
+        const v = validate(schema, input);
         if (!v.ok) return v;
       }
       if (entry && typeof entry.requiredCapability === 'string') {

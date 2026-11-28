@@ -6,4 +6,4 @@ Portable, zero-native cryptographic record helpers, canonical application input 
 
 - **Signed records (`codec.ts`):** `createSigningIdentity`, `signRecord`, `verifyRecord`, `encodeRecord`, `decodeRecord`, `recordDigest`, `equalRecord`.
 - **Application descriptions (`definition.ts`):** `validateApplicationDescription`, `applicationDescriptionDigest`, `checkedApplicationInputSchema`, `parseApplicationInput`.
-- **Protocol-Agnostic Admission (`admission.ts`):** `evaluateAdmission`, `signAdmissionCheckpoint`, `signAdmissionMessage`, `computeIncludedSetDigest`, `evidenceDigest`, `signHostAttestationV2`, `verifyHostAttestationV2`, `AdmissionEvidence`, `PinnedFrontier`, `AdmissionDecision`.
+- **Protocol-Agnostic Admission (`admission.ts`):** `evaluateAdmission`, `computeAdmissionScopeId`, `canonicalAdmissionCheckpointMessage`, `checkpointPayloadToJson`, `signAdmissionCheckpoint`, `signAdmissionMessage`, `computeIncludedSetDigest`, `evidenceDigest`, `signHostAttestationV2`, `verifyHostAttestationV2`, `AdmissionEvidence`, `PinnedFrontier`, `AdmissionDecision`.

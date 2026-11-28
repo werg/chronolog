@@ -106,7 +106,7 @@ describe('cold open and snapshot bootstrap', () => {
   })
 
   for (const privateLog of [true, false]) {
-    it(`bootstraps a fresh peer from a signed snapshot instead of replaying (${privateLog ? 'private' : 'public'} log)`, async () => {
+    it(`bootstraps a fresh peer from a snapshot, then confirms it by one replay (${privateLog ? 'private' : 'public'} log)`, async () => {
       const { a, b, open } = await fixture(privateLog)
       const sessA = await open(new MemoryBytesStore(), a)
       await author(sessA, 0, 30)
@@ -117,7 +117,11 @@ describe('cold open and snapshot bootstrap', () => {
         await Promise.all([la.synchronize(), lb.synchronize()])
         await until(() => sessB.revision().digest === sessA.revision().digest)
         expect(perfCounters()['wire.send.snapshot'] ?? 0).toBe(1)
-        expect(perfCounters()['vm.reduce'] ?? 0).toBeLessThan(5)
+        // A peer snapshot without admission evidence is first paint only: once B holds every op it
+        // covers, B replays them exactly once and keeps its own replay (30 ops, never more).
+        await until(() => !sessB.snapshotProvisional)
+        expect(sessB.rejectedSnapshots).toBe(0)
+        expect(perfCounters()['vm.reduce'] ?? 0).toBeLessThanOrEqual(35)
         expect(await sessB.query('kv', { key: 'k3' })).toEqual(await sessA.query('kv', { key: 'k3' }))
         // B keeps authoring on top of the frontier and A converges.
         await author(sessB, 30, 2, 100_000)
@@ -131,6 +135,27 @@ describe('cold open and snapshot bootstrap', () => {
       }
     })
   }
+
+  it('exports one snapshot per revision for any number of bootstrapping links', async () => {
+    const { a, b, open } = await fixture(true)
+    const sessA = await open(new MemoryBytesStore(), a)
+    await author(sessA, 0, 20)
+    let exports = 0
+    const original = sessA.exportMaterializedSnapshot.bind(sessA)
+    sessA.exportMaterializedSnapshot = (options => { exports++; return original(options) })
+    const fresh = await Promise.all([open(new MemoryBytesStore(), b), open(new MemoryBytesStore(), b), open(new MemoryBytesStore(), b)])
+    try {
+      resetPerfCounters()
+      const links = await Promise.all(fresh.map(peer => link(sessA, peer)))
+      await Promise.all(links.flat().map(l => l.synchronize()))
+      for (const peer of fresh) await until(() => peer.revision().digest === sessA.revision().digest)
+      expect(perfCounters()['wire.send.snapshot'] ?? 0).toBe(3)
+      expect(exports).toBe(1)
+      await Promise.all(links.flat().map(l => l.close()))
+    } finally {
+      await Promise.all([sessA.close(), ...fresh.map(peer => peer.close())])
+    }
+  })
 
   it('replays history when snapshot bootstrap is disabled', async () => {
     const { a, b, open } = await fixture(true)

@@ -18,7 +18,7 @@ async function counterKernel(): Promise<{ kernel: TopicKernel; op: (id: string, 
       $reducers: { runtime: { js: QUICKJS_RUNTIME_ID, builtins: {} }, imports: { '@app/counter': `cas:sha256-${hash}` }, topics: { counter: { module: '@app/counter' } } },
       counter: 0,
     },
-    limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+    limits: { maxMemoryBytes: 16 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
     salt: new Uint8Array(16).fill(7),
   }
   const kernel = new TopicKernel({ genesis, cas })

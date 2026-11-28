@@ -23,7 +23,7 @@ const nativeRtc = !values['no-native-rtc'];
 const source = git(['rev-parse', 'HEAD']).trim(), sourceTree = git(['rev-parse', 'HEAD^{tree}']).trim();
 
 const entries = Object.fromEntries([
-  'index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'kernel', 'mirror', 'workerd-plugin',
+  'index', 'native', 'browser', 'worker', 'webrtc', 'websocket', 'kernel', 'mirror', 'workerd-plugin',
   ...(nativeRtc ? ['webrtc-native'] : []),
 ].map(name => [name, join(root, 'packages/peer-session/src', `${name}.ts`)]));
 
@@ -66,7 +66,7 @@ assert(
 );
 
 // Verify browser/worker entrypoints never statically pull Node APIs or werift.
-for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'tendriller', 'kernel', 'mirror']) {
+for (const entry of ['index', 'browser', 'worker', 'webrtc', 'websocket', 'kernel', 'mirror']) {
   const entryOut = Object.entries(bundled.metafile.outputs).find(([, value]) =>
     value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(entryOut, `Missing bundled entry: ${entry}`);
@@ -96,7 +96,7 @@ const runtimeModules = Object.fromEntries(Object.entries(bundled.metafile.output
 const eagerHeavyImpl = path =>
   /^(?:packages\/peer-session\/src\/(?:browser-storage-selector|browser-capabilities|session|content|network-content)\.ts|packages\/materializer\/src\/(?:kernel|quickjs-sandbox)\.ts|packages\/sqlite-cas\/|packages\/records\/src\/(?:browser|native|record-envelope|indexeddb-bytes-store)\.ts)/u.test(path);
 
-for (const entry of ['index', 'browser', 'worker', 'tendriller']) {
+for (const entry of ['index', 'browser', 'worker']) {
   const entryOut = Object.entries(bundled.metafile.outputs).find(([, value]) =>
     value.entryPoint === relative(root, entries[entry]).replaceAll('\\', '/'));
   assert(entryOut, `Missing protocol entry: ${entry}`);
@@ -108,7 +108,7 @@ for (const entry of ['index', 'browser', 'worker', 'tendriller']) {
     assert(mod, `Missing emitted module: ${path}`);
     for (const input of mod.inputs) {
       assert(!eagerHeavyImpl(input), `Passive ${entry} entry eagerly loads heavy implementation: ${input}`);
-      if (entry === 'browser' || entry === 'tendriller') {
+      if (entry === 'browser') {
         assert(!/^packages\/peer-session\/src\/(?:session|runtime|device|browser-device|network)\.ts$/u.test(input),
           `Page ${entry} entry loads participant ownership: ${input}`);
       }

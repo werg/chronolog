@@ -190,6 +190,7 @@ export async function evaluateDerivation(options: EvaluateDerivationOptions): Pr
         moduleSpecifier: '__builder__',
         exportName: 'default',
         method: 'derive',
+        logId: null,
         state: null,
         payload: {
           inputs: drv.inputs,

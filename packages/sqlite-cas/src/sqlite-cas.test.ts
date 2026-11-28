@@ -14,6 +14,7 @@ import {
   CAS_BUILTIN_ID,
   CRYPTO_BUILTIN_ID,
   QUICKJS_RUNTIME_ID,
+  QuickJsSandbox,
   TopicKernel,
   seedStandardModules,
   type KernelOperationInput,
@@ -41,7 +42,7 @@ function makeOp(
   return { opId: operationIdDigest(core), core }
 }
 
-describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
+describe('sqlite-cas.wasm + RLS', () => {
   it('runs deterministic SQL + sqlite-vec + fts5 + O(1) rollback suffix replay with exact dbRoot parity', async () => {
     const driver = await createSqliteCasDriver()
     const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
@@ -106,7 +107,7 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
         },
         db: null,
       },
-      limits: { maxMemoryBytes: 32 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 32 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(11),
     }
 
@@ -256,14 +257,14 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
         },
         $admission: {
           members: [
-            { publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: true },
-            { publicKey: aliceHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
-            { publicKey: bobHex, reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
+            { publicKey: adminHex, reader: true, writer: true, administrator: true, publisher: true },
+            { publicKey: aliceHex, reader: true, writer: true, administrator: false, publisher: false },
+            { publicKey: bobHex, reader: true, writer: true, administrator: false, publisher: false },
           ],
         },
         sql: null,
       },
-      limits: { maxMemoryBytes: 32 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16 },
+      limits: { maxMemoryBytes: 32 * 1024 * 1024, maxTopicStateBytes: 65_536, maxUpdatesPerOp: 16, maxFuel: 200_000 },
       salt: new Uint8Array(16).fill(12),
     }
 
@@ -373,5 +374,60 @@ describe('Chronolog v2 sqlite-cas.wasm + RLS (Phase 2 Gate 2)', () => {
     expect(tasks.rows).toEqual([['t1', 'Alice task']])
     const notes = await kernel.query('sql', { sql: 'SELECT id, body FROM alice_notes' }) as { rows: unknown[][] }
     expect(notes.rows).toEqual([['n1', 'collab edit!']])
+  })
+
+  it('meters SQLite VM steps with the invocation fuel budget (runaway CTEs end as vm:fuel_exhausted)', async () => {
+    const driver = await createSqliteCasDriver()
+    const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
+    const hash = await cas.put(utf8(`
+      import { openDb } from 'chronolog:sqlite';
+      export default {
+        reduce(_s, tx) {
+          const db = openDb(null);
+          let out;
+          try {
+            db.exec('CREATE TABLE t(n INTEGER)');
+            db.exec('INSERT INTO t SELECT count(*) FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?) SELECT x FROM c)', [tx.payload.n]);
+            out = db.query('SELECT n FROM t').rows[0][0];
+          } catch (e) { out = 'caught'; }
+          return { ok: true, state: out };
+        },
+      };
+    `), [], 'private')
+    const run = async (sandbox: QuickJsSandbox, n: number, maxFuel: number) => sandbox.invoke({
+      imports: { 'app/sql': `cas:sha256-${hash}` },
+      builtins: { 'chronolog:sqlite': driver.builtinId },
+      moduleSpecifier: 'app/sql',
+      logId: 'ab'.repeat(32),
+      exportName: 'default',
+      method: 'reduce',
+      state: null,
+      payload: { n },
+      tx: { opId: '0'.repeat(64), author: '1'.repeat(64), authorTimestampMs: 1, operationId: 'sql' },
+      topics: {},
+      cas,
+      casPartition: 'private',
+      readOnly: false,
+      maxMemoryBytes: 32 * 1024 * 1024,
+      maxFuel,
+    })
+    const a = new QuickJsSandbox({ sqliteDriver: driver })
+    expect(await run(a, 100, 1_000)).toEqual({ ok: true, value: { ok: true, state: 100 } })
+    // Catching the aborted statement cannot buy more fuel.
+    expect(await run(a, 50_000_000, 1_000)).toEqual({ ok: false, code: 'vm:fuel_exhausted' })
+    // The exhaustion threshold is a pure function of the SQL and budget.
+    const threshold = async (sandbox: QuickJsSandbox): Promise<number> => {
+      let lo = 1
+      let hi = 1_000
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2)
+        if ((await run(sandbox, 20_000, mid)).ok) hi = mid
+        else lo = mid + 1
+      }
+      return lo
+    }
+    const t1 = await threshold(a)
+    expect(t1).toBeGreaterThan(20)
+    expect(await threshold(new QuickJsSandbox({ sqliteDriver: driver }))).toBe(t1)
   })
 })

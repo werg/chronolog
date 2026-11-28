@@ -1,15 +1,24 @@
 import { bytesToHex, decodeCanonicalCbor, DEFAULT_DECODE_LIMITS, encodeCanonicalCbor, hexToBytes, perfTimeAsync, sha256Sync, utf8 } from '@chronolog/canonical'
 import { openSqlBranch, type SqlBranch } from './sql-extensions.js'
 import {
+  buildTreeEpochUpdate,
   combineShares,
   decryptEpochPayload,
   deriveEpochMailboxKeyPair,
   encryptEpochPayload,
+  epochKeyCommitment,
   KEY_BOX_SUITE_X25519,
   KEY_BOX_SUITE_XWING,
+  KEY_TREE_SUITE_X25519,
+  KEY_TREE_SUITE_XWING,
+  openTreeEpoch,
+  readKeyTreeFromCas,
   signEd25519Sync,
   splitSecret,
+  writeKeyTreeToCas,
   type KeyBoxSuite,
+  type KeyTreeEpochPayload,
+  type KeyTreeSuite,
 } from '@chronolog/crypto'
 import {
   casRef,
@@ -40,6 +49,7 @@ import {
   decodeTrustedSignedOperation,
   encodeEncryptedEnvelope,
   encodeLogGenesis,
+  encodeOperationCore,
   encodeSignedOperation,
   encryptedEnvelopeDigest,
   envelopeAad,
@@ -104,8 +114,10 @@ import { createCasMirrorClient } from './cas-mirror.js'
 import type { ApplicationDevice } from './device.js'
 import { describeApplication, type ApplicationDefinition } from './definition.js'
 import { FactIdSet } from './reconcile.js'
+import { standardModuleHashes } from './standard-modules.js'
+import { admissionOpRef, finalizedInputs, materializeControl } from './control-plane.js'
+import { EPOCH_KEY_GROUP, KeyStore, parseVaultKeyGroup, ringKeyGroup, TREE_SEED_GROUP, vaultKeyGroup } from './key-store.js'
 import {
-  epochKeyCommitmentV2,
   hpkeOpenEpochKey,
   hpkeSealEpochKey,
   type EpochKeyBox,
@@ -129,6 +141,7 @@ import {
 } from './operation.js'
 import {
   APPLICATION_EVENT_CURSOR_LIMIT,
+  FACTS_SOURCE_STORE,
   type ApplicationChange,
   type ApplicationEvent,
   type ApplicationEventBatch,
@@ -178,10 +191,33 @@ class FactMap<V> extends Map<string, V> {
   }
 }
 
-let standardHashes: Set<string> | undefined
-function standardModuleHashes(): Set<string> {
-  return standardHashes ??= new Set(Object.values(STANDARD_MODULE_SOURCES).map(src => computeCasHash(utf8(src), [])))
+/** Envelope map that also indexes the op ids it holds (an op can sit in several rewrapped envelopes). */
+class EnvelopeFactMap extends FactMap<StoredEncryptedEnvelope> {
+  readonly #opIds = new Map<string, number>()
+  holdsOp(opId: string): boolean { return this.#opIds.has(opId) }
+  override set(key: string, value: StoredEncryptedEnvelope): this {
+    if (!this.has(key)) {
+      const opId = bytesToHex(value.envelope.opId)
+      this.#opIds.set(opId, (this.#opIds.get(opId) ?? 0) + 1)
+    }
+    return super.set(key, value)
+  }
+  override delete(key: string): boolean {
+    const value = this.get(key)
+    if (value !== undefined) {
+      const opId = bytesToHex(value.envelope.opId)
+      const count = (this.#opIds.get(opId) ?? 1) - 1
+      if (count <= 0) this.#opIds.delete(opId)
+      else this.#opIds.set(opId, count)
+    }
+    return super.delete(key)
+  }
+  override clear(): void {
+    this.#opIds.clear()
+    super.clear()
+  }
 }
+
 
 export interface SessionFacts {
   readonly genesisBytes?: Uint8Array
@@ -219,16 +255,18 @@ export interface MemberRecord {
   readonly label?: string
   readonly scopes?: readonly string[]
   readonly expiresAtMs?: number
+  /** Author of the operation that admitted this member (may grant it lockboxes). */
+  readonly admittedBy?: string
   readonly reader: boolean
   readonly writer: boolean
   readonly administrator: boolean
   readonly publisher: boolean
-  readonly finalizer: boolean
 }
 
 export interface GuardianMember {
   readonly publicKey: string
-  readonly wrapKey: string
+  readonly wrapKey?: string
+  readonly pqWrapKey?: string
   readonly label?: string
 }
 
@@ -240,7 +278,8 @@ export interface GuardiansConfig {
 export interface RecoveryRequestRecord {
   readonly requestId: string
   readonly newPublicKey: string
-  readonly newWrapKey: string
+  readonly newWrapKey?: string
+  readonly newPqWrapKey?: string
   readonly label: string
   readonly verificationCode: string
   readonly approvals: readonly string[]
@@ -261,7 +300,6 @@ export interface AdmissionRoster {
   readonly writers?: readonly string[]
   readonly administrators?: readonly string[]
   readonly publishers?: readonly string[]
-  readonly finalizers?: readonly string[]
   readonly openReaders?: boolean
   readonly openWriters?: boolean
   readonly blockedAuthors?: readonly string[]
@@ -287,9 +325,12 @@ export interface KeysTopicState {
   readonly policy?: KeysPolicy
   readonly epochs: Readonly<Record<string, {
     readonly epoch: number
-    readonly suite?: KeyBoxSuite
+    readonly suite?: KeyBoxSuite | KeyTreeSuite
     readonly keyCommitment: string
     readonly mailboxVerifyKey?: string
+    readonly treeRef?: string
+    readonly leafCount?: number
+    readonly activeMembers?: readonly string[]
     readonly boxes: Readonly<Record<string, EpochKeyBox>>
   }>>
   readonly rings?: Readonly<Record<string, KeyRingState>>
@@ -307,6 +348,15 @@ export interface SealedRecipientBox {
   readonly nonce: string
   readonly ciphertext: string
   readonly boxes: Readonly<Record<string, EpochKeyBox>>
+}
+
+export interface VaultSealedBox {
+  readonly format: 'chronolog-vault-box/v1'
+  readonly vaultId: string
+  readonly epoch: number
+  readonly encoding: 'json' | 'bytes'
+  readonly nonce: string
+  readonly ciphertext: string
 }
 
 export interface CheckpointBootstrapSnapshot {
@@ -338,6 +388,16 @@ export interface OpenApplicationSessionOptions<D extends ApplicationDefinition =
   readonly release: () => void | Promise<void>
 }
 
+/** One vault in a `chronolog/vaults` topic state. */
+interface VaultTopicEntry {
+  readonly currentEpoch?: number
+  readonly members?: readonly string[]
+  readonly epochs?: Readonly<Record<string, { readonly epoch: number; readonly keyCommitment?: string; readonly boxes?: Readonly<Record<string, EpochKeyBox>> }>>
+}
+
+/** How a snapshot frontier is trusted on adoption: produced by this deployment, or verified by evidence/replay. */
+type SnapshotTrust = 'local' | 'untrusted'
+
 interface StoredPublicOp {
   readonly raw: Uint8Array
   readonly signed: SignedOperation
@@ -359,6 +419,8 @@ interface LocalPendingOp {
   readonly core: OperationCore
   currentEnvelopeDigest: string
   currentEpoch: number
+  /** Commitment of the epoch key the current envelope is encrypted under. */
+  currentCommitment: string
 }
 
 interface EvaluatedAdmissionRoster {
@@ -368,7 +430,6 @@ interface EvaluatedAdmissionRoster {
   readonly writers: ReadonlySet<string>
   readonly administrators: ReadonlySet<string>
   readonly publishers: ReadonlySet<string>
-  readonly finalizers: ReadonlySet<string>
   readonly openReaders: boolean
   readonly openWriters: boolean
   readonly blockedAuthors: ReadonlySet<string>
@@ -377,6 +438,9 @@ interface EvaluatedAdmissionRoster {
   readonly recoveryRequests: Readonly<Record<string, RecoveryRequestRecord>>
   readonly multisig: AdmissionMultisigInfo | null
 }
+
+/** Upper bound on op ids one retention receipt may cover (senders batch at most 1024). */
+const MAX_RETENTION_ITEMS = 4096
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false
@@ -413,7 +477,7 @@ function toApplicationEvent(ev: EmittedKernelEvent): ApplicationEvent {
 }
 
 /**
- * Chronolog v2 ApplicationSession.
+ * ApplicationSession: one replica of one log.
  *
  * Built directly on:
  * - Flat timestamp-ordered operation set: (authorTimestampMs, author, opId)
@@ -460,13 +524,16 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#pendingDelta.push(source === undefined ? { scope, id } : { scope, id, source })
   }
   readonly #publicOps = new FactMap<StoredPublicOp>(this.#publicFactIds, (id, source) => this.#recordDelta('public', id, source))
-  readonly #encryptedEnvelopes = new FactMap<StoredEncryptedEnvelope>(this.#privateFactIds, (id, source) => this.#recordDelta('private', id, source))
+  readonly #encryptedEnvelopes = new EnvelopeFactMap(this.#privateFactIds, (id, source) => this.#recordDelta('private', id, source))
   readonly #undecryptedEnvelopes = new Set<string>()
   readonly #localPending = new Map<string, LocalPendingOp>()
   readonly #retentions = new Map<string, Map<string, RetentionEvidence>>()
   readonly #evidence = new FactMap<AdmissionEvidence>(this.#publicFactIds, (id, source) => this.#recordDelta('public', id, source))
-  readonly #epochKeys = new Map<number, Uint8Array>()
-  readonly #ringKeys = new Map<string, Map<number, Uint8Array>>()
+  /** Every epoch, ring, vault and TreeKEM seed key this replica holds (commitment-keyed, see key-store.ts). */
+  readonly #keys: KeyStore
+  /** Topic hash last scanned for lockboxes, per key-bearing topic (unchanged topics are not rescanned). */
+  readonly #scannedKeyTopics = new Map<string, string>()
+  readonly #missingTreeCasHashes = new Set<string>()
 
   readonly #statusListeners = new Set<(status: SessionStatus) => void>()
   readonly #changeListeners = new Set<(change: ApplicationChange) => void>()
@@ -495,7 +562,19 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #pendingSnapshotBundle: {
     readonly cache: KernelMaterializedCache
     readonly casNodes: readonly SessionCasNode[]
+    readonly trust: SnapshotTrust
   } | null = null
+  /**
+   * Set while this.#kernel's frontier came from an unattested snapshot (first paint only): it is
+   * not persisted, not re-exported, its op ids are not trusted, and control decisions read the
+   * replica's own control kernel. Cleared once replay of the covered ops reproduces it.
+   */
+  #provisionalSnapshot: { readonly stateRoot: string; readonly historyDigest: string; readonly opIds: readonly string[] } | null = null
+  /** Private full replica: blind kernel folding only admitted public ops (created when evidence excludes one). */
+  #admittedControlKernel: TopicKernel | null = null
+  /** Public log / blind host with admission evidence: persistent probe folding every public op. */
+  #probeKernel: TopicKernel | null = null
+  #probeHasSqlite = false
   /**
    * Op ids this replica already verified (signature + id) before folding them into a persisted
    * materialized cache, plus ops it authored. Trust shortcut on cold open: an envelope re-read
@@ -531,6 +610,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.cas = cas
     this.#store = options.store
     this.#prefix = `v2/${this.logId}`
+    this.#keys = new KeyStore(this.#store, this.#prefix)
     this.#release = options.release
     this.#blindHostMode = options.blindHostMode ?? false
     if (options.sqliteWasmModule !== undefined) this.#sqliteWasmModule = options.sqliteWasmModule
@@ -574,7 +654,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         applicationId: this.applicationId,
         isReader: pk => this.isReader(pk),
         currentEpoch: () => Math.max(0, this.currentEpoch()),
-        epochKey: epoch => this.#epochKeys.get(epoch) ?? null,
+        epochKey: epoch => this.#groupKey('default', epoch) ?? null,
       },
     })
 
@@ -659,6 +739,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     await session.#hydrateFromEntries(nonCasEntries)
     session.#pendingDelta = [] // facts loaded from local storage are not news to any peer
     await session.#rematerialize()
+    await session.#settleLocalPending()
     return session
   }
 
@@ -668,9 +749,11 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (!this.genesis.privateLog || this.#blindHostMode) return 'public'
     const epoch = this.currentEpoch()
     if (epoch < 0) return 'ready'
-    if (this.#epochKeys.has(epoch)) return 'ready'
-    const hasBox = this.keysState().epochs?.[String(epoch)]?.boxes?.[this.identity.publicKey] !== undefined
-    return hasBox ? 'pending-unseal' : 'missing-lockbox'
+    if (this.hasEpochKey(epoch)) return 'ready'
+    const entry = this.keysState().epochs?.[String(epoch)]
+    const hasAccess = entry?.boxes?.[this.identity.publicKey] !== undefined ||
+      (Array.isArray(entry?.activeMembers) && entry.activeMembers.includes(this.identity.publicKey))
+    return hasAccess ? 'pending-unseal' : 'missing-lockbox'
   }
 
   get status(): SessionStatus {
@@ -682,7 +765,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const canAuthorControl = !this.#closed && !this.#blindHostMode && (isAdmin || isPub)
     const canAuthorData = !this.#closed && !this.#blindHostMode && this.isWriter(pk) && (keyState === 'public' || keyState === 'ready')
     const canAuthor = canAuthorData || canAuthorControl
-    const awaitingKeys = this.genesis.privateLog && !this.#blindHostMode && this.isReader(pk) && this.currentEpoch() >= 0 && !this.#epochKeys.has(this.currentEpoch())
+    const awaitingKeys = this.genesis.privateLog && !this.#blindHostMode && this.isReader(pk) && this.currentEpoch() >= 0 && !this.hasEpochKey(this.currentEpoch())
     return Object.freeze({
       ...(this.#kernel.pendingDependencies.length > 0 ? { pendingDependencies: this.#kernel.pendingDependencies } : {}),
       canAuthor,
@@ -707,7 +790,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         writers: [],
         administrators: [],
         publishers: [],
-        finalizers: [],
         openReaders: false,
         openWriters: false,
         blockedAuthors: [],
@@ -724,7 +806,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       writers: p.openWriters ? ['*'] : [...p.writers].sort(),
       administrators: [...p.administrators].sort(),
       publishers: [...p.publishers].sort(),
-      finalizers: [...p.finalizers].sort(),
       openReaders: p.openReaders,
       openWriters: p.openWriters,
       blockedAuthors: [...p.blockedAuthors].sort(),
@@ -833,12 +914,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   keysState(): KeysTopicState {
-    const raw = this.#kernel.topic('$keys') as KeysTopicState | null
+    const raw = this.#controlView().topic('$keys') as KeysTopicState | null
     if (raw === null || typeof raw !== 'object') return { currentEpoch: -1, epochs: {} }
     return raw
   }
 
-  keysPolicy(): Required<Pick<KeysPolicy, 'rotateOnRemove' | 'minSuite' | 'paddingBucketBytes' | 'hideEnvelopeAuthor'>> & {
+  keysPolicy(): Required<Pick<KeysPolicy, 'rotateOnRemove' | 'minSuite' | 'paddingBucketBytes' | 'hideEnvelopeAuthor' | 'distribution'>> & {
     readonly maxOpsPerEpoch?: number
   } {
     const raw = this.keysState().policy
@@ -850,6 +931,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ? raw.paddingBucketBytes
           : 0,
       hideEnvelopeAuthor: raw?.hideEnvelopeAuthor === true,
+      distribution: raw?.distribution === 'tree' ? 'tree' : 'flat',
       ...(typeof raw?.maxOpsPerEpoch === 'number' && Number.isSafeInteger(raw.maxOpsPerEpoch) && raw.maxOpsPerEpoch >= 1
         ? { maxOpsPerEpoch: raw.maxOpsPerEpoch }
         : {}),
@@ -893,14 +975,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }): Promise<EncryptedOperationEnvelope> {
     const policy = this.keysPolicy()
     const envAuthor = policy.hideEnvelopeAuthor ? ANONYMOUS_AUTHOR : options.authorBytes
-    const aad = envelopeAad(options.logIdBytes, options.opIdBytes, envAuthor)
+    const aad = envelopeAad(options.logIdBytes, options.opIdBytes, envAuthor, options.ring)
     const enc = await encryptEpochPayload(
       options.epochKey,
       BigInt(options.epoch),
       options.opBytes,
       aad,
       undefined,
-      { suite: 'hkdf-aes-256-gcm', paddingBucketBytes: policy.paddingBucketBytes },
+      { paddingBucketBytes: policy.paddingBucketBytes },
     )
     const baseEnv: EncryptedOperationEnvelope = {
       version: 1,
@@ -911,7 +993,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       nonce: enc.nonce,
       ciphertext: enc.ciphertext,
       ...(options.ring === 'default' ? {} : { ring: options.ring }),
-      suite: 'hkdf-aes-256-gcm',
     }
     if (!policy.hideEnvelopeAuthor) return baseEnv
     const mailboxKp = deriveEpochMailboxKeyPair(options.epochKey)
@@ -920,52 +1001,72 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   currentEpoch(): number {
-    const state = this.keysState()
-    if (state.currentEpoch >= 0) return state.currentEpoch
-    if (this.#epochKeys.size > 0) return Math.max(...this.#epochKeys.keys())
-    return -1
+    return this.#currentEpochFrom(this.#kernel)
+  }
+
+  /** On-log `keyCommitment` of `(ring, epoch)` in `$keys` (undefined until that epoch materializes). */
+  #onLogCommitment(ring: string, epoch: number, kernel: TopicKernel = this.#controlView()): string | undefined {
+    const keys = this.#keysStateFrom(kernel)
+    const entry = ring === 'default' ? keys.epochs?.[String(epoch)] : keys.rings?.[ring]?.epochs?.[String(epoch)]
+    return typeof entry?.keyCommitment === 'string' ? entry.keyCommitment : undefined
+  }
+
+  /**
+   * The held key for `(ring, epoch)` whose commitment matches `$keys` (before the epoch is on the
+   * log, the first installed candidate). A losing concurrent rotation's key is never selected.
+   */
+  #groupKey(ring: string, epoch: number, kernel: TopicKernel = this.#controlView()): Uint8Array | undefined {
+    return this.#keys.get(ringKeyGroup(ring), epoch, this.#onLogCommitment(ring, epoch, kernel))
   }
 
   epochKey(epoch: number): Uint8Array | null {
-    return this.#epochKeys.get(epoch)?.slice() ?? null
+    return this.#groupKey('default', epoch)?.slice() ?? null
   }
 
   hasEpochKey(epoch: number): boolean {
-    return this.#epochKeys.has(epoch)
+    return this.#groupKey('default', epoch) !== undefined
   }
 
   exportEpochKeys(): ReadonlyMap<number, Uint8Array> {
     const out = new Map<number, Uint8Array>()
-    for (const [ep, key] of this.#epochKeys) out.set(ep, key.slice())
+    for (const ep of this.#keys.epochs(EPOCH_KEY_GROUP)) {
+      const key = this.#groupKey('default', ep)
+      if (key !== undefined) out.set(ep, key.slice())
+    }
     return out
   }
 
   async installEpochKey(epoch: number, key: Uint8Array): Promise<void> {
     check(Number.isSafeInteger(epoch) && epoch >= 0 && key instanceof Uint8Array && key.length === 32, 'EPOCH_KEY_INVALID')
-    this.#epochKeys.set(epoch, key.slice())
-    await this.#store.put(`${this.#prefix}/epoch-key/${epoch}`, key.slice())
+    await this.#keys.install(EPOCH_KEY_GROUP, epoch, key)
   }
 
   async installRingKey(ring: string, epoch: number, key: Uint8Array): Promise<void> {
     check(typeof ring === 'string' && ring.length > 0 && ring !== 'default', 'RING_NAME_INVALID')
     check(Number.isSafeInteger(epoch) && epoch >= 0 && key instanceof Uint8Array && key.length === 32, 'EPOCH_KEY_INVALID')
-    let map = this.#ringKeys.get(ring)
-    if (map === undefined) {
-      map = new Map()
-      this.#ringKeys.set(ring, map)
-    }
-    map.set(epoch, key.slice())
-    await this.#store.put(`${this.#prefix}/ring-key/${ring}/${epoch}`, key.slice())
+    await this.#keys.install(ringKeyGroup(ring), epoch, key)
   }
 
   ringKey(ring: string, epoch: number): Uint8Array | null {
-    if (ring === 'default') return this.epochKey(epoch)
-    return this.#ringKeys.get(ring)?.get(epoch)?.slice() ?? null
+    return this.#groupKey(ring, epoch)?.slice() ?? null
+  }
+
+  /**
+   * Zero every symmetric secret this session holds in memory (epoch, ring and vault keys, TreeKEM
+   * node seeds). `purgeStore: true` also deletes their persisted copies (ephemeral hosts); a
+   * durable device keeps them so it can reopen. `close()` calls this without `purgeStore`.
+   */
+  async wipeSecrets(options: { readonly purgeStore?: boolean } = {}): Promise<void> {
+    this.#keys.wipe()
+    this.#scannedKeyTopics.clear()
+    if (options.purgeStore === true) await this.#keys.purgePersisted()
   }
 
   /**
    * Heal any admitted reader missing HPKE lockboxes in `$keys` for epochs we hold
    * (e.g. concurrent admission + epoch rotation, multisig approvals, or late wrapKey addition).
+   * Only grants `$keys` accepts are attempted: as an administrator for every reader, otherwise
+   * only for members this identity admitted (`admittedBy`).
    */
   async backfillMissingEpochBoxes(options: { readonly minEpoch?: number } = {}): Promise<number> {
     if (!this.genesis.privateLog || this.#blindHostMode) return 0
@@ -974,14 +1075,19 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (keysState.currentEpoch < 0) return 0
     const minEp = Math.max(0, options.minEpoch ?? 0)
     const members = this.permissions().members
+    const self = this.identity.publicKey
+    const isAdmin = this.permissions().administrators?.includes(self) === true
     let sealedMembers = 0
     for (const member of members) {
       if (!member.reader || (!member.wrapKey && !member.pqWrapKey)) continue
+      if (!isAdmin && member.admittedBy !== self) continue
       const epochBoxes: Record<string, EpochKeyBox> = {}
       for (let ep = minEp; ep <= keysState.currentEpoch; ep++) {
-        const epKey = this.#epochKeys.get(ep)
+        const epKey = this.#groupKey('default', ep)
         if (epKey === undefined) continue
-        if (keysState.epochs?.[String(ep)]?.boxes?.[member.publicKey] !== undefined) continue
+        const epEntry = keysState.epochs?.[String(ep)]
+        if (epEntry?.boxes?.[member.publicKey] !== undefined) continue
+        if (Array.isArray(epEntry?.activeMembers) && epEntry.activeMembers.includes(member.publicKey)) continue
         const sealed = await this.#sealBoxForMember(member, epKey, this.logId, ep)
         if (sealed !== null) epochBoxes[String(ep)] = sealed
       }
@@ -1007,31 +1113,51 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async syncFromStore(): Promise<boolean> {
     if (this.#closed || this.#store.readChangesSince === undefined) return false
     return this.#serial(async () => {
-      const { latestSeq, changes } = await this.#store.readChangesSince!(this.#lastSyncSeq)
-      if (latestSeq <= this.#lastSyncSeq || changes.length === 0) {
-        this.#lastSyncSeq = Math.max(this.#lastSyncSeq, latestSeq)
-        return false
-      }
-      this.#lastSyncSeq = latestSeq
       const uniqueKeys = new Set<string>()
       const prefix = `${this.#prefix}/`
-      for (const ch of changes) {
-        if (ch.deleted) continue
-        if (ch.key.startsWith('cas/') || (ch.key.startsWith(prefix) && ch.key !== `${prefix}materialized-cache`)) {
-          uniqueKeys.add(ch.key)
+      // Drain the change feed: stores may page it (IndexedDB returns at most 4096 changes per call).
+      // The cursor advances only over changes actually read here, never past a sibling's commit;
+      // this replica's own writes are in the feed too and are skipped below without a store read.
+      let rescan: number | null = null
+      for (;;) {
+        const { latestSeq, changes, reset } = await this.#store.readChangesSince!(this.#lastSyncSeq)
+        // The store pruned its changelog below our cursor: rescan everything, resume at latestSeq.
+        if (reset === true) { rescan = latestSeq; break }
+        let next = this.#lastSyncSeq
+        for (const ch of changes) {
+          if (ch.seq > next) next = ch.seq
+          if (ch.deleted) continue
+          if (ch.key.startsWith('cas/') || (ch.key.startsWith(prefix) && ch.key !== `${prefix}materialized-cache`)) {
+            uniqueKeys.add(ch.key)
+          }
         }
+        if (changes.length === 0) next = Math.max(next, latestSeq)
+        if (next <= this.#lastSyncSeq) break
+        this.#lastSyncSeq = next
+        if (changes.length === 0) break
       }
-      if (uniqueKeys.size === 0) return false
       let changed = false
-      for (const key of uniqueKeys) {
-        const val = await this.#store.get(key)
-        if (val === null) continue
-        if (this.cas.indexPersistedEntry({ key, value: val }, { verifyHash: false })) {
-          changed = true
-          continue
+      // `changed` only for entries newly indexed here (sibling writes), never for own or known ones.
+      const ingest = async (entry: BytesStoreEntry): Promise<void> => {
+        if (entry.key.startsWith('cas/')) {
+          const known = this.#holdsStoreKey(entry.key)
+          this.cas.indexPersistedEntry(entry, { verifyHash: false })
+          if (!known && this.#holdsStoreKey(entry.key)) changed = true
+          return
         }
-        if (await this.#ingestSingleStoreEntry({ key, value: val })) {
-          changed = true
+        if (entry.key === `${prefix}materialized-cache` || !entry.key.startsWith(prefix)) return
+        if (await this.#ingestSingleStoreEntry(entry, FACTS_SOURCE_STORE)) changed = true
+      }
+      if (rescan !== null) {
+        for (const entry of await readAllStoreEntries(this.#store)) {
+          if (!this.#holdsStoreKey(entry.key)) await ingest(entry)
+        }
+        this.#lastSyncSeq = rescan
+      } else {
+        for (const key of uniqueKeys) {
+          if (this.#holdsStoreKey(key)) continue
+          const val = await this.#store.get(key)
+          if (val !== null) await ingest({ key, value: val })
         }
       }
       if (changed) {
@@ -1040,6 +1166,22 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
       return changed
     })
+  }
+
+  /** True when the fact a store key holds is already in memory (own writes seen in the change feed). */
+  #holdsStoreKey(key: string): boolean {
+    if (key.startsWith('cas/')) {
+      const rest = key.slice('cas/'.length)
+      if (rest.startsWith('pub/')) return this.cas.hasSync(rest.slice(4), 'public')
+      if (rest.startsWith('priv/')) return this.cas.hasSync(rest.slice(5), 'private')
+      return false
+    }
+    const rest = key.slice(this.#prefix.length + 1)
+    if (rest.startsWith('public-op/')) return this.#publicOps.has(rest.slice('public-op/'.length))
+    if (rest.startsWith('enc-env/')) return this.#encryptedEnvelopes.has(rest.slice('enc-env/'.length))
+    if (rest.startsWith('local-pending/')) return this.#localPending.has(rest.slice('local-pending/'.length))
+    if (rest.startsWith('evidence/')) return this.#evidence.has(rest.slice('evidence/'.length))
+    return false
   }
 
   topic(name: string): JsonValue | null {
@@ -1145,6 +1287,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (this.#closed) return
     const rev = this.#lastLocalRevision.digest
     if (
+      this.#provisionalSnapshot !== null || // unverified snapshot state is never persisted
       this.#kernel.pendingDependencies.length > 0 ||
       (this.#kernel.materializedOutcomes.length === 0 && this.#kernel.frontierOrderLength === 0) ||
       rev === this.#lastPersistedCacheDigest
@@ -1355,7 +1498,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const writers = parseStringList(s.writers)
         const admins = parseStringList(s.administrators)
         const pubs = parseStringList(s.publishers)
-        const fins = parseStringList(s.finalizers)
         const blocked = parseStringList(s.blockedAuthors)
         const admission = (s.admission !== null && typeof s.admission === 'object' && !Array.isArray(s.admission))
           ? s.admission as { readonly hostKey?: string }
@@ -1390,7 +1532,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           writers: writers.keys,
           administrators: admins.keys,
           publishers: pubs.keys,
-          finalizers: fins.keys,
           openReaders,
           openWriters,
           blockedAuthors: blocked.keys,
@@ -1409,25 +1550,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     this.#lastAdmissionHash = admHash
   }
 
-  async #ingestSingleStoreEntry(entry: BytesStoreEntry): Promise<boolean> {
+  /** Index one persisted store entry; `source` tags facts a sibling tab wrote (FACTS_SOURCE_STORE). */
+  async #ingestSingleStoreEntry(entry: BytesStoreEntry, source?: string): Promise<boolean> {
     const prefix = `${this.#prefix}/`
     if (!entry.key.startsWith(prefix)) return false
     const rest = entry.key.slice(prefix.length)
-    if (rest.startsWith('epoch-key/')) {
-      const ep = Number(rest.slice('epoch-key/'.length))
-      if (Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32 && !this.#epochKeys.has(ep)) {
-        this.#epochKeys.set(ep, entry.value.slice())
-        return true
-      }
-    } else if (rest.startsWith('ring-key/')) {
-      const parts = rest.slice('ring-key/'.length).split('/')
-      const ring = parts[0]
-      const ep = Number(parts[1])
-      if (ring && ring !== 'default' && Number.isSafeInteger(ep) && ep >= 0 && entry.value.length === 32) {
-        let map = this.#ringKeys.get(ring)
-        if (map === undefined) { map = new Map(); this.#ringKeys.set(ring, map) }
-        if (!map.has(ep)) { map.set(ep, entry.value.slice()); return true }
-      }
+    if (rest.startsWith(KeyStore.STORE_SEGMENT)) {
+      return this.#keys.hydrate(rest, entry.value)
     } else if (rest.startsWith('public-op/')) {
       const keyOpId = rest.slice('public-op/'.length)
       if (this.#publicOps.has(keyOpId)) return false
@@ -1439,7 +1568,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const core = decodeTrustedOperationCore(signed.coreBytes)
         const opId = keyOpId
         if (bytesToHex(core.logId) === this.logId && core.visibility === 'public' && !this.#publicOps.has(opId)) {
-          this.#publicOps.set(opId, { raw: entry.value.slice(), signed, core })
+          this.#publicOps.setFrom(opId, { raw: entry.value.slice(), signed, core }, source)
           return true
         }
       } catch { /* ignore corrupt entry */ }
@@ -1453,7 +1582,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (bytesToHex(envelope.logId) === this.logId) {
           const digest = keyDigest
           if (!this.#encryptedEnvelopes.has(digest)) {
-            this.#encryptedEnvelopes.set(digest, { digest, raw: entry.value, envelope, fromStore: true })
+            this.#encryptedEnvelopes.setFrom(digest, { digest, raw: entry.value, envelope, fromStore: true }, source)
             this.#undecryptedEnvelopes.add(digest)
             return true
           }
@@ -1473,6 +1602,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             core,
             currentEnvelopeDigest: rec.envelopeDigest,
             currentEpoch: rec.epoch,
+            currentCommitment: rec.commitment,
           })
           return true
         }
@@ -1489,7 +1619,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         const ev = decodeRecord<AdmissionEvidence>(entry.value)
         const computedKey = await evidenceDigest(ev)
         if (!this.#evidence.has(computedKey)) {
-          this.#evidence.set(computedKey, ev)
+          this.#evidence.setFrom(computedKey, ev, source)
           return true
         }
       } catch { /* ignore */ }
@@ -1505,9 +1635,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const cached = decodeMaterializedCache(entry.value)
       if (cached !== null && cached.logId === this.logId && cached.blindHostMode === this.#blindHostMode) {
         this.#pendingMaterializedCache = cached
-        // Every op in a persisted cache passed signature + id verification before it was folded in.
+        // Suffix ops of a persisted cache passed signature + id verification on this replica before
+        // they were folded in. Frontier ids came from a snapshot this replica did not replay, so
+        // they never enter the trusted set.
         for (const id of cached.orderOpIds) this.#trustedOpIds.add(id)
-        for (const id of cached.frontierOpIds) this.#trustedOpIds.add(id)
       }
     }
     return false
@@ -1520,19 +1651,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   }
 
   /**
-   * Decode + verify a v3 snapshot bundle (see snapshot-codec.ts): decrypts private-log bundles
-   * with the epoch key, checks the Ed25519 signature, and rejects signers that are not members
-   * under the permissions this replica currently knows.
+   * Decode a v3 snapshot bundle (see snapshot-codec.ts): decrypts private-log bundles with the
+   * epoch key and checks the bundle's Ed25519 signature (integrity only; trust is decided by
+   * `#adoptSnapshotFrontier`).
    */
   async #decodeMaterializedSnapshot(bytes: Uint8Array): Promise<{
     readonly cache: KernelMaterializedCache
     readonly casNodes: readonly SessionCasNode[]
   } | null> {
     if (this.genesis.privateLog && this.#blindHostMode) return null
-    const decoded = await decodeSnapshotBundle(bytes, this.logId, epoch => this.#epochKeys.get(epoch))
+    const decoded = await decodeSnapshotBundle(bytes, this.logId, epoch => this.#groupKey('default', epoch))
     if (decoded === null) return null
     if (decoded.cache.blindHostMode !== this.#blindHostMode) return null
-    if (!this.isMember(decoded.signer)) return null
     return { cache: decoded.cache, casNodes: decoded.casNodes }
   }
 
@@ -1545,55 +1675,181 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   #currentEpochFrom(kernel: TopicKernel): number {
     const state = this.#keysStateFrom(kernel)
     if (state.currentEpoch >= 0) return state.currentEpoch
-    if (this.#epochKeys.size > 0) return Math.max(...this.#epochKeys.keys())
-    return -1
+    const held = this.#keys.epochs(EPOCH_KEY_GROUP)
+    return held.length > 0 ? held[held.length - 1]! : -1
   }
 
+  async #storeTreeNodeSeeds(seeds: ReadonlyMap<string, Uint8Array>): Promise<void> {
+    for (const [pubKeyHash, seed] of seeds) await this.#keys.install(TREE_SEED_GROUP, 0, seed, pubKeyHash)
+  }
+
+  async #installVaultKey(topic: string, vaultId: string, epoch: number, key: Uint8Array): Promise<void> {
+    await this.#keys.install(vaultKeyGroup(topic, vaultId), epoch, key)
+  }
+
+  #vaultState(topic: string, vaultId: string, kernel: TopicKernel = this.#kernel): VaultTopicEntry | undefined {
+    const raw = kernel.topic(topic) as { readonly vaults?: Record<string, unknown> } | null
+    const vault = raw !== null && typeof raw === 'object' ? raw.vaults?.[vaultId] : undefined
+    return vault !== null && typeof vault === 'object' ? vault : undefined
+  }
+
+  /** The held vault key whose commitment matches the vault topic's on-log `keyCommitment`. */
+  #getVaultKey(vaultId: string, epoch: number, topic = 'vaults'): Uint8Array | undefined {
+    const commitment = this.#vaultState(topic, vaultId)?.epochs?.[String(epoch)]?.keyCommitment
+    return this.#keys.get(vaultKeyGroup(topic, vaultId), epoch, commitment)
+  }
+
+  /** Topics bound to `chronolog/vaults` (memoized per `$reducers` hash). */
+  #vaultTopicsMemo: { readonly reducersHash: string; readonly topics: readonly string[] } | null = null
+  #vaultTopics(kernel: TopicKernel): readonly string[] {
+    const reducersHash = kernel.topicHash('$reducers') ?? ''
+    if (this.#vaultTopicsMemo?.reducersHash === reducersHash) return this.#vaultTopicsMemo.topics
+    const reducers = kernel.topic('$reducers') as {
+      readonly imports?: Record<string, string>
+      readonly topics?: Record<string, { readonly module?: string }>
+    } | null
+    const importsCfg = reducers?.imports ?? {}
+    const topics: string[] = []
+    for (const [topicName, binding] of Object.entries(reducers?.topics ?? {})) {
+      if (isControlTopic(topicName)) continue
+      const mod = binding?.module
+      if (topicName === 'vaults' || mod === 'chronolog/vaults' || (typeof mod === 'string' && importsCfg[mod] === 'chronolog/vaults')) topics.push(topicName)
+    }
+    this.#vaultTopicsMemo = { reducersHash, topics }
+    return topics
+  }
+
+  /**
+   * Open this device's vault lockboxes. A vault topic is rescanned only when its hash changed;
+   * a key is installed only when it matches the on-log `keyCommitment`, and a lockbox that failed
+   * to open is never retried.
+   */
+  async #unsealAvailableVaultKeys(kernel: TopicKernel = this.#kernel): Promise<boolean> {
+    if (this.#blindHostMode) return false
+    let unlockedAny = false
+    for (const topicName of this.#vaultTopics(kernel)) {
+      const hash = kernel.topicHash(topicName) ?? ''
+      const scanKey = `vault-topic:${topicName}`
+      if (this.#scannedKeyTopics.get(scanKey) === hash) continue
+      this.#scannedKeyTopics.set(scanKey, hash)
+      const raw = kernel.topic(topicName) as { readonly vaults?: Record<string, VaultTopicEntry> } | null
+      if (!raw || typeof raw !== 'object' || !raw.vaults || typeof raw.vaults !== 'object') continue
+      for (const [vaultId, vault] of Object.entries(raw.vaults)) {
+        const group = vaultKeyGroup(topicName, vaultId)
+        for (const entry of Object.values(vault?.epochs ?? {})) {
+          const commitment = entry.keyCommitment
+          if (typeof commitment !== 'string') continue
+          if (this.#keys.has(group, entry.epoch, commitment)) continue
+          const box = entry.boxes?.[this.identity.publicKey]
+          if (box === undefined) continue
+          const attempt = `${commitment}:${box.encapsulatedKey.slice(0, 64)}`
+          if (this.#keys.isFailed(group, entry.epoch, attempt)) continue
+          try {
+            const plainKey = await hpkeOpenEpochKey(
+              this.device.wrapKey.privateKey,
+              this.device.wrapKey.publicKey,
+              box,
+              `${this.logId}:vault:${vaultId}`,
+              entry.epoch,
+              this.device.pqWrapKey?.secretKey,
+            )
+            if (epochKeyCommitment(plainKey) !== commitment) { this.#keys.markFailed(group, entry.epoch, attempt); continue }
+            await this.#keys.install(group, entry.epoch, plainKey, commitment)
+            unlockedAny = true
+          } catch {
+            this.#keys.markFailed(group, entry.epoch, attempt) // not our box or corrupted
+          }
+        }
+      }
+    }
+    return unlockedAny
+  }
+
+  /** Open one HPKE lockbox for `(group, epoch)` and install it if it matches `commitment`. */
+  async #openLockbox(group: string, scope: string, epoch: number, commitment: string, box: EpochKeyBox): Promise<boolean> {
+    // A replaced lockbox (wrap-key rotation) is a new attempt; a failed one is never retried.
+    const attempt = `${commitment}:${box.encapsulatedKey.slice(0, 64)}`
+    if (this.#keys.isFailed(group, epoch, attempt)) return false
+    try {
+      const plainKey = await hpkeOpenEpochKey(
+        this.device.wrapKey.privateKey,
+        this.device.wrapKey.publicKey,
+        box,
+        scope,
+        epoch,
+        this.device.pqWrapKey?.secretKey,
+      )
+      if (epochKeyCommitment(plainKey) !== commitment) { this.#keys.markFailed(group, epoch, attempt); return false }
+      await this.#keys.install(group, epoch, plainKey, commitment)
+      return true
+    } catch {
+      this.#keys.markFailed(group, epoch, attempt) // wrong wrap key or corrupted lockbox
+      return false
+    }
+  }
+
+  /**
+   * Open every default-ring and compartment-ring lockbox (flat or TreeKEM) addressed to this
+   * device whose on-log commitment it does not hold yet. Skipped while `$keys` is unchanged and no
+   * TreeKEM node is still missing; missing tree nodes are reported via `missingCasDependencies()`
+   * (pulled from peers with `cas-want` and from `casMirrors`).
+   */
   async #unsealAvailableEpochKeys(kernel: TopicKernel = this.#kernel): Promise<boolean> {
     if (!this.genesis.privateLog || this.#blindHostMode) return false
+    const keysHash = kernel.topicHash('$keys') ?? ''
+    if (this.#scannedKeyTopics.get('$keys') === keysHash && this.#missingTreeCasHashes.size === 0) return false
+    this.#scannedKeyTopics.set('$keys', keysHash)
+    this.#missingTreeCasHashes.clear()
     const keys = this.#keysStateFrom(kernel)
     let unlockedAny = false
     for (const entry of Object.values(keys.epochs ?? {})) {
-      if (this.#epochKeys.has(entry.epoch)) continue
+      const commitment = entry.keyCommitment
+      if (typeof commitment !== 'string' || this.#keys.has(EPOCH_KEY_GROUP, entry.epoch, commitment)) continue
+      if (typeof entry.treeRef === 'string') {
+        const hash = tryParseCasRef(entry.treeRef)
+        if (hash !== null) {
+          const readRes = await readKeyTreeFromCas(hash, async h => (await this.cas.get(h, 'public'))?.bytes ?? null)
+          if (!readRes.ok) {
+            for (const missing of readRes.missingHashes) this.#missingTreeCasHashes.add(missing)
+          } else if (!this.#keys.isFailed(EPOCH_KEY_GROUP, entry.epoch, `${commitment}:${entry.treeRef}`)) {
+            try {
+              const opened = await openTreeEpoch({
+                scope: this.logId,
+                payload: readRes.payload,
+                keyCommitment: commitment,
+                wrapPrivateKey: this.device.wrapKey.privateKey,
+                wrapPublicKeyHex: this.device.wrapKey.publicKey,
+                ...(this.device.pqWrapKey === undefined ? {} : {
+                  pqSecretKey: this.device.pqWrapKey.secretKey,
+                  pqPublicKeyHex: this.device.pqWrapKey.publicKey,
+                }),
+                cachedNodeSeeds: this.#keys.view(TREE_SEED_GROUP, 0),
+              })
+              if (opened !== null && epochKeyCommitment(opened.epochKey) === commitment) {
+                await this.#keys.install(EPOCH_KEY_GROUP, entry.epoch, opened.epochKey, commitment)
+                await this.#storeTreeNodeSeeds(opened.derivedSeeds)
+                unlockedAny = true
+                continue
+              }
+              this.#keys.markFailed(EPOCH_KEY_GROUP, entry.epoch, `${commitment}:${entry.treeRef}`)
+            } catch {
+              // Corrupt tree node or not in the active tree; a flat box below may still open.
+              this.#keys.markFailed(EPOCH_KEY_GROUP, entry.epoch, `${commitment}:${entry.treeRef}`)
+            }
+          }
+        }
+      }
       const box = entry.boxes?.[this.identity.publicKey]
       if (box === undefined) continue
-      try {
-        const plainKey = await hpkeOpenEpochKey(
-          this.device.wrapKey.privateKey,
-          this.device.wrapKey.publicKey,
-          box,
-          this.logId,
-          entry.epoch,
-          this.device.pqWrapKey?.secretKey,
-        )
-        if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
-        await this.installEpochKey(entry.epoch, plainKey)
-        unlockedAny = true
-      } catch {
-        // Wrong wrap key or corrupted lockbox — ignore
-      }
+      if (await this.#openLockbox(EPOCH_KEY_GROUP, this.logId, entry.epoch, commitment, box)) unlockedAny = true
     }
     for (const [ringName, ringState] of Object.entries(keys.rings ?? {})) {
-      const existingMap = this.#ringKeys.get(ringName)
+      const group = ringKeyGroup(ringName)
       for (const entry of Object.values(ringState.epochs ?? {})) {
-        if (existingMap?.has(entry.epoch)) continue
+        if (typeof entry.keyCommitment !== 'string' || this.#keys.has(group, entry.epoch, entry.keyCommitment)) continue
         const box = entry.boxes?.[this.identity.publicKey]
         if (box === undefined) continue
-        try {
-          const plainKey = await hpkeOpenEpochKey(
-            this.device.wrapKey.privateKey,
-            this.device.wrapKey.publicKey,
-            box,
-            `${this.logId}:${ringName}`,
-            entry.epoch,
-            this.device.pqWrapKey?.secretKey,
-          )
-          if (epochKeyCommitmentV2(plainKey) !== entry.keyCommitment) continue
-          await this.installRingKey(ringName, entry.epoch, plainKey)
-          unlockedAny = true
-        } catch {
-          // Not a member of this compartment ring — ignore
-        }
+        if (await this.#openLockbox(group, `${this.logId}:${ringName}`, entry.epoch, entry.keyCommitment, box)) unlockedAny = true
       }
     }
     return unlockedAny
@@ -1609,9 +1865,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         continue
       }
       const ring = entry.envelope.ring ?? 'default'
-      const epochKey = ring === 'default'
-        ? this.#epochKeys.get(entry.envelope.epoch)
-        : this.#ringKeys.get(ring)?.get(entry.envelope.epoch)
+      // AES-GCM authenticates the key, so trying every held candidate for this epoch is safe; the
+      // on-log commitment goes first (the others only exist after a lost concurrent rotation).
+      const candidates = this.#keys.candidates(ringKeyGroup(ring), entry.envelope.epoch, this.#onLogCommitment(ring, entry.envelope.epoch))
       // Own pending ops: the local-pending record already holds the signed plaintext for exactly
       // this envelope, so there is nothing to decrypt or verify.
       const pending = this.#localPending.get(bytesToHex(entry.envelope.opId))
@@ -1620,17 +1876,23 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         this.#undecryptedEnvelopes.delete(digest)
         continue
       }
-      if (epochKey === undefined) continue
+      if (candidates.length === 0) continue
       // Decrypt + verify concurrently (WebCrypto runs these off the JS thread where available).
       work.push((async () => {
         try {
-          const aad = envelopeAad(entry.envelope.logId, entry.envelope.opId, entry.envelope.author)
-          const plaintext = await decryptEpochPayload(epochKey, {
-            epoch: BigInt(entry.envelope.epoch),
-            nonce: entry.envelope.nonce,
-            ciphertext: entry.envelope.ciphertext,
-            ...(entry.envelope.suite === undefined ? {} : { suite: entry.envelope.suite }),
-          }, aad)
+          const aad = envelopeAad(entry.envelope.logId, entry.envelope.opId, entry.envelope.author, ring)
+          let plaintext: Uint8Array | undefined
+          for (const epochKey of candidates) {
+            try {
+              plaintext = await decryptEpochPayload(epochKey, {
+                epoch: BigInt(entry.envelope.epoch),
+                nonce: entry.envelope.nonce,
+                ciphertext: entry.envelope.ciphertext,
+              }, aad)
+              break
+            } catch { /* next candidate */ }
+          }
+          if (plaintext === undefined) return
           let verified: { readonly core: OperationCore; readonly opId: Uint8Array }
           let signed: SignedOperation
           const trustedId = entry.fromStore === true ? bytesToHex(entry.envelope.opId) : null
@@ -1673,15 +1935,22 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (!this.genesis.privateLog || this.#blindHostMode) return false
     const newestEpoch = this.#currentEpochFrom(kernel)
     if (newestEpoch < 0) return false
-    const newestKey = this.#epochKeys.get(newestEpoch)
+    const newestKey = this.#groupKey('default', newestEpoch, kernel)
     if (newestKey === undefined || !this.isWriter(this.identity.publicKey)) return false
+    const newestCommitment = epochKeyCommitment(newestKey)
+    const keysState = this.#keysStateFrom(kernel)
 
     let rewrapped = false
+    // #localPending holds only ops no remote member has retained yet (see #settleLocalPending).
     for (const [opId, pending] of this.#localPending) {
-      const keysState = this.#keysStateFrom(kernel)
       const pendingRing = keysState.topicRings?.[pending.core.updates[0]?.topic ?? ''] ?? 'default'
       if (pendingRing !== 'default') continue
-      if (pending.currentEpoch >= newestEpoch) continue
+      if (pending.currentEpoch > newestEpoch) continue
+      // Same epoch is only rewrapped when it was sealed under a key that lost a concurrent rotation.
+      if (pending.currentEpoch === newestEpoch && (
+        pending.currentCommitment === newestCommitment ||
+        this.#onLogCommitment('default', pending.currentEpoch, kernel) === pending.currentCommitment
+      )) continue
       const logIdBytes = hexToBytes(this.logId)
       const opIdBytes = hexToBytes(opId)
       const env = await this.#encryptOperationEnvelope({
@@ -1712,7 +1981,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       })
       pending.currentEpoch = newestEpoch
       pending.currentEnvelopeDigest = envDigest
-      await this.#store.put(`${this.#prefix}/local-pending/${opId}`, encodeLocalPending(pending.raw, envDigest, newestEpoch))
+      pending.currentCommitment = newestCommitment
+      await this.#store.put(`${this.#prefix}/local-pending/${opId}`, encodeLocalPending(pending.raw, envDigest, newestEpoch, newestCommitment))
       rewrapped = true
     }
     return rewrapped
@@ -1724,12 +1994,19 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   readonly #sqliteScanNegative = new Set<string>()
   /** operationId -> opId for ops authored by this identity (O(1) inspect by caller-chosen id). */
   readonly #ownOperationIds = new Map<string, string>()
-  #kernelInput(opId: string, core: OperationCore, ring?: string): KernelOperationInput {
+  /** `${visibility}\0${operationId}` -> opId for ops authored by this identity (submit idempotency). */
+  readonly #ownOpsByIdempotencyKey = new Map<string, string>()
+  #kernelInput(opId: string, core: OperationCore, envelope?: { readonly ring: string; readonly epoch: number }): KernelOperationInput {
     let input = this.#kernelInputs.get(opId)
-    if (input === undefined || input.core !== core || input.ring !== ring) {
-      input = { opId: hexToBytes(opId), core, verified: true, ...(ring === undefined ? {} : { ring }) }
+    const ring = envelope?.ring
+    const epoch = envelope?.epoch
+    if (input === undefined || input.core !== core || input.ring !== ring || input.epoch !== epoch) {
+      input = { opId: hexToBytes(opId), core, verified: true, ...(envelope === undefined ? {} : { ring: envelope.ring, epoch: envelope.epoch }) }
       this.#kernelInputs.set(opId, input)
-      if (bytesToHex(core.author) === this.identity.publicKey) this.#ownOperationIds.set(core.operationId, opId)
+      if (bytesToHex(core.author) === this.identity.publicKey) {
+        this.#ownOperationIds.set(core.operationId, opId)
+        this.#ownOpsByIdempotencyKey.set(`${core.visibility}\0${core.operationId}`, opId)
+      }
     }
     return input
   }
@@ -1740,33 +2017,171 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       byOpId.set(opId, this.#kernelInput(opId, entry.core))
     }
     if (!this.#blindHostMode) {
+      // An op held under several envelopes (offline rewrap) counts against the lowest epoch it was
+      // sealed under, so the `$keys.policy.maxOpsPerEpoch` input never depends on arrival order.
+      const chosen = new Map<string, { readonly core: OperationCore; readonly ring: string; readonly epoch: number }>()
       for (const entry of this.#encryptedEnvelopes.values()) {
         if (entry.decrypted === undefined) continue
-        if (!byOpId.has(entry.decrypted.opId)) {
-          byOpId.set(
-            entry.decrypted.opId,
-            this.#kernelInput(entry.decrypted.opId, entry.decrypted.core, entry.envelope.ring ?? 'default'),
-          )
+        const opId = entry.decrypted.opId
+        if (byOpId.has(opId)) continue
+        const prev = chosen.get(opId)
+        if (prev === undefined || entry.envelope.epoch < prev.epoch) {
+          chosen.set(opId, { core: entry.decrypted.core, ring: entry.envelope.ring ?? 'default', epoch: entry.envelope.epoch })
         }
       }
+      for (const [opId, c] of chosen) byOpId.set(opId, this.#kernelInput(opId, c.core, { ring: c.ring, epoch: c.epoch }))
     }
     return byOpId
   }
 
   /** Swap in a SQLite-capable kernel before restoring state whose reducers need chronolog:sqlite. */
-  async #upgradeKernelForSqlite(reducers: JsonValue | undefined): Promise<void> {
-    if (this.#kernelHasSqlite || !await this.#ensureSqliteIfNeeded(reducers) || this.#sqliteDriver === undefined) return
-    this.#kernel.dispose()
-    this.#kernel = new TopicKernel({
+  /** A fresh kernel for this log (session blind mode unless `blind` is set; SQLite once loaded). */
+  #newKernel(options: { readonly blind?: boolean } = {}): TopicKernel {
+    return new TopicKernel({
       genesis: this.genesisBytes,
       cas: this.cas,
-      blindHostMode: this.#blindHostMode,
+      blindHostMode: options.blind ?? this.#blindHostMode,
       ...this.#sandboxOptions,
-      sqliteDriver: this.#sqliteDriver,
+      ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
     })
-    this.#kernelHasSqlite = true
+  }
+
+  /** Swap the main kernel (frontier, final view and provisional snapshot state go with it). */
+  #replaceKernel(next: TopicKernel): void {
+    if (next !== this.#kernel) this.#kernel.dispose()
+    this.#kernel = next
+    this.#kernelHasSqlite = this.#sqliteDriver !== undefined
     this.#finalKernel?.dispose()
     this.#finalKernel = null
+    this.#provisionalSnapshot = null
+  }
+
+  /** Swap in a SQLite-capable kernel before restoring state whose reducers need chronolog:sqlite. */
+  async #upgradeKernelForSqlite(reducers: JsonValue | undefined): Promise<void> {
+    if (this.#kernelHasSqlite || !await this.#ensureSqliteIfNeeded(reducers) || this.#sqliteDriver === undefined) return
+    this.#replaceKernel(this.#newKernel())
+  }
+
+  /** Kernel whose `$*` state drives control decisions (own control kernel while a snapshot is provisional). */
+  #controlView(): TopicKernel {
+    if (this.#provisionalSnapshot !== null) return this.#admittedControlKernel ?? this.#controlKernel ?? this.#kernel
+    return this.#kernel
+  }
+
+  /**
+   * True when `(stateRoot, historyDigest, covered op set)` equals admission checkpoint evidence this
+   * replica verified, or the frontier it pinned itself.
+   */
+  #snapshotIsAttested(snapshot: { readonly stateRoot: string; readonly historyDigest: string; readonly opIds: readonly string[] }): boolean {
+    const digest = computeIncludedSetDigest(snapshot.opIds)
+    const pf = this.#pinnedFrontier
+    if (pf !== null && pf.stateRoot === snapshot.stateRoot && pf.historyDigest === snapshot.historyDigest &&
+      computeIncludedSetDigest(pf.includedOpIds) === digest) return true
+    for (const ev of this.#admissionDecision.verifiedEvidence) {
+      const p = ev.payload as Partial<AdmissionCheckpointPayload> | null
+      if (p === null || typeof p !== 'object' || p.logId !== this.logId) continue
+      if (p.stateRoot !== snapshot.stateRoot || p.historyDigest !== snapshot.historyDigest) continue
+      if (!Array.isArray(p.inclusions)) continue
+      const opIds: string[] = []
+      let valid = true
+      for (const item of p.inclusions as readonly unknown[]) {
+        if (typeof item !== 'object' || item === null || typeof (item as { readonly opId?: unknown }).opId !== 'string') {
+          valid = false
+          break
+        }
+        opIds.push((item as { readonly opId: string }).opId)
+      }
+      if (!valid || computeIncludedSetDigest(opIds) !== digest) continue
+      return true
+    }
+    return false
+  }
+
+  /**
+   * The ONE snapshot adoption path (peer `snapshot` message, `importMaterializedSnapshot`,
+   * host-cached `materializedSnapshot`, `admission.bootstrapFromCheckpoint`): the snapshot's state
+   * becomes this replica's frontier, so the ops it covers are not replayed. Who signed a bundle
+   * grants no trust (on open logs anyone is a member). Trust comes from:
+   * - `'local'`: the bundle was produced by this deployment (host-cached `materializedSnapshot`),
+   *   like the local materialized cache;
+   * - evidence: `#snapshotIsAttested` (verified admission checkpoint or the local pinned frontier);
+   * - otherwise the snapshot is provisional: first paint only, until `#verifyProvisionalSnapshot`
+   *   replays the covered ops and confirms (or replaces) it.
+   */
+  async #adoptSnapshotFrontier(
+    cache: KernelMaterializedCache,
+    casNodes: readonly SessionCasNode[],
+    trust: SnapshotTrust,
+    options: { readonly force?: boolean } = {},
+  ): Promise<boolean> {
+    const opIds = [...cache.frontierOpIds, ...cache.orderOpIds]
+    // Adopt the snapshot only when it is ahead of what this replica already materialized.
+    if (options.force !== true && opIds.length <= this.#kernel.revision('local').orderLength) return false
+    if (casNodes.length > 0) await this.cas.putManyVerified(casNodes)
+    await this.#upgradeKernelForSqlite(cache.topics.$reducers)
+    if (!await this.#kernel.restoreSnapshotFrontier(cache)) return false
+    this.#materializedCacheHits++
+    const snapshot = { stateRoot: cache.stateRoot, historyDigest: cache.historyDigest, opIds }
+    this.#provisionalSnapshot = trust === 'local' || this.#snapshotIsAttested(snapshot) ? null : snapshot
+    return true
+  }
+
+  /**
+   * Confirm a provisional snapshot: as soon as admission evidence attests it, or every covered op is
+   * held, replay exactly those ops on a fresh kernel. The replay becomes the main kernel either way;
+   * if it does not reproduce the snapshot's stateRoot and historyDigest the snapshot was forged and
+   * its state is gone (the next materialize folds the remaining ops on top of the replay).
+   */
+  async #verifyProvisionalSnapshot(allByOpId: ReadonlyMap<string, KernelOperationInput>): Promise<void> {
+    const pending = this.#provisionalSnapshot
+    if (pending === null) return
+    if (this.#snapshotIsAttested(pending)) { this.#provisionalSnapshot = null; return }
+    if (allByOpId.size < pending.opIds.length) return
+    const inputs: KernelOperationInput[] = []
+    for (const id of pending.opIds) {
+      const input = allByOpId.get(id)
+      if (input === undefined) return
+      inputs.push(input)
+    }
+    const verifier = this.#newKernel()
+    let adopted = false
+    try {
+      const replay = await verifier.materialize(inputs)
+      if (replay.pendingDependencies.length > 0) return
+      const rev = verifier.revision('local')
+      if (rev.stateRoot !== pending.stateRoot || rev.historyDigest !== pending.historyDigest) this.#rejectedSnapshots++
+      this.#replaceKernel(verifier)
+      adopted = true
+    } finally {
+      if (!adopted) verifier.dispose()
+    }
+  }
+
+  #rejectedSnapshots = 0
+
+  /** True while the local state rests on an unverified snapshot frontier (first paint only). */
+  get snapshotProvisional(): boolean {
+    return this.#provisionalSnapshot !== null
+  }
+
+  /** Snapshots this replica adopted provisionally and then rejected because replay disagreed. */
+  get rejectedSnapshots(): number {
+    return this.#rejectedSnapshots
+  }
+
+  /**
+   * Give up on a provisional snapshot that cannot be confirmed yet (call after reconciliation with
+   * peers completed): drop the frontier and replay every op this replica holds.
+   */
+  settleProvisionalSnapshot(): Promise<boolean> {
+    return this.#serial(async () => {
+      if (this.#provisionalSnapshot === null) return false
+      await this.#rematerialize()
+      if (this.#provisionalSnapshot === null) return false
+      this.#replaceKernel(this.#newKernel())
+      await this.#rematerialize()
+      return true
+    })
   }
 
   async #rematerialize(): Promise<void> {
@@ -1788,52 +2203,72 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
       let controlKernel: TopicKernel
       let rewrapped = false
-      let ephemeralControl: TopicKernel | null = null
       let allByOpId: Map<string, KernelOperationInput>
 
       if (this.#controlKernel !== null) {
-        // Private log full replica: run the public control pass on the isolated #controlKernel
-        // so this.#kernel never loses private ops or suffix snapshots mid-rematerialization.
-        controlKernel = this.#controlKernel
-        await controlKernel.materialize(publicInputs)
-        await this.#refreshAdmissionCache(controlKernel)
-        await this.#unsealAvailableEpochKeys(controlKernel)
+        // Private log full replica: the public control pass runs on the isolated blind
+        // #controlKernel (the admission probe), so this.#kernel never loses private ops or suffix
+        // snapshots mid-rematerialization. Lockboxes are opened from the probe state (a superset;
+        // keys are commitment-bound, so a key from an excluded rotation is never selected).
+        await this.#controlKernel.materialize(publicInputs)
+        await this.#unsealAvailableEpochKeys(this.#controlKernel)
+        for (let hop = 0; hop < 8 && this.#missingTreeCasHashes.size > 0 && this.#casMirrors.length > 0; hop++) {
+          const fetched = await this.#pullMissingFromMirrors()
+          if (fetched === 0) break
+          await this.#unsealAvailableEpochKeys(this.#controlKernel)
+        }
         await this.#decryptPendingEnvelopes()
-        rewrapped = await this.#rewrapPendingLocalOps(controlKernel)
         allByOpId = this.#collectDecryptedKernelInputs()
+        const control = await materializeControl({
+          logId: this.logId,
+          probe: this.#controlKernel,
+          publicOps: publicInputs,
+          admissionOps: [...allByOpId.values()].map(admissionOpRef),
+          evidence: [...this.#evidence.values()],
+          pinnedFrontier: this.#pinnedFrontier,
+          admitted: () => this.#admittedControlKernel ??= this.#newKernel({ blind: true }),
+        })
+        this.#admissionDecision = control.admission
+        controlKernel = control.control
+        await this.#refreshAdmissionCache(controlKernel)
+        rewrapped = await this.#rewrapPendingLocalOps(controlKernel)
       } else {
-        // Public log or blind host: only public ops exist in the local kernel.
-        // If admission evidence or a pinned frontier exists, probe $admission on an isolated kernel
-        // so this.#kernel never transiently exposes excluded operations.
+        // Public log or blind host: only public ops exist in the local kernel. With admission
+        // evidence or a pinned frontier, a persistent probe kernel judges history so this.#kernel
+        // never transiently exposes excluded operations (it folds only the admitted ops below).
         allByOpId = this.#collectDecryptedKernelInputs()
         if (this.#evidence.size > 0 || this.#pinnedFrontier !== null) {
           await this.#ensureSqliteIfNeeded()
-          controlKernel = new TopicKernel({
-            genesis: this.genesisBytes,
-            cas: this.cas,
-            blindHostMode: this.#blindHostMode,
-            ...this.#sandboxOptions,
-            ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
+          if (this.#probeKernel !== null && this.#sqliteDriver !== undefined && !this.#probeHasSqlite) {
+            this.#probeKernel.dispose()
+            this.#probeKernel = null
+          }
+          if (this.#probeKernel === null) {
+            this.#probeKernel = this.#newKernel()
+            this.#probeHasSqlite = this.#sqliteDriver !== undefined
+          }
+          const control = await materializeControl({
+            logId: this.logId,
+            probe: this.#probeKernel,
+            publicOps: publicInputs,
+            admissionOps: [...allByOpId.values()].map(admissionOpRef),
+            evidence: [...this.#evidence.values()],
+            pinnedFrontier: this.#pinnedFrontier,
+            admitted: 'caller',
           })
-          ephemeralControl = controlKernel
-          await controlKernel.materialize(publicInputs)
+          this.#admissionDecision = control.admission
+          controlKernel = control.control
         } else {
           controlKernel = this.#kernel
+          this.#admissionDecision = await evaluateAdmission({
+            logId: this.logId,
+            ops: [...allByOpId.values()].map(admissionOpRef),
+            evidence: [],
+            pinnedFrontier: null,
+            evaluator: controlKernel.createAdmissionEvaluator(),
+          })
         }
       }
-
-      this.#admissionDecision = await evaluateAdmission({
-        logId: this.logId,
-        ops: [...allByOpId.entries()].map(([opId, input]) => ({
-          opId,
-          author: bytesToHex(input.core.author),
-          authorTimestampMs: input.core.authorTimestampMs,
-          visibility: input.core.visibility,
-        })),
-        evidence: [...this.#evidence.values()],
-        pinnedFrontier: this.#pinnedFrontier,
-        evaluator: controlKernel.createAdmissionEvaluator(),
-      })
 
       const eligibleLocal: KernelOperationInput[] = []
       for (const [opId, input] of allByOpId) {
@@ -1842,48 +2277,24 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       const needsKernelUpgrade = await this.#ensureSqliteIfNeeded(controlKernel.topic('$reducers'), controlKernel.topic('$mounts'))
-      // The isolated $admission probe kernel is not needed past this point.
-      ephemeralControl?.dispose()
-      if (needsKernelUpgrade && this.#sqliteDriver !== undefined) {
-        this.#kernel.dispose()
-        const nextKernel = new TopicKernel({
-          genesis: this.genesisBytes,
-          cas: this.cas,
-          blindHostMode: this.#blindHostMode,
-          ...this.#sandboxOptions,
-          sqliteDriver: this.#sqliteDriver,
-        })
-        this.#kernel = nextKernel
-        this.#kernelHasSqlite = true
-        this.#finalKernel?.dispose()
-        this.#finalKernel = null
-      }
+      if (needsKernelUpgrade && this.#sqliteDriver !== undefined) this.#replaceKernel(this.#newKernel())
 
-      // Attempt O(1) or suffix-only restore from local cache or host-cached encrypted Snapshot Bundle.
+      // Snapshot bootstrap: a host-cached (trusted) or peer-supplied bundle becomes the frontier.
       if (this.#pendingEncryptedSnapshot !== null) {
         const decoded = await this.#decodeMaterializedSnapshot(this.#pendingEncryptedSnapshot)
         if (decoded !== null) {
-          if (decoded.casNodes.length > 0) {
-            await this.cas.putManyVerified(decoded.casNodes)
-          }
-          this.#pendingSnapshotBundle = decoded
+          this.#pendingSnapshotBundle = { ...decoded, trust: 'local' }
           this.#pendingEncryptedSnapshot = null
-        } else if (this.#epochKeys.size > 0 || !this.genesis.privateLog) {
+        } else if (this.#keys.epochs(EPOCH_KEY_GROUP).length > 0 || !this.genesis.privateLog) {
           this.#pendingEncryptedSnapshot = null
         }
       }
       if (this.#pendingSnapshotBundle !== null) {
         const bundle = this.#pendingSnapshotBundle
         this.#pendingSnapshotBundle = null
-        const covered = bundle.cache.frontierOpIds.length + bundle.cache.orderOpIds.length
-        // Adopt the snapshot only when it is ahead of what this replica already materialized.
-        if (covered > this.#kernel.revision('local').orderLength) {
-          await this.#upgradeKernelForSqlite(bundle.cache.topics.$reducers)
-          // Trust shortcut (snapshot bootstrap): the member-signed state becomes this replica's
-          // frontier without replaying the history it summarizes; later facts are still verified.
-          if (await this.#kernel.restoreSnapshotFrontier(bundle.cache)) this.#materializedCacheHits++
-        }
+        await this.#adoptSnapshotFrontier(bundle.cache, bundle.casNodes, bundle.trust)
       }
+      if (this.#provisionalSnapshot !== null) await this.#verifyProvisionalSnapshot(allByOpId)
       if (this.#pendingMaterializedCache !== null && (eligibleLocal.length > 0 || this.#pendingMaterializedCache.frontierOpIds.length > 0)) {
         const cached = this.#pendingMaterializedCache
         this.#pendingMaterializedCache = null
@@ -1902,16 +2313,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         if (!(error instanceof Error) || error.message !== 'KERNEL_FRONTIER_REWIND') throw error
         // An op sorts before state folded into a snapshot frontier: drop the frontier and replay
         // every op this replica holds (deterministic order wins over bootstrap speed).
-        this.#kernel.dispose()
-        this.#kernel = new TopicKernel({
-          genesis: this.genesisBytes,
-          cas: this.cas,
-          blindHostMode: this.#blindHostMode,
-          ...this.#sandboxOptions,
-          ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
-        })
-        this.#finalKernel?.dispose()
-        this.#finalKernel = null
+        this.#replaceKernel(this.#newKernel())
         localResult = await this.#kernel.materialize(eligibleLocal)
       }
       if (localResult.pendingDependencies.length > 0 && this.#casMirrors.length > 0) {
@@ -1921,21 +2323,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
       }
       if (!this.#kernelHasSqlite && await this.#ensureSqliteIfNeeded(this.#kernel.topic('$reducers')) && this.#sqliteDriver !== undefined) {
-        const nextKernel = new TopicKernel({
-          genesis: this.genesisBytes,
-          cas: this.cas,
-          blindHostMode: this.#blindHostMode,
-          ...this.#sandboxOptions,
-          sqliteDriver: this.#sqliteDriver,
-        })
+        const nextKernel = this.#newKernel()
         localResult = await nextKernel.materialize(eligibleLocal)
-        this.#kernel.dispose()
-        this.#kernel = nextKernel
-        this.#kernelHasSqlite = true
-        this.#finalKernel?.dispose()
-        this.#finalKernel = null
+        this.#replaceKernel(nextKernel)
       }
-      await this.#refreshAdmissionCache(this.#kernel)
+      // While a snapshot is provisional, roles come from this replica's own control replay.
+      await this.#refreshAdmissionCache(this.#controlView())
+      await this.#unsealAvailableVaultKeys(this.#kernel)
       this.#lastLocalRevision = toMaterializedRevision(localResult.revision)
 
       // Debounce local materialized cache persistence (off the critical write path; flushed on close).
@@ -1948,18 +2342,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       if (this.#admissionDecision.closedThroughMs !== null) {
-        this.#finalKernel ??= new TopicKernel({
-          genesis: this.genesisBytes,
-          cas: this.cas,
-          blindHostMode: this.#blindHostMode,
-          ...this.#sandboxOptions,
-          ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
-        })
-        const finalInputs: KernelOperationInput[] = []
-        for (const [opId, input] of allByOpId) {
-          if (this.#admissionDecision.includedOpIds.has(opId)) finalInputs.push(input)
-        }
-        await this.#finalKernel.materialize(finalInputs)
+        this.#finalKernel ??= this.#newKernel()
+        await this.#finalKernel.materialize(finalizedInputs(allByOpId.values(), this.#admissionDecision))
         this.#lastFinalRevision = toMaterializedRevision(this.#finalKernel.revision('final'))
       } else {
         this.#lastFinalRevision = null
@@ -2076,20 +2460,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       }
 
       const operationId = input.operationId ?? crypto.randomUUID()
-      for (const [opId, entry] of this.#publicOps) {
-        if (
-          entry.core.visibility === visibility &&
-          bytesToHex(entry.core.author) === this.identity.publicKey &&
-          entry.core.operationId === operationId
-        ) {
-          return new ApplicationOperation(opId, operationId, this)
-        }
-      }
-      for (const [opId, pending] of this.#localPending) {
-        if (pending.core.visibility === visibility && pending.core.operationId === operationId) {
-          return new ApplicationOperation(opId, operationId, this)
-        }
-      }
+      // Idempotent per (visibility, author, operationId), including ops already settled remotely.
+      const existingOpId = this.#ownOpsByIdempotencyKey.get(`${visibility}\0${operationId}`)
+      if (existingOpId !== undefined) return new ApplicationOperation(existingOpId, operationId, this)
 
       const combinedChecks: OperationAssumption[] = [...(input.assumptions?.checks ?? [])]
       const onFailed = input.assumptions?.onFailed
@@ -2142,6 +2515,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const opIdBytes = operationIdDigest(signed.coreBytes)
       const opIdHex = bytesToHex(opIdBytes)
 
+      this.#ownOpsByIdempotencyKey.set(`${visibility}\0${operationId}`, opIdHex)
       if (visibility === 'public') {
         await this.#store.put(`${this.#prefix}/public-op/${opIdHex}`, opBytes, { durability: 'strict' })
         this.#publicOps.set(opIdHex, { raw: opBytes, signed, core })
@@ -2154,10 +2528,9 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ? this.currentEpoch()
           : (keysState.rings?.[ring]?.currentEpoch ?? -1)
         check(epoch >= 0, 'EPOCH_KEY_REQUIRED')
-        const epochKey = ring === 'default'
-          ? this.#epochKeys.get(epoch)
-          : this.#ringKeys.get(ring)?.get(epoch)
+        const epochKey = this.#groupKey(ring, epoch)
         check(epochKey !== undefined, 'EPOCH_KEY_MISSING')
+        const commitment = epochKeyCommitment(epochKey)
         const env = await this.#encryptOperationEnvelope({
           epochKey,
           epoch,
@@ -2174,7 +2547,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           { key: `${this.#prefix}/enc-env/${envDigest}`, value: envBytes },
           {
             key: `${this.#prefix}/local-pending/${opIdHex}`,
-            value: encodeLocalPending(opBytes, envDigest, epoch),
+            value: encodeLocalPending(opBytes, envDigest, epoch, commitment),
           },
         ], { durability: 'strict' })
         this.#encryptedEnvelopes.set(envDigest, {
@@ -2189,12 +2562,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           core,
           currentEnvelopeDigest: envDigest,
           currentEpoch: epoch,
+          currentCommitment: commitment,
         })
       }
 
-      if (this.#store.latestChangeSeq !== undefined) {
-        this.#lastSyncSeq = Math.max(this.#lastSyncSeq, await this.#store.latestChangeSeq())
-      }
       this.#emitFacts()
       void this.#scheduleMaterialize().catch(() => undefined)
       return new ApplicationOperation(opIdHex, operationId, this)
@@ -2247,9 +2618,24 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       updates: updatesList.map(u => ({ topic: u.topic, input: normalizeJsonValue(u.input) })),
       ...(assumptions === undefined ? {} : { assumptions }),
     }
-    const signed = await signOperationCore(core, this.device.identity.privateKey)
-    const opIdBytes = operationIdDigest(signed.coreBytes)
-    const res = await this.#kernel.simulate({ opId: opIdBytes, core, verified: true })
+    const opIdBytes = operationIdDigest(encodeOperationCore(core))
+    let envelope: { readonly ring: string; readonly epoch: number } | undefined
+    if (this.genesis.privateLog && visibility === 'encrypted') {
+      const keysState = this.keysState()
+      const topicRings = keysState.topicRings ?? {}
+      const resolvedRings = new Set(updatesList.map(u => topicRings[u.topic] ?? 'default'))
+      check(resolvedRings.size === 1, 'OPERATION_CROSS_COMPARTMENT_FORBIDDEN')
+      const ring = [...resolvedRings][0]!
+      // The epoch submit() would seal under, so a simulation sees the same `maxOpsPerEpoch` budget.
+      const epoch = ring === 'default' ? this.currentEpoch() : (keysState.rings?.[ring]?.currentEpoch ?? -1)
+      envelope = { ring, epoch }
+    }
+    const res = await this.#kernel.simulate({
+      opId: opIdBytes,
+      core,
+      verified: true,
+      ...(envelope === undefined ? {} : envelope.epoch >= 0 ? envelope : { ring: envelope.ring }),
+    })
     return {
       ok: res.ok,
       outcome: res.outcome,
@@ -2601,7 +2987,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly writer?: boolean
     readonly administrator?: boolean
     readonly publisher?: boolean
-    readonly finalizer?: boolean
     readonly attestation?: { readonly payload: JsonValue; readonly signature: string }
     readonly minEpoch?: number
     readonly operationId?: string
@@ -2619,7 +3004,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       writer: options.writer ?? true,
       administrator: options.administrator ?? false,
       publisher: options.publisher ?? false,
-      finalizer: options.finalizer ?? false,
     }
     const updates: TopicUpdate[] = [
       {
@@ -2634,46 +3018,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
     if (this.genesis.privateLog && (options.reader ?? true) && (options.wrapKey || options.pqWrapKey)) {
       const keysState = this.keysState()
-      const policy = this.keysPolicy()
       if (keysState.currentEpoch < 0) {
-        const epoch0 = this.#epochKeys.get(0) ?? crypto.getRandomValues(new Uint8Array(32))
-        await this.installEpochKey(0, epoch0)
-        const boxes: Record<string, EpochKeyBox> = {}
-        const allReaders = new Map<string, { readonly wrapKey?: string; readonly pqWrapKey?: string }>()
-        for (const m of this.permissions().members) {
-          if (m.reader && (m.wrapKey || m.pqWrapKey)) {
-            allReaders.set(m.publicKey, {
-              ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
-              ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
-            })
-          }
-        }
-        allReaders.set(options.publicKey, {
+        const extraReader = {
+          publicKey: options.publicKey,
           ...(options.wrapKey ? { wrapKey: options.wrapKey } : {}),
           ...(options.pqWrapKey ? { pqWrapKey: options.pqWrapKey } : {}),
-        })
-        let allPq = allReaders.size > 0
-        for (const [pk, keys] of allReaders) {
-          const box = await this.#sealBoxForMember(keys, epoch0, this.logId, 0)
-          if (box !== null) {
-            boxes[pk] = box
-            if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
-          }
         }
-        const epochSuite: KeyBoxSuite = (policy.minSuite === KEY_BOX_SUITE_XWING || allPq)
-          ? KEY_BOX_SUITE_XWING
-          : KEY_BOX_SUITE_X25519
-        updates.push({
-          topic: '$keys',
-          input: {
-            action: 'rotateEpoch',
-            epoch: 0,
-            ...(epochSuite !== KEY_BOX_SUITE_X25519 ? { suite: epochSuite } : {}),
-            keyCommitment: epochKeyCommitmentV2(epoch0),
-            mailboxVerifyKey: this.#mailboxVerifyKey(epoch0),
-            boxes: boxes as unknown as JsonValue,
-          },
+        const existingEpoch0 = this.#keys.get(EPOCH_KEY_GROUP, 0)
+        const built = await this.#buildEpochRotationUpdate({
+          extraMembers: [extraReader],
+          ...(existingEpoch0 === undefined ? {} : { newEpochKey: existingEpoch0 }),
         })
+        updates.push(built.update)
       } else {
         const minEp = options.minEpoch ?? 0
         const epochBoxes: Record<string, EpochKeyBox> = {}
@@ -2682,7 +3038,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ...(options.pqWrapKey ? { pqWrapKey: options.pqWrapKey } : {}),
         }
         for (let ep = minEp; ep <= keysState.currentEpoch; ep++) {
-          const epKey = this.#epochKeys.get(ep)
+          const epKey = this.#groupKey('default', ep)
           if (epKey === undefined) continue
           const box = await this.#sealBoxForMember(targetKeys, epKey, this.logId, ep)
           if (box !== null) epochBoxes[String(ep)] = box
@@ -2697,6 +3053,17 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
             },
           })
         }
+        // `distribution: 'tree'`: retained epochs are granted as flat boxes above (history), and the
+        // new reader joins the key tree in the same atomic op via an O(log N) tree rotation, so the
+        // current epoch is again a TreeKEM epoch covering every reader. Only administrators may
+        // rotate; other admitting members leave the tree join to the next administrator rotation.
+        if (this.keysPolicy().distribution === 'tree' && this.isAdministrator(this.identity.publicKey)) {
+          const built = await this.#buildEpochRotationUpdate({
+            mode: 'tree',
+            extraMembers: [{ publicKey: options.publicKey, ...targetKeys }],
+          })
+          if (built.treeRef !== undefined) updates.push(built.update)
+        }
       }
     }
 
@@ -2709,58 +3076,204 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
   }
 
-  async rotateEpoch(options: {
+  /**
+   * Unified epoch rotation builder respecting `$keys.policy` (`distribution: 'flat' | 'tree'`, `minSuite`)
+   * for `admitMember` (epoch 0), `rotateEpoch`, `rotateTreeEpoch`, and `removeMember`.
+   */
+  async #buildEpochRotationUpdate(options: {
     readonly excludeMembers?: readonly string[]
+    readonly extraMembers?: readonly { readonly publicKey: string; readonly wrapKey?: string; readonly pqWrapKey?: string }[]
     readonly newEpochKey?: Uint8Array
-    readonly suite?: KeyBoxSuite
-    readonly operationId?: string
-    readonly authorTimestampMs?: bigint
-  } = {}): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> {
-    check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_LOG_ONLY')
-    await this.#flushPendingMaterialization()
+    readonly suite?: KeyBoxSuite | KeyTreeSuite
+    readonly mode?: 'flat' | 'tree'
+  } = {}): Promise<{
+    readonly epoch: number
+    readonly treeRef?: string
+    readonly copathBoxes?: number
+    readonly update: TopicUpdate
+  }> {
     const keysState = this.keysState()
     const policy = this.keysPolicy()
     const nextEpoch = keysState.currentEpoch + 1
+    const mode: 'flat' | 'tree' = options.mode ?? (
+      options.suite?.startsWith('hpke-tree-')
+        ? 'tree'
+        : (options.suite !== undefined ? 'flat' : policy.distribution)
+    )
+    const exclude = new Set(options.excludeMembers ?? [])
+    const readersByPk = new Map<string, { readonly publicKey: string; readonly wrapKey?: string; readonly pqWrapKey?: string }>()
+    for (const m of this.permissions().members) {
+      if (!m.reader || (!m.wrapKey && !m.pqWrapKey) || exclude.has(m.publicKey)) continue
+      readersByPk.set(m.publicKey, {
+        publicKey: m.publicKey,
+        ...(m.wrapKey ? { wrapKey: m.wrapKey } : {}),
+        ...(m.pqWrapKey ? { pqWrapKey: m.pqWrapKey } : {}),
+      })
+    }
+    for (const extra of options.extraMembers ?? []) {
+      if ((extra.wrapKey || extra.pqWrapKey) && !exclude.has(extra.publicKey)) {
+        readersByPk.set(extra.publicKey, extra)
+      }
+    }
+
+    if (mode === 'tree' && options.newEpochKey === undefined && readersByPk.size > 0) {
+      let previousTree: KeyTreeEpochPayload | null = null
+      const prevEntry = keysState.currentEpoch >= 0 ? keysState.epochs[String(keysState.currentEpoch)] : undefined
+      if (prevEntry?.treeRef) {
+        const prevHash = tryParseCasRef(prevEntry.treeRef)
+        if (prevHash !== null) {
+          const readRes = await readKeyTreeFromCas(prevHash, async h => (await this.cas.get(h, 'public'))?.bytes ?? null)
+          if (readRes.ok) previousTree = readRes.payload
+        }
+      }
+      const requestedSuite: KeyTreeSuite | undefined =
+        options.suite === KEY_TREE_SUITE_XWING || options.suite === KEY_BOX_SUITE_XWING
+          ? KEY_TREE_SUITE_XWING
+          : options.suite === KEY_TREE_SUITE_X25519 || options.suite === KEY_BOX_SUITE_X25519
+            ? KEY_TREE_SUITE_X25519
+            : (policy.minSuite === KEY_BOX_SUITE_XWING ? KEY_TREE_SUITE_XWING : undefined)
+      const built = await buildTreeEpochUpdate({
+        scope: this.logId,
+        epoch: nextEpoch,
+        updaterPublicKey: this.identity.publicKey,
+        activeMembers: [...readersByPk.values()],
+        previousTree,
+        ...(requestedSuite === undefined ? {} : { suite: requestedSuite }),
+      })
+      const treeHash = await writeKeyTreeToCas(built.payload, (bytes, links) => this.cas.put(bytes, links, 'public'))
+      const treeRef = casRef(treeHash)
+      await this.installEpochKey(nextEpoch, built.epochKey)
+      await this.#storeTreeNodeSeeds(built.derivedSeeds)
+      return {
+        epoch: nextEpoch,
+        treeRef,
+        copathBoxes: built.payload.copathBoxes.length,
+        update: {
+          topic: '$keys',
+          input: {
+            action: 'rotateTreeEpoch',
+            epoch: nextEpoch,
+            suite: built.payload.suite,
+            keyCommitment: epochKeyCommitment(built.epochKey),
+            mailboxVerifyKey: this.#mailboxVerifyKey(built.epochKey),
+            treeRef,
+          },
+        },
+      }
+    }
+
     const key = options.newEpochKey ?? crypto.getRandomValues(new Uint8Array(32))
     await this.installEpochKey(nextEpoch, key)
-
-    const exclude = new Set(options.excludeMembers ?? [])
+    const flatRequestedSuite: KeyBoxSuite | undefined =
+      options.suite === KEY_BOX_SUITE_XWING || options.suite === KEY_BOX_SUITE_X25519 ? options.suite : undefined
     const boxes: Record<string, EpochKeyBox> = {}
     let boxCount = 0
     let allPq = true
-    for (const m of this.permissions().members) {
-      if (!m.reader || (!m.wrapKey && !m.pqWrapKey) || exclude.has(m.publicKey)) continue
-      const box = await this.#sealBoxForMember(m, key, this.logId, nextEpoch, options.suite)
+    for (const m of readersByPk.values()) {
+      const box = await this.#sealBoxForMember(m, key, this.logId, nextEpoch, flatRequestedSuite)
       if (box !== null) {
         boxes[m.publicKey] = box
         boxCount++
         if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
       }
     }
-    const epochSuite: KeyBoxSuite = options.suite ?? (
+    const epochSuite: KeyBoxSuite = flatRequestedSuite ?? (
       (policy.minSuite === KEY_BOX_SUITE_XWING || (boxCount > 0 && allPq))
         ? KEY_BOX_SUITE_XWING
         : KEY_BOX_SUITE_X25519
     )
-
-    const operation = await this.submit({
-      visibility: 'public',
-      awaitMaterialized: true,
-      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
-      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
-      updates: [{
+    return {
+      epoch: nextEpoch,
+      update: {
         topic: '$keys',
         input: {
           action: 'rotateEpoch',
           epoch: nextEpoch,
           ...(epochSuite !== KEY_BOX_SUITE_X25519 ? { suite: epochSuite } : {}),
-          keyCommitment: epochKeyCommitmentV2(key),
+          keyCommitment: epochKeyCommitment(key),
           mailboxVerifyKey: this.#mailboxVerifyKey(key),
           boxes: boxes as unknown as JsonValue,
         },
-      }],
+      },
+    }
+  }
+
+  async rotateEpoch(options: {
+    readonly excludeMembers?: readonly string[]
+    readonly newEpochKey?: Uint8Array
+    readonly suite?: KeyBoxSuite | KeyTreeSuite
+    readonly mode?: 'flat' | 'tree'
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  } = {}): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> {
+    check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_LOG_ONLY')
+    await this.#flushPendingMaterialization()
+    const built = await this.#buildEpochRotationUpdate(options)
+    const operation = await this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [built.update],
     })
-    return { epoch: nextEpoch, operation }
+    return { epoch: built.epoch, operation }
+  }
+
+  /**
+   * Sub-linear O(log N) Key-Tagged TreeKEM epoch rotation over structural-sharing public CAS DAG.
+   * Safe under Chronolog's flat leaderless undo-do-redo order (decoupled epoch roots +
+   * `targetPubKeyHash`-tagged copath boxes + deterministic `keysNeedsRotation()` healing).
+   */
+  async rotateTreeEpoch(options: {
+    readonly excludeMembers?: readonly string[]
+    readonly suite?: KeyTreeSuite
+    readonly operationId?: string
+    readonly authorTimestampMs?: bigint
+  } = {}): Promise<{ readonly epoch: number; readonly treeRef: string; readonly copathBoxes: number; readonly operation: ApplicationOperation }> {
+    check(this.genesis.privateLog, 'EPOCH_ROTATION_PRIVATE_LOG_ONLY')
+    await this.#flushPendingMaterialization()
+    const built = await this.#buildEpochRotationUpdate({ ...options, mode: 'tree' })
+    check(built.treeRef !== undefined, 'TREE_EPOCH_MEMBERS_REQUIRED')
+    const operation = await this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [built.update],
+    })
+    return { epoch: built.epoch, treeRef: built.treeRef, copathBoxes: built.copathBoxes ?? 0, operation }
+  }
+
+  /** Check whether the latest `$keys` epoch still holds any removed member or exceeded `policy.maxOpsPerEpoch`. */
+  async keysNeedsRotation(): Promise<{
+    readonly needsRotation: boolean
+    readonly staleMembers: readonly string[]
+    readonly epochOpsCount: number
+    readonly maxOpsPerEpoch: number | null
+  }> {
+    await this.#flushPendingMaterialization()
+    const res = await this.#kernel.query('$keys', { kind: 'needsRotation' }).catch(() => null) as {
+      readonly needsRotation?: unknown
+      readonly staleMembers?: unknown
+    } | null
+    const staleMembers = Array.isArray(res?.staleMembers) ? res.staleMembers.filter((s): s is string => typeof s === 'string') : []
+    const currentEpoch = this.currentEpoch()
+    let epochOpsCount = 0
+    if (currentEpoch >= 0) {
+      for (const entry of this.#encryptedEnvelopes.values()) {
+        if ((entry.envelope.ring ?? 'default') === 'default' && entry.envelope.epoch === currentEpoch) {
+          epochOpsCount++
+        }
+      }
+    }
+    const maxOpsPerEpoch = this.keysPolicy().maxOpsPerEpoch ?? null
+    const opsExceeded = maxOpsPerEpoch !== null && epochOpsCount >= maxOpsPerEpoch
+    return {
+      needsRotation: res?.needsRotation === true || staleMembers.length > 0 || opsExceeded,
+      staleMembers,
+      epochOpsCount,
+      maxOpsPerEpoch,
+    }
   }
 
   /** Update on-log `$keys.policy` (minSuite, paddingBucketBytes, hideEnvelopeAuthor, rotateOnRemove, maxOpsPerEpoch). */
@@ -2822,7 +3335,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const plainBytes = payload instanceof Uint8Array ? payload : utf8(canonicalJson(normalizeJsonValue(payload)))
     const dek = crypto.getRandomValues(new Uint8Array(32))
     const aad = utf8(`chronolog-sealed/v1:${this.logId}:${encoding}`)
-    const enc = await encryptEpochPayload(dek, 0n, plainBytes, aad, undefined, { suite: 'hkdf-aes-256-gcm' })
+    const enc = await encryptEpochPayload(dek, 0n, plainBytes, aad)
     const boxes: Record<string, EpochKeyBox> = {}
     for (const r of recipients) {
       const target = typeof r === 'string'
@@ -2843,10 +3356,36 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
   }
 
-  /** Unseal a `SealedRecipientBox` created by `sealFor()` using this device's X25519 or hybrid PQ X-Wing wrap key. */
-  async unseal<T = JsonValue>(box: SealedRecipientBox): Promise<T> {
-    check(box !== null && typeof box === 'object' && box.format === 'chronolog-sealed/v1', 'SEALED_BOX_INVALID')
-    const myBox = box.boxes[this.identity.publicKey]
+  /**
+   * Unified decoder for both selective-recipient boxes (`chronolog-sealed/v1` from `sealFor()`)
+   * and Private Capability Vault boxes (`chronolog-vault-box/v1` from `vaults.seal()`),
+   * accepting either an object or a serialized JSON string.
+   */
+  async unseal<T = JsonValue>(
+    box: SealedRecipientBox | VaultSealedBox | string,
+    options: { readonly topic?: string } = {},
+  ): Promise<T> {
+    const parsed: unknown = typeof box === 'string'
+      ? (() => { try { return JSON.parse(box) as unknown } catch { return null } })()
+      : box
+    check(parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed), 'SEALED_BOX_INVALID')
+    const fmt = (parsed as { readonly format?: unknown }).format
+    if (fmt === 'chronolog-vault-box/v1') {
+      const vb = parsed as VaultSealedBox
+      const key = this.#getVaultKey(vb.vaultId, vb.epoch, options.topic ?? 'vaults')
+      check(key !== undefined, 'VAULT_KEY_MISSING')
+      const aad = utf8(`chronolog-vault-box/v1:${this.logId}:${vb.vaultId}:${vb.epoch}:${vb.encoding}`)
+      const plainBytes = await decryptEpochPayload(key, {
+        epoch: BigInt(vb.epoch),
+        nonce: hexToBytes(vb.nonce),
+        ciphertext: hexToBytes(vb.ciphertext),
+      }, aad)
+      if (vb.encoding === 'bytes') return plainBytes as unknown as T
+      return JSON.parse(new TextDecoder().decode(plainBytes)) as T
+    }
+    check(fmt === 'chronolog-sealed/v1', 'SEALED_BOX_INVALID')
+    const sb = parsed as SealedRecipientBox
+    const myBox = sb.boxes[this.identity.publicKey]
     check(myBox !== undefined, 'SEALED_BOX_NOT_A_RECIPIENT')
     const dek = await hpkeOpenEpochKey(
       this.device.wrapKey.privateKey,
@@ -2857,18 +3396,256 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       this.device.pqWrapKey?.secretKey,
     )
     try {
-      const aad = utf8(`chronolog-sealed/v1:${this.logId}:${box.encoding}`)
+      const aad = utf8(`chronolog-sealed/v1:${this.logId}:${sb.encoding}`)
       const plainBytes = await decryptEpochPayload(dek, {
         epoch: 0n,
-        nonce: hexToBytes(box.nonce),
-        ciphertext: hexToBytes(box.ciphertext),
-        suite: 'hkdf-aes-256-gcm',
+        nonce: hexToBytes(sb.nonce),
+        ciphertext: hexToBytes(sb.ciphertext),
       }, aad)
-      if (box.encoding === 'bytes') return plainBytes as unknown as T
+      if (sb.encoding === 'bytes') return plainBytes as unknown as T
       return JSON.parse(new TextDecoder().decode(plainBytes)) as T
     } finally {
       dek.fill(0)
     }
+  }
+
+  /**
+   * Private Capability Vaults (`chronolog/vaults`): fine-grained, encrypted-partition row/project/folder
+   * sharing with O(1) member adds, per-vault forward-secret removals, and zero metadata leaked to blind hosts.
+   */
+  readonly vaults = {
+    hasKey: (vaultId: string, epoch?: number, topic = 'vaults'): boolean => {
+      if (epoch === undefined) return this.#keys.epochs(vaultKeyGroup(topic, vaultId)).length > 0
+      return this.#getVaultKey(vaultId, epoch, topic) !== undefined
+    },
+
+    currentEpoch: (vaultId: string, topic = 'vaults'): number => {
+      const ep = this.#vaultState(topic, vaultId)?.currentEpoch
+      if (typeof ep === 'number' && ep >= 0) return ep
+      const held = this.#keys.epochs(vaultKeyGroup(topic, vaultId))
+      return held.length > 0 ? held[held.length - 1]! : -1
+    },
+
+    create: async (
+      vaultId: string,
+      options: {
+        readonly members?: readonly string[]
+        readonly admins?: readonly string[]
+        readonly topic?: string
+        readonly operationId?: string
+        readonly authorTimestampMs?: bigint
+      } = {},
+    ): Promise<ApplicationOperation> => {
+      await this.#flushPendingMaterialization()
+      const topic = options.topic ?? 'vaults'
+      const key = crypto.getRandomValues(new Uint8Array(32))
+      await this.#installVaultKey(topic, vaultId, 0, key)
+      const memberKeys = [...new Set([this.identity.publicKey, ...(options.admins ?? []), ...(options.members ?? [])])].sort()
+      const boxes: Record<string, EpochKeyBox> = {}
+      for (const pk of memberKeys) {
+        const m = this.member(pk) ?? (pk === this.identity.publicKey
+          ? { wrapKey: this.device.wrapKey.publicKey, ...(this.device.pqWrapKey ? { pqWrapKey: this.device.pqWrapKey.publicKey } : {}) }
+          : null)
+        check(m !== null && (m.wrapKey !== undefined || m.pqWrapKey !== undefined), 'VAULT_MEMBER_WRAP_KEY_MISSING')
+        const box = await this.#sealBoxForMember(m, key, `${this.logId}:vault:${vaultId}`, 0)
+        check(box !== null, 'VAULT_MEMBER_PQ_KEY_REQUIRED')
+        boxes[pk] = box
+      }
+      return this.submit({
+        awaitMaterialized: true,
+        ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+        ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+        updates: [{
+          topic,
+          input: {
+            action: 'createVault',
+            vaultId,
+            keyCommitment: epochKeyCommitment(key),
+            boxes: boxes as unknown as JsonValue,
+            members: memberKeys,
+            ...(options.admins ? { admins: [...options.admins] } : {}),
+          },
+        }],
+      })
+    },
+
+    addMember: async (
+      vaultId: string,
+      memberPublicKey: string,
+      options: {
+        readonly minEpoch?: number
+        readonly admin?: boolean
+        readonly topic?: string
+        readonly operationId?: string
+        readonly authorTimestampMs?: bigint
+      } = {},
+    ): Promise<ApplicationOperation> => {
+      await this.#flushPendingMaterialization()
+      const topic = options.topic ?? 'vaults'
+      const target = this.member(memberPublicKey)
+      check(target !== null && (target.wrapKey !== undefined || target.pqWrapKey !== undefined), 'VAULT_MEMBER_WRAP_KEY_MISSING')
+      const curEp = this.vaults.currentEpoch(vaultId, topic)
+      check(curEp >= 0, 'VAULT_NOT_FOUND')
+      const minEp = Math.max(0, options.minEpoch ?? 0)
+      const epochBoxes: Record<string, EpochKeyBox> = {}
+      for (let ep = minEp; ep <= curEp; ep++) {
+        const k = this.#getVaultKey(vaultId, ep, topic)
+        if (k === undefined) continue
+        const box = await this.#sealBoxForMember(target, k, `${this.logId}:vault:${vaultId}`, ep)
+        check(box !== null, 'VAULT_MEMBER_PQ_KEY_REQUIRED')
+        epochBoxes[String(ep)] = box
+      }
+      return this.submit({
+        awaitMaterialized: true,
+        ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+        ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+        updates: [{
+          topic,
+          input: {
+            action: 'addMember',
+            vaultId,
+            member: memberPublicKey,
+            ...(options.admin === true ? { admin: true } : {}),
+            epochBoxes: epochBoxes as unknown as JsonValue,
+          },
+        }],
+      })
+    },
+
+    removeMember: async (
+      vaultId: string,
+      memberPublicKey: string,
+      options: {
+        readonly topic?: string
+        readonly operationId?: string
+        readonly authorTimestampMs?: bigint
+      } = {},
+    ): Promise<{ readonly epoch: number; readonly operation: ApplicationOperation }> => {
+      await this.#flushPendingMaterialization()
+      const topic = options.topic ?? 'vaults'
+      const raw = this.#kernel.topic(topic) as { readonly vaults?: Record<string, { readonly currentEpoch: number; readonly members: readonly string[] }> } | null
+      const vault = raw?.vaults?.[vaultId]
+      check(vault !== undefined, 'VAULT_NOT_FOUND')
+      const nextEpoch = vault.currentEpoch + 1
+      const key = crypto.getRandomValues(new Uint8Array(32))
+      await this.#installVaultKey(topic, vaultId, nextEpoch, key)
+      const boxes: Record<string, EpochKeyBox> = {}
+      for (const pk of vault.members) {
+        if (pk === memberPublicKey) continue
+        const m = this.member(pk) ?? (pk === this.identity.publicKey
+          ? { wrapKey: this.device.wrapKey.publicKey, ...(this.device.pqWrapKey ? { pqWrapKey: this.device.pqWrapKey.publicKey } : {}) }
+          : null)
+        if (!m) continue
+        const box = await this.#sealBoxForMember(m, key, `${this.logId}:vault:${vaultId}`, nextEpoch)
+        check(box !== null, 'VAULT_MEMBER_PQ_KEY_REQUIRED')
+        boxes[pk] = box
+      }
+      const operation = await this.submit({
+        awaitMaterialized: true,
+        ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+        ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+        updates: [{
+          topic,
+          input: {
+            action: 'removeMember',
+            vaultId,
+            member: memberPublicKey,
+            epoch: nextEpoch,
+            keyCommitment: epochKeyCommitment(key),
+            boxes: boxes as unknown as JsonValue,
+          },
+        }],
+      })
+      return { epoch: nextEpoch, operation }
+    },
+
+    seal: async (vaultId: string, payload: JsonValue | Uint8Array, options: { readonly topic?: string } = {}): Promise<VaultSealedBox> => {
+      const topic = options.topic ?? 'vaults'
+      const vault = this.#vaultState(topic, vaultId)
+      const epoch = vault?.currentEpoch ?? -1
+      check(epoch >= 0, 'VAULT_NOT_FOUND')
+      const commitment = vault?.epochs?.[String(epoch)]?.keyCommitment
+      check(typeof commitment === 'string', 'VAULT_KEY_MISSING')
+      // Seal only under the key the log commits to (never a losing concurrent rotation's key).
+      const key = this.#keys.get(vaultKeyGroup(topic, vaultId), epoch, commitment)
+      check(key !== undefined, 'VAULT_KEY_MISSING')
+      const encoding: 'json' | 'bytes' = payload instanceof Uint8Array ? 'bytes' : 'json'
+      const plainBytes = payload instanceof Uint8Array ? payload : utf8(canonicalJson(normalizeJsonValue(payload)))
+      const aad = utf8(`chronolog-vault-box/v1:${this.logId}:${vaultId}:${epoch}:${encoding}`)
+      const enc = await encryptEpochPayload(key, BigInt(epoch), plainBytes, aad)
+      return {
+        format: 'chronolog-vault-box/v1',
+        vaultId,
+        epoch,
+        encoding,
+        nonce: bytesToHex(enc.nonce),
+        ciphertext: bytesToHex(enc.ciphertext),
+      }
+    },
+
+    unseal: async <T = JsonValue>(
+      box: VaultSealedBox | SealedRecipientBox | string,
+      options: { readonly strict?: boolean; readonly topic?: string } = {},
+    ): Promise<T | null> => {
+      try {
+        return await this.unseal<T>(box, options)
+      } catch (err) {
+        if (options.strict) throw err
+        return null
+      }
+    },
+
+    unsealRows: async <T>(
+      rowsOrResult: T,
+      options: { readonly topic?: string } = {},
+    ): Promise<T> => {
+      const unsealCell = async (val: unknown): Promise<unknown> => {
+        if (typeof val === 'string') {
+          const trimmed = val.trim()
+          if (trimmed.startsWith('{') && trimmed.endsWith('}') && (trimmed.includes('"chronolog-vault-box/v1"') || trimmed.includes('"chronolog-sealed/v1"'))) {
+            let parsed: unknown
+            try { parsed = JSON.parse(trimmed) } catch { return val }
+            if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              const fmt = (parsed as { readonly format?: unknown }).format
+              if (fmt === 'chronolog-vault-box/v1' || fmt === 'chronolog-sealed/v1') {
+                return this.vaults.unseal(parsed as VaultSealedBox | SealedRecipientBox, { strict: false, ...options })
+              }
+            }
+          }
+          return val
+        }
+        if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+          const fmt = (val as { readonly format?: unknown }).format
+          if (fmt === 'chronolog-vault-box/v1' || fmt === 'chronolog-sealed/v1') {
+            return this.vaults.unseal(val as VaultSealedBox | SealedRecipientBox, { strict: false, ...options })
+          }
+        }
+        return val
+      }
+      const unsealRowList = async (list: readonly unknown[]): Promise<unknown[]> => {
+        const out: unknown[] = []
+        for (const row of list) {
+          if (Array.isArray(row)) {
+            out.push(await Promise.all(row.map(unsealCell)))
+          } else if (row !== null && typeof row === 'object') {
+            const next: Record<string, unknown> = {}
+            for (const [k, v] of Object.entries(row)) next[k] = await unsealCell(v)
+            out.push(next)
+          } else {
+            out.push(row)
+          }
+        }
+        return out
+      }
+      if (Array.isArray(rowsOrResult)) {
+        return (await unsealRowList(rowsOrResult)) as unknown as T
+      }
+      if (rowsOrResult !== null && typeof rowsOrResult === 'object' && Array.isArray((rowsOrResult as { readonly rows?: unknown }).rows)) {
+        const resObj = rowsOrResult as Record<string, unknown> & { readonly rows: readonly unknown[] }
+        return { ...resObj, rows: await unsealRowList(resObj.rows) } as unknown as T
+      }
+      return rowsOrResult
+    },
   }
 
   /**
@@ -2888,6 +3665,23 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     check(this.genesis.privateLog, 'COMPARTMENT_PRIVATE_LOG_ONLY')
     check(typeof ringName === 'string' && ringName.length > 0 && ringName !== 'default', 'RING_NAME_INVALID')
     await this.#flushPendingMaterialization()
+    const built = await this.#buildRingRotationUpdate(ringName, options.members, { topics: options.topics, ...(options.suite === undefined ? {} : { suite: options.suite }) })
+    const operation = await this.submit({
+      visibility: 'public',
+      awaitMaterialized: true,
+      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
+      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
+      updates: [built.update],
+    })
+    return { ring: ringName, epoch: built.epoch, operation }
+  }
+
+  /** Build a `rotateRingEpoch` update sealing a fresh epoch key of `ringName` to exactly `members`. */
+  async #buildRingRotationUpdate(
+    ringName: string,
+    members: readonly { readonly publicKey: string; readonly wrapKey?: string; readonly pqWrapKey?: string }[],
+    options: { readonly topics?: readonly string[]; readonly suite?: KeyBoxSuite } = {},
+  ): Promise<{ readonly epoch: number; readonly update: TopicUpdate }> {
     const keysState = this.keysState()
     const policy = this.keysPolicy()
     const prevRing = keysState.rings?.[ringName]
@@ -2898,7 +3692,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const boxes: Record<string, EpochKeyBox> = {}
     let boxCount = 0
     let allPq = true
-    for (const m of options.members) {
+    for (const m of members) {
       const box = await this.#sealBoxForMember(m, key, `${this.logId}:${ringName}`, nextEpoch, options.suite)
       if (box !== null) {
         boxes[m.publicKey] = box
@@ -2911,27 +3705,22 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         ? KEY_BOX_SUITE_XWING
         : KEY_BOX_SUITE_X25519
     )
-
-    const operation = await this.submit({
-      visibility: 'public',
-      awaitMaterialized: true,
-      ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
-      ...(options.authorTimestampMs === undefined ? {} : { authorTimestampMs: options.authorTimestampMs }),
-      updates: [{
+    return {
+      epoch: nextEpoch,
+      update: {
         topic: '$keys',
         input: {
           action: 'rotateRingEpoch',
           ring: ringName,
           epoch: nextEpoch,
           ...(ringSuite !== KEY_BOX_SUITE_X25519 ? { suite: ringSuite } : {}),
-          keyCommitment: epochKeyCommitmentV2(key),
+          keyCommitment: epochKeyCommitment(key),
           mailboxVerifyKey: this.#mailboxVerifyKey(key),
           boxes: boxes as unknown as JsonValue,
-          topics: [...options.topics],
+          ...(options.topics === undefined ? {} : { topics: [...options.topics] }),
         },
-      }],
-    })
-    return { ring: ringName, epoch: nextEpoch, operation }
+      },
+    }
   }
 
   /**
@@ -2957,7 +3746,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           threshold: options.threshold,
           members: options.guardians.map(g => ({
             publicKey: g.publicKey,
-            wrapKey: g.wrapKey,
+            ...(g.wrapKey ? { wrapKey: g.wrapKey } : {}),
+            ...(g.pqWrapKey ? { pqWrapKey: g.pqWrapKey } : {}),
             ...(g.label ? { label: g.label } : {}),
           })),
         },
@@ -2969,14 +3759,30 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const vaultPayload: {
         readonly epochs: Record<string, string>
         readonly rings: Record<string, Record<string, string>>
-      } = { epochs: {}, rings: {} }
-      for (const [ep, key] of this.#epochKeys) {
-        vaultPayload.epochs[String(ep)] = bytesToHex(key)
+        readonly vaults: Record<string, Record<string, string>>
+      } = { epochs: {}, rings: {}, vaults: {} }
+      for (const ep of this.#keys.epochs(EPOCH_KEY_GROUP)) {
+        const key = this.#groupKey('default', ep)
+        if (key !== undefined) vaultPayload.epochs[String(ep)] = bytesToHex(key)
       }
-      for (const [ring, map] of this.#ringKeys) {
+      for (const group of this.#keys.groups('ring:')) {
+        const ring = group.slice('ring:'.length)
         const ringObj: Record<string, string> = {}
-        for (const [ep, key] of map) ringObj[String(ep)] = bytesToHex(key)
+        for (const ep of this.#keys.epochs(group)) {
+          const key = this.#groupKey(ring, ep)
+          if (key !== undefined) ringObj[String(ep)] = bytesToHex(key)
+        }
         vaultPayload.rings[ring] = ringObj
+      }
+      for (const group of this.#keys.groups('vault:')) {
+        const parsedGroup = parseVaultKeyGroup(group)
+        if (parsedGroup === null) continue
+        const vObj: Record<string, string> = {}
+        for (const ep of this.#keys.epochs(group)) {
+          const key = this.#getVaultKey(parsedGroup.vaultId, ep, parsedGroup.topic) ?? this.#keys.get(group, ep)
+          if (key !== undefined) vObj[String(ep)] = bytesToHex(key)
+        }
+        vaultPayload.vaults[`${parsedGroup.topic}:${parsedGroup.vaultId}`] = vObj
       }
       const aad = utf8(`chronolog-recovery-vault:${this.logId}`)
       const encVault = await encryptEpochPayload(recoveryKey, 0n, utf8(JSON.stringify(vaultPayload)), aad)
@@ -2986,7 +3792,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       for (let i = 0; i < options.guardians.length; i++) {
         const g = options.guardians[i]!
         const share = shares[i]!
-        const box = await hpkeSealEpochKey(g.wrapKey, share.bytes, `${this.logId}:recovery-share`, share.index)
+        const box = await this.#sealBoxForMember(g, share.bytes, `${this.logId}:recovery-share`, share.index)
+        check(box !== null, 'GUARDIAN_WRAP_KEY_REQUIRED')
         guardianShares[g.publicKey] = { index: share.index, box }
       }
       updates.push({
@@ -3035,6 +3842,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           requestId,
           newPublicKey: this.identity.publicKey,
           newWrapKey: this.device.wrapKey.publicKey,
+          ...(this.device.pqWrapKey ? { newPqWrapKey: this.device.pqWrapKey.publicKey } : {}),
           label: options.label ?? 'Recovered device',
           verificationCode,
         },
@@ -3071,13 +3879,18 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         myShare.box,
         `${this.logId}:recovery-share`,
         myShare.index,
+        this.device.pqWrapKey?.secretKey,
       )
-      const resealedBox = await hpkeSealEpochKey(
-        req.newWrapKey,
+      const resealedBox = await this.#sealBoxForMember(
+        {
+          ...(req.newWrapKey ? { wrapKey: req.newWrapKey } : {}),
+          ...(req.newPqWrapKey ? { pqWrapKey: req.newPqWrapKey } : {}),
+        },
         shareBytes,
         `${this.logId}:recovery-grant`,
         myShare.index,
       )
+      check(resealedBox !== null, 'RECOVERY_TARGET_WRAP_KEY_REQUIRED')
       updates.push({
         topic: '$keys',
         input: {
@@ -3126,6 +3939,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           entry.box,
           `${this.logId}:recovery-grant`,
           entry.index,
+          this.device.pqWrapKey?.secretKey,
         )
         decodedShares.push({ index: entry.index, bytes })
       }
@@ -3139,6 +3953,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       const parsed = JSON.parse(new TextDecoder().decode(plainBytes)) as {
         readonly epochs: Record<string, string>
         readonly rings: Record<string, Record<string, string>>
+        readonly vaults?: Record<string, Record<string, string>>
       }
 
       let restoredEpochs = 0
@@ -3153,6 +3968,14 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         }
         restoredRings++
       }
+      for (const [storageKey, eps] of Object.entries(parsed.vaults ?? {})) {
+        const sep = storageKey.indexOf(':')
+        const topic = sep > 0 ? storageKey.slice(0, sep) : 'vaults'
+        const vaultId = sep > 0 ? storageKey.slice(sep + 1) : storageKey
+        for (const [epStr, hexKey] of Object.entries(eps)) {
+          await this.#installVaultKey(topic, vaultId, Number(epStr), hexToBytes(hexKey))
+        }
+      }
 
       await this.#rematerialize()
       return { restoredEpochs, restoredRings }
@@ -3164,42 +3987,28 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     readonly operationId?: string
     readonly authorTimestampMs?: bigint
   } = {}): Promise<ApplicationOperation> {
-    const updates: TopicUpdate[] = [
-      { topic: '$admission', input: { action: 'removeMember', publicKey } },
-    ]
+    await this.#flushPendingMaterialization()
+    const updates: TopicUpdate[] = []
     const policy = this.keysPolicy()
     const shouldRotate = options.rotateEpoch ?? policy.rotateOnRemove
+    // `$admission` only lets a reader lose access after an EARLIER update of the same op rotated
+    // every ring whose latest epoch it holds, so the rotation goes first.
     if (this.genesis.privateLog && shouldRotate) {
-      const nextEpoch = this.keysState().currentEpoch + 1
-      const key = crypto.getRandomValues(new Uint8Array(32))
-      await this.installEpochKey(nextEpoch, key)
-      const boxes: Record<string, EpochKeyBox> = {}
-      let boxCount = 0
-      let allPq = true
-      for (const m of this.permissions().members) {
-        if (!m.reader || (!m.wrapKey && !m.pqWrapKey) || m.publicKey === publicKey) continue
-        const box = await this.#sealBoxForMember(m, key, this.logId, nextEpoch)
-        if (box !== null) {
-          boxes[m.publicKey] = box
-          boxCount++
-          if (box.suite !== KEY_BOX_SUITE_XWING) allPq = false
-        }
+      const built = await this.#buildEpochRotationUpdate({ excludeMembers: [publicKey] })
+      updates.push(built.update)
+      // Every compartment ring whose latest epoch the member holds is re-sealed to its other holders.
+      const roster = new Map(this.permissions().members.map(m => [m.publicKey, m]))
+      for (const [ringName, ring] of Object.entries(this.keysState().rings ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+        const latest = ring.epochs[String(ring.currentEpoch)]
+        if (latest === undefined || !Object.hasOwn(latest.boxes, publicKey)) continue
+        const holders = Object.keys(latest.boxes)
+          .filter(pk => pk !== publicKey)
+          .map(pk => roster.get(pk))
+          .filter((m): m is MemberRecord => m !== undefined && (m.wrapKey !== undefined || m.pqWrapKey !== undefined))
+        updates.push((await this.#buildRingRotationUpdate(ringName, holders)).update)
       }
-      const epochSuite: KeyBoxSuite = (policy.minSuite === KEY_BOX_SUITE_XWING || (boxCount > 0 && allPq))
-        ? KEY_BOX_SUITE_XWING
-        : KEY_BOX_SUITE_X25519
-      updates.push({
-        topic: '$keys',
-        input: {
-          action: 'rotateEpoch',
-          epoch: nextEpoch,
-          ...(epochSuite !== KEY_BOX_SUITE_X25519 ? { suite: epochSuite } : {}),
-          keyCommitment: epochKeyCommitmentV2(key),
-          mailboxVerifyKey: this.#mailboxVerifyKey(key),
-          boxes: boxes as unknown as JsonValue,
-        },
-      })
     }
+    updates.push({ topic: '$admission', input: { action: 'removeMember', publicKey } })
     return this.submit({
       visibility: 'public',
       awaitMaterialized: true,
@@ -3457,9 +4266,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           ...(this.#sqliteDriver === undefined ? {} : { sqliteDriver: this.#sqliteDriver }),
         })
         let snap: ReturnType<TopicKernel['snapshot']>
+        let seenOpsRoot: string
         try {
           await tempKernel.materialize(included)
-          await tempKernel.commitSeenOpsRoot()
+          seenOpsRoot = await tempKernel.commitSeenOpsRoot()
           snap = tempKernel.snapshot()
         } finally {
           tempKernel.dispose()
@@ -3477,6 +4287,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           includedSetDigest: computeIncludedSetDigest(inclusions.map(i => i.opId)),
           historyDigest: snap.historyDigest,
           stateRoot: snap.stateRoot,
+          seenOpsRoot,
           inclusions,
         }
         const data: JsonValue = options.data === undefined
@@ -3530,13 +4341,27 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
           { key: `${this.#prefix}/evidence/${key}`, value: encodeRecord(evidence) },
           { key: `${this.#prefix}/pinned-frontier`, value: encodeRecord(frontier) },
         ], { durability: 'strict' })
-        await this.#kernel.bootstrapFromCheckpoint(snapshot)
-        if (this.#controlKernel !== null) {
-          await this.#controlKernel.bootstrapFromCheckpoint(snapshot)
+        // The checkpoint state becomes the frontier through the one snapshot adoption path: its
+        // inclusions are covered (never replayed again), and the pinned frontier attests it.
+        const cache: KernelMaterializedCache = {
+          v: 2,
+          logId: this.logId,
+          blindHostMode: this.#blindHostMode,
+          topics: snapshot.topics,
+          seenOpsRoot: snapshot.seenOpsRoot,
+          historyDigest: snapshot.historyDigest,
+          stateRoot: snapshot.stateRoot,
+          frontierOpIds: frontier.includedOpIds,
+          frontierMaxTimestampMs: frontier.closedThroughMs,
+          orderOpIds: [],
+          outcomes: [],
+          topicLastOpIds: {},
         }
-        this.#lastLocalRevision = toMaterializedRevision(this.#kernel.revision('local'))
-        this.#emitChange({ kind: 'finalized', revision: this.#lastLocalRevision, revisedOpIds: [] })
-        this.#emitStatus()
+        check(await this.#adoptSnapshotFrontier(cache, [], 'untrusted', { force: true }), 'CHECKPOINT_SNAPSHOT_INVALID')
+        if (this.#controlKernel !== null) {
+          await this.#controlKernel.restoreSnapshotFrontier({ ...cache, blindHostMode: true })
+        }
+        await this.#rematerialize()
       })
     },
   }
@@ -3683,7 +4508,8 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
 
   async retain(opId: string, subject: { readonly author: string; readonly envelopeDigest: string }): Promise<RetentionEvidence> {
     const [evidence] = await this.retainMany([{ opId, author: subject.author, envelopeDigest: subject.envelopeDigest }])
-    return evidence!
+    check(evidence !== undefined, 'RETENTION_OP_NOT_HELD')
+    return evidence
   }
 
   /** Index a (batch) retention receipt under every op it covers; true if anything was new. */
@@ -3705,10 +4531,13 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
   async retainMany(
     items: readonly { readonly opId: string; readonly author?: string; readonly envelopeDigest?: string }[],
   ): Promise<readonly RetentionEvidence[]> {
-    if (items.length === 0) return []
-    const fresh = [...new Set(items.map(item => item.opId))]
-      .filter(opId => this.#retentions.get(opId)?.get(this.identity.publicKey) === undefined)
-    if (fresh.length === 0) return items.map(item => this.#retentions.get(item.opId)!.get(this.identity.publicKey)!)
+    // A receipt attests durable possession: never sign for ops this replica does not hold (for
+    // example facts the merge skipped or rejected).
+    const held = [...new Set(items.map(item => item.opId))].filter(opId => this.#holdsOp(opId))
+    const own = (): RetentionEvidence[] => [...new Set(held.map(opId => this.#retentions.get(opId)!.get(this.identity.publicKey)!))]
+    if (held.length === 0) return []
+    const fresh = held.filter(opId => this.#retentions.get(opId)?.get(this.identity.publicKey) === undefined)
+    if (fresh.length === 0) return own()
     const evidence = await signRecord('operation-retention', {
       applicationId: this.applicationId,
       peer: this.identity.publicKey,
@@ -3722,7 +4551,33 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     }
     await this.#store.put(`${this.#prefix}/retention/${await recordDigest(evidence.payload)}`, encodeRecord(evidence), { durability: 'relaxed' })
     this.#emitFacts()
-    return items.map(item => this.#retentions.get(item.opId)!.get(this.identity.publicKey)!)
+    return own()
+  }
+
+  /** True when this replica durably holds the op (as a public op or inside an encrypted envelope). */
+  #holdsOp(opId: string): boolean {
+    return this.#publicOps.has(opId) || this.#encryptedEnvelopes.holdsOp(opId)
+  }
+
+  /**
+   * Drop `local-pending` records of own ops that a remote member has retained: they are no longer
+   * pending, so they are neither rewrapped on later rotations nor kept as a second plaintext copy.
+   */
+  async #settleLocalPending(opIds: Iterable<string> = this.#localPending.keys()): Promise<void> {
+    const settled: string[] = []
+    for (const opId of opIds) {
+      if (!this.#localPending.has(opId)) continue
+      const byPeer = this.#retentions.get(opId)
+      if (byPeer === undefined) continue
+      for (const signer of byPeer.keys()) {
+        if (signer !== this.identity.publicKey && this.isMember(signer)) { settled.push(opId); break }
+      }
+    }
+    if (settled.length === 0) return
+    for (const opId of settled) this.#localPending.delete(opId)
+    const keys = settled.map(opId => `${this.#prefix}/local-pending/${opId}`)
+    if (this.#store.deleteMany !== undefined) await this.#store.deleteMany(keys)
+    else for (const key of keys) await this.#store.delete?.(key)
   }
 
   /**
@@ -3778,7 +4633,12 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     const minOps = options.minOps ?? 1
     if (
       totalOps < minOps ||
-      this.#kernel.pendingDependencies.length > 0
+      this.#kernel.pendingDependencies.length > 0 ||
+      // Never relay state this replica has not verified itself.
+      this.#provisionalSnapshot !== null ||
+      // Compartment-ring topics would leak to every epoch-key holder (bundles are sealed under the
+      // default epoch key only).
+      Object.keys(this.keysState().topicRings ?? {}).length > 0
     ) {
       return null
     }
@@ -3786,7 +4646,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     if (this.genesis.privateLog) {
       if (this.#blindHostMode) return null
       const epoch = this.#currentEpochFrom(this.#kernel)
-      const key = epoch >= 0 ? this.#epochKeys.get(epoch) : undefined
+      const key = epoch >= 0 ? this.#groupKey('default', epoch) : undefined
       if (key === undefined) return null
       encryption = { epoch, key }
     }
@@ -3836,10 +4696,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return this.#serial(async () => {
       const decoded = await this.#decodeMaterializedSnapshot(bytes)
       if (decoded === null) return false
-      if (decoded.casNodes.length > 0) {
-        await this.cas.putManyVerified(decoded.casNodes)
-      }
-      this.#pendingSnapshotBundle = decoded
+      this.#pendingSnapshotBundle = { ...decoded, trust: 'untrusted' }
       await this.#rematerialize()
       return true
     })
@@ -4152,10 +5009,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     })
   }
 
-  /** CAS hashes replay is blocked on (modules, reducer-read nodes, SQLite pages). */
+  /** CAS hashes replay or TreeKEM key unsealing is blocked on (modules, reducer-read nodes, SQLite pages, key-tree DAG nodes). */
   missingCasDependencies(): string[] {
-    const out = new Set<string>()
-    for (const kernel of [this.#kernel, this.#controlKernel, this.#finalKernel]) {
+    const out = new Set<string>(this.#missingTreeCasHashes)
+    for (const kernel of [this.#kernel, this.#controlKernel, this.#admittedControlKernel, this.#probeKernel, this.#finalKernel]) {
       for (const dep of kernel?.pendingDependencies ?? []) {
         const hash = dep.slice(dep.indexOf('/') + 1)
         if (/^[0-9a-f]{64}$/u.test(hash)) out.add(hash)
@@ -4239,14 +5096,19 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         factsChanged = true
       }
 
+      const retainedOpIds: string[] = []
       for (const ev of facts.retentions ?? []) {
         if (ev.payload.applicationId !== this.applicationId || !Array.isArray(ev.payload.items)) continue
+        if (ev.payload.items.length > MAX_RETENTION_ITEMS || ev.payload.peer !== ev.signer) continue
+        // Receipts from non-members are spam: never verified, persisted or regossiped.
+        if (!this.isMember(ev.signer)) continue
         // Verify once per batch receipt, and only if it says something new.
         if (ev.payload.items.every((opId: string) => this.#retentions.get(opId)?.has(ev.signer) === true)) continue
         await verifyRecord('operation-retention', ev, ev.signer)
         if (this.#indexRetention(ev)) {
           storeBatch.push({ key: `${this.#prefix}/retention/${await recordDigest(ev.payload)}`, value: encodeRecord(ev) })
           factsChanged = true
+          if (ev.signer !== this.identity.publicKey) for (const opId of ev.payload.items) if (typeof opId === 'string') retainedOpIds.push(opId)
         }
       }
 
@@ -4267,9 +5129,6 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
         for (let i = 0; i < storeBatch.length; i += 128) {
           await writeBytesMany(this.#store, storeBatch.slice(i, i + 128), { durability: 'relaxed' })
         }
-        if (this.#store.latestChangeSeq !== undefined) {
-          this.#lastSyncSeq = Math.max(this.#lastSyncSeq, await this.#store.latestChangeSeq())
-        }
       }
 
       if (materializedChanged) {
@@ -4277,6 +5136,7 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       } else if (factsChanged) {
         this.#emitStatus()
       }
+      if (retainedOpIds.length > 0) await this.#settleLocalPending(retainedOpIds)
       if (factsChanged) {
         this.#emitFacts()
       }
@@ -4287,15 +5147,10 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
     return this.#serial(async () => {
       await this.#flushPendingMaterialization()
       const roots = this.#kernel.gcRoots()
-      if (this.#controlKernel !== null) {
-        for (const r of this.#controlKernel.gcRoots()) roots.add(r)
+      for (const kernel of [this.#controlKernel, this.#admittedControlKernel, this.#probeKernel, this.#finalKernel]) {
+        if (kernel !== null) for (const r of kernel.gcRoots()) roots.add(r)
       }
-      if (this.#finalKernel !== null) {
-        for (const r of this.#finalKernel.gcRoots()) roots.add(r)
-      }
-      for (const src of Object.values(STANDARD_MODULE_SOURCES)) {
-        roots.add(computeCasHash(utf8(src), []))
-      }
+      for (const hash of standardModuleHashes()) roots.add(hash)
       return this.cas.collectGarbage(roots)
     })
   }
@@ -4330,24 +5185,28 @@ export class ApplicationSession<D extends ApplicationDefinition = ApplicationDef
       this.#emitStatus()
       this.#kernel.dispose()
       this.#controlKernel?.dispose()
+      this.#admittedControlKernel?.dispose()
+      this.#probeKernel?.dispose()
       this.#finalKernel?.dispose()
+      await this.wipeSecrets()
       await this.content.close()
       await this.#release()
     })()
   }
 }
 
-/** Binary local-pending record: CBOR [1, signed op bytes, envelope digest, epoch]. */
-function encodeLocalPending(raw: Uint8Array, envelopeDigest: string, epoch: number): Uint8Array {
-  return encodeCanonicalCbor([1n, raw, hexToBytes(envelopeDigest), BigInt(epoch)])
+/** Binary local-pending record: CBOR [1, signed op bytes, envelope digest, epoch, epoch-key commitment]. */
+function encodeLocalPending(raw: Uint8Array, envelopeDigest: string, epoch: number, commitment: string): Uint8Array {
+  return encodeCanonicalCbor([1n, raw, hexToBytes(envelopeDigest), BigInt(epoch), hexToBytes(commitment)])
 }
 
-function decodeLocalPending(bytes: Uint8Array): { readonly raw: Uint8Array; readonly envelopeDigest: string; readonly epoch: number } {
+function decodeLocalPending(bytes: Uint8Array): { readonly raw: Uint8Array; readonly envelopeDigest: string; readonly epoch: number; readonly commitment: string } {
   const value = decodeCanonicalCbor(bytes, DEFAULT_DECODE_LIMITS)
-  check(Array.isArray(value) && value.length === 4 && value[0] === 1n && value[1] instanceof Uint8Array &&
-    value[2] instanceof Uint8Array && value[2].length === 32 && typeof value[3] === 'bigint', 'LOCAL_PENDING_INVALID')
-  const [, raw, digest, epoch] = value as unknown as readonly [bigint, Uint8Array, Uint8Array, bigint]
-  return { raw, envelopeDigest: bytesToHex(digest), epoch: Number(epoch) }
+  check(Array.isArray(value) && value.length === 5 && value[0] === 1n && value[1] instanceof Uint8Array &&
+    value[2] instanceof Uint8Array && value[2].length === 32 && typeof value[3] === 'bigint' &&
+    value[4] instanceof Uint8Array && value[4].length === 32, 'LOCAL_PENDING_INVALID')
+  const [, raw, digest, epoch, commitment] = value as unknown as readonly [bigint, Uint8Array, Uint8Array, bigint, Uint8Array]
+  return { raw, envelopeDigest: bytesToHex(digest), epoch: Number(epoch), commitment: bytesToHex(commitment) }
 }
 
 async function readAllStoreEntries(store: BytesStore): Promise<readonly { readonly key: string; readonly value: Uint8Array }[]> {

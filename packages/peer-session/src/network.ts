@@ -143,6 +143,26 @@ type Message =
   | { readonly kind: 'snapshot'; readonly requestId: string; readonly bytes: Uint8Array | null }
 
 /** Physical feed counters only protect framing. Every operation authenticates its own immutable authored order. */
+/** Snapshot exports served per peer link; a bootstrap needs one (the second covers a retry). */
+const SNAPSHOTS_PER_LINK = 2
+const snapshotExports = new WeakMap<ApplicationSession, { readonly revision: string; readonly bytes: Promise<Uint8Array | null> }>()
+
+/**
+ * The session's current materialized snapshot, exported once per local revision and shared by
+ * every link (the bytes are opaque here). Null when the log is too small to beat replay
+ * (`minOps`), the export fails, or it exceeds `maxBytes`.
+ */
+function cachedSnapshot(session: ApplicationSession, maxBytes: number): Promise<Uint8Array | null> {
+  const revision = session.revision('local').digest, cached = snapshotExports.get(session)
+  if (cached !== undefined && cached.revision === revision) return cached.bytes
+  // Only serve a frontier-only P2P snapshot when the log has enough ops to beat direct replay;
+  // tiny logs replay faster, use less bandwidth, and preserve events.
+  const bytes = session.exportMaterializedSnapshot({ minOps: 16 })
+    .then(value => value !== null && value.length <= maxBytes ? value : null, () => null)
+  snapshotExports.set(session, { revision, bytes })
+  return bytes
+}
+
 export async function connectApplicationPeer(session: ApplicationSession, options: ApplicationPeerConnectOptions): Promise<ApplicationPeerLink> {
   check(session.status.connectedPeers < APPLICATION_NETWORK_LIMITS.peers, 'SESSION_PEER_LIMIT')
   const lifetime = new AbortController()
@@ -432,7 +452,7 @@ export async function connectApplicationPeer(session: ApplicationSession, option
     // reply before handling anything that follows, so the snapshot lands ahead of those facts.
     const SNAPSHOT_MAX_BYTES = 24 * 1024 * 1024
     const snapshotWaiters = new Map<string, () => void>()
-    let snapshotRequested = false
+    let snapshotRequested = false, snapshotsServed = 0
     const snapshotScopeAllowed = (): boolean => !session.genesis.privateLog || privateAllowed()
     const requestSnapshot = (): Promise<void> => {
       if (snapshotRequested || !snapshotScopeAllowed() || !session.wantsSnapshotBootstrap()) return Promise.resolve()
@@ -602,11 +622,11 @@ export async function connectApplicationPeer(session: ApplicationSession, option
               // Private-log peers ask only after their public round settled (just before the ack
               // that would trigger our own check), so verify membership here as that ack would.
               if (session.genesis.privateLog) verifyMember()
-              if (snapshotScopeAllowed()) {
-                // Only serve a frontier-only P2P snapshot when the log has enough ops to beat
-                // direct replay; tiny logs replay faster, use less bandwidth, and preserve events.
-                try { bytes = await session.exportMaterializedSnapshot({ minOps: 16 }) } catch { bytes = null }
-                if (bytes !== null && bytes.length > SNAPSHOT_MAX_BYTES) bytes = null
+              // A bootstrap needs one snapshot per link; members only, and every link shares one
+              // export per revision, so repeated requests cannot make us re-export and re-sign.
+              if (snapshotScopeAllowed() && session.isMember(peerId) && snapshotsServed < SNAPSHOTS_PER_LINK) {
+                snapshotsServed++
+                bytes = await cachedSnapshot(session, SNAPSHOT_MAX_BYTES)
               }
               void post({ kind: 'snapshot', requestId: message.requestId, bytes })
               break

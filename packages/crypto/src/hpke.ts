@@ -131,18 +131,34 @@ async function extractAndExpand(dhValue: Uint8Array, kemContext: Uint8Array): Pr
   return labeledExpand(KEM_SUITE_ID, eaePrk, 'shared_secret', kemContext, HASH_SIZE)
 }
 
-interface HpkeKeySchedule { readonly key: Uint8Array; readonly nonce: Uint8Array; readonly exporterSecret: Uint8Array }
+export interface HpkeKeySchedule { readonly key: Uint8Array; readonly nonce: Uint8Array; readonly exporterSecret: Uint8Array }
 
-async function keySchedule(sharedSecret: Uint8Array, info: Uint8Array): Promise<HpkeKeySchedule> {
-  const pskIdHash = await labeledExtract(HPKE_SUITE_ID, new Uint8Array(), 'psk_id_hash', new Uint8Array())
-  const infoHash = await labeledExtract(HPKE_SUITE_ID, new Uint8Array(), 'info_hash', info)
+/**
+ * RFC 9180 §5.1 `KeySchedule` for `mode_base` (no PSK) with HKDF-SHA256 and AES-256-GCM
+ * (`Nk = 32`, `Nn = 12`). `hpkeSuiteId` is `"HPKE" || I2OSP(kem_id, 2) || I2OSP(kdf_id, 2) || I2OSP(aead_id, 2)`.
+ */
+export async function hpkeBaseKeySchedule(
+  hpkeSuiteId: Uint8Array,
+  sharedSecret: Uint8Array,
+  info: Uint8Array,
+): Promise<HpkeKeySchedule> {
+  const pskIdHash = await labeledExtract(hpkeSuiteId, new Uint8Array(), 'psk_id_hash', new Uint8Array())
+  const infoHash = await labeledExtract(hpkeSuiteId, new Uint8Array(), 'info_hash', info)
   const keyScheduleContext = concatBytes(Uint8Array.of(0), pskIdHash, infoHash)
-  const secret = await labeledExtract(HPKE_SUITE_ID, sharedSecret, 'secret', new Uint8Array())
-  return {
-    key: await labeledExpand(HPKE_SUITE_ID, secret, 'key', keyScheduleContext, 32),
-    nonce: await labeledExpand(HPKE_SUITE_ID, secret, 'base_nonce', keyScheduleContext, 12),
-    exporterSecret: await labeledExpand(HPKE_SUITE_ID, secret, 'exp', keyScheduleContext, HASH_SIZE),
+  const secret = await labeledExtract(hpkeSuiteId, sharedSecret, 'secret', new Uint8Array())
+  try {
+    return {
+      key: await labeledExpand(hpkeSuiteId, secret, 'key', keyScheduleContext, 32),
+      nonce: await labeledExpand(hpkeSuiteId, secret, 'base_nonce', keyScheduleContext, 12),
+      exporterSecret: await labeledExpand(hpkeSuiteId, secret, 'exp', keyScheduleContext, HASH_SIZE),
+    }
+  } finally {
+    secret.fill(0)
   }
+}
+
+function keySchedule(sharedSecret: Uint8Array, info: Uint8Array): Promise<HpkeKeySchedule> {
+  return hpkeBaseKeySchedule(HPKE_SUITE_ID, sharedSecret, info)
 }
 
 async function aesGcmSeal(keyBytes: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): Promise<Uint8Array> {

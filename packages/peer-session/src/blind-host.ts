@@ -2,12 +2,7 @@ import {
   bytesToHex,
   utf8,
 } from '@chronolog/canonical'
-import {
-  evaluateAdmission,
-  type AdmissionDecision,
-  type AdmissionEvidence,
-  type PinnedFrontier,
-} from '@chronolog/authority'
+import type { AdmissionDecision, AdmissionEvidence, PinnedFrontier } from '@chronolog/authority'
 import {
   seedStandardModules,
   TopicKernel,
@@ -35,6 +30,7 @@ import {
   type LogGenesis,
   type OperationCore,
 } from '@chronolog/protocol'
+import { finalizedInputs, materializeControl } from './control-plane.js'
 
 const HEX32 = /^[0-9a-f]{64}$/u
 
@@ -136,7 +132,6 @@ export interface ControlAdmissionSummary {
   readonly writers: readonly string[]
   readonly administrators: readonly string[]
   readonly publishers: readonly string[]
-  readonly finalizers: readonly string[]
   readonly blockedAuthors: readonly string[]
   readonly removedMembers: readonly string[]
   readonly admission: JsonValue | null
@@ -168,7 +163,6 @@ export async function extractControlAdmission(kernel: TopicKernel): Promise<Cont
   const writers = stringList(summary.writers)
   const administrators = stringList(summary.administrators)
   const publishers = stringList(summary.publishers)
-  const finalizers = stringList(summary.finalizers)
   const blockedAuthors = stringList(summary.blockedAuthors)
   const removedMembers = stringList(summary.removedMembers)
   const admission = (summary.admission as JsonValue | undefined) ?? null
@@ -188,7 +182,6 @@ export async function extractControlAdmission(kernel: TopicKernel): Promise<Cont
     writers,
     administrators,
     publishers,
-    finalizers,
     blockedAuthors,
     removedMembers,
     admission,
@@ -212,6 +205,7 @@ export interface BlindHostControlResult {
   readonly topics: Readonly<Record<string, JsonValue>>
   readonly outcomes: readonly KernelOperationOutcome[]
   readonly pendingDependencies: readonly string[]
+  /** Admitted control state: ops excluded by `admission` are not folded (identical to full replicas). */
   readonly roster: ControlAdmissionSummary
   readonly initialRoster: ControlAdmissionSummary
   readonly admission: AdmissionDecision
@@ -224,8 +218,9 @@ export interface BlindHostControlResult {
 /**
  * Reusable blind-host control engine: replays public control operations (`$reducers`,
  * `$admission`, `$keys`, `$publications`, `$mounts`, `$builders`) with `blindHostMode: true`
- * and zero decryption keys, queries `$admission` roster and `admit(...)` over external
- * evidence, and computes exact reachable public CAS hashes for GC.
+ * and zero decryption keys through the same `materializeControl` derivation full replicas use
+ * (`$admission.admit(...)` over external evidence; excluded ops are not folded), and computes
+ * exact reachable public CAS hashes for GC.
  */
 export async function replayBlindHostControl(options: ReplayBlindHostOptions): Promise<BlindHostControlResult> {
   const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
@@ -246,28 +241,20 @@ export async function replayBlindHostControl(options: ReplayBlindHostOptions): P
   })
   try {
     const initialRoster = await extractControlAdmission(kernel)
-    const result = await kernel.materialize(options.publicOps)
+    const { admission, result } = await materializeControl({
+      logId: bytesToHex(kernel.logId),
+      probe: kernel,
+      publicOps: options.publicOps,
+      evidence: options.evidence ?? [],
+      pinnedFrontier: options.pinnedFrontier ?? null,
+      admitted: 'probe',
+    })
     const snap = kernel.snapshot()
     const roster = await extractControlAdmission(kernel)
 
-    const logIdHex = bytesToHex(kernel.logId)
-    const opList = options.publicOps.map(op => ({
-      opId: bytesToHex(op.opId),
-      author: bytesToHex(op.core.author),
-      authorTimestampMs: op.core.authorTimestampMs,
-      visibility: op.core.visibility,
-    }))
-    const admission = await evaluateAdmission({
-      logId: logIdHex,
-      ops: opList,
-      evidence: options.evidence ?? [],
-      pinnedFrontier: options.pinnedFrontier ?? null,
-      evaluator: kernel.createAdmissionEvaluator(),
-    })
-
     let finalizedTopics: Readonly<Record<string, JsonValue>> | null = null
     if (options.includeFinalized !== false && admission.closedThroughMs !== null) {
-      const finalOps = options.publicOps.filter(op => admission.includedOpIds.has(bytesToHex(op.opId)))
+      const finalOps = finalizedInputs(options.publicOps, admission)
       const finalKernel = new TopicKernel({
         genesis: options.genesis,
         cas,

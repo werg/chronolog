@@ -20,7 +20,6 @@ describe('Worker RPC bridge for SQL branching, time-travel, social recovery, com
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: true,
       topics: {

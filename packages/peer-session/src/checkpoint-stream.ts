@@ -2,10 +2,9 @@ import type { BytesStore, BytesStoreEntry } from '@chronolog/records'
 import { bytesToHex } from '@chronolog/protocol'
 import { reserveCheckpointStore, retireDeviceStore } from './checkpoint-lifecycle.js'
 import { deriveAesKey, validateMetadata } from './checkpoint-codec.js'
-import { assertDeviceNotRetired, DEVICE_RETIRED_KEY,
+import { assertDeviceNotRetired, CHECKPOINT_FORMAT, DEVICE_RETIRED_KEY,
   type CheckpointMetadata, type CheckpointOutboxRecord } from './checkpoint.js'
 
-export const STREAM_CHECKPOINT_FORMAT = 'chronolog-device-checkpoint-v2'
 const MAGIC = Uint8Array.of(67, 76, 67, 80, 2)
 const BLOCK = 65_536, MAX_FRAME = 2 * 1024 * 1024
 const text = new TextEncoder(), utf8 = new TextDecoder('utf-8', { fatal: true })
@@ -51,7 +50,7 @@ function keyValid(key: unknown): asserts key is string {
 function outboxRecord(value: unknown): asserts value is CheckpointOutboxRecord {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
     Object.keys(value).some(key => !['operationId', 'command', 'payloadHash', 'createdAt', 'status'].includes(key))) throw fail('CHECKPOINT_CORRUPT')
-  validateMetadata({ format: STREAM_CHECKPOINT_FORMAT, applicationId: null, deviceId: null, createdAt: '1970-01-01T00:00:00.000Z',
+  validateMetadata({ format: CHECKPOINT_FORMAT, applicationId: null, deviceId: null, createdAt: '1970-01-01T00:00:00.000Z',
     entryCount: 0, hasSqlDatabase: false, outboxCount: 1, manifestSha256: '0'.repeat(64) }, [value as CheckpointOutboxRecord])
 }
 function sizeValid(size: unknown): asserts size is number {
@@ -73,7 +72,7 @@ function nonce(header: Uint8Array, index: number): Uint8Array<ArrayBuffer> {
   return join(header.subarray(27, 35), uint(index))
 }
 function metadata(options: ExportCheckpointStreamOptions, count: number, digest: Uint8Array, createdAt: string): CheckpointMetadata {
-  return { format: STREAM_CHECKPOINT_FORMAT, applicationId: options.applicationId ?? null, deviceId: options.deviceId ?? null,
+  return { format: CHECKPOINT_FORMAT, applicationId: options.applicationId ?? null, deviceId: options.deviceId ?? null,
     createdAt, entryCount: count, hasSqlDatabase: options.sqlDatabase !== undefined, outboxCount: options.outbox?.length ?? 0, manifestSha256: bytesToHex(digest) }
 }
 
@@ -195,7 +194,7 @@ export async function restoreDeviceCheckpointStream(target: BytesStore, source: 
         const frame = await nextFrame()
         if (frame[0] === 5) {
           result = { metadata: (JSON.parse(utf8.decode(frame.subarray(1))) as { metadata: CheckpointMetadata }).metadata, outbox }
-          if (result.metadata?.format !== STREAM_CHECKPOINT_FORMAT) throw fail('CHECKPOINT_CORRUPT')
+          if (result.metadata?.format !== CHECKPOINT_FORMAT) throw fail('CHECKPOINT_CORRUPT')
           validateMetadata(result.metadata, result.outbox)
           if (result.metadata.entryCount !== count || result.metadata.hasSqlDatabase !== sqlSeen || result.metadata.outboxCount !== result.outbox.length || result.metadata.manifestSha256 !== bytesToHex(digest)) throw fail('CHECKPOINT_INTEGRITY_MISMATCH')
           if (await reader.read(1, true) !== null) throw fail('CHECKPOINT_CORRUPT')

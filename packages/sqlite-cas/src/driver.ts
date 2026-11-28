@@ -1,4 +1,5 @@
 import createSqliteCasWasm from '../wasm/sqlite-cas.mjs'
+import { FuelExhaustedError, HOST_BYTES_PER_FUEL, type FuelMeter } from '@chronolog/materializer'
 import type {
   SqliteBuiltinDriver,
   SqliteDbHandle,
@@ -9,11 +10,12 @@ import type {
   SqliteQueryResult,
 } from '@chronolog/materializer'
 
-export const SQLITE_CAS_BUILTIN_ID = 'sqlite-cas@1#sha256-c1e6ecad7402fc981728ff06143ba9b453724dc4faa144cacb085f60e18e280c'
+export const SQLITE_CAS_BUILTIN_ID = 'sqlite-cas@1#sha256-a01d70697dcf727d631ffe292979bc5c1c5c4ec4c9ba53fa1ed8400c51dbbee1'
 import type { JsonValue } from '@chronolog/protocol'
 import { MerklePageFile } from './merkle-pages.js'
 
 const SQLITE_OK = 0
+const SQLITE_INTERRUPT = 9
 const SQLITE_IOERR = 10
 const SQLITE_IOERR_SHORT_READ = 522
 const SQLITE_ROW = 100
@@ -87,6 +89,8 @@ interface EmscriptenSqliteModule {
     historyCol?(row: number, col: number): string | null
     historyNum?(row: number, col: number): number
     can?(capability: string, actor: string): boolean
+    /** Called every 1000 VDBE opcodes; nonzero interrupts the statement (fuel exhausted). */
+    progress?(): number
   }
 }
 
@@ -135,6 +139,8 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
     const mod = await factory(wasmConfig)
     let activeFile: MerklePageFile | null = null
     let activeIntrospection: SqliteIntrospectionHooks | undefined
+    /** Deterministic fuel of the open handle: 1 unit per 1000 VDBE opcodes and per 32 KiB of page reads. */
+    let activeFuel: { readonly meter: FuelMeter; readBytes: number; charged: number } | null = null
     let missingCasError: Error | null = null
     let activeDdl: {
       allow: SqliteDdlAllowlist
@@ -148,6 +154,14 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
     mod._casHooks = {
       read(offset, bufPtr, amt) {
         if (activeFile === null) return SQLITE_IOERR
+        if (activeFuel !== null) {
+          activeFuel.readBytes += amt
+          const due = Math.floor(activeFuel.readBytes / HOST_BYTES_PER_FUEL)
+          if (due > activeFuel.charged) {
+            try { activeFuel.meter.charge(due - activeFuel.charged) } catch { return SQLITE_IOERR }
+            activeFuel.charged = due
+          }
+        }
         try {
           const dest = mod.HEAPU8.subarray(bufPtr, bufPtr + amt)
           const full = activeFile.readInto(offset, dest)
@@ -250,6 +264,10 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
         if (col === 7) return item.rejectionCode
         return null
       },
+      progress() {
+        if (activeFuel === null) return 0
+        try { activeFuel.meter.charge(1); return 0 } catch { return 1 }
+      },
       historyNum(row, col) {
         const item = activeIntrospection?.history?.[row]
         if (item === undefined) return 0
@@ -268,6 +286,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
         missingCasError = null
         throw err
       }
+      if (activeFuel?.meter.exhausted === true) throw new FuelExhaustedError()
     }
 
     const bindParams = (stmt: number, params: readonly JsonValue[]): void => {
@@ -326,8 +345,10 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
           partition: openOpts.partition,
           onMissingCas: openOpts.onMissingCas,
         })
+        const fuelState = openOpts.fuel === undefined ? null : { meter: openOpts.fuel, readBytes: 0, charged: 0 }
         activeFile = pageFile
         activeIntrospection = openOpts.introspection
+        activeFuel = fuelState
 
         const setContext = (): void => {
           withCString(mod, openOpts.actor, actorPtr => {
@@ -352,6 +373,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
           if (closed) throw new Error('SQLITE_HANDLE_CLOSED')
           activeFile = pageFile
           activeIntrospection = openOpts.introspection
+          activeFuel = fuelState
           setContext()
         }
 
@@ -403,6 +425,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
                     continue
                   }
                   if (stepRc === SQLITE_DONE) break
+                  if (stepRc === SQLITE_INTERRUPT && fuelState?.meter.exhausted === true) throw new FuelExhaustedError()
                   const msg = mod.UTF8ToString(mod._chronolog_errmsg(db))
                   throw new Error(`SQLITE_STEP_ERROR(${stepRc}): ${msg}`)
                 }
@@ -486,6 +509,7 @@ export async function createSqliteCasDriver(options: CreateSqliteCasDriverOption
             if (activeFile === pageFile) {
               activeFile = null
               activeIntrospection = undefined
+              activeFuel = null
             }
           },
         }

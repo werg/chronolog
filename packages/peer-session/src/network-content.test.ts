@@ -33,7 +33,7 @@ describe('bounded content protocol on an authenticated channel', () => {
     expect(streamed).toHaveLength(3)
     // Raw ciphertext on the wire: exactly header + plaintext + AES tag, no hex/base64 inflation.
     expect(streamed.every(item => item.message.type === 'chunk-response' && item.message.bytes instanceof Uint8Array && item.message.bytes.length <= MAX_CONTENT_ENCRYPTED_CHUNK_BYTES)).toBe(true)
-    expect(MAX_CONTENT_ENCRYPTED_CHUNK_BYTES).toBe(CONTENT_CHUNK_BYTES + 37)
+    expect(MAX_CONTENT_ENCRYPTED_CHUNK_BYTES).toBe(CONTENT_CHUNK_BYTES + 50)
     p.close()
     expect(await f.contents[1]!.readBytes(reference, { maxBytes: bytes.length })).toEqual(bytes)
   })

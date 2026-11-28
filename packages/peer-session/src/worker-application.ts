@@ -1,13 +1,15 @@
 import type { EphemeralSignal, SignalSubscribeOptions, SignalSendOptions, SignalPayload } from '@chronolog/signals'
 import type { JsonValue } from '@chronolog/protocol'
 import type { ApplicationEndpointBinding as InlineApplicationEndpointBinding, ApplicationEndpointContext as InlineApplicationEndpointContext } from './owner-types.js'
-import type { ApplicationDescription as InlineApplicationDescription, AdmissionDecision, AdmissionEquivocation, AdmissionEvidence as InlineAdmissionEvidence, PinnedFrontier } from '@chronolog/authority'
+import type { ApplicationDescription as InlineApplicationDescription } from '@chronolog/authority'
 import type { SqliteExecOptions, SqliteExecResult, SqliteQueryResult } from '@chronolog/materializer'
-import type { ApplicationPeerDiagnostics as InlineApplicationPeerDiagnostics } from './network.js'
 import type { ApplicationWorkerEndpoint } from './worker-transport.js'
-import type { AdmissionRoster, AdmissionScheduleEntry, CheckpointBootstrapSnapshot, GuardianMember, SessionFacts as InlineSessionFacts, SimulationResult } from './session.js'
 import type { SqlBranchDiff, SqlBranchProposal } from './sql-extensions.js'
 import { APPLICATION_OWNER_PROTOCOL, type OwnerNotice, type OwnerResponse } from './worker-application-protocol.js'
+import {
+  OWNER_FORWARDED_METHODS,
+  type ForwardedOwnerMethods, type ForwardedOwnerNamespace, type OwnerForwardedMethodName, type OwnerForwardedNamespace, type OwnerForwardedResult,
+} from './owner-methods.js'
 import type { ApplicationChange, ApplicationEventOptions, ApplicationReadView, CommandOptions, MaterializedRevision, SessionStatus, WaitOptions } from './session-types.js'
 import type { ApplicationSubmission, MaterializedOperation, OperationInspection, RetentionEvidence } from './operation.js'
 import type { ContentReference, ContentUpload, ContentRetention } from './content.js'
@@ -40,13 +42,36 @@ export interface WorkerApplicationReadView {
 export class WorkerApplicationOperation {
   readonly stored = true
   constructor(readonly id: string, readonly operationId: string, private readonly session: WorkerApplicationSession) {}
-  inspect(): Promise<OperationInspection> { return this.session.request('operation.inspect', [this.id]) }
+  inspect(): Promise<OperationInspection> { return this.session.inspectOperation(this.id) }
   materialized(options?: WaitOptions): Promise<MaterializedOperation> { return this.session.wait(this.id, 'materialized', options) }
   retained(options?: WaitOptions): Promise<readonly RetentionEvidence[]> { return this.session.wait(this.id, 'retained', options) }
   finalized(options?: WaitOptions): Promise<MaterializedOperation> { return this.session.wait(this.id, 'finalized', options) }
 }
 
+type OperationIds = { readonly id: string; readonly operationId: string }
+
+/** Decode one forwarded owner result, rebuilding operation handles bound to `session`. */
+async function callForwarded(session: WorkerApplicationSession, method: OwnerForwardedMethodName, args: readonly unknown[]): Promise<unknown> {
+  const result = await session.request<OwnerForwardedResult>(method, args)
+  if (result.operation === 'self') { const ids = result.value as OperationIds; return new WorkerApplicationOperation(ids.id, ids.operationId, session) }
+  if (result.operation === 'field') { const value = result.value as { readonly operation: OperationIds }; return { ...value, operation: new WorkerApplicationOperation(value.operation.id, value.operation.operationId, session) } }
+  return result.value
+}
+
+function forwardedNamespace<N extends OwnerForwardedNamespace>(session: WorkerApplicationSession, namespace: N): ForwardedOwnerNamespace<N> {
+  const prefix = `${namespace}.`, methods: Record<string, (...args: readonly unknown[]) => Promise<unknown>> = {}
+  for (const method of Object.keys(OWNER_FORWARDED_METHODS) as OwnerForwardedMethodName[]) {
+    if (method.startsWith(prefix)) methods[method.slice(prefix.length)] = (...args) => callForwarded(session, method, args)
+  }
+  return Object.freeze(methods) as unknown as ForwardedOwnerNamespace<N>
+}
+
+/** Every top-level `OWNER_FORWARDED_METHODS` entry, installed on the prototype below. */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging, @typescript-eslint/no-empty-object-type
+export interface WorkerApplicationSession extends ForwardedOwnerMethods {}
+
 /** Page facade owns bounded RPC and local UI state, never keys, SQL or ordering. */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkerApplicationSession {
   readonly #endpoint: ApplicationWorkerEndpoint
   readonly #attachment = crypto.randomUUID()
@@ -144,18 +169,8 @@ export class WorkerApplicationSession {
   async resumeAttachment(): Promise<InlineApplicationEndpointBinding | null> { this.#status = await this.request('attachment.resume', []); this.#attachmentState = 'active'; return this.endpoint ?? null }
   detach(): Promise<void> { return this.close() }
   async submit(input: ApplicationSubmission): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('submit', [input]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
-  simulate(input: ApplicationSubmission): Promise<SimulationResult> { return this.request('simulate', [input]) }
   async command(name: string, input: unknown, options: CommandOptions = {}): Promise<WorkerApplicationOperation> { const value = await this.request<{ id: string; operationId: string }>('command', [name, input, options]); return new WorkerApplicationOperation(value.id, value.operationId, this) }
   query(name: string, input: unknown = null): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly value: unknown }> { return this.request('query', [name, input]) }
-  topic(name: string): Promise<JsonValue | null> { return this.request('topic', [name]) }
-  queryAsOf(topic: string, input: JsonValue = null, target: { readonly opId: string } | { readonly atTimestampMs: bigint }): Promise<{ readonly applicationId: string; readonly revision: MaterializedRevision; readonly targetOpId: string | null; readonly value: JsonValue }> {
-    return this.request('queryAsOf', [topic, input, target])
-  }
-  opOutcome(opId: string): Promise<'accepted' | 'rejected' | null> { return this.request('opOutcome', [opId]) }
-  topicLastOpId(topic: string): Promise<string | null> { return this.request('topicLastOpId', [topic]) }
-  permissions(): Promise<AdmissionRoster> { return this.request('permissions.summary', []) }
-  admissionStatus(opId: string): Promise<'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local'> { return this.request('admission.opStatus', [opId]) }
-
   async forkSql(topic: string): Promise<WorkerSqlBranch> {
     const opened = await this.request<{ readonly id: string; readonly topic: string; readonly baseRoot: string | null }>('sqlBranch.open', [topic])
     let closed = false
@@ -172,52 +187,6 @@ export class WorkerApplicationSession {
     }
   }
 
-  async createCompartment(
-    ringName: string,
-    options: {
-      readonly topics: readonly string[]
-      readonly members: readonly { readonly publicKey: string; readonly wrapKey: string }[]
-      readonly operationId?: string
-      readonly authorTimestampMs?: bigint
-    },
-  ): Promise<{ readonly ring: string; readonly epoch: number; readonly operation: WorkerApplicationOperation }> {
-    const res = await this.request<{ readonly ring: string; readonly epoch: number; readonly operation: { readonly id: string; readonly operationId: string } }>('compartment.create', [ringName, options])
-    return { ring: res.ring, epoch: res.epoch, operation: new WorkerApplicationOperation(res.operation.id, res.operation.operationId, this) }
-  }
-
-  async setupSocialRecovery(options: {
-    readonly guardians: readonly GuardianMember[]
-    readonly threshold: number
-    readonly operationId?: string
-    readonly authorTimestampMs?: bigint
-  }): Promise<WorkerApplicationOperation> {
-    const res = await this.request<{ readonly id: string; readonly operationId: string }>('recovery.setup', [options])
-    return new WorkerApplicationOperation(res.id, res.operationId, this)
-  }
-
-  async requestSocialRecovery(options: {
-    readonly requestId?: string
-    readonly label?: string
-    readonly verificationCode?: string
-    readonly operationId?: string
-    readonly authorTimestampMs?: bigint
-  } = {}): Promise<{ readonly requestId: string; readonly verificationCode: string; readonly operation: WorkerApplicationOperation }> {
-    const res = await this.request<{ readonly requestId: string; readonly verificationCode: string; readonly operation: { readonly id: string; readonly operationId: string } }>('recovery.request', [options])
-    return { requestId: res.requestId, verificationCode: res.verificationCode, operation: new WorkerApplicationOperation(res.operation.id, res.operation.operationId, this) }
-  }
-
-  async approveSocialRecovery(
-    requestId: string,
-    options: { readonly operationId?: string; readonly authorTimestampMs?: bigint } = {},
-  ): Promise<WorkerApplicationOperation> {
-    const res = await this.request<{ readonly id: string; readonly operationId: string }>('recovery.approve', [requestId, options])
-    return new WorkerApplicationOperation(res.id, res.operationId, this)
-  }
-
-  completeSocialRecovery(): Promise<{ readonly restoredEpochs: number; readonly restoredRings: number }> {
-    return this.request('recovery.complete', [])
-  }
-  readEvents(options: ApplicationEventOptions & { readonly view?: 'local' | 'final' } = {}): Promise<ReturnType<ApplicationReadView['readEvents']>> { return this.request('readEvents', [options]) }
   wait<T>(id: string, fact: string, options: WaitOptions = {}): Promise<T> { const timeoutMs = options.timeoutMs ?? 30_000; return this.request('operation.wait', [id, fact, timeoutMs], { ...options, timeoutMs: Math.min(120_000, timeoutMs + 1000) }) }
 
   async readView(options: { readonly view?: 'local' | 'final' } = {}): Promise<WorkerApplicationReadView> {
@@ -255,19 +224,9 @@ export class WorkerApplicationSession {
     try { while (!signal.aborted) { if (queue.length === 0) await new Promise<void>(resolve => { wake = resolve }); while (queue.length > 0 && !signal.aborted) yield queue.shift()! } } finally { stop(); signal.removeEventListener('abort', abort) }
   }
 
-  diagnostics(): Promise<readonly InlineApplicationPeerDiagnostics[]> { return this.request('diagnostics.peers', []) }
   endpoints(): Promise<readonly (InlineApplicationEndpointBinding & { readonly state: 'active' | 'suspended' })[]> { return this.request('endpoints.list', []) }
-  exportFacts(options?: { readonly includePrivateCas?: boolean; readonly includeGenesis?: boolean }): Promise<InlineSessionFacts> { return this.request('facts.export', options === undefined ? [] : [options]) }
-  mergeFacts(facts: InlineSessionFacts): Promise<void> { return this.request('facts.merge', [facts]) }
-
-  readonly admission = {
-    status: (): Promise<AdmissionDecision & { readonly schedule: readonly AdmissionScheduleEntry[]; readonly pinnedFrontier: PinnedFrontier | null }> => this.request('admission.status', []),
-    opStatus: (opId: string): Promise<'equivocated' | 'finalized' | 'excluded' | 'synced' | 'local'> => this.request('admission.opStatus', [opId]),
-    equivocations: (): Promise<readonly AdmissionEquivocation[]> => this.request('admission.equivocations', []),
-    createCheckpoint: (options: { readonly throughMs: bigint }): Promise<{ readonly evidence: InlineAdmissionEvidence; readonly snapshot: CheckpointBootstrapSnapshot }> => this.request('admission.createCheckpoint', [options]),
-    submitEvidence: (evidence: readonly InlineAdmissionEvidence[]): Promise<void> => this.request('admission.submitEvidence', [evidence]),
-    pinFrontier: (frontier: PinnedFrontier | null): Promise<void> => this.request('admission.pinFrontier', [frontier]),
-  }
+  readonly vaults: ForwardedOwnerNamespace<'vaults'> = forwardedNamespace(this, 'vaults')
+  readonly admission: ForwardedOwnerNamespace<'admission'> = forwardedNamespace(this, 'admission')
 
   readonly extensions = {
     call: <T = unknown>(name: string, args: readonly unknown[] = [], options: WaitOptions = {}): Promise<T> => this.request('extension.call', [name, args], options),
@@ -434,6 +393,15 @@ export class WorkerApplicationSession {
     this.#detach(new Error('ENDPOINT_CLOSED'))
     this.#endpoint.close?.()
   }
+}
+
+for (const method of Object.keys(OWNER_FORWARDED_METHODS) as OwnerForwardedMethodName[]) {
+  if (method.includes('.')) continue
+  Object.defineProperty(WorkerApplicationSession.prototype, method, {
+    configurable: true,
+    writable: true,
+    value(this: WorkerApplicationSession, ...args: readonly unknown[]): Promise<unknown> { return callForwarded(this, method, args) },
+  })
 }
 
 export async function connectApplicationOwner(

@@ -28,12 +28,13 @@ import {
   type ChronologPackageNode,
   type ContentAddressedStore,
 } from '@chronolog/records'
-import { WASM_BUILTIN_ID, WasmSandbox } from './wasm-sandbox.js'
+import { FuelExhaustedError, FuelMeter, HOST_CALL_FUEL, hostBytesFuel, WASM_BUILTIN_ID, WasmSandbox } from './wasm-sandbox.js'
 
 export const QUICKJS_RUNTIME_ID = 'quickjs-ng@0.32.0'
 export const CRYPTO_BUILTIN_ID = 'crypto@2'
 export const CAS_BUILTIN_ID = 'cas@1'
-export const DEFAULT_MAX_FUEL = 200_000
+/** Fuel per Ed25519 verification (P-256 costs twice this), on top of the per-call/byte cost. */
+export const SIGNATURE_VERIFY_FUEL = 20
 export { WASM_BUILTIN_ID }
 
 /** Uncatchable host-level signal that a required CAS chunk/module is missing locally. */
@@ -45,6 +46,10 @@ export class MissingDependencyError extends Error {
   }
 }
 
+/**
+ * Local (non-consensus) wall-clock watchdog fired. Only raised for invocations marked `local: true`
+ * (UI queries/describe); consensus calls are bounded by deterministic fuel alone.
+ */
 export class OperationalTimeoutError extends Error {
   readonly code = 'OPERATIONAL_TIMEOUT' as const
   constructor(message = 'REDUCER_WATCHDOG_TIMEOUT') {
@@ -123,6 +128,12 @@ export interface SqliteBuiltinDriver {
     readonly readOnly: boolean
     readonly onMissingCas: (hash: string) => never
     readonly introspection?: SqliteIntrospectionHooks
+    /**
+     * Deterministic fuel budget of the calling invocation. When set, SQLite VM steps and page reads
+     * charge it and a statement that exhausts it aborts (the invocation ends `vm:fuel_exhausted`).
+     * Omitted only by local non-consensus tooling (e.g. SQL branches).
+     */
+    readonly fuel?: FuelMeter
   }): SqliteDbHandle
 }
 
@@ -130,6 +141,7 @@ export interface QuickJsSandboxOptions {
   /** Optional static pre-compiled WebAssembly.Module (required on Cloudflare Workers). */
   readonly wasmModule?: WebAssembly.Module
   readonly sqliteDriver?: SqliteBuiltinDriver
+  /** Wall-clock budget for `local: true` invocations only (default 2000 ms). */
   readonly watchdogMs?: number
 }
 
@@ -146,6 +158,11 @@ export interface ReducerInvocationInput {
   readonly moduleSpecifier: string
   readonly exportName: string
   readonly method: 'reduce' | 'query' | 'describe' | 'onConflict' | 'derive' | 'admit' | 'authorize' | 'verify'
+  /**
+   * Lowercase-hex log id exposed read-only as `ctx.logId` on every reducer/query/describe/authorize/
+   * verify/admit invocation. `null` only for log-independent derivations (`derive`).
+   */
+  readonly logId: string | null
   readonly state: JsonValue
   readonly payload: JsonValue
   readonly tx?: {
@@ -159,7 +176,6 @@ export interface ReducerInvocationInput {
   readonly conflict?: AssumptionFailureInfo
   /** Lazy outcome lookup for ops visible to this invocation (never serialized wholesale into the VM). */
   readonly opOutcome?: (opId: string) => 'accepted' | 'rejected' | null
-  readonly opOutcomes?: Readonly<Record<string, 'accepted' | 'rejected'>>
   readonly topicLastOpIds?: Readonly<Record<string, string>>
   readonly authorLastOpIds?: Readonly<Record<string, string>>
   readonly txVisibility?: 'public' | 'encrypted'
@@ -177,13 +193,20 @@ export interface ReducerInvocationInput {
   /** Visible topic states; read lazily by `ctx.topic()` / `ctx.query()` through host calls. */
   readonly topics: Readonly<Record<string, JsonValue>>
   /** Optional precomputed content hash of a visible topic state (memoization key for nested queries). */
-  readonly topicHash?: (topic: string) => string | undefined
   readonly config?: JsonValue
   readonly cas: ContentAddressedStore
   readonly casPartition: CasPartition
   readonly readOnly: boolean
   readonly maxMemoryBytes: number
-  readonly maxFuel?: number
+  /** Deterministic fuel budget (genesis `limits.maxFuel`), shared by nested calls and host bridges. */
+  readonly maxFuel: number
+  /**
+   * True only for local, non-consensus reads (UI `query()`/`describe()`): enables the wall-clock
+   * watchdog (`OperationalTimeoutError`) and runtime pooling. Consensus calls (reduce, authorize,
+   * verify, onConflict, admit, assumption queries) leave it unset: they are bounded by fuel alone
+   * and run in a fresh QuickJS runtime so GC/memory-limit behaviour is history-independent.
+   */
+  readonly local?: boolean
 }
 
 export type ReducerInvocationResult =
@@ -194,7 +217,7 @@ const CRYPTO_MODULE_SHIM = `
 export function sha256(input) { return globalThis.__chronologHost.sha256(input); }
 export function hmacSha256(keyHex, message) { return globalThis.__chronologHost.hmacSha256(keyHex, message); }
 export function verifyEd25519(pubKeyHex, message, sigHex) { return globalThis.__chronologHost.verifyEd25519(pubKeyHex, message, sigHex); }
-export function verifyP256(pubKeyHex, message, sigHex) { return globalThis.__chronologHost.verifyP256(pubKeyHex, message, sigHex); }
+export function verifyP256(pubKeyHex, message, sigHex, format) { return globalThis.__chronologHost.verifyP256(pubKeyHex, message, sigHex, String(format)); }
 export function canonicalJson(value) { return globalThis.__chronologHost.canonicalJson(value); }
 `
 
@@ -292,7 +315,7 @@ const __assertDeterministicJson = (val, path) => {
   }
 };
 [JSON, JSON.parse, JSON.stringify, String, Object.is,
-  (topic, query, can, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config) => Object.freeze({ topic, query, can, reject: __reject, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config: __deepFreeze(config) }),
+  (topic, query, can, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config, logId) => Object.freeze({ logId, topic, query, can, reject: __reject, mount, mountQuery, opOutcome, topicLastOpId, authorLastOpId, config: __deepFreeze(config) }),
   (out) => { __assertDeterministicJson(out, '$'); return JSON.stringify({ __ok: true, value: out }); },
   __deepFreeze];
 `
@@ -389,7 +412,7 @@ export class QuickJsSandbox {
   readonly #sqliteDriver: SqliteBuiltinDriver | undefined
   readonly #watchdogMs: number
   readonly #runtimePool: (QuickJSRuntime | undefined)[] = []
-  readonly #nestedQueryCache = new Map<string, string>()
+  /** Nested control-topic query memo: result plus the exact fuel it consumed (re-charged on hit). */
   /** Content-addressed immutable cache: casHash -> parsed chronolog-pkg/v1 manifest or decoded UTF-8 JS source. */
   readonly #moduleCache = new Map<string, DecodedCasModule>()
   readonly #wasmSandbox = new WasmSandbox()
@@ -419,7 +442,6 @@ export class QuickJsSandbox {
       try { this.#runtimePool[i]?.dispose() } catch { /* ignore */ }
       this.#runtimePool[i] = undefined
     }
-    this.#nestedQueryCache.clear()
     this.#moduleCache.clear()
     this.#wasmSandbox.clearCache()
   }
@@ -469,10 +491,10 @@ export class QuickJsSandbox {
   async invoke(input: ReducerInvocationInput): Promise<ReducerInvocationResult> {
     if (this.#disposed) throw new Error('SANDBOX_DISPOSED')
     const readPartition: CasPartition | 'any' = input.casPartition === 'public' ? 'public' : 'any'
-    const maxFuel = input.maxFuel ?? DEFAULT_MAX_FUEL
 
-    // Demand-page loop for both pure-WASM and QuickJS invocations
+    // Demand-page loop for both pure-WASM and QuickJS invocations (each attempt starts a fresh budget)
     for (let faults = 0; faults < 256; faults++) {
+      const fuel = new FuelMeter(input.maxFuel)
       try {
         perfCount(`vm.${input.method}`)
         // Check if target module is a standalone pure-WASM package (chronolog-pkg/v1 with runtime: 'wasm-pure')
@@ -490,6 +512,7 @@ export class QuickJsSandbox {
             return this.#wasmSandbox.invokeReducer({
               wasmHash,
               method: input.method,
+              logId: input.logId ?? '',
               state: input.state,
               payload: input.payload,
               ...(input.tx === undefined ? {} : { tx: input.tx }),
@@ -502,14 +525,14 @@ export class QuickJsSandbox {
                 writePartition: input.casPartition,
                 readOnly: input.readOnly,
                 maxMemoryBytes: input.maxMemoryBytes,
-                maxFuel,
+                fuel,
                 onMissingCas: (h) => { throw new MissingDependencyError(h, 'cas') },
               },
             })
           }
         }
         const qjs = await this.#wasmPromise
-        return this.#invokeSync(qjs, input, 0)
+        return this.#invokeSync(qjs, input, 0, fuel)
       } catch (err) {
         if (err instanceof MissingDependencyError && await input.cas.ensureLoaded(err.hash, readPartition)) {
           continue
@@ -518,11 +541,12 @@ export class QuickJsSandbox {
       }
     }
     const qjs = await this.#wasmPromise
-    return this.#invokeSync(qjs, input, 0)
+    return this.#invokeSync(qjs, input, 0, new FuelMeter(input.maxFuel))
   }
 
-  #acquireRuntime(qjs: QuickJSWASMModule, depth: number): QuickJSRuntime {
-    const existing = this.#runtimePool[depth]
+  /** Pooled runtime for local reads; a fresh runtime for consensus calls (history-independent GC/limits). */
+  #acquireRuntime(qjs: QuickJSWASMModule, depth: number, local: boolean): QuickJSRuntime {
+    const existing = local ? this.#runtimePool[depth] : undefined
     if (existing !== undefined) {
       this.#runtimePool[depth] = undefined
       return existing
@@ -530,26 +554,26 @@ export class QuickJsSandbox {
     return qjs.newRuntime()
   }
 
-  #releaseRuntime(runtime: QuickJSRuntime, depth: number, healthy: boolean): void {
-    if (healthy && this.#runtimePool[depth] === undefined) {
+  #releaseRuntime(runtime: QuickJSRuntime, depth: number, healthy: boolean, local: boolean): void {
+    if (local && healthy && this.#runtimePool[depth] === undefined) {
       this.#runtimePool[depth] = runtime
       return
     }
     try { runtime.dispose() } catch { /* ignore */ }
   }
 
-  #invokeSync(qjs: QuickJSWASMModule, input: ReducerInvocationInput, depth: number): ReducerInvocationResult {
-    const runtime = this.#acquireRuntime(qjs, depth)
+  #invokeSync(qjs: QuickJSWASMModule, input: ReducerInvocationInput, depth: number, fuel: FuelMeter): ReducerInvocationResult {
+    const local = input.local === true
+    const runtime = this.#acquireRuntime(qjs, depth, local)
     const openDbs = new Map<number, SqliteDbHandle>()
     let nextDbId = 1
     let missingDep: MissingDependencyError | null = null
     const moduleLoadState: { error: Error | null } = { error: null }
-    let fuelExhausted = false
     let timedOut = false
     let healthy = true
-    const maxFuel = input.maxFuel ?? DEFAULT_MAX_FUEL
-    let fuelTicks = 0
-    const deadline = Date.now() + this.#watchdogMs
+    const deadline = local ? Date.now() + this.#watchdogMs : Infinity
+    /** Charge a host bridge; a thrown FuelExhaustedError latches the meter (interrupt follows). */
+    const chargeBytes = (bytes: number): void => { fuel.charge(hostBytesFuel(bytes)) }
 
     const readPartition: CasPartition | 'any' = input.casPartition === 'public' ? 'public' : 'any'
     const writePartition: CasPartition = input.casPartition
@@ -587,14 +611,12 @@ export class QuickJsSandbox {
     try {
       runtime.setMemoryLimit(input.maxMemoryBytes)
       runtime.setMaxStackSize(512 * 1024)
-      // Deterministic fuel metering for consensus replay; wall-clock watchdog only for local read-only calls.
+      // Deterministic fuel metering: one unit per interrupt tick (the tick counter lives in the fresh
+      // context, so tick positions are identical on every replica). Wall clock only for local reads.
       runtime.setInterruptHandler(() => {
-        if (missingDep !== null) return true
-        if (++fuelTicks > maxFuel) {
-          fuelExhausted = true
-          return true
-        }
-        if (input.readOnly && Date.now() > deadline) {
+        if (missingDep !== null || fuel.exhausted) return true
+        try { fuel.charge(1) } catch { return true }
+        if (local && Date.now() > deadline) {
           timedOut = true
           return true
         }
@@ -760,8 +782,14 @@ export class QuickJsSandbox {
       const owned: QuickJSHandle[] = []
       const own = (h: QuickJSHandle): QuickJSHandle => { owned.push(h); return h }
       try {
+        const preludeFailure = (): ReducerInvocationResult => {
+          if (missingDep !== null) throw missingDep as Error
+          if (timedOut) throw new OperationalTimeoutError()
+          if (fuel.exhausted) return { ok: false, code: 'vm:fuel_exhausted' }
+          return { ok: false, code: 'vm:prelude_failed' }
+        }
         const preludeRes = ctx.evalCode(DETERMINISM_PRELUDE, '__prelude__.js')
-        if (preludeRes.error) { preludeRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }
+        if (preludeRes.error) { preludeRes.error.dispose(); return preludeFailure() }
         const preludeOut = own(preludeRes.value)
         const intrinsic = (i: number): QuickJSHandle => own(ctx.getProp(preludeOut, i))
 
@@ -781,6 +809,7 @@ export class QuickJsSandbox {
             if (fn === undefined) continue
             const handle = ctx.newFunction(name, (...args) => {
               if (missingDep !== null) throw missingDep
+              fuel.charge(HOST_CALL_FUEL)
               return fn(...args)
             })
             ctx.setProp(hostObj, name, handle)
@@ -800,21 +829,6 @@ export class QuickJsSandbox {
             return JSON.stringify(topicState)
           }
           const nestedPartition: CasPartition = (readPartition === 'public' || isControlTopic(topicName)) ? 'public' : input.casPartition
-          const modRef = input.imports[binding.module] ?? binding.module
-          const canMemoize = isControlTopic(topicName) && modRef.startsWith('cas:sha256-') && Object.keys(input.imports).length <= 32
-          let memoKey: string | null = null
-          if (canMemoize) {
-            const stateKey = input.topicHash?.(topicName) ?? bytesToHex(sha256Sync(utf8(JSON.stringify(topicState))))
-            const inputKey = JSON.stringify(rawQueryInput)
-            const configKey = binding.config === undefined ? '' : JSON.stringify(binding.config)
-            memoKey = `${nestedPartition}\0${modRef}\0${binding.export ?? 'default'}\0${stateKey}\0${configKey}\0${inputKey}`
-            const hit = this.#nestedQueryCache.get(memoKey)
-            if (hit !== undefined) {
-              this.#nestedQueryCache.delete(memoKey)
-              this.#nestedQueryCache.set(memoKey, hit)
-              return hit
-            }
-          }
           let nestedRes: ReducerInvocationResult
           try {
             nestedRes = this.#invokeSync(qjs, {
@@ -824,17 +838,18 @@ export class QuickJsSandbox {
               moduleSpecifier: binding.module,
               exportName: binding.export ?? 'default',
               method: 'query',
+              logId: input.logId,
               state: topicState,
               payload: normalizeJsonValue(rawQueryInput),
               topics: input.topics,
-              ...(input.topicHash === undefined ? {} : { topicHash: input.topicHash }),
               ...(binding.config === undefined ? {} : { config: binding.config }),
               cas: input.cas,
               casPartition: nestedPartition,
               readOnly: true,
               maxMemoryBytes: input.maxMemoryBytes,
-              maxFuel,
-            }, depth + 1)
+              maxFuel: input.maxFuel,
+              ...(local ? { local } : {}),
+            }, depth + 1, fuel)
           } catch (err) {
             if (err instanceof MissingDependencyError) {
               missingDep ??= err
@@ -842,21 +857,14 @@ export class QuickJsSandbox {
             }
             throw err
           }
+          if (fuel.exhausted) throw new FuelExhaustedError()
           if (!nestedRes.ok) {
             if (nestedRes.code === 'vm:missing_method:query') {
               return JSON.stringify(topicState)
             }
             throw new Error(`TOPIC_QUERY_FAILED:${nestedRes.code}:${nestedRes.detail ?? ''}`)
           }
-          const serialized = JSON.stringify(nestedRes.value)
-          if (memoKey !== null) {
-            this.#nestedQueryCache.set(memoKey, serialized)
-            if (this.#nestedQueryCache.size > 512) {
-              const oldest = this.#nestedQueryCache.keys().next().value
-              if (oldest !== undefined) this.#nestedQueryCache.delete(oldest)
-            }
-          }
-          return serialized
+          return JSON.stringify(nestedRes.value)
         }
 
         // Verified cross-log sub-state query against a pinned snapshot inside $mounts!
@@ -899,6 +907,7 @@ export class QuickJsSandbox {
               moduleSpecifier: binding.module,
               exportName: binding.export ?? 'default',
               method: 'query',
+              logId: input.logId,
               state: targetState,
               payload: normalizeJsonValue(rawQueryInput),
               topics: mt,
@@ -907,8 +916,9 @@ export class QuickJsSandbox {
               casPartition: 'public',
               readOnly: true,
               maxMemoryBytes: input.maxMemoryBytes,
-              maxFuel,
-            }, depth + 1)
+              maxFuel: input.maxFuel,
+              ...(local ? { local } : {}),
+            }, depth + 1, fuel)
           } catch (err) {
             if (err instanceof MissingDependencyError) {
               missingDep ??= err
@@ -916,6 +926,7 @@ export class QuickJsSandbox {
             }
             throw err
           }
+          if (fuel.exhausted) throw new FuelExhaustedError()
           if (!nestedRes.ok) {
             if (nestedRes.code === 'vm:missing_method:query') {
               return JSON.stringify(targetState)
@@ -928,6 +939,7 @@ export class QuickJsSandbox {
         bindFn('sha256', (dataHandle) => {
           const raw = ctx.dump(dataHandle) as unknown
           const bytes = typeof raw === 'string' ? utf8(raw) : raw instanceof Uint8Array ? raw : utf8(JSON.stringify(raw))
+          chargeBytes(bytes.byteLength)
           return ctx.newString(bytesToHex(sha256Sync(bytes)))
         })
 
@@ -936,6 +948,7 @@ export class QuickJsSandbox {
           if (!/^(?:[0-9a-f]{2})+$/u.test(keyHex) || keyHex.length > 2048) throw new Error('HMAC_KEY_INVALID')
           const msgRaw = ctx.dump(msgH) as unknown
           const msgBytes = typeof msgRaw === 'string' ? utf8(msgRaw) : msgRaw instanceof Uint8Array ? msgRaw : utf8(JSON.stringify(msgRaw))
+          chargeBytes(msgBytes.byteLength)
           return ctx.newString(bytesToHex(hmacSha256Sync(hexToBytes(keyHex), msgBytes)))
         })
 
@@ -945,21 +958,30 @@ export class QuickJsSandbox {
           const sigHex = ctx.getString(sigH)
           if (!/^[0-9a-f]{64}$/u.test(pubHex) || !/^[0-9a-f]{128}$/u.test(sigHex)) return ctx.false
           const msgBytes = typeof msgRaw === 'string' ? utf8(msgRaw) : msgRaw instanceof Uint8Array ? msgRaw : utf8(JSON.stringify(msgRaw))
+          fuel.charge(SIGNATURE_VERIFY_FUEL)
+          chargeBytes(msgBytes.byteLength)
           return verifyEd25519Sync(hexToBytes(pubHex), msgBytes, hexToBytes(sigHex)) ? ctx.true : ctx.false
         })
 
-        bindFn('verifyP256', (pubH, msgH, sigH) => {
+        // verifyP256(pubKeyHex, message, sigHex, format): format is 'der' (WebAuthn) or 'compact' (r||s).
+        bindFn('verifyP256', (pubH, msgH, sigH, formatH) => {
           const pubHex = ctx.getString(pubH)
           const msgRaw = ctx.dump(msgH) as unknown
           const sigHex = ctx.getString(sigH)
-          if (!/^(?:[0-9a-f]{66}|[0-9a-f]{130})$/u.test(pubHex) || !/^[0-9a-f]{128,144}$/u.test(sigHex) || sigHex.length % 2 !== 0) return ctx.false
+          const format = formatH === undefined ? '' : ctx.getString(formatH)
+          if (format !== 'der' && format !== 'compact') return ctx.false
+          if (!/^(?:[0-9a-f]{66}|[0-9a-f]{130})$/u.test(pubHex) || !/^(?:[0-9a-f]{2}){8,72}$/u.test(sigHex)) return ctx.false
           const msgBytes = typeof msgRaw === 'string' ? utf8(msgRaw) : msgRaw instanceof Uint8Array ? msgRaw : utf8(JSON.stringify(msgRaw))
-          return verifyP256Sync(hexToBytes(pubHex), msgBytes, hexToBytes(sigHex)) ? ctx.true : ctx.false
+          fuel.charge(2 * SIGNATURE_VERIFY_FUEL)
+          chargeBytes(msgBytes.byteLength)
+          return verifyP256Sync(hexToBytes(pubHex), msgBytes, hexToBytes(sigHex), format) ? ctx.true : ctx.false
         })
 
         bindFn('canonicalJson', (valH) => {
           const val = normalizeJsonValue(ctx.dump(valH))
-          return ctx.newString(canonicalEventPayload(val))
+          const text = canonicalEventPayload(val)
+          chargeBytes(text.length)
+          return ctx.newString(text)
         })
 
         bindFn('casPut', (bytesH, linksH) => {
@@ -968,6 +990,7 @@ export class QuickJsSandbox {
           const bytes = typeof raw === 'string' ? utf8(raw) : raw instanceof Uint8Array ? raw : Array.isArray(raw) ? Uint8Array.from(raw as number[]) : (() => { throw new Error('CAS_PUT_BYTES_INVALID') })()
           const rawLinks = linksH === undefined ? [] : (ctx.dump(linksH) as unknown)
           if (!Array.isArray(rawLinks) || !rawLinks.every(l => typeof l === 'string')) throw new Error('CAS_PUT_LINKS_INVALID')
+          chargeBytes(bytes.byteLength)
           const hash = input.cas.putSync(bytes, rawLinks, writePartition)
           return ctx.newString(hash)
         })
@@ -981,6 +1004,7 @@ export class QuickJsSandbox {
             tripMissing(hash, 'cas')
             return ctx.undefined
           }
+          chargeBytes(node.bytes.byteLength)
           return ctx.newString(JSON.stringify({ bytesHex: bytesToHex(node.bytes), links: node.links }))
         })
 
@@ -999,7 +1023,7 @@ export class QuickJsSandbox {
             writePartition,
             readOnly: input.readOnly,
             maxMemoryBytes: input.maxMemoryBytes,
-            maxFuel,
+            fuel,
             onMissingCas: (h) => tripMissing(h, 'cas'),
           })
           return ctx.newString(JSON.stringify(result))
@@ -1017,7 +1041,7 @@ export class QuickJsSandbox {
             writePartition,
             readOnly: input.readOnly,
             maxMemoryBytes: input.maxMemoryBytes,
-            maxFuel,
+            fuel,
             onMissingCas: (h) => tripMissing(h, 'cas'),
           })
           return ctx.newString(JSON.stringify(result))
@@ -1039,17 +1063,16 @@ export class QuickJsSandbox {
               const ids = input.topicLastOpIds
               return ids !== undefined && Object.hasOwn(ids, name) ? ids[name]! : null
             },
-            opOutcome: (opId: string) => {
-              if (input.opOutcome !== undefined) return input.opOutcome(opId)
-              if (input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, opId)) return input.opOutcomes[opId]!
-              return null
-            },
+            opOutcome: (opId: string) => input.opOutcome?.(opId) ?? null,
             authorLastOpId: (author: string) => {
               const ids = input.authorLastOpIds
               return ids !== undefined && Object.hasOwn(ids, author) ? ids[author]! : null
             },
             topicQueryJson: (topic: string, inputJson: string) => {
-              try { return queryTopic(topic, inputJson) } catch { return null }
+              try { return queryTopic(topic, inputJson) } catch (err) {
+                if (err instanceof MissingDependencyError) throw err
+                return null
+              }
             },
             can: (capability: string, actor: string) => {
               try {
@@ -1058,7 +1081,8 @@ export class QuickJsSandbox {
                   ? { kind: 'can', capability: 'scope', scope: capability.slice(6), actor, atMs: input.tx?.authorTimestampMs ?? 0 }
                   : { kind: 'can', capability, actor, atMs: input.tx?.authorTimestampMs ?? 0 }
                 return JSON.parse(queryTopic('$admission', JSON.stringify(qInput))) === true
-              } catch {
+              } catch (err) {
+                if (err instanceof MissingDependencyError) throw err
                 return false
               }
             },
@@ -1092,6 +1116,7 @@ export class QuickJsSandbox {
               readOnly: input.readOnly,
               onMissingCas: (hash) => tripMissing(hash, 'sqlite'),
               introspection,
+              fuel,
             })
             const id = nextDbId++
             openDbs.set(id, db)
@@ -1163,6 +1188,7 @@ export class QuickJsSandbox {
         const ctxMethod = (name: string, fn: (...args: QuickJSHandle[]) => QuickJSHandle | { error: QuickJSHandle } | { value: QuickJSHandle }) => {
           const handle = ctx.newFunction(name, (...args) => {
             if (missingDep !== null) throw missingDep
+            fuel.charge(HOST_CALL_FUEL)
             try {
               return fn(...args)
             } catch (err) {
@@ -1176,7 +1202,9 @@ export class QuickJsSandbox {
         const readTopicCached = (key: string): QuickJSHandle => {
           let cached = topicCache.get(key)
           if (cached === undefined) {
-            const res = vmParse(JSON.stringify(Object.hasOwn(input.topics, key) ? input.topics[key]! : null))
+            const text = JSON.stringify(Object.hasOwn(input.topics, key) ? input.topics[key]! : null)
+            chargeBytes(text.length)
+            const res = vmParse(text)
             if (res.error) throw new VmThrow(res.error)
             const frozen = ctx.callFunction(deepFreezeH, ctx.undefined, res.value)
             res.value.dispose()
@@ -1213,7 +1241,8 @@ export class QuickJsSandbox {
           }
           try {
             return JSON.parse(queryTopic('$admission', JSON.stringify(qInput))) === true ? ctx.true : ctx.false
-          } catch {
+          } catch (err) {
+            if (err instanceof MissingDependencyError) throw err
             return ctx.false
           }
         })
@@ -1234,9 +1263,7 @@ export class QuickJsSandbox {
         })
         ctxMethod('opOutcome', (opIdH) => {
           const key = vmString(opIdH)
-          const outcome = input.opOutcome !== undefined
-            ? input.opOutcome(key)
-            : input.opOutcomes !== undefined && Object.hasOwn(input.opOutcomes, key) ? input.opOutcomes[key]! : null
+          const outcome = input.opOutcome?.(key) ?? null
           return outcome === null ? ctx.null : ctx.newString(outcome)
         })
         ctxMethod('topicLastOpId', (nameH) => {
@@ -1252,10 +1279,11 @@ export class QuickJsSandbox {
           return key.length > 0 && ids !== undefined && Object.hasOwn(ids, key) ? ctx.newString(ids[key]!) : ctx.null
         })
         const configRes = vmParse(JSON.stringify(input.config ?? null))
-        if (configRes.error) { configRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }
+        if (configRes.error) { configRes.error.dispose(); return preludeFailure() }
         ctxMembers.push(own(configRes.value))
+        ctxMembers.push(input.logId === null ? ctx.null : own(ctx.newString(input.logId)))
         const ctxRes = ctx.callFunction(makeCtxH, ctx.undefined, ...ctxMembers)
-        if (ctxRes.error) { ctxRes.error.dispose(); return { ok: false, code: 'vm:prelude_failed' } }
+        if (ctxRes.error) { ctxRes.error.dispose(); return preludeFailure() }
         const ctxObj = own(ctxRes.value)
 
         // Load entry module (triggers 2-arg scoped normalizer + Import Map loading)
@@ -1268,13 +1296,13 @@ export class QuickJsSandbox {
           const dumped = ctx.dump(loadRes.error) as unknown
           loadRes.error.dispose()
           if (missingDep !== null) throw missingDep as Error
-          if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
+          if (fuel.exhausted) return { ok: false, code: 'vm:fuel_exhausted' }
           if (timedOut) throw new OperationalTimeoutError()
           return { ok: false, code: 'vm:module_load_error', detail: moduleLoadState.error !== null ? moduleLoadState.error.message : formatJsError(dumped) }
         }
         own(loadRes.value)
         if (missingDep !== null) throw missingDep as Error
-        if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
+        if (fuel.exhausted) return { ok: false, code: 'vm:fuel_exhausted' }
         if (timedOut) throw new OperationalTimeoutError()
 
         // Run: `const fn = target && target[method]; fn(...args)`; output is
@@ -1328,7 +1356,7 @@ export class QuickJsSandbox {
           const dumped = ctx.dump(runResult.error) as unknown
           runResult.error.dispose()
           if (missingDep !== null) throw missingDep as Error
-          if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
+          if (fuel.exhausted) return { ok: false, code: 'vm:fuel_exhausted' }
           if (timedOut) throw new OperationalTimeoutError()
           if (
             dumped !== null &&
@@ -1338,6 +1366,9 @@ export class QuickJsSandbox {
             const rej = dumped as { readonly code?: unknown; readonly detail?: unknown }
             const code = typeof rej.code === 'string' && rej.code.length > 0 ? rej.code : 'rejected'
             const detail = typeof rej.detail === 'string' && rej.detail.length > 0 ? rej.detail : undefined
+            if (input.method === 'query' || input.method === 'describe' || input.method === 'derive' || input.method === 'admit') {
+              return { ok: false, code, ...(detail === undefined ? {} : { detail }) }
+            }
             return {
               ok: true,
               value: { ok: false, code, ...(detail === undefined ? {} : { detail }) },
@@ -1352,7 +1383,7 @@ export class QuickJsSandbox {
           return { ok: false, code, detail }
         }
         if (missingDep !== null) throw missingDep as Error
-        if (fuelExhausted) return { ok: false, code: 'vm:fuel_exhausted' }
+        if (fuel.exhausted) return { ok: false, code: 'vm:fuel_exhausted' }
         if (timedOut) throw new OperationalTimeoutError()
         if (runResult.kind === 'missing') {
           return { ok: false, code: `vm:missing_method:${input.method}` }
@@ -1375,8 +1406,8 @@ export class QuickJsSandbox {
       healthy = false
       throw err
     } finally {
-      if (timedOut || fuelExhausted || missingDep !== null) healthy = false
-      this.#releaseRuntime(runtime, depth, healthy)
+      if (timedOut || fuel.exhausted || missingDep !== null) healthy = false
+      this.#releaseRuntime(runtime, depth, healthy, local)
     }
   }
 }

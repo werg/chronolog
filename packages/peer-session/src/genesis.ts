@@ -1,4 +1,4 @@
-import { bytesToHex, concatBytes, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
+import { bytesToHex, hexToBytes, utf8 } from '@chronolog/canonical'
 import {
   hpkeOpenBase,
   hpkeSealBase,
@@ -41,13 +41,7 @@ export interface KeysPolicy {
   readonly minSuite?: KeyBoxSuite
   readonly paddingBucketBytes?: number
   readonly hideEnvelopeAuthor?: boolean
-}
-
-export function epochKeyCommitmentV2(epochKey: Uint8Array): string {
-  if (!(epochKey instanceof Uint8Array) || epochKey.length !== 32) {
-    throw new Error('EPOCH_KEY_INVALID')
-  }
-  return bytesToHex(sha256Sync(concatBytes(utf8('chronolog/epoch-key-commitment/v2:'), epochKey)))
+  readonly distribution?: 'flat' | 'tree'
 }
 
 export async function hpkeSealEpochKey(
@@ -118,7 +112,6 @@ export interface LogMemberSeed {
   readonly writer?: boolean
   readonly administrator?: boolean
   readonly publisher?: boolean
-  readonly finalizer?: boolean
 }
 
 export interface LogTopicSeed {
@@ -206,7 +199,7 @@ export interface CreatedLogGenesis {
 }
 
 /**
- * Create a Chronolog v2 genesis block with hash-pinned standard modules, custom ES modules,
+ * Create a log genesis block with hash-pinned standard modules, custom ES modules,
  * multi-file/WASM `chronolog-pkg/v1` packages, optional `$mounts`, and optional `$builders`.
  */
 export async function createLogGenesis(options: CreateLogGenesisOptions): Promise<CreatedLogGenesis> {
@@ -292,7 +285,6 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
       writer: m.writer ?? true,
       administrator: m.administrator ?? (m.publicKey === options.creator.publicKey),
       publisher: m.publisher ?? (m.publicKey === options.creator.publicKey),
-      finalizer: m.finalizer ?? false,
     })
   }
   const members = [...memberByKey.values()].sort((a, b) => a.publicKey.localeCompare(b.publicKey))
@@ -309,10 +301,10 @@ export async function createLogGenesis(options: CreateLogGenesisOptions): Promis
   const sealReducers: Record<string, true> = {}
   const sealPaths: Record<string, Record<string, 'frozen' | 'append-only'>> = {}
   for (const r of options.seals?.reducers ?? []) {
-    if (typeof r === 'string' && r.length > 0 && r !== '$seals') sealReducers[r] = true
+    if (typeof r === 'string' && r.length > 0) sealReducers[r] = true
   }
   for (const p of options.seals?.paths ?? []) {
-    if (typeof p.topic !== 'string' || p.topic.length === 0 || p.topic === '$seals') continue
+    if (typeof p.topic !== 'string' || p.topic.length === 0) continue
     if (typeof p.path !== 'string' || p.path.length === 0) continue
     const mode: 'frozen' | 'append-only' = p.mode === 'append-only' ? 'append-only' : 'frozen'
     const existing = sealPaths[p.topic] ?? (sealPaths[p.topic] = {})

@@ -9,4 +9,11 @@ export {
   serveTabWorkerOwner,
   type TabWorkerOwnedSession,
   type ServeTabWorkerOwnerOptions,
+  type TabWorkerConfiguration,
+  type TabWorkerOpenContext,
+  type TabWorkerOwnerHandle,
+  type TabWorkerScope,
+  type TabWorkerServices,
 } from './worker-tab-owner.js'
+export { FACTS_SOURCE_STORE } from './session-types.js'
+export { connectHttpSync, httpSyncFactId, HTTP_SYNC_SOURCE, type HttpSyncLink, type HttpSyncLinkOptions, type HttpSyncLinkResult } from './http-sync-link.js'

@@ -87,3 +87,9 @@ export interface WaitOptions {
 }
 
 export const APPLICATION_EVENT_CURSOR_LIMIT = 128 * 1024
+
+/**
+ * `FactsDelta` item `source` for facts a session ingested from its shared multi-tab store
+ * (`syncFromStore`). Tab owners do not rebroadcast such facts to sibling tabs.
+ */
+export const FACTS_SOURCE_STORE = 'store'

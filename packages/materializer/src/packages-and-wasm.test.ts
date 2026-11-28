@@ -51,7 +51,7 @@ const WASM_ADD_BYTES = new Uint8Array([
 
 /**
  * Valid standalone pure-WASM reducer (chronolog-wasm/v1 ABI):
- * Exports: memory (1 page), alloc(len)->i32, reduce(ptr,len)->i64 (packed outPtr<<32 | outLen),
+ * Exports: memory (1 page, max 1), alloc(len)->i32, reduce(ptr,len)->i64 (packed outPtr<<32 | outLen),
  * returning canonical JSON `{"ok":true,"state":{"wasm":true}}` stored in linear memory at offset 16.
  */
 function buildPureWasmReducerBytes(jsonResponse: string): Uint8Array {
@@ -100,7 +100,7 @@ function buildPureWasmReducerBytes(jsonResponse: string): Uint8Array {
     0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e,
   ])
   const funcSec = sec(3, [0x02, 0x00, 0x01])
-  const memSec = sec(5, [0x01, 0x00, 0x01]) // 1 page
+  const memSec = sec(5, [0x01, 0x01, 0x01, 0x01]) // 1 page, declared max 1 page (required)
   const expSec = sec(7, [
     0x03,
     ...str('memory'), 0x02, 0x00,
@@ -292,7 +292,7 @@ describe('Scoped chronolog-pkg/v1, capability attenuation, fuel, WASM, derivatio
       limits: { ...DEFAULT_GENESIS_LIMITS, maxFuel: 40 },
       salt: new Uint8Array(16).fill(2),
       initialTopics: {
-        $admission: { members: [{ publicKey: pubHex, reader: true, writer: true, administrator: true, publisher: true, finalizer: false }], admission: null },
+        $admission: { members: [{ publicKey: pubHex, reader: true, writer: true, administrator: true, publisher: true }], admission: null },
         $reducers: {
           runtime: DEFAULT_RUNTIME_MANIFEST as unknown as JsonValue,
           imports: { ...stdImports, '@app/calc': v1.ref, '@app/spin': spin.ref },
@@ -468,8 +468,8 @@ describe('Scoped chronolog-pkg/v1, capability attenuation, fuel, WASM, derivatio
       initialTopics: {
         $admission: {
           members: [
-            { publicKey: bytesToHex(admin.publicKeyBytes), reader: true, writer: true, administrator: true, publisher: true, finalizer: false },
-            { publicKey: bytesToHex(nonAdmin.publicKeyBytes), reader: true, writer: true, administrator: false, publisher: false, finalizer: false },
+            { publicKey: bytesToHex(admin.publicKeyBytes), reader: true, writer: true, administrator: true, publisher: true },
+            { publicKey: bytesToHex(nonAdmin.publicKeyBytes), reader: true, writer: true, administrator: false, publisher: false },
           ],
           admission: null,
         },

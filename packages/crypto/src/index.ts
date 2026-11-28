@@ -1,5 +1,6 @@
 export * from './epoch.js'
 export * from './hpke.js'
 export * from './xwing.js'
+export * from './keytree.js'
 export * from './ed25519-sync.js'
 export * from './shamir.js'

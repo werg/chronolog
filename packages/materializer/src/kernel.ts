@@ -32,6 +32,7 @@ import {
   MissingDependencyError,
   QuickJsSandbox,
   type QuickJsSandboxOptions,
+  type ReducerInvocationResult,
 } from './quickjs-sandbox.js'
 
 export interface KernelOperationInput {
@@ -41,6 +42,11 @@ export interface KernelOperationInput {
   readonly verified?: boolean
   /** Compartment key ring that decrypted this encrypted operation ('default' when omitted). */
   readonly ring?: string
+  /**
+   * Public envelope epoch of an encrypted operation on a private log. Required to enforce
+   * `$keys.policy.maxOpsPerEpoch`: when that budget is set, an encrypted op without it is rejected.
+   */
+  readonly epoch?: number
 }
 
 export interface KernelRevision {
@@ -54,6 +60,106 @@ export interface KernelRevision {
 interface RecordedOpOutcome {
   readonly outcome: 'accepted' | 'rejected'
   readonly visibility: OperationVisibility
+  /** Key ring of an encrypted op on a private log (null otherwise); scopes outcome visibility. */
+  readonly ring: string | null
+}
+
+type ApplyStep =
+  | { readonly kind: 'done'; readonly outcome: KernelOperationOutcome }
+  | { readonly kind: 'missing'; readonly dependency: string }
+
+type TopicBindingConfig = ReducersConfig['topics'][string]
+
+interface AssumptionFailure {
+  readonly code: string
+  readonly detail: string
+  readonly checkIndex: number
+}
+
+/** Everything one operation's evaluation may observe (see TopicKernel#opView). */
+interface OpView {
+  readonly visible: (topic: string) => boolean
+  readonly filter: (topics: Readonly<Record<string, JsonValue>>) => Readonly<Record<string, JsonValue>>
+  readonly topicLastOpIds: Readonly<Record<string, string>>
+  readonly authorLastOpIds: Readonly<Record<string, string>>
+  readonly opOutcome: (opId: string) => 'accepted' | 'rejected' | null
+  /** Public op on a private log (`$*` only). */
+  readonly publicOnly: boolean
+}
+
+interface OpContext {
+  readonly core: OperationCore
+  readonly opIdHex: string
+  readonly authorHex: string
+  readonly view: OpView
+  /** CAS partition reducers of this op write to. */
+  readonly casPartition: CasPartition
+}
+
+interface CommitCandidate {
+  readonly kind: 'commit'
+  readonly topics: Record<string, JsonValue>
+  readonly hashes: ReadonlyMap<string, string>
+  readonly events: readonly EmittedKernelEvent[]
+}
+
+type EvaluateResult = CommitCandidate | { readonly kind: 'rejected'; readonly code: string; readonly detail?: string }
+
+/**
+ * Interpret an authorize/verify result: null when allowed (including a module that does not export
+ * the method), otherwise the rejection. `false` or `{ ok: false, code?, detail? }` deny.
+ */
+function decisionDenial(
+  res: ReducerInvocationResult,
+  method: 'authorize' | 'verify',
+  defaultCode: string,
+): { readonly kind: 'rejected'; readonly code: string; readonly detail?: string } | null {
+  if (!res.ok) {
+    if (res.code === `vm:missing_method:${method}`) return null
+    return { kind: 'rejected', code: res.code, ...(res.detail === undefined ? {} : { detail: res.detail }) }
+  }
+  if (res.value === false) return { kind: 'rejected', code: defaultCode }
+  if (res.value !== null && typeof res.value === 'object' && !Array.isArray(res.value)) {
+    const obj = res.value as Readonly<Record<string, JsonValue>>
+    if (obj.ok === false) {
+      return {
+        kind: 'rejected',
+        code: typeof obj.code === 'string' && obj.code.length > 0 ? obj.code : defaultCode,
+        ...(typeof obj.detail === 'string' ? { detail: obj.detail } : {}),
+      }
+    }
+  }
+  return null
+}
+
+/** `$keys.topicRings` (topic -> ring) or null when the log defines no ring bindings. */
+function topicRingsOf(topics: Readonly<Record<string, JsonValue>>): Readonly<Record<string, JsonValue>> | null {
+  const keys = topics.$keys
+  if (keys === null || keys === undefined || typeof keys !== 'object' || Array.isArray(keys)) return null
+  const raw = (keys as Readonly<Record<string, JsonValue>>).topicRings
+  return raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Readonly<Record<string, JsonValue>>)
+    : null
+}
+
+/** `$keys.policy.maxOpsPerEpoch` as a positive safe integer, or null when no budget is set. */
+function maxOpsPerEpochOf(topics: Readonly<Record<string, JsonValue>>): number | null {
+  const keys = topics.$keys
+  if (keys === null || typeof keys !== 'object' || Array.isArray(keys)) return null
+  const policy = (keys as Readonly<Record<string, JsonValue>>).policy
+  if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) return null
+  const max = (policy as Readonly<Record<string, JsonValue>>).maxOpsPerEpoch
+  return typeof max === 'number' && Number.isSafeInteger(max) && max >= 1 ? max : null
+}
+
+function ringOfTopic(topicRings: Readonly<Record<string, JsonValue>> | null, topic: string): string {
+  const bound = topicRings?.[topic]
+  return typeof bound === 'string' && bound.length > 0 ? bound : 'default'
+}
+
+/** Private-log `authorLastOpIds` key: last op of `author` among ops of `ring` (newer than its last public op). */
+function ringAuthorKey(ring: string, author: string): string {
+  return `${ring}:${author}`
 }
 
 /**
@@ -66,6 +172,7 @@ export interface KernelSnapshot {
   readonly topicLastOpIds: ReadonlyMap<string, string>
   readonly authorLastOpIds: ReadonlyMap<string, string>
   readonly publicAuthorLastOpIds: ReadonlyMap<string, string>
+  readonly epochOpCounts: ReadonlyMap<string, number>
   readonly seenLength: number
   readonly historyDigest: string
   readonly stateRoot: string
@@ -116,6 +223,8 @@ interface KernelMutableState {
   topicLastOpIds: Map<string, string>
   authorLastOpIds: Map<string, string>
   publicAuthorLastOpIds: Map<string, string>
+  /** Private logs: `${ring}:${epoch}` -> accepted encrypted ops (for `$keys.policy.maxOpsPerEpoch`). */
+  epochOpCounts: Map<string, number>
   historyDigest: string
   stateRoot: string
 }
@@ -190,7 +299,8 @@ function computeTopicHashes(topics: Readonly<Record<string, JsonValue>>): Map<st
   return out
 }
 
-function computeStateRoot(topics: Readonly<Record<string, JsonValue>>): string {
+/** Commitment over every topic's content hash (CRDT contract §4 `stateRoot`). */
+export function computeStateRoot(topics: Readonly<Record<string, JsonValue>>): string {
   return stateRootFromHashes(computeTopicHashes(topics))
 }
 
@@ -322,18 +432,38 @@ function readTopicPath(root: JsonValue | undefined, path: string): JsonValue | u
   return cur
 }
 
-function resolveEffectiveBindingTag(reducersRaw: JsonValue | undefined, topic: string): string {
+/**
+ * Deterministic identity of a topic's reducer binding, used by `$seals.reducers` pinning and the
+ * `$admission.verify` presence memo. It is a pure function of `$reducers` (never of local CAS
+ * contents): the binding's module reference, export and config plus the log-wide runtime
+ * (engine + builtins) and the FULL import map, which is everything module resolution can consult
+ * (`chronolog/*` overrides, package fallbacks to top-level imports, transitive bare specifiers).
+ * Consequently a sealed reducer also freezes the import map; new topics can still be added with
+ * direct `cas:sha256-...` module references in `$reducers.topics`.
+ */
+function reducerBindingTag(reducersRaw: JsonValue | undefined, topic: string): string {
   if (reducersRaw === undefined) return 'NONE'
   let cfg: ReducersConfig
   try { cfg = assertValidReducersConfig(reducersRaw) } catch { return 'INVALID' }
   const b = cfg.topics[topic]
   if (b === undefined) return 'UNBOUND'
-  const resolvedModule = b.module.startsWith('cas:sha256-') ? b.module : (cfg.imports[b.module] ?? b.module)
   return canonicalValueTag({
-    module: resolvedModule,
+    module: b.module,
     export: b.export ?? 'default',
     config: b.config ?? null,
+    runtime: { js: cfg.runtime.js, builtins: cfg.runtime.builtins },
+    imports: cfg.imports,
   })
+}
+
+/** The binding's own resolved module reference, export and config (diagnostics only). */
+function directBindingTag(reducersRaw: JsonValue | undefined, topic: string): string {
+  if (reducersRaw === undefined) return 'NONE'
+  let cfg: ReducersConfig
+  try { cfg = assertValidReducersConfig(reducersRaw) } catch { return 'INVALID' }
+  const b = cfg.topics[topic]
+  if (b === undefined) return 'UNBOUND'
+  return canonicalValueTag({ module: cfg.imports[b.module] ?? b.module, export: b.export ?? 'default', config: b.config ?? null })
 }
 
 function checkSealsEnforced(
@@ -344,10 +474,14 @@ function checkSealsEnforced(
   const seals = normalizeSealsState(beforeSealsRaw)
   const lockedReducers = Object.keys(seals.reducers)
   if (lockedReducers.length > 0 && beforeTopics.$reducers !== afterTopics.$reducers) {
-    for (const topic of lockedReducers) {
-      if (resolveEffectiveBindingTag(beforeTopics.$reducers, topic) !== resolveEffectiveBindingTag(afterTopics.$reducers, topic)) {
-        return { ok: false, code: 'seal:reducer_locked', detail: topic }
-      }
+    const violated = lockedReducers
+      .filter(topic => reducerBindingTag(beforeTopics.$reducers, topic) !== reducerBindingTag(afterTopics.$reducers, topic))
+      .sort()
+    if (violated.length > 0) {
+      // Report the sealed topics whose own module/export/config changed; fall back to every sealed
+      // topic invalidated only by a shared import-map or runtime change.
+      const direct = violated.filter(topic => directBindingTag(beforeTopics.$reducers, topic) !== directBindingTag(afterTopics.$reducers, topic))
+      return { ok: false, code: 'seal:reducer_locked', detail: (direct.length > 0 ? direct : violated).join(',') }
     }
   }
   for (const [topic, rules] of Object.entries(seals.paths)) {
@@ -393,12 +527,14 @@ function checkSealsEnforced(
 }
 
 /**
- * Chronolog v2 Topic Kernel & Suffix-Replay Engine.
+ * Chronolog Topic Kernel & Suffix-Replay Engine.
  * - Flat timestamp-ordered operation set: (authorTimestampMs, author, opId)
  * - Strict two-way public/encrypted control partition (blind-host equivalent)
  * - Scoped idempotency (visibility, author, operationId) in authenticated seenOpsRoot
  * - Rolling historyDigest + stateRoot + revision.digest
  * - Fresh QuickJSContext per call + uncatchable MissingDependency suspension
+ * - `$keys.topicRings` compartments: an encrypted op only observes `$*` and its own ring
+ * - Consensus calls are bounded by genesis `limits.maxFuel` only (no wall clock)
  */
 export class TopicKernel {
   readonly genesis: LogGenesis
@@ -424,8 +560,14 @@ export class TopicKernel {
   /** Set when a materialize threw mid-replay: the live logs no longer match committed state. */
   #logsDirty = false
   #topicLastOpIds = new Map<string, string>()
+  /**
+   * Non-private logs: author -> last accepted op. Private logs: `${ring}:${author}` -> last accepted
+   * encrypted op of that ring, present only while newer than the author's last public op.
+   */
   #authorLastOpIds = new Map<string, string>()
   #publicAuthorLastOpIds = new Map<string, string>()
+  /** `${ring}:${epoch}` -> accepted encrypted ops of that epoch (enforces `$keys.policy.maxOpsPerEpoch`). */
+  #epochOpCounts = new Map<string, number>()
   #historyDigest: string = ZERO_HASH
   #stateRoot: string
   #pendingDependencies = new Set<string>()
@@ -433,6 +575,8 @@ export class TopicKernel {
   #snapshots = new Map<number, KernelSnapshot>()
   /** All $reducers module/package CAS hashes ever activated in the current replay window (prevents GC from dropping intermediate upgrades). */
   #historicalReducerRoots = new Set<string>()
+  /** Every key ring ever seen (monotonic superset; only used to retire ring-scoped author entries). */
+  #ringNames = new Set<string>(['default'])
   #frontierOpIds = new Set<string>()
   #frontierOrderLength = 0
   #frontierMaxTimestampMs = 0n
@@ -475,6 +619,7 @@ export class TopicKernel {
       topicLastOpIds: new Map(state.topicLastOpIds),
       authorLastOpIds: new Map(state.authorLastOpIds),
       publicAuthorLastOpIds: new Map(state.publicAuthorLastOpIds),
+      epochOpCounts: new Map(state.epochOpCounts),
       seenLength: state.seen.length,
       historyDigest: state.historyDigest,
       stateRoot: state.stateRoot,
@@ -489,6 +634,7 @@ export class TopicKernel {
       topicLastOpIds: new Map(this.#topicLastOpIds),
       authorLastOpIds: new Map(this.#authorLastOpIds),
       publicAuthorLastOpIds: new Map(this.#publicAuthorLastOpIds),
+      epochOpCounts: new Map(this.#epochOpCounts),
       seenLength: this.#committedSeenLength,
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
@@ -587,8 +733,24 @@ export class TopicKernel {
     return this.#topicLastOpIds.get(topic) ?? null
   }
 
-  authorLastOpId(author: string, options: { readonly publicOnly?: boolean } = {}): string | null {
-    return (options.publicOnly === true ? this.#publicAuthorLastOpIds : this.#authorLastOpIds).get(author) ?? null
+  /** Record ring names that appear in restored ring-scoped author entries. */
+  #seedRingNames(): void {
+    if (!this.genesis.privateLog) return
+    for (const key of this.#authorLastOpIds.keys()) {
+      const at = key.lastIndexOf(':')
+      if (at > 0) this.#ringNames.add(key.slice(0, at))
+    }
+  }
+
+  /**
+   * Last accepted op of `author` as an operation authored now would observe it (`author_last_op`
+   * assumptions): `publicOnly` for a public op; otherwise, on private logs, the view of an encrypted
+   * op in `ring` (default 'default'): its ring's ops and all public ops.
+   */
+  authorLastOpId(author: string, options: { readonly publicOnly?: boolean; readonly ring?: string } = {}): string | null {
+    if (options.publicOnly === true) return this.#publicAuthorLastOpIds.get(author) ?? null
+    if (!this.genesis.privateLog) return this.#authorLastOpIds.get(author) ?? null
+    return this.#authorLastOpIds.get(ringAuthorKey(options.ring ?? 'default', author)) ?? this.#publicAuthorLastOpIds.get(author) ?? null
   }
 
   get outcomes(): readonly KernelOperationOutcome[] {
@@ -674,6 +836,7 @@ export class TopicKernel {
       topicLastOpIds: Object.fromEntries(this.#topicLastOpIds),
       authorLastOpIds: Object.fromEntries(this.#authorLastOpIds),
       publicAuthorLastOpIds: Object.fromEntries(this.#publicAuthorLastOpIds),
+      epochOpCounts: Object.fromEntries(this.#epochOpCounts),
     }
   }
 
@@ -756,9 +919,13 @@ export class TopicKernel {
     this.#topicLastOpIds = new Map(Object.entries(cache.topicLastOpIds ?? {}))
     this.#authorLastOpIds = new Map(Object.entries(cache.authorLastOpIds ?? {}))
     this.#publicAuthorLastOpIds = new Map(Object.entries(cache.publicAuthorLastOpIds ?? {}))
-    for (const o of this.#outcomes) {
-      this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility })
+    this.#epochOpCounts = new Map(Object.entries(cache.epochOpCounts ?? {}))
+    for (let i = 0; i < this.#outcomes.length; i++) {
+      const o = this.#outcomes[i]!
+      const ring = this.genesis.privateLog && o.visibility === 'encrypted' ? (order[i]!.ring ?? 'default') : null
+      this.#outcomeLog.add(o.opId, { outcome: o.outcome, visibility: o.visibility, ring })
     }
+    this.#seedRingNames()
     this.#frontierOpIds = new Set(cache.frontierOpIds)
     this.#frontierOrderLength = cache.frontierOpIds.length
     this.#frontierMaxTimestampMs = BigInt(cache.frontierMaxTimestampMs ?? 0n)
@@ -802,6 +969,7 @@ export class TopicKernel {
     this.#topicLastOpIds.clear()
     this.#authorLastOpIds.clear()
     this.#publicAuthorLastOpIds.clear()
+    this.#epochOpCounts.clear()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(checkpoint.topics)) : structuredClone(checkpoint.topics)
     this.#topicHashes = computeTopicHashes(this.#topics)
     this.#resetLogs(decodedSeen)
@@ -829,6 +997,8 @@ export class TopicKernel {
     this.#topicLastOpIds = new Map(Object.entries(cache.topicLastOpIds ?? {}))
     this.#authorLastOpIds = new Map(Object.entries(cache.authorLastOpIds ?? {}))
     this.#publicAuthorLastOpIds = new Map(Object.entries(cache.publicAuthorLastOpIds ?? {}))
+    this.#epochOpCounts = new Map(Object.entries(cache.epochOpCounts ?? {}))
+    this.#seedRingNames()
     this.#topics = this.blindHostMode ? filterPublicTopics(structuredClone(cache.topics)) : structuredClone(cache.topics)
     this.#topicHashes = computeTopicHashes(this.#topics)
     this.#resetLogs(decodedSeen)
@@ -927,6 +1097,7 @@ export class TopicKernel {
       topicLastOpIds: new Map(snap.topicLastOpIds),
       authorLastOpIds: new Map(snap.authorLastOpIds),
       publicAuthorLastOpIds: new Map(snap.publicAuthorLastOpIds),
+      epochOpCounts: new Map(snap.epochOpCounts),
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
     }
@@ -978,6 +1149,7 @@ export class TopicKernel {
       this.#topicLastOpIds = work.topicLastOpIds
       this.#authorLastOpIds = work.authorLastOpIds
       this.#publicAuthorLastOpIds = work.publicAuthorLastOpIds
+      this.#epochOpCounts = work.epochOpCounts
       this.#historyDigest = work.historyDigest
       this.#stateRoot = work.stateRoot
       this.#order = nextOrder
@@ -1003,608 +1175,148 @@ export class TopicKernel {
     }
   }
 
+  /**
+   * Apply one operation to `work`. A MissingDependencyError anywhere in evaluation suspends the op
+   * (`kind: 'missing'`) and leaves `work` exactly as it was (including the idempotency log).
+   */
   async #applyOne(
     work: KernelMutableState,
     entry: KernelOperationInput,
     opIdHex: string,
     authorHex: string,
-  ): Promise<{ readonly kind: 'done'; readonly outcome: KernelOperationOutcome } | { readonly kind: 'missing'; readonly dependency: string }> {
+  ): Promise<ApplyStep> {
+    const seenMark = work.seen.length
+    try {
+      return await this.#applyOneInner(work, entry, opIdHex, authorHex)
+    } catch (err) {
+      if (err instanceof MissingDependencyError) {
+        work.seen.truncate(seenMark)
+        return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
+      }
+      throw err
+    }
+  }
+
+  async #applyOneInner(
+    work: KernelMutableState,
+    entry: KernelOperationInput,
+    opIdHex: string,
+    authorHex: string,
+  ): Promise<ApplyStep> {
     const core = entry.core
-    const makeRejected = (
+    const privateLog = this.genesis.privateLog
+    const ring = privateLog && core.visibility === 'encrypted' ? (entry.ring ?? 'default') : null
+    if (ring !== null) this.#ringNames.add(ring)
+    const reject = (
       code: string,
       detail?: string,
       extra?: { readonly conflictRecorded?: boolean; readonly events?: readonly EmittedKernelEvent[] },
-    ): { readonly kind: 'done'; readonly outcome: KernelOperationOutcome } => {
+    ): ApplyStep => {
       const evs = extra?.events ?? []
-      const outcome: KernelOperationOutcome = {
-        opId: opIdHex,
-        author: authorHex,
-        operationId: core.operationId,
-        authorTimestampMs: core.authorTimestampMs,
-        visibility: core.visibility,
-        outcome: 'rejected',
-        rejectionCode: code,
-        ...(detail === undefined ? {} : { rejectionDetail: detail }),
-        ...(extra?.conflictRecorded === true ? { conflictRecorded: true } : {}),
-        events: evs,
-      }
-      work.outcomes.add(opIdHex, { outcome: 'rejected', visibility: core.visibility })
+      work.outcomes.add(opIdHex, { outcome: 'rejected', visibility: core.visibility, ring })
       work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'rejected', code, evs)
-      return { kind: 'done', outcome }
+      return {
+        kind: 'done',
+        outcome: {
+          opId: opIdHex,
+          author: authorHex,
+          operationId: core.operationId,
+          authorTimestampMs: core.authorTimestampMs,
+          visibility: core.visibility,
+          outcome: 'rejected',
+          rejectionCode: code,
+          ...(detail === undefined ? {} : { rejectionDetail: detail }),
+          ...(extra?.conflictRecorded === true ? { conflictRecorded: true } : {}),
+          events: evs,
+        },
+      }
     }
 
-    // Strict two-way partition check on privateLog
-    if (this.genesis.privateLog) {
+    // Scoped idempotency (visibility, author, operationId). Every outcome other than this duplicate
+    // rejection consumes the key, so the consumed set is a pure function of the ordered history.
+    const dedupKey = seenOpKey(core.visibility, authorHex, core.operationId)
+    if (work.seen.has(dedupKey)) return reject('operation_conflict')
+    work.seen.add(dedupKey, true)
+
+    const topicRings = topicRingsOf(work.topics)
+    if (privateLog) {
       if (core.visibility === 'public') {
-        if (core.updates.some(u => !isControlTopic(u.topic))) {
-          return makeRejected('partition:public_op_private_topic')
-        }
+        if (core.updates.some(u => !isControlTopic(u.topic))) return reject('partition:public_op_private_topic')
       } else {
-        if (core.updates.some(u => isControlTopic(u.topic))) {
-          return makeRejected('partition:encrypted_op_control_topic')
-        }
-        // Kernel-enforced compartment ring isolation: any topic bound in `$keys.topicRings`
-        // MUST be encrypted under that exact ring and cannot be mixed with another ring.
-        const keysObj =
-          work.topics.$keys !== null && typeof work.topics.$keys === 'object' && !Array.isArray(work.topics.$keys)
-            ? (work.topics.$keys as Readonly<Record<string, JsonValue>>)
-            : null
-        const rawTopicRings = keysObj?.topicRings
-        const topicRings =
-          rawTopicRings !== undefined && rawTopicRings !== null && typeof rawTopicRings === 'object' && !Array.isArray(rawTopicRings)
-            ? (rawTopicRings as Readonly<Record<string, JsonValue>>)
-            : null
+        if (core.updates.some(u => isControlTopic(u.topic))) return reject('partition:encrypted_op_control_topic')
+        // Kernel-enforced compartment ring isolation: any topic bound in `$keys.topicRings` MUST be
+        // encrypted under that exact ring and cannot be mixed with another ring.
         if (topicRings !== null) {
           let requiredRing: string | null = null
           for (const u of core.updates) {
-            const bound = topicRings[u.topic]
-            const topicRing = typeof bound === 'string' && bound.length > 0 ? bound : 'default'
+            const topicRing = ringOfTopic(topicRings, u.topic)
             if (requiredRing === null) requiredRing = topicRing
             else if (requiredRing !== topicRing) {
-              return makeRejected('ring:mixed_updates', `Cannot mix topics from rings "${requiredRing}" and "${topicRing}"`)
+              return reject('ring:mixed_updates', `Cannot mix topics from rings "${requiredRing}" and "${topicRing}"`)
             }
           }
-          const actualRing = entry.ring ?? 'default'
-          if (requiredRing !== null && actualRing !== requiredRing) {
-            return makeRejected('ring:mismatch', `Expected ring "${requiredRing}", got "${actualRing}"`)
+          if (requiredRing !== null && ring !== requiredRing) {
+            return reject('ring:mismatch', `Expected ring "${requiredRing}", got "${String(ring)}"`)
           }
         }
       }
     }
+    if (core.updates.length > this.genesis.limits.maxUpdatesPerOp) return reject('limit:max_updates_per_op')
 
-    if (core.updates.length > this.genesis.limits.maxUpdatesPerOp) {
-      return makeRejected('limit:max_updates_per_op')
-    }
-
-    // Scoped idempotency check: (visibility, author, operationId)
-    const dedupKey = seenOpKey(core.visibility, authorHex, core.operationId)
-    if (work.seen.has(dedupKey)) {
-      return makeRejected('operation_conflict')
-    }
-
-    // Consume idempotency handle (even if reducer rejects, matching Chronolog's contract)
-    const casPartition: CasPartition = (this.genesis.privateLog && core.visibility === 'public') ? 'public' : 'private'
-    const isPublicOnPrivate = this.genesis.privateLog && core.visibility === 'public'
-
-    const visibleOutcome = (opId: string): 'accepted' | 'rejected' | null => {
-      const rec = work.outcomes.get(opId)
-      if (rec === undefined || (isPublicOnPrivate && rec.visibility !== 'public')) return null
-      return rec.outcome
-    }
-    const buildVisibleTopicLastOpIds = (): Record<string, string> => {
-      const out: Record<string, string> = {}
-      for (const [topicName, lastId] of work.topicLastOpIds) {
-        if (isPublicOnPrivate && !isControlTopic(topicName)) continue
-        out[topicName] = lastId
+    // `$keys.policy.maxOpsPerEpoch`: accepted encrypted ops per (ring, envelope epoch), counted in
+    // canonical order. Every replica holding the ring key sees the same ops, so the cut is identical.
+    let epochKey: string | null = null
+    if (ring !== null) {
+      const budget = maxOpsPerEpochOf(work.topics)
+      if (entry.epoch !== undefined) epochKey = `${ring}:${entry.epoch}`
+      if (budget !== null) {
+        if (epochKey === null) return reject('epoch_op_budget_exhausted', 'Encrypted operation input carries no envelope epoch')
+        if ((work.epochOpCounts.get(epochKey) ?? 0) >= budget) {
+          return reject('epoch_op_budget_exhausted', `Epoch ${String(entry.epoch)} of ring "${ring}" reached $keys.policy.maxOpsPerEpoch (${String(budget)})`)
+        }
       }
-      return out
     }
 
-    const buildVisibleAuthorLastOpIds = (): Record<string, string> => {
-      const source = isPublicOnPrivate ? work.publicAuthorLastOpIds : work.authorLastOpIds
-      return Object.fromEntries(source)
+    const view = this.#opView(work, core.visibility, ring, topicRings)
+    const op: OpContext = {
+      core,
+      opIdHex,
+      authorHex,
+      view,
+      casPartition: privateLog && core.visibility === 'public' ? 'public' : 'private',
     }
 
-    // Evaluate signed operation-level assumptions before applying topic updates
     if (core.assumptions !== undefined && core.assumptions.checks.length > 0) {
-      const visibleTopicsForAssumptions = isPublicOnPrivate ? filterPublicTopics(work.topics) : work.topics
-      const visibleTopicLastOps = buildVisibleTopicLastOpIds()
-      const visibleAuthorLastOps = buildVisibleAuthorLastOpIds()
-      let failure: { readonly code: string; readonly detail?: string; readonly checkIndex: number } | null = null
-
-      for (let i = 0; i < core.assumptions.checks.length; i++) {
-        const chk: OperationAssumption = core.assumptions.checks[i]!
-        if (chk.kind === 'op_accepted') {
-          const st = visibleOutcome(chk.opId)
-          if (st === null) {
-            failure = { code: 'assumption:missing_op', detail: `Required op ${chk.opId} not present`, checkIndex: i }
-            break
-          }
-          if (st !== 'accepted') {
-            failure = { code: 'assumption:dependency_rejected', detail: `Required op ${chk.opId} was rejected`, checkIndex: i }
-            break
-          }
-        } else if (chk.kind === 'op_rejected') {
-          const st = visibleOutcome(chk.opId)
-          if (st === null) {
-            failure = { code: 'assumption:missing_op', detail: `Referenced op ${chk.opId} not present`, checkIndex: i }
-            break
-          }
-          if (st !== 'rejected') {
-            failure = { code: 'assumption:expected_rejected', detail: `Expected op ${chk.opId} to be rejected`, checkIndex: i }
-            break
-          }
-        } else if (chk.kind === 'op_present') {
-          const st = visibleOutcome(chk.opId)
-          if (st === null) {
-            failure = { code: 'assumption:missing_op', detail: `Required op ${chk.opId} not present`, checkIndex: i }
-            break
-          }
-        } else if (chk.kind === 'author_last_op') {
-          const targetAuthor = chk.author ?? authorHex
-          const actual = Object.hasOwn(visibleAuthorLastOps, targetAuthor) ? visibleAuthorLastOps[targetAuthor]! : null
-          if (actual !== chk.lastOpId) {
-            failure = { code: 'assumption:author_history_mismatch', detail: `Author ${targetAuthor} lastOpId expected ${String(chk.lastOpId)}, got ${String(actual)}`, checkIndex: i }
-            break
-          }
-        } else if (chk.kind === 'topic_revision') {
-          if (isPublicOnPrivate && !isControlTopic(chk.topic)) {
-            failure = { code: 'partition:public_op_private_assumption', detail: `Public op cannot assume private topic ${chk.topic}`, checkIndex: i }
-            break
-          }
-          const actual = Object.hasOwn(visibleTopicLastOps, chk.topic) ? visibleTopicLastOps[chk.topic]! : null
-          if (actual !== chk.lastOpId) {
-            failure = { code: 'assumption:topic_modified', detail: `Topic ${chk.topic} lastOpId expected ${String(chk.lastOpId)}, got ${String(actual)}`, checkIndex: i }
-            break
-          }
-        } else if (chk.kind === 'query_match') {
-          if (isPublicOnPrivate && !isControlTopic(chk.topic)) {
-            failure = { code: 'partition:public_op_private_assumption', detail: `Public op cannot query private topic ${chk.topic}`, checkIndex: i }
-            break
-          }
-          let reducersConfig: ReducersConfig
-          try {
-            reducersConfig = assertValidReducersConfig(work.topics.$reducers)
-          } catch (err) {
-            failure = { code: 'reducers_config_invalid', detail: err instanceof Error ? err.message : String(err), checkIndex: i }
-            break
-          }
-          const binding = reducersConfig.topics[chk.topic]
-          const topicState: JsonValue = Object.hasOwn(visibleTopicsForAssumptions, chk.topic) ? visibleTopicsForAssumptions[chk.topic]! : null
-          let actualValue: JsonValue = topicState
-          if (binding !== undefined) {
-            let qRes
-            try {
-              qRes = await this.sandbox.invoke({
-                imports: reducersConfig.imports,
-                builtins: reducersConfig.runtime.builtins,
-                topicBindings: reducersConfig.topics,
-                moduleSpecifier: binding.module,
-                exportName: binding.export ?? 'default',
-                method: 'query',
-                state: topicState,
-                payload: chk.query,
-                opOutcome: visibleOutcome,
-                topicLastOpIds: visibleTopicLastOps,
-                topics: visibleTopicsForAssumptions,
-                ...(binding.config === undefined ? {} : { config: binding.config }),
-                cas: this.cas,
-                casPartition: (isPublicOnPrivate || isControlTopic(chk.topic)) ? 'public' : 'private',
-                readOnly: true,
-                maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-                ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
-              })
-            } catch (err) {
-              if (err instanceof MissingDependencyError) {
-                return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
-              }
-              throw err
-            }
-            if (!qRes.ok) {
-              if (qRes.code !== 'vm:missing_method:query') {
-                failure = { code: 'assumption:query_failed', detail: qRes.detail ?? qRes.code, checkIndex: i }
-                break
-              }
-            } else {
-              actualValue = qRes.value
-            }
-          }
-          if (canonicalJson(actualValue) !== canonicalJson(chk.expect)) {
-            failure = { code: 'assumption:query_mismatch', detail: `Query assumption ${i} on ${chk.topic} did not match`, checkIndex: i }
-            break
-          }
-        }
-      }
-
+      const failure = await this.#checkAssumptions(work, op)
       if (failure !== null) {
-        work.seen.add(dedupKey, true)
-        if (core.assumptions.onFailed === 'record_conflict' && failure.code !== 'partition:public_op_private_assumption') {
-          const primaryUpdate = core.updates[0]!
-          let reducersConfig: ReducersConfig | null = null
-          try { reducersConfig = assertValidReducersConfig(work.topics.$reducers) } catch { /* leave null */ }
-          const binding = reducersConfig?.topics[primaryUpdate.topic]
-          if (reducersConfig !== null && binding !== undefined) {
-            const curTopicState: JsonValue = Object.hasOwn(work.topics, primaryUpdate.topic) ? work.topics[primaryUpdate.topic]! : null
-            let conflictRes
-            try {
-              conflictRes = await this.sandbox.invoke({
-                imports: reducersConfig.imports,
-                builtins: reducersConfig.runtime.builtins,
-                topicBindings: reducersConfig.topics,
-                moduleSpecifier: binding.module,
-                exportName: binding.export ?? 'default',
-                method: 'onConflict',
-                state: curTopicState,
-                payload: primaryUpdate.input,
-                tx: {
-                  opId: opIdHex,
-                  author: authorHex,
-                  authorTimestampMs: Number(core.authorTimestampMs),
-                  operationId: core.operationId,
-                },
-                conflict: failure,
-                opOutcome: visibleOutcome,
-                topicLastOpIds: visibleTopicLastOps,
-                topics: visibleTopicsForAssumptions,
-                ...(binding.config === undefined ? {} : { config: binding.config }),
-                cas: this.cas,
-                casPartition,
-                readOnly: false,
-                maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-                ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
-              })
-            } catch (err) {
-              if (err instanceof MissingDependencyError) {
-                return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
-              }
-              throw err
-            }
-            if (conflictRes.ok && conflictRes.value !== null && typeof conflictRes.value === 'object' && !Array.isArray(conflictRes.value)) {
-              const outRec = conflictRes.value as Readonly<Record<string, JsonValue>>
-              if (outRec.ok === true) {
-                const nextTopicState: JsonValue = outRec.state === undefined ? null : outRec.state
-                const encodedTopic = encodeCanonicalJsonCbor(nextTopicState)
-                if (encodedTopic.length <= this.genesis.limits.maxTopicStateBytes) {
-                  const conflictEvents: EmittedKernelEvent[] = []
-                  let ord = 0
-                  if (Array.isArray(outRec.events)) {
-                    for (const rawEv of outRec.events as readonly JsonValue[]) {
-                      if (rawEv !== null && typeof rawEv === 'object' && !Array.isArray(rawEv)) {
-                        const ev = rawEv as Readonly<Record<string, JsonValue>>
-                        if (typeof ev.topic === 'string') {
-                          conflictEvents.push({
-                            opId: opIdHex,
-                            eventOrdinal: ord++,
-                            topic: ev.topic,
-                            payload: ev.payload ?? null,
-                            author: authorHex,
-                            operationId: core.operationId,
-                            authorTimestampMs: core.authorTimestampMs,
-                          })
-                        }
-                      }
-                    }
-                  }
-                  work.topics = { ...work.topics, [primaryUpdate.topic]: nextTopicState }
-                  work.topicHashes.set(primaryUpdate.topic, hashTopicBytes(encodedTopic))
-                  work.stateRoot = stateRootFromHashes(work.topicHashes)
-                  return makeRejected(failure.code, failure.detail, { conflictRecorded: true, events: conflictEvents })
-                }
-              }
-            }
+        const foreign = failure.code === 'partition:public_op_private_assumption' || failure.code === 'ring:foreign_assumption'
+        if (core.assumptions.onFailed === 'record_conflict' && !foreign) {
+          const evaluated = await this.#evaluate(work, op, failure)
+          if (evaluated.kind === 'commit') {
+            this.#commitTopics(work, evaluated)
+            return reject(failure.code, failure.detail, { conflictRecorded: true, events: evaluated.events })
           }
         }
-        return makeRejected(failure.code, failure.detail)
+        return reject(failure.code, failure.detail)
       }
     }
 
-    // Copy-on-write working topics map (topic values are immutable; only the record is copied)
-    const workingTopics: Record<string, JsonValue> = { ...work.topics }
-    const workingHashes = new Map<string, string>()
-    const topicHash = (name: string): string | undefined => workingHashes.get(name) ?? work.topicHashes.get(name)
-    const emitted: EmittedKernelEvent[] = []
-    let ordinal = 0
-    const visibleTopicLastOpsForReduce = buildVisibleTopicLastOpIds()
-    const visibleAuthorLastOpsForReduce = buildVisibleAuthorLastOpIds()
-
-    // Global fail-closed $admission.authorize(state, tx, ctx) gate (monotonic attenuation:
-    // topic reducers can only tighten, never weaken global admission decisions).
-    if (core.updates.some(u => u.topic !== '$admission')) {
-      let authReducersConfig: ReducersConfig
-      try {
-        authReducersConfig = assertValidReducersConfig(workingTopics.$reducers)
-      } catch (err) {
-        return makeRejected('reducers_config_invalid', err instanceof Error ? err.message : String(err))
-      }
-      const admissionBinding = authReducersConfig.topics.$admission
-      if (admissionBinding !== undefined) {
-        let authRes
-        try {
-          authRes = await this.sandbox.invoke({
-            imports: authReducersConfig.imports,
-            builtins: authReducersConfig.runtime.builtins,
-            topicBindings: authReducersConfig.topics,
-            moduleSpecifier: admissionBinding.module,
-            exportName: admissionBinding.export ?? 'default',
-            method: 'authorize',
-            state: Object.hasOwn(workingTopics, '$admission') ? workingTopics.$admission! : null,
-            payload: null,
-            tx: {
-              opId: opIdHex,
-              author: authorHex,
-              authorTimestampMs: Number(core.authorTimestampMs),
-              operationId: core.operationId,
-              visibility: core.visibility,
-              updates: core.updates,
-            },
-            opOutcome: visibleOutcome,
-            topicLastOpIds: visibleTopicLastOpsForReduce,
-            authorLastOpIds: visibleAuthorLastOpsForReduce,
-            txVisibility: core.visibility,
-            topics: filterPublicTopics(workingTopics),
-            topicHash,
-            ...(admissionBinding.config === undefined ? {} : { config: admissionBinding.config }),
-            cas: this.cas,
-            casPartition: 'public',
-            readOnly: true,
-            maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-            ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
-          })
-        } catch (err) {
-          if (err instanceof MissingDependencyError) {
-            return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
-          }
-          throw err
-        }
-        if (authRes.ok) {
-          if (authRes.value === false) {
-            work.seen.add(dedupKey, true)
-            return makeRejected('admission_denied')
-          }
-          if (authRes.value !== null && typeof authRes.value === 'object' && !Array.isArray(authRes.value)) {
-            const authObj = authRes.value as Readonly<Record<string, JsonValue>>
-            if (authObj.ok === false) {
-              work.seen.add(dedupKey, true)
-              return makeRejected(
-                typeof authObj.code === 'string' && authObj.code.length > 0 ? authObj.code : 'admission_denied',
-                typeof authObj.detail === 'string' ? authObj.detail : undefined,
-              )
-            }
-          }
-        } else if (authRes.code !== 'vm:missing_method:authorize') {
-          work.seen.add(dedupKey, true)
-          return makeRejected(authRes.code, authRes.detail)
-        }
-      }
+    const evaluated = await this.#evaluate(work, op, null)
+    if (evaluated.kind === 'rejected') return reject(evaluated.code, evaluated.detail)
+    this.#commitTopics(work, evaluated)
+    work.outcomes.add(opIdHex, { outcome: 'accepted', visibility: core.visibility, ring })
+    if (epochKey !== null) work.epochOpCounts.set(epochKey, (work.epochOpCounts.get(epochKey) ?? 0) + 1)
+    for (const u of core.updates) work.topicLastOpIds.set(u.topic, opIdHex)
+    if (!privateLog) {
+      work.authorLastOpIds.set(authorHex, opIdHex)
+    } else if (ring !== null) {
+      work.authorLastOpIds.set(ringAuthorKey(ring, authorHex), opIdHex)
+    } else {
+      // A later public op supersedes every ring-scoped entry of this author (see #opView).
+      for (const name of this.#ringNames) work.authorLastOpIds.delete(ringAuthorKey(name, authorHex))
     }
-
-    for (const update of core.updates) {
-      let reducersConfig: ReducersConfig
-      try {
-        reducersConfig = assertValidReducersConfig(workingTopics.$reducers)
-      } catch (err) {
-        return makeRejected('reducers_config_invalid', err instanceof Error ? err.message : String(err))
-      }
-
-      const binding = reducersConfig.topics[update.topic]
-      if (binding === undefined) {
-        // Missing reducer for $reducers means rules are permanently frozen; missing reducer for any topic rejects cleanly.
-        return makeRejected(update.topic === '$reducers' ? 'reducers_frozen' : `no_reducer:${update.topic}`)
-      }
-
-      // Public-control ops on privateLog only see $* control topics and public CAS
-      const visibleTopics = (this.genesis.privateLog && core.visibility === 'public')
-        ? filterPublicTopics(workingTopics)
-        : workingTopics
-
-      const curTopicState: JsonValue = Object.hasOwn(workingTopics, update.topic) ? workingTopics[update.topic]! : null
-
-      let res
-      try {
-        res = await this.sandbox.invoke({
-          imports: reducersConfig.imports,
-          builtins: reducersConfig.runtime.builtins,
-          topicBindings: reducersConfig.topics,
-          moduleSpecifier: binding.module,
-          exportName: binding.export ?? 'default',
-          method: 'reduce',
-          state: curTopicState,
-          payload: update.input,
-          tx: {
-            opId: opIdHex,
-            author: authorHex,
-            authorTimestampMs: Number(core.authorTimestampMs),
-            operationId: core.operationId,
-          },
-          opOutcome: visibleOutcome,
-          topicLastOpIds: visibleTopicLastOpsForReduce,
-          authorLastOpIds: visibleAuthorLastOpsForReduce,
-          txVisibility: core.visibility,
-          topics: visibleTopics,
-          topicHash,
-          ...(binding.config === undefined ? {} : { config: binding.config }),
-          cas: this.cas,
-          casPartition,
-          readOnly: false,
-          maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-          ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
-        })
-      } catch (err) {
-        if (err instanceof MissingDependencyError) {
-          return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
-        }
-        throw err
-      }
-
-      if (!res.ok) {
-        work.seen.add(dedupKey, true)
-        return makeRejected(res.code, res.detail)
-      }
-
-      const outObj = res.value
-      if (outObj === null || typeof outObj !== 'object' || Array.isArray(outObj)) {
-        work.seen.add(dedupKey, true)
-        return makeRejected('vm:invalid_reducer_return')
-      }
-      const outRec = outObj as Readonly<Record<string, JsonValue>>
-      if (typeof outRec.ok !== 'boolean') {
-        work.seen.add(dedupKey, true)
-        return makeRejected('vm:invalid_reducer_return')
-      }
-
-      if (!outRec.ok) {
-        const rejCode = typeof outRec.code === 'string' && outRec.code.length > 0 ? outRec.code : 'reducer:rejected'
-        const rejDetail = typeof outRec.detail === 'string' ? outRec.detail : undefined
-        work.seen.add(dedupKey, true)
-        return makeRejected(rejCode, rejDetail)
-      }
-
-      const nextTopicState: JsonValue = outRec.state === undefined ? null : outRec.state
-      const encodedTopic = encodeCanonicalJsonCbor(nextTopicState)
-      if (encodedTopic.length > this.genesis.limits.maxTopicStateBytes) {
-        work.seen.add(dedupKey, true)
-        return makeRejected('limit:max_topic_state_bytes')
-      }
-
-      // If updating $reducers, validate new config shape immediately and pin its module hashes!
-      if (update.topic === '$reducers') {
-        try { assertValidReducersConfig(nextTopicState) }
-        catch (err) {
-          work.seen.add(dedupKey, true)
-          return makeRejected('reducers_config_invalid', err instanceof Error ? err.message : String(err))
-        }
-        extractCasHashes(nextTopicState, this.#historicalReducerRoots)
-      }
-
-      workingTopics[update.topic] = nextTopicState
-      workingHashes.set(update.topic, hashTopicBytes(encodedTopic))
-
-      if (Array.isArray(outRec.events)) {
-        for (const rawEv of outRec.events as readonly JsonValue[]) {
-          if (rawEv !== null && typeof rawEv === 'object' && !Array.isArray(rawEv)) {
-            const ev = rawEv as Readonly<Record<string, JsonValue>>
-            if (typeof ev.topic === 'string') {
-              emitted.push({
-                opId: opIdHex,
-                eventOrdinal: ordinal++,
-                topic: ev.topic,
-                payload: ev.payload ?? null,
-                author: authorHex,
-                operationId: core.operationId,
-                authorTimestampMs: core.authorTimestampMs,
-              })
-            }
-          }
-        }
-      }
-    }
-
-    // Kernel-enforced monotonic immutability controller ($seals):
-    // 1. Existing seals can NEVER be removed or weakened (even if $seals reducer were modified).
-    const sealMono = checkSealsMonotonicity(work.topics.$seals, workingTopics.$seals)
-    if (!sealMono.ok) {
-      work.seen.add(dedupKey, true)
-      return makeRejected(sealMono.code, sealMono.detail)
-    }
-    // 2. Enforce all active reducer hash locks and frozen/append-only JSON path locks.
-    const sealCheck = checkSealsEnforced(work.topics.$seals, work.topics, workingTopics)
-    if (!sealCheck.ok) {
-      work.seen.add(dedupKey, true)
-      return makeRejected(sealCheck.code, sealCheck.detail)
-    }
-
-    // 3. Optional flat semantic post-condition hook: $admission.verify(before, after, tx, ctx).
-    //    Skipped in O(1) when the resolved $admission module does not export `verify`.
-    {
-      let postReducersConfig: ReducersConfig | null = null
-      try { postReducersConfig = assertValidReducersConfig(workingTopics.$reducers) } catch { /* ignore */ }
-      const admBinding = postReducersConfig?.topics.$admission
-      if (postReducersConfig !== null && admBinding !== undefined) {
-        const verifyCacheKey = resolveEffectiveBindingTag(workingTopics.$reducers, '$admission')
-        if (this.#admissionHasVerify.get(verifyCacheKey) !== false) {
-          const isPublicOnly = this.genesis.privateLog && core.visibility === 'public'
-          const visibleBefore = isPublicOnly ? filterPublicTopics(work.topics) : work.topics
-          const visibleAfter = isPublicOnly ? filterPublicTopics(workingTopics) : workingTopics
-          let verifyRes
-          try {
-            verifyRes = await this.sandbox.invoke({
-              imports: postReducersConfig.imports,
-              builtins: postReducersConfig.runtime.builtins,
-              topicBindings: postReducersConfig.topics,
-              moduleSpecifier: admBinding.module,
-              exportName: admBinding.export ?? 'default',
-              method: 'verify',
-              state: Object.hasOwn(visibleAfter, '$admission') ? visibleAfter.$admission! : null,
-              payload: { before: visibleBefore, after: visibleAfter },
-              tx: {
-                opId: opIdHex,
-                author: authorHex,
-                authorTimestampMs: Number(core.authorTimestampMs),
-                operationId: core.operationId,
-                visibility: core.visibility,
-                updates: core.updates,
-              },
-              opOutcome: visibleOutcome,
-              topicLastOpIds: visibleTopicLastOpsForReduce,
-              authorLastOpIds: visibleAuthorLastOpsForReduce,
-              txVisibility: core.visibility,
-              topics: visibleAfter,
-              topicHash,
-              ...(admBinding.config === undefined ? {} : { config: admBinding.config }),
-              cas: this.cas,
-              casPartition: isPublicOnly ? 'public' : casPartition,
-              readOnly: true,
-              maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-              ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
-            })
-          } catch (err) {
-            if (err instanceof MissingDependencyError) {
-              return { kind: 'missing', dependency: `${err.kind}/${err.hash}` }
-            }
-            throw err
-          }
-          if (!verifyRes.ok && verifyRes.code === 'vm:missing_method:verify') {
-            this.#admissionHasVerify.set(verifyCacheKey, false)
-          } else {
-            this.#admissionHasVerify.set(verifyCacheKey, true)
-            if (!verifyRes.ok) {
-              work.seen.add(dedupKey, true)
-              return makeRejected(verifyRes.code, verifyRes.detail)
-            }
-            if (verifyRes.value === false) {
-              work.seen.add(dedupKey, true)
-              return makeRejected('verify:rejected')
-            }
-            if (verifyRes.value !== null && typeof verifyRes.value === 'object' && !Array.isArray(verifyRes.value)) {
-              const vObj = verifyRes.value as Readonly<Record<string, JsonValue>>
-              if (vObj.ok === false) {
-                work.seen.add(dedupKey, true)
-                return makeRejected(
-                  typeof vObj.code === 'string' && vObj.code.length > 0 ? vObj.code : 'verify:rejected',
-                  typeof vObj.detail === 'string' ? vObj.detail : undefined,
-                )
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Atomic commit of all topic updates in this op
-    work.seen.add(dedupKey, true)
-    work.topics = workingTopics
-    for (const [name, hash] of workingHashes) work.topicHashes.set(name, hash)
-    work.outcomes.add(opIdHex, { outcome: 'accepted', visibility: core.visibility })
-    for (const u of core.updates) {
-      work.topicLastOpIds.set(u.topic, opIdHex)
-    }
-    work.authorLastOpIds.set(authorHex, opIdHex)
-    if (core.visibility === 'public') {
-      work.publicAuthorLastOpIds.set(authorHex, opIdHex)
-    }
-    work.stateRoot = stateRootFromHashes(work.topicHashes)
-    work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'accepted', null, emitted)
-
+    if (core.visibility === 'public') work.publicAuthorLastOpIds.set(authorHex, opIdHex)
+    work.historyDigest = advanceHistoryDigest(work.historyDigest, opIdHex, 'accepted', null, evaluated.events)
     return {
       kind: 'done',
       outcome: {
@@ -1615,9 +1327,325 @@ export class TopicKernel {
         visibility: core.visibility,
         outcome: 'accepted',
         rejectionCode: null,
-        events: emitted,
+        events: evaluated.events,
       },
     }
+  }
+
+  /** Install an evaluated candidate's topic states (and pin any new `$reducers` module hashes). */
+  #commitTopics(work: KernelMutableState, candidate: CommitCandidate): void {
+    if (candidate.topics.$reducers !== work.topics.$reducers && candidate.topics.$reducers !== undefined) {
+      extractCasHashes(candidate.topics.$reducers, this.#historicalReducerRoots)
+    }
+    work.topics = candidate.topics
+    for (const [name, hash] of candidate.hashes) work.topicHashes.set(name, hash)
+    work.stateRoot = stateRootFromHashes(work.topicHashes)
+  }
+
+  /**
+   * What an operation's evaluation may observe. Public ops on private logs see `$*` only; encrypted
+   * ops see `$*` plus the topics, outcomes and last-op ids of their own `$keys` ring, so a replica's
+   * result never depends on which other rings it can decrypt. Non-private logs see everything.
+   */
+  #opView(
+    work: KernelMutableState,
+    visibility: OperationVisibility,
+    ring: string | null,
+    topicRings: Readonly<Record<string, JsonValue>> | null,
+  ): OpView {
+    if (!this.genesis.privateLog) {
+      return {
+        visible: () => true,
+        filter: topics => topics,
+        topicLastOpIds: Object.fromEntries(work.topicLastOpIds),
+        authorLastOpIds: Object.fromEntries(work.authorLastOpIds),
+        opOutcome: opId => work.outcomes.get(opId)?.outcome ?? null,
+        publicOnly: false,
+      }
+    }
+    if (visibility === 'public' || ring === null) {
+      return {
+        visible: isControlTopic,
+        filter: filterPublicTopics,
+        topicLastOpIds: Object.fromEntries([...work.topicLastOpIds].filter(([t]) => isControlTopic(t))),
+        authorLastOpIds: Object.fromEntries(work.publicAuthorLastOpIds),
+        opOutcome: opId => {
+          const rec = work.outcomes.get(opId)
+          return rec === undefined || rec.visibility !== 'public' ? null : rec.outcome
+        },
+        publicOnly: true,
+      }
+    }
+    const visible = (topic: string): boolean => isControlTopic(topic) || ringOfTopic(topicRings, topic) === ring
+    const allVisible = topicRings === null && ring === 'default'
+    const authorLastOpIds: Record<string, string> = Object.fromEntries(work.publicAuthorLastOpIds)
+    const prefix = `${ring}:`
+    for (const [key, opId] of work.authorLastOpIds) {
+      if (key.startsWith(prefix) && key.lastIndexOf(':') === prefix.length - 1) authorLastOpIds[key.slice(prefix.length)] = opId
+    }
+    return {
+      visible,
+      filter: allVisible ? topics => topics : topics => {
+        const out: Record<string, JsonValue> = {}
+        for (const [k, v] of Object.entries(topics)) if (visible(k)) out[k] = v
+        return out
+      },
+      topicLastOpIds: Object.fromEntries([...work.topicLastOpIds].filter(([t]) => visible(t))),
+      authorLastOpIds,
+      opOutcome: opId => {
+        const rec = work.outcomes.get(opId)
+        return rec === undefined || (rec.visibility !== 'public' && rec.ring !== ring) ? null : rec.outcome
+      },
+      publicOnly: false,
+    }
+  }
+
+  /** Shared `sandbox.invoke` plumbing for every consensus call made while applying `op`. */
+  #invokeFor(
+    op: OpContext,
+    config: ReducersConfig,
+    binding: TopicBindingConfig,
+    call: {
+      readonly method: 'reduce' | 'query' | 'onConflict' | 'authorize' | 'verify'
+      readonly state: JsonValue
+      readonly payload: JsonValue
+      readonly topics: Readonly<Record<string, JsonValue>>
+      readonly casPartition: CasPartition
+      readonly readOnly: boolean
+      readonly controlTx?: boolean
+      readonly conflict?: AssumptionFailure
+    },
+  ): Promise<ReducerInvocationResult> {
+    const core = op.core
+    return this.sandbox.invoke({
+      logId: this.logIdHex,
+      imports: config.imports,
+      builtins: config.runtime.builtins,
+      topicBindings: config.topics,
+      moduleSpecifier: binding.module,
+      exportName: binding.export ?? 'default',
+      method: call.method,
+      state: call.state,
+      payload: call.payload,
+      tx: call.controlTx === true
+        ? {
+            opId: op.opIdHex,
+            author: op.authorHex,
+            authorTimestampMs: Number(core.authorTimestampMs),
+            operationId: core.operationId,
+            visibility: core.visibility,
+            updates: core.updates,
+          }
+        : { opId: op.opIdHex, author: op.authorHex, authorTimestampMs: Number(core.authorTimestampMs), operationId: core.operationId },
+      ...(call.conflict === undefined ? {} : { conflict: call.conflict }),
+      opOutcome: op.view.opOutcome,
+      topicLastOpIds: op.view.topicLastOpIds,
+      authorLastOpIds: op.view.authorLastOpIds,
+      txVisibility: core.visibility,
+      topics: call.topics,
+      ...(binding.config === undefined ? {} : { config: binding.config }),
+      cas: this.cas,
+      casPartition: call.casPartition,
+      readOnly: call.readOnly,
+      maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
+      maxFuel: this.genesis.limits.maxFuel,
+    })
+  }
+
+  /** Evaluate signed operation-level assumptions against the op's view; null when all hold. */
+  async #checkAssumptions(work: KernelMutableState, op: OpContext): Promise<AssumptionFailure | null> {
+    const checks = op.core.assumptions?.checks ?? []
+    const foreign = (topic: string, what: string, checkIndex: number): AssumptionFailure => op.view.publicOnly
+      ? { code: 'partition:public_op_private_assumption', detail: `Public op cannot ${what} private topic ${topic}`, checkIndex }
+      : { code: 'ring:foreign_assumption', detail: `Op cannot ${what} topic ${topic} of another key ring`, checkIndex }
+    for (let i = 0; i < checks.length; i++) {
+      const chk: OperationAssumption = checks[i]!
+      if (chk.kind === 'op_accepted' || chk.kind === 'op_rejected' || chk.kind === 'op_present') {
+        const st = op.view.opOutcome(chk.opId)
+        if (st === null) return { code: 'assumption:missing_op', detail: `Required op ${chk.opId} not present`, checkIndex: i }
+        if (chk.kind === 'op_accepted' && st !== 'accepted') {
+          return { code: 'assumption:dependency_rejected', detail: `Required op ${chk.opId} was rejected`, checkIndex: i }
+        }
+        if (chk.kind === 'op_rejected' && st !== 'rejected') {
+          return { code: 'assumption:expected_rejected', detail: `Expected op ${chk.opId} to be rejected`, checkIndex: i }
+        }
+      } else if (chk.kind === 'author_last_op') {
+        const targetAuthor = chk.author ?? op.authorHex
+        const ids = op.view.authorLastOpIds
+        const actual = Object.hasOwn(ids, targetAuthor) ? ids[targetAuthor]! : null
+        if (actual !== chk.lastOpId) {
+          return { code: 'assumption:author_history_mismatch', detail: `Author ${targetAuthor} lastOpId expected ${String(chk.lastOpId)}, got ${String(actual)}`, checkIndex: i }
+        }
+      } else if (chk.kind === 'topic_revision') {
+        if (!op.view.visible(chk.topic)) return foreign(chk.topic, 'assume', i)
+        const ids = op.view.topicLastOpIds
+        const actual = Object.hasOwn(ids, chk.topic) ? ids[chk.topic]! : null
+        if (actual !== chk.lastOpId) {
+          return { code: 'assumption:topic_modified', detail: `Topic ${chk.topic} lastOpId expected ${String(chk.lastOpId)}, got ${String(actual)}`, checkIndex: i }
+        }
+      } else if (chk.kind === 'query_match') {
+        if (!op.view.visible(chk.topic)) return foreign(chk.topic, 'query', i)
+        let config: ReducersConfig
+        try {
+          config = assertValidReducersConfig(work.topics.$reducers)
+        } catch (err) {
+          return { code: 'reducers_config_invalid', detail: err instanceof Error ? err.message : String(err), checkIndex: i }
+        }
+        const binding = config.topics[chk.topic]
+        const topicState: JsonValue = Object.hasOwn(work.topics, chk.topic) ? work.topics[chk.topic]! : null
+        let actualValue: JsonValue = topicState
+        if (binding !== undefined) {
+          const qRes = await this.#invokeFor(op, config, binding, {
+            method: 'query',
+            state: topicState,
+            payload: chk.query,
+            topics: op.view.filter(work.topics),
+            casPartition: op.view.publicOnly || isControlTopic(chk.topic) ? 'public' : 'private',
+            readOnly: true,
+          })
+          if (qRes.ok) actualValue = qRes.value
+          else if (qRes.code !== 'vm:missing_method:query') {
+            return { code: 'assumption:query_failed', detail: qRes.detail ?? qRes.code, checkIndex: i }
+          }
+        }
+        if (canonicalJson(actualValue) !== canonicalJson(chk.expect)) {
+          return { code: 'assumption:query_mismatch', detail: `Query assumption ${i} on ${chk.topic} did not match`, checkIndex: i }
+        }
+      }
+    }
+    return null
+  }
+
+  /**
+   * The single candidate pipeline shared by normal application and `onConflict` recording:
+   * `$admission.authorize` -> reduce (every update) or onConflict (primary update) -> `$reducers`
+   * validation -> kernel `$seals` monotonicity + enforcement -> `$admission.verify`.
+   * Returns the candidate topic states to commit, or the rejection.
+   */
+  async #evaluate(work: KernelMutableState, op: OpContext, conflict: AssumptionFailure | null): Promise<EvaluateResult> {
+    const core = op.core
+    let config: ReducersConfig
+    try {
+      config = assertValidReducersConfig(work.topics.$reducers)
+    } catch (err) {
+      return { kind: 'rejected', code: 'reducers_config_invalid', detail: err instanceof Error ? err.message : String(err) }
+    }
+    const workingTopics: Record<string, JsonValue> = { ...work.topics }
+    const workingHashes = new Map<string, string>()
+
+    // 1. Global fail-closed $admission.authorize(state, tx, ctx) gate (monotonic attenuation: topic
+    //    reducers can only tighten, never weaken global admission decisions).
+    const admission = config.topics.$admission
+    if (admission !== undefined && core.updates.some(u => u.topic !== '$admission')) {
+      const authRes = await this.#invokeFor(op, config, admission, {
+        method: 'authorize',
+        state: Object.hasOwn(workingTopics, '$admission') ? workingTopics.$admission! : null,
+        payload: null,
+        topics: filterPublicTopics(workingTopics),
+        casPartition: 'public',
+        readOnly: true,
+        controlTx: true,
+      })
+      const denied = decisionDenial(authRes, 'authorize', 'admission_denied')
+      if (denied !== null) return denied
+    }
+
+    // 2. Produce the candidate: every update through its reducer, or the primary update's onConflict.
+    const events: EmittedKernelEvent[] = []
+    const updates = conflict === null ? core.updates : core.updates.slice(0, 1)
+    for (const update of updates) {
+      let stepConfig: ReducersConfig
+      try {
+        stepConfig = assertValidReducersConfig(workingTopics.$reducers)
+      } catch (err) {
+        return { kind: 'rejected', code: 'reducers_config_invalid', detail: err instanceof Error ? err.message : String(err) }
+      }
+      const binding = stepConfig.topics[update.topic]
+      if (binding === undefined) {
+        // No reducer for $reducers means rules are permanently frozen; any other unbound topic rejects cleanly.
+        return { kind: 'rejected', code: update.topic === '$reducers' ? 'reducers_frozen' : `no_reducer:${update.topic}` }
+      }
+      const res = await this.#invokeFor(op, stepConfig, binding, {
+        method: conflict === null ? 'reduce' : 'onConflict',
+        state: Object.hasOwn(workingTopics, update.topic) ? workingTopics[update.topic]! : null,
+        payload: update.input,
+        topics: op.view.filter(workingTopics),
+        casPartition: op.casPartition,
+        readOnly: false,
+        ...(conflict === null ? {} : { conflict }),
+      })
+      if (!res.ok) return { kind: 'rejected', code: res.code, ...(res.detail === undefined ? {} : { detail: res.detail }) }
+      const out = res.value
+      if (out === null || typeof out !== 'object' || Array.isArray(out)) return { kind: 'rejected', code: 'vm:invalid_reducer_return' }
+      const outRec = out as Readonly<Record<string, JsonValue>>
+      if (typeof outRec.ok !== 'boolean') return { kind: 'rejected', code: 'vm:invalid_reducer_return' }
+      if (!outRec.ok) {
+        return {
+          kind: 'rejected',
+          code: typeof outRec.code === 'string' && outRec.code.length > 0 ? outRec.code : 'reducer:rejected',
+          ...(typeof outRec.detail === 'string' ? { detail: outRec.detail } : {}),
+        }
+      }
+      const nextTopicState: JsonValue = outRec.state === undefined ? null : outRec.state
+      const encodedTopic = encodeCanonicalJsonCbor(nextTopicState)
+      if (encodedTopic.length > this.genesis.limits.maxTopicStateBytes) return { kind: 'rejected', code: 'limit:max_topic_state_bytes' }
+      if (update.topic === '$reducers') {
+        try { assertValidReducersConfig(nextTopicState) } catch (err) {
+          return { kind: 'rejected', code: 'reducers_config_invalid', detail: err instanceof Error ? err.message : String(err) }
+        }
+      }
+      workingTopics[update.topic] = nextTopicState
+      workingHashes.set(update.topic, hashTopicBytes(encodedTopic))
+      if (Array.isArray(outRec.events)) {
+        for (const rawEv of outRec.events as readonly JsonValue[]) {
+          if (rawEv === null || typeof rawEv !== 'object' || Array.isArray(rawEv)) continue
+          const ev = rawEv as Readonly<Record<string, JsonValue>>
+          if (typeof ev.topic !== 'string') continue
+          events.push({
+            opId: op.opIdHex,
+            eventOrdinal: events.length,
+            topic: ev.topic,
+            payload: ev.payload ?? null,
+            author: op.authorHex,
+            operationId: core.operationId,
+            authorTimestampMs: core.authorTimestampMs,
+          })
+        }
+      }
+    }
+
+    // 3. Kernel-enforced monotonic immutability ($seals): existing seals can never be removed or
+    //    weakened, and every reducer pin and frozen/append-only path lock holds.
+    const sealMono = checkSealsMonotonicity(work.topics.$seals, workingTopics.$seals)
+    if (!sealMono.ok) return { kind: 'rejected', code: sealMono.code, detail: sealMono.detail }
+    const sealCheck = checkSealsEnforced(work.topics.$seals, work.topics, workingTopics)
+    if (!sealCheck.ok) return { kind: 'rejected', code: sealCheck.code, detail: sealCheck.detail }
+
+    // 4. Optional flat semantic post-condition $admission.verify(before, after, tx, ctx), resolved
+    //    from the post-state config; skipped in O(1) once a binding is known not to export verify.
+    let postConfig: ReducersConfig | null = null
+    try { postConfig = assertValidReducersConfig(workingTopics.$reducers) } catch { /* validated above */ }
+    const postAdmission = postConfig?.topics.$admission
+    if (postConfig !== null && postAdmission !== undefined) {
+      const verifyKey = reducerBindingTag(workingTopics.$reducers, '$admission')
+      if (this.#admissionHasVerify.get(verifyKey) !== false) {
+        const visibleAfter = op.view.filter(workingTopics)
+        const vRes = await this.#invokeFor(op, postConfig, postAdmission, {
+          method: 'verify',
+          state: Object.hasOwn(visibleAfter, '$admission') ? visibleAfter.$admission! : null,
+          payload: { before: op.view.filter(work.topics), after: visibleAfter },
+          topics: visibleAfter,
+          casPartition: op.casPartition,
+          readOnly: true,
+          controlTx: true,
+        })
+        const missing = !vRes.ok && vRes.code === 'vm:missing_method:verify'
+        this.#admissionHasVerify.set(verifyKey, !missing)
+        const denied = decisionDenial(vRes, 'verify', 'verify:rejected')
+        if (denied !== null) return denied
+      }
+    }
+    return { kind: 'commit', topics: workingTopics, hashes: workingHashes, events }
   }
 
   /** Execute a pure read-only query against a topic's query() export (or return raw topic state if no query export). */
@@ -1675,6 +1703,7 @@ export class TopicKernel {
         rejectionCode: o.rejectionCode,
       }))
     const res = await this.sandbox.invoke({
+      logId: this.logIdHex,
       imports: reducersConfig.imports,
       builtins: reducersConfig.runtime.builtins,
       topicBindings: reducersConfig.topics,
@@ -1688,13 +1717,13 @@ export class TopicKernel {
       authorLastOpIds: visibleAuthorLastOps,
       historyRows,
       topics: visibleTopics,
-      ...(topicsOverride === undefined ? { topicHash: (name: string) => this.#topicHashes.get(name) } : {}),
       ...(binding.config === undefined ? {} : { config: binding.config }),
       cas: this.cas,
       casPartition,
       readOnly: true,
       maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-      ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
+      maxFuel: this.genesis.limits.maxFuel,
+      local: true,
     })
     if (!res.ok) {
       if (res.code === 'vm:missing_method:query') return structuredClone(state)
@@ -1752,6 +1781,7 @@ export class TopicKernel {
       topicLastOpIds: new Map(snap.topicLastOpIds),
       authorLastOpIds: new Map(snap.authorLastOpIds),
       publicAuthorLastOpIds: new Map(snap.publicAuthorLastOpIds),
+      epochOpCounts: new Map(snap.epochOpCounts),
       historyDigest: snap.historyDigest,
       stateRoot: snap.stateRoot,
     }
@@ -1821,6 +1851,7 @@ export class TopicKernel {
       const state = Object.hasOwn(this.#topics, topic) ? this.#topics[topic]! : null
       const casPartition: CasPartition = (this.genesis.privateLog && isControlTopic(topic)) ? 'public' : 'private'
       const res = await this.sandbox.invoke({
+        logId: this.logIdHex,
         imports: reducersConfig.imports,
         builtins: reducersConfig.runtime.builtins,
         topicBindings: reducersConfig.topics,
@@ -1835,7 +1866,8 @@ export class TopicKernel {
         casPartition,
         readOnly: true,
         maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-        ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
+        maxFuel: this.genesis.limits.maxFuel,
+        local: true,
       })
       if (res.ok) out[topic] = res.value
       this.#describeCache.set(key, res.ok ? structuredClone(res.value) : undefined)
@@ -1879,6 +1911,7 @@ export class TopicKernel {
       topicLastOpIds: new Map(this.#topicLastOpIds),
       authorLastOpIds: new Map(this.#authorLastOpIds),
       publicAuthorLastOpIds: new Map(this.#publicAuthorLastOpIds),
+      epochOpCounts: new Map(this.#epochOpCounts),
       historyDigest: this.#historyDigest,
       stateRoot: this.#stateRoot,
     }
@@ -1953,6 +1986,7 @@ export class TopicKernel {
       const payload = toJsonSafe(input)
       try {
         const res = await this.sandbox.invoke({
+          logId: this.logIdHex,
           imports: reducersConfig.imports,
           builtins: reducersConfig.runtime.builtins,
           topicBindings: reducersConfig.topics,
@@ -1967,7 +2001,7 @@ export class TopicKernel {
           casPartition: 'public',
           readOnly: true,
           maxMemoryBytes: this.genesis.limits.maxMemoryBytes,
-          ...(this.genesis.limits.maxFuel === undefined ? {} : { maxFuel: this.genesis.limits.maxFuel }),
+          maxFuel: this.genesis.limits.maxFuel,
         })
         if (!res.ok || res.value === null || typeof res.value !== 'object' || Array.isArray(res.value)) return null
         return res.value as {

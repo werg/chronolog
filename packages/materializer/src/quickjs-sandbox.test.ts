@@ -2,18 +2,17 @@ import { describe, expect, it } from 'vitest'
 import { bytesToHex, utf8 } from '@chronolog/canonical'
 import type { JsonValue } from '@chronolog/protocol'
 import { ContentAddressedStore, MemoryBytesStore } from '@chronolog/records'
-import { CRYPTO_BUILTIN_ID, QuickJsSandbox, type ReducerInvocationInput } from './quickjs-sandbox.js'
+import { CRYPTO_BUILTIN_ID, OperationalTimeoutError, QuickJsSandbox, type ReducerInvocationInput } from './quickjs-sandbox.js'
 
 const TX = { opId: '0'.repeat(64), author: '1'.repeat(64), authorTimestampMs: 5, operationId: 'op' }
 
-async function setup(source: string): Promise<{ sandbox: QuickJsSandbox; input: (over?: Partial<ReducerInvocationInput>) => ReducerInvocationInput }> {
+async function setup(source: string, sandbox = new QuickJsSandbox()): Promise<{ sandbox: QuickJsSandbox; input: (over?: Partial<ReducerInvocationInput>) => ReducerInvocationInput }> {
   const cas = new ContentAddressedStore({ store: new MemoryBytesStore() })
   const hash = await cas.put(utf8(source), [], 'private')
-  const sandbox = new QuickJsSandbox()
   const input = (over: Partial<ReducerInvocationInput> = {}): ReducerInvocationInput => ({
-    imports: { 'app/m': `cas:sha256-${hash}` }, builtins: {}, moduleSpecifier: 'app/m', exportName: 'default',
+    imports: { 'app/m': `cas:sha256-${hash}` }, builtins: {}, moduleSpecifier: 'app/m', exportName: 'default', logId: 'ab'.repeat(32),
     method: 'reduce', state: null, payload: null, tx: TX, topics: {}, cas, casPartition: 'private', readOnly: false,
-    maxMemoryBytes: 16 * 1024 * 1024, ...over,
+    maxMemoryBytes: 16 * 1024 * 1024, maxFuel: 200_000, ...over,
   })
   return { sandbox, input }
 }
@@ -104,6 +103,7 @@ describe('QuickJsSandbox ctx', () => {
         return { ok: true, state: {
           frozen: Object.isFrozen(ctx),
           keys: Object.keys(ctx),
+          logId: ctx.logId,
           sameTopic: ctx.topic('t') === before && ctx.topic({ toString() { return 't' } }) === before,
           topic: before, missing: ctx.topic('nope'),
           outcome: [ctx.opOutcome('a'), ctx.opOutcome('b'), ctx.opOutcome('c')],
@@ -126,12 +126,13 @@ describe('QuickJsSandbox ctx', () => {
     const out = await value(sandbox, input({
       state: { s: 1 }, payload: { p: 2 }, config: { c: 3 },
       topics: { t: { v: 1 }, $mounts: { mounts: { m1: { topics: {} } } } },
-      opOutcomes: { a: 'accepted', b: 'rejected' },
+      opOutcome: (id: string) => (id === 'a' ? 'accepted' : id === 'b' ? 'rejected' : null),
       topicLastOpIds: { t: 'f'.repeat(64) },
     }))
     expect(out).toEqual({ ok: true, state: {
       frozen: true,
-      keys: ['topic', 'query', 'can', 'reject', 'mount', 'mountQuery', 'opOutcome', 'topicLastOpId', 'authorLastOpId', 'config'],
+      keys: ['logId', 'topic', 'query', 'can', 'reject', 'mount', 'mountQuery', 'opOutcome', 'topicLastOpId', 'authorLastOpId', 'config'],
+      logId: 'ab'.repeat(32),
       sameTopic: true,
       topic: { v: 1 }, missing: null,
       outcome: ['accepted', 'rejected', null],
@@ -193,8 +194,10 @@ describe('QuickJsSandbox ctx', () => {
             ok: true,
             state: {
               mac: hmacSha256('4a656665', 'what do ya want for nothing?'),
-              valid: verifyP256(pubHex, msg, sigHex),
-              invalid: verifyP256(pubHex, msg + '!', sigHex),
+              valid: verifyP256(pubHex, msg, sigHex, 'compact'),
+              invalid: verifyP256(pubHex, msg + '!', sigHex, 'compact'),
+              wrongFormat: verifyP256(pubHex, msg, sigHex, 'der'),
+              noFormat: verifyP256(pubHex, msg, sigHex),
             },
           };
         },
@@ -206,7 +209,73 @@ describe('QuickJsSandbox ctx', () => {
         mac: '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843',
         valid: true,
         invalid: false,
+        wrongFormat: false,
+        noFormat: false,
       },
     })
+  })
+})
+
+describe('QuickJsSandbox deterministic fuel', () => {
+  const BURN = `
+    function burn() { let s = 0; for (let i = 0; i < 200000; i++) s += i; return s; }
+    export const burner = { query() { return burn(); } };
+    export const once = { reduce(_s, _tx, ctx) { return { ok: true, state: ctx.query('$burn', {}) }; } };
+    export const twice = { reduce(_s, _tx, ctx) { ctx.query('$burn', {}); return { ok: true, state: ctx.query('$burn', {}) }; } };
+    export const own = { reduce() { return { ok: true, state: burn() }; } };
+    export const hashLoop = { reduce() {
+      const big = 'x'.repeat(1 << 20);
+      try { for (let i = 0; i < 50; i++) sha256(big); } catch { /* cannot buy more fuel */ }
+      return { ok: true, state: 'escaped' };
+    } };
+  `.replace('export const hashLoop', "import { sha256 } from 'chronolog:crypto';\n    export const hashLoop")
+  const bindings = { $burn: { module: 'app/m', export: 'burner' } }
+
+  async function minimalFuel(sandbox: QuickJsSandbox, input: (over?: Partial<ReducerInvocationInput>) => ReducerInvocationInput, exportName: string): Promise<number> {
+    let lo = 1
+    let hi = 200_000
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2)
+      const res = await sandbox.invoke(input({ exportName, maxFuel: mid, topicBindings: bindings, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } }))
+      if (res.ok) hi = mid
+      else {
+        expect(res).toEqual({ ok: false, code: 'vm:fuel_exhausted' })
+        lo = mid + 1
+      }
+    }
+    return lo
+  }
+
+  it('shares one budget across nested ctx.query() calls and charges memo hits their original cost', async () => {
+    const { sandbox, input } = await setup(BURN)
+    const once = await minimalFuel(sandbox, input, 'once')
+    expect(once).toBeGreaterThan(10)
+    // The second nested call is a memo hit; it must still cost what computing it costs.
+    expect(await sandbox.invoke(input({ exportName: 'twice', maxFuel: once, topicBindings: bindings, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } }))).toEqual({ ok: false, code: 'vm:fuel_exhausted' })
+    const twice = await minimalFuel(sandbox, input, 'twice')
+    expect(twice).toBeGreaterThan(once + Math.floor(once / 2))
+    // Same thresholds on a cold sandbox (empty memo, fresh runtimes): fuel never depends on local history.
+    const cold = await setup(BURN)
+    expect(await minimalFuel(cold.sandbox, cold.input, 'twice')).toBe(twice)
+    expect(await minimalFuel(cold.sandbox, cold.input, 'once')).toBe(once)
+    expect(await minimalFuel(cold.sandbox, cold.input, 'own')).toBe(await minimalFuel(sandbox, input, 'own'))
+  })
+
+  it('charges host bridges by bytes, and a caught exhaustion still ends the call as vm:fuel_exhausted', async () => {
+    const { sandbox, input } = await setup(BURN)
+    expect(await sandbox.invoke(input({ exportName: 'hashLoop', maxFuel: 500, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } })))
+      .toEqual({ ok: false, code: 'vm:fuel_exhausted' })
+    expect(await value(sandbox, input({ exportName: 'hashLoop', maxFuel: 5_000, builtins: { 'chronolog:crypto': CRYPTO_BUILTIN_ID } })))
+      .toEqual({ ok: true, state: 'escaped' })
+  })
+
+  it('applies the wall-clock watchdog only to local reads, never to consensus calls', async () => {
+    const sandbox = new QuickJsSandbox({ watchdogMs: 1 })
+    const { input } = await setup(`
+      export default { query() { let s = 0; for (let i = 0; i < 3000000; i++) s += i % 7; return s; } };
+    `, sandbox)
+    const consensus = input({ method: 'query', readOnly: true, maxFuel: 1_000_000 })
+    expect((await sandbox.invoke(consensus)).ok).toBe(true)
+    await expect(sandbox.invoke({ ...consensus, local: true })).rejects.toBeInstanceOf(OperationalTimeoutError)
   })
 })

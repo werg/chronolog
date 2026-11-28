@@ -15,7 +15,6 @@ describe('Universal operation assumptions & ergonomic SQL row guards', () => {
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {
@@ -124,7 +123,6 @@ describe('Universal operation assumptions & ergonomic SQL row guards', () => {
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {

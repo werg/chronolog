@@ -10,26 +10,67 @@ import {
 const TABLE = 'values'
 const STAGING = 'checkpoint-staging'
 const CHANGELOG = 'changelog'
-const VERSION = 3
+/** Holds the pruned changelog floor and one acknowledged-seq cursor per reading store instance (tab). */
+const CHANGELOG_META = 'changelog-meta'
+const FLOOR_KEY = 'floor'
+const CURSOR_PREFIX = 'cursor:'
+const VERSION = 4
+const DEFAULT_CHANGELOG_WINDOW = 65_536
+const DEFAULT_CURSOR_TTL_MS = 24 * 60 * 60 * 1000
 
-/** Multi-tab ACID IndexedDB BytesStore with atomic delta changelog and configurable durability. */
+export interface IndexedDbBytesStoreOpenOptions {
+  /** Fail with APPLICATION_DATA_STORAGE_MISSING instead of creating a fresh database. */
+  readonly create?: boolean
+  /** Maximum changelog entries retained behind the latest seq, even when a tab has not acknowledged them. */
+  readonly changelogWindow?: number
+  /** A tab cursor that has not polled `readChangesSince` for this long no longer holds back pruning. */
+  readonly cursorTtlMs?: number
+}
+
+/** `readChangesSince` result; `reset` means the cursor fell below the pruned floor and the caller must fully rescan. */
+export interface IndexedDbChangesResult {
+  readonly latestSeq: number
+  readonly changes: readonly BytesStoreChange[]
+  readonly reset: boolean
+}
+
+/**
+ * Multi-tab ACID IndexedDB BytesStore with atomic delta changelog and configurable durability.
+ *
+ * The changelog is pruned on every `readChangesSince` call: entries at or below
+ * the minimum seq acknowledged by every live reading tab are deleted, and the
+ * log never retains more than `changelogWindow` entries behind the latest seq.
+ * A reader whose cursor fell below the pruned floor (window overflow, or a tab
+ * frozen past `cursorTtlMs`) receives `reset: true` with no changes and must
+ * rescan the store instead of applying deltas.
+ */
 export class IndexedDbBytesStore implements BytesStore {
   readonly #database: IDBDatabase
+  readonly #cursorKey = CURSOR_PREFIX + crypto.randomUUID()
+  readonly #changelogWindow: number
+  readonly #cursorTtlMs: number
+  #cursorRegistered = false
   #pending: Promise<void> = Promise.resolve()
   #closing: Promise<void> | undefined
   #closed = false
   #invalid: Error | undefined
 
-  private constructor(database: IDBDatabase) {
+  private constructor(database: IDBDatabase, changelogWindow: number, cursorTtlMs: number) {
     this.#database = database
+    this.#changelogWindow = changelogWindow
+    this.#cursorTtlMs = cursorTtlMs
     database.onversionchange = () => {
       this.#invalid = new Error('INDEXEDDB_STORE_VERSION_CHANGED')
       database.close()
     }
   }
 
-  static open(name: string, { create = true } = {}): Promise<IndexedDbBytesStore> {
+  static open(name: string, {
+    create = true, changelogWindow = DEFAULT_CHANGELOG_WINDOW, cursorTtlMs = DEFAULT_CURSOR_TTL_MS,
+  }: IndexedDbBytesStoreOpenOptions = {}): Promise<IndexedDbBytesStore> {
     if (typeof indexedDB === 'undefined') return Promise.reject(new Error('BROWSER_STORAGE_BACKEND_UNSUPPORTED'))
+    if (!Number.isSafeInteger(changelogWindow) || changelogWindow < 1 || !Number.isSafeInteger(cursorTtlMs) || cursorTtlMs < 0)
+      return Promise.reject(new Error('INDEXEDDB_STORE_OPTIONS_INVALID'))
     return new Promise((resolve, reject) => {
       let blocked = false, missing = false
       const request = indexedDB.open('chronolog-data:' + name, VERSION)
@@ -45,6 +86,7 @@ export class IndexedDbBytesStore implements BytesStore {
         if (!request.result.objectStoreNames.contains(CHANGELOG)) {
           request.result.createObjectStore(CHANGELOG, { autoIncrement: true })
         }
+        if (!request.result.objectStoreNames.contains(CHANGELOG_META)) request.result.createObjectStore(CHANGELOG_META)
       }
       request.onerror = () => {
         reject(missing ? new Error('APPLICATION_DATA_STORAGE_MISSING') : request.error ?? new Error('INDEXEDDB_STORE_OPEN_FAILED'))
@@ -52,7 +94,7 @@ export class IndexedDbBytesStore implements BytesStore {
       request.onblocked = () => { blocked = true; reject(new Error('INDEXEDDB_STORE_BLOCKED')) }
       request.onsuccess = () => {
         if (blocked) request.result.close()
-        else resolve(new IndexedDbBytesStore(request.result))
+        else resolve(new IndexedDbBytesStore(request.result, changelogWindow, cursorTtlMs))
       }
     })
   }
@@ -254,36 +296,88 @@ export class IndexedDbBytesStore implements BytesStore {
     } finally { release(); await owner }
   }
 
+  /** Latest assigned change seq; never below the pruned floor, even when the whole changelog was pruned. */
   async latestChangeSeq(): Promise<number> {
-    return this.#enqueue(() => this.#readTx(CHANGELOG, log => {
+    return this.#enqueue(() => this.#readTx([CHANGELOG, CHANGELOG_META], tx => {
       let latest = 0
-      const req = log.openKeyCursor(null, 'prev')
+      const floor = tx.objectStore(CHANGELOG_META).get(FLOOR_KEY)
+      const req = tx.objectStore(CHANGELOG).openKeyCursor(null, 'prev')
       req.onsuccess = () => {
         const cursor = req.result
         if (cursor !== null && typeof cursor.key === 'number') latest = cursor.key
       }
-      return () => latest
+      return () => Math.max(latest, floorValue(floor.result))
     }))
   }
 
-  async readChangesSince(afterSeq: number): Promise<{ readonly latestSeq: number; readonly changes: readonly BytesStoreChange[] }> {
-    return this.#enqueue(() => this.#readTx(CHANGELOG, log => {
+  /**
+   * Read up to 4096 changes after `afterSeq`, acknowledge `afterSeq` for this
+   * store instance, and prune entries every live reader has acknowledged (or
+   * that fell outside the retention window). Returns `reset: true` when
+   * `afterSeq` is below the pruned floor: deltas were lost and the caller must
+   * rescan, then resume from `latestSeq`.
+   */
+  async readChangesSince(afterSeq: number): Promise<IndexedDbChangesResult> {
+    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) return Promise.reject(new Error('BYTES_STORE_SEQ_INVALID'))
+    const now = Date.now(), window = this.#changelogWindow, ttl = this.#cursorTtlMs, cursorKey = this.#cursorKey
+    this.#cursorRegistered = true
+    return this.#enqueue(() => this.#writeTx([CHANGELOG, CHANGELOG_META], 'relaxed', tx => {
+      const log = tx.objectStore(CHANGELOG), meta = tx.objectStore(CHANGELOG_META)
       const changes: BytesStoreChange[] = []
-      let latestSeq = afterSeq
-      const range = afterSeq > 0 ? IDBKeyRange.lowerBound(afterSeq, true) : undefined
-      const req = log.openCursor(range)
-      req.onsuccess = () => {
-        const cursor = req.result
-        if (cursor === null) return
-        const seq = typeof cursor.key === 'number' ? cursor.key : 0
-        const val = cursor.value as { readonly key?: unknown; readonly deleted?: unknown } | undefined
-        if (seq > latestSeq) latestSeq = seq
-        if (val && typeof val.key === 'string') {
-          changes.push({ seq, key: val.key, deleted: val.deleted === true })
+      let result: IndexedDbChangesResult | undefined
+      const floorRequest = meta.get(FLOOR_KEY)
+      floorRequest.onsuccess = () => {
+        const floor = floorValue(floorRequest.result)
+        const last = log.openKeyCursor(null, 'prev')
+        last.onsuccess = () => {
+          const lastKey = last.result?.key
+          const latest = Math.max(floor, typeof lastKey === 'number' ? lastKey : 0)
+          if (afterSeq < floor) {
+            // The deltas between afterSeq and floor are gone; after its rescan this reader is at `latest`.
+            meta.put({ seq: latest, at: now }, cursorKey)
+            result = { latestSeq: latest, changes, reset: true }
+            return
+          }
+          let latestSeq = afterSeq
+          const req = log.openCursor(IDBKeyRange.lowerBound(afterSeq, true))
+          req.onsuccess = () => {
+            const cursor = req.result
+            if (cursor !== null) {
+              const seq = typeof cursor.key === 'number' ? cursor.key : 0
+              const val = cursor.value as { readonly key?: unknown; readonly deleted?: unknown } | undefined
+              if (seq > latestSeq) latestSeq = seq
+              if (val && typeof val.key === 'string') changes.push({ seq, key: val.key, deleted: val.deleted === true })
+              if (changes.length < 4096) { cursor.continue(); return }
+            }
+            result = { latestSeq, changes, reset: false }
+            meta.put({ seq: afterSeq, at: now }, cursorKey)
+            prune(floor, latest)
+          }
         }
-        if (changes.length < 4096) cursor.continue()
       }
-      return () => ({ latestSeq, changes })
+      const prune = (floor: number, latest: number): void => {
+        let minAck = latest
+        const cursors = meta.openCursor(IDBKeyRange.bound(CURSOR_PREFIX, CURSOR_PREFIX + '\uffff'))
+        cursors.onsuccess = () => {
+          const cursor = cursors.result
+          if (cursor !== null) {
+            const value = cursor.value as { readonly seq?: unknown; readonly at?: unknown } | undefined
+            const seq = value?.seq, at = value?.at
+            if (typeof seq !== 'number' || typeof at !== 'number' || at < now - ttl) cursor.delete()
+            else if (seq < minAck) minAck = seq
+            cursor.continue()
+            return
+          }
+          const target = Math.min(latest, Math.max(minAck, latest - window))
+          if (target <= floor) return
+          log.delete(IDBKeyRange.upperBound(target))
+          meta.put(target, FLOOR_KEY)
+        }
+      }
+      return () => {
+        if (result === undefined) throw new Error('INDEXEDDB_CHANGELOG_READ_FAILED')
+        return result
+      }
     }))
   }
 
@@ -330,7 +424,17 @@ export class IndexedDbBytesStore implements BytesStore {
   close(): Promise<void> {
     if (this.#closing !== undefined) return this.#closing
     this.#closed = true
-    this.#closing = this.#pending.then(() => { this.#database.close() })
+    this.#closing = this.#pending.then(async () => {
+      // Release this tab's changelog cursor so it no longer holds back pruning.
+      if (this.#cursorRegistered && this.#invalid === undefined) {
+        try {
+          await this.#writeTx([CHANGELOG_META], 'relaxed', tx => {
+            tx.objectStore(CHANGELOG_META).delete(this.#cursorKey); return () => undefined
+          })
+        } catch { /* An expired cursor is evicted by the TTL instead. */ }
+      }
+      this.#database.close()
+    })
     return this.#closing
   }
 
@@ -345,13 +449,19 @@ export class IndexedDbBytesStore implements BytesStore {
     return task
   }
 
-  #readTx<T>(storeName: string, enqueue: (table: IDBObjectStore) => () => T): Promise<T> {
+  #readTx<T>(storeName: string, enqueue: (table: IDBObjectStore) => () => T): Promise<T>
+  #readTx<T>(storeNames: readonly string[], enqueue: (tx: IDBTransaction) => () => T): Promise<T>
+  #readTx<T>(storeNames: string | readonly string[], enqueue: ((table: IDBObjectStore) => () => T) | ((tx: IDBTransaction) => () => T)): Promise<T> {
     return new Promise((resolve, reject) => {
       let transaction: IDBTransaction
-      try { transaction = this.#database.transaction(storeName, 'readonly') }
+      try { transaction = this.#database.transaction(typeof storeNames === 'string' ? storeNames : [...storeNames], 'readonly') }
       catch (error) { reject(error); return }
       let value: () => T
-      try { value = enqueue(transaction.objectStore(storeName)) }
+      try {
+        value = typeof storeNames === 'string'
+          ? (enqueue as (table: IDBObjectStore) => () => T)(transaction.objectStore(storeNames))
+          : (enqueue as (tx: IDBTransaction) => () => T)(transaction)
+      }
       catch (error) {
         try { transaction.abort() } catch { /* Preserve the original request failure. */ }
         reject(error); return
@@ -378,6 +488,10 @@ export class IndexedDbBytesStore implements BytesStore {
       transaction.onerror = () => { /* The abort event carries the transaction failure. */ }
     })
   }
+}
+
+function floorValue(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0
 }
 
 /** Scratch-only conformance probe; never opens the device's actual database. */

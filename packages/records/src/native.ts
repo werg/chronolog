@@ -159,6 +159,29 @@ export class NativeBytesStore implements BytesStore {
       }
     } finally { release(); await owner }
   }
+  /** Key-ordered entries whose key starts with `prefix` (pages from the first key >= prefix). */
+  async *iteratePrefix(prefix: string): AsyncIterable<BytesStoreEntry> {
+    let release!: () => void, started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve }), ready = new Promise<void>(resolve => { started = resolve })
+    const owner = this.#enqueue(async () => { started(); await held })
+    await Promise.race([ready, owner])
+    try {
+      if (prefix.length > 0) {
+        const exact = await this.#request<Uint8Array | null>('get', { key: prefix })
+        if (exact !== null) yield { key: prefix, value: exact }
+      }
+      let after = prefix
+      for (;;) {
+        const page = await this.#request<BytesStoreEntry[]>('page', { after })
+        if (page.length === 0) return
+        for (const entry of page) {
+          if (!entry.key.startsWith(prefix)) return
+          after = entry.key
+          yield entry
+        }
+      }
+    } finally { release(); await owner }
+  }
   async entries(): Promise<readonly BytesStoreEntry[]> {
     const entries: BytesStoreEntry[] = []
     for await (const entry of this.iterateEntries()) entries.push(entry)

@@ -49,6 +49,8 @@ export interface KernelMaterializedCache {
   /** Last accepted op per author (and public-only per author on private logs) for causal-chain checks. */
   readonly authorLastOpIds?: Readonly<Record<string, string>>
   readonly publicAuthorLastOpIds?: Readonly<Record<string, string>>
+  /** Private logs: accepted encrypted ops per `${ring}:${epoch}` (`$keys.policy.maxOpsPerEpoch`). */
+  readonly epochOpCounts?: Readonly<Record<string, number>>
 }
 
 const MAGIC = 0x434c4d43 // 'CLMC'
@@ -91,6 +93,7 @@ export function encodeMaterializedCache(cache: KernelMaterializedCache): Uint8Ar
     topicLastOpIds: cache.topicLastOpIds,
     ...(cache.authorLastOpIds === undefined ? {} : { authorLastOpIds: cache.authorLastOpIds }),
     ...(cache.publicAuthorLastOpIds === undefined ? {} : { publicAuthorLastOpIds: cache.publicAuthorLastOpIds }),
+    ...(cache.epochOpCounts === undefined ? {} : { epochOpCounts: cache.epochOpCounts }),
     authors,
   }))
   const body = utf8(JSON.stringify(outcomes))
@@ -124,7 +127,8 @@ export function decodeMaterializedCache(bytes: Uint8Array): KernelMaterializedCa
     const header = JSON.parse(text.decode(bytes.subarray(at, at + headerLen))) as {
       logId: string; blindHostMode: boolean; topics: Record<string, JsonValue>; seenOpsRoot: string
       historyDigest: string; stateRoot: string; frontierMaxTimestampMs: string
-      topicLastOpIds: Record<string, string>; authorLastOpIds?: Record<string, string>; publicAuthorLastOpIds?: Record<string, string>; authors: string[]
+      topicLastOpIds: Record<string, string>; authorLastOpIds?: Record<string, string>; publicAuthorLastOpIds?: Record<string, string>
+      epochOpCounts?: Record<string, number>; authors: string[]
     }
     at += headerLen
     const readIds = (): string[] => {
@@ -173,6 +177,7 @@ export function decodeMaterializedCache(bytes: Uint8Array): KernelMaterializedCa
       topicLastOpIds: header.topicLastOpIds,
       ...(header.authorLastOpIds === undefined ? {} : { authorLastOpIds: header.authorLastOpIds }),
       ...(header.publicAuthorLastOpIds === undefined ? {} : { publicAuthorLastOpIds: header.publicAuthorLastOpIds }),
+      ...(header.epochOpCounts === undefined ? {} : { epochOpCounts: header.epochOpCounts }),
     }
   } catch {
     return null

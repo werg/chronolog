@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { decodeRecord, encodeRecord, verifyRecord } from '@chronolog/authority'
-import { ApplicationContent, CONTENT_CHUNK_BYTES, CONTENT_CHUNK_HEADER_BYTES, MAX_CONTENT_CHUNKS, assertContentManifest } from './content.js'
+import { ApplicationContent, CONTENT_CHUNK_BYTES, CONTENT_CHUNK_HEADER_BYTES, CONTENT_CHUNK_OVERHEAD_BYTES, MAX_CONTENT_CHUNKS, assertContentManifest } from './content.js'
 import { contentFixture, deferred, payload } from './content-test-fixture.js'
 
 const cleanup: Array<() => Promise<unknown>> = []
@@ -24,10 +24,10 @@ describe('encrypted resumable content', () => {
     expect(await reopened.readBytes(reference, { maxBytes: bytes.length })).toEqual(bytes)
     for (const entry of await f.stores[0]!.entries()) {
       if (!entry.key.includes('/chunk/')) continue
-      // Binary chunk: [format][epoch u64][nonce 12][ciphertext + tag], no record encoding.
+      // Binary chunk: [format][epoch u64][salt 24][ciphertext + pad tag + GCM tag], no record encoding.
       const index = Number(entry.key.slice(entry.key.lastIndexOf('/') + 1))
       expect(entry.value[0]).toBe(1)
-      expect(entry.value.length).toBe(CONTENT_CHUNK_HEADER_BYTES + (index === 0 ? CONTENT_CHUNK_BYTES : 17) + 16)
+      expect(entry.value.length).toBe(CONTENT_CHUNK_HEADER_BYTES + (index === 0 ? CONTENT_CHUNK_BYTES : 17) + CONTENT_CHUNK_OVERHEAD_BYTES)
     }
     await resumed.discard()
     expect(await reopened.readBytes(reference, { maxBytes: bytes.length })).toEqual(bytes)

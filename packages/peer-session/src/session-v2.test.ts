@@ -254,7 +254,7 @@ describe('Chronolog v2 ApplicationSession (Gate 3)', () => {
     const devA = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const devJoiner = await openApplicationDevice({ store: new MemoryBytesStore(), create: true })
     const created = await createLogGenesis({
-      creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true, finalizer: true },
+      creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
       members: [{ publicKey: devJoiner.identity.publicKey, wrapKey: devJoiner.wrapKey.publicKey, reader: true, writer: true }],
       privateLog: true,
       imports: { 'app/kv': KV_REDUCER },

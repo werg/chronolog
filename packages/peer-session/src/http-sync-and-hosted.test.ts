@@ -17,8 +17,8 @@ import {
   type HttpSyncFactItem,
 } from './mirror.js'
 import { runEphemeralHostedSession } from './kernel.js'
+import { connectHttpSync, httpSyncFactId } from './http-sync-link.js'
 import {
-  acquireAtomicLock,
   connectNativeIpc,
   openExclusiveSqliteFence,
   startNativeIpcServer,
@@ -107,9 +107,10 @@ describe('Binary CBOR HTTP sync-v3, Ephemeral Hosted Runner & Native Supervisor'
         getFacts: ids => Promise.resolve(ids.filter(id => clientMap.has(id)).map(id => ({ id, bytes: clientMap.get(id)! }))),
         onReceive: items => {
           for (const item of items) clientMap.set(item.id, item.bytes)
-          return Promise.resolve()
+          return Promise.resolve(items.map(item => item.id))
         },
       })
+      expect(res.converged).toBe(true)
       expect(res.pushed).toBe(25)
       expect(res.pulled).toBe(60)
       expect(serverMap.size).toBe(125)
@@ -120,13 +121,112 @@ describe('Binary CBOR HTTP sync-v3, Ephemeral Hosted Runner & Native Supervisor'
       const res2 = await client.reconcile('mailbox', {
         ids: localIds,
         getFacts: () => Promise.resolve([]),
-        onReceive: () => Promise.resolve(),
+        onReceive: () => Promise.resolve([]),
       })
+      expect(res2.converged).toBe(true)
       expect(res2.rounds).toBe(1)
       expect(res2.pushed).toBe(0)
       expect(res2.pulled).toBe(0)
     } finally {
       await srv.close()
+    }
+  })
+
+  it('continues past reply limits until a fresh client holds every fact, and never counts rejected bytes as held', async () => {
+    const makeFact = (label: string): HttpSyncFactItem => {
+      const bytes = utf8(`fact:${label}`)
+      return { id: bytesToHex(sha256Sync(bytes)), bytes }
+    }
+    const serverMap = new Map<string, Uint8Array>()
+    for (let i = 0; i < 1500; i++) { const f = makeFact(`s-${i}`); serverMap.set(f.id, f.bytes) }
+    const store: BlindSyncStore = {
+      listIds: () => Promise.resolve([...serverMap.keys()]),
+      getFacts: (_scope, ids) => Promise.resolve(ids.flatMap(id => serverMap.has(id) ? [{ id, bytes: serverMap.get(id)! }] : [])),
+      putFacts: (_scope, items) => { for (const item of items) serverMap.set(item.id, item.bytes); return Promise.resolve({ accepted: items.length }) },
+    }
+    const srv = await startWebServer(createHttpSyncHandler({ store, maxPushPerReply: 100 }))
+    try {
+      const client = createHttpSyncClient(srv.baseUrl)
+      const held = new Map<string, Uint8Array>(), ids = new FactIdSet()
+      const res = await client.reconcile('control', {
+        ids,
+        getFacts: wanted => Promise.resolve(wanted.map(id => ({ id, bytes: held.get(id)! }))),
+        onReceive: items => { for (const item of items) held.set(item.id, item.bytes); return Promise.resolve(items.map(item => item.id)) },
+      })
+      expect(res.converged).toBe(true)
+      expect(res.pulled).toBe(1500)
+      expect(held.size).toBe(1500)
+      expect(ids.size).toBe(1500)
+
+      // A client that rejects some bytes (e.g. bad signatures) stops instead of looping, and never
+      // records the rejected ids as held.
+      const bad = makeFact('bad'); serverMap.set(bad.id, bad.bytes)
+      const res2 = await client.reconcile('control', {
+        ids,
+        getFacts: () => Promise.resolve([]),
+        onReceive: items => Promise.resolve(items.filter(item => item.id !== bad.id).map(item => item.id)),
+      })
+      expect(res2.converged).toBe(false)
+      expect(ids.has(bad.id)).toBe(false)
+      expect(res2.rounds).toBeLessThan(16)
+    } finally {
+      await srv.close()
+    }
+  })
+
+  it('syncs two sessions through a sync-v3 HTTP host with connectHttpSync (no peer link)', async () => {
+    const stores = { control: new Map<string, Uint8Array>(), mailbox: new Map<string, Uint8Array>() }
+    const cas = new Map<string, Uint8Array>()
+    const store: BlindSyncStore = {
+      listIds: scope => Promise.resolve([...stores[scope].keys()]),
+      getFacts: (scope, ids) => Promise.resolve(ids.flatMap(id => stores[scope].has(id) ? [{ id, bytes: stores[scope].get(id)! }] : [])),
+      async putFacts(scope, items, casPush) {
+        let accepted = 0
+        for (const item of items) {
+          if (await httpSyncFactId(scope, item.bytes) !== item.id) continue
+          if (!stores[scope].has(item.id)) { stores[scope].set(item.id, item.bytes); accepted++ }
+        }
+        for (const node of casPush) cas.set(node.hash, node.bytes)
+        return { accepted }
+      },
+      getCasNodes: (_scope, hashes) => Promise.resolve(hashes.flatMap(hash => cas.has(hash) ? [{ hash, bytes: cas.get(hash)! }] : [])),
+    }
+    const srv = await startWebServer(createHttpSyncHandler({ store }))
+    const [devA, devB] = await Promise.all([
+      openApplicationDevice({ store: new MemoryBytesStore(), create: true }),
+      openApplicationDevice({ store: new MemoryBytesStore(), create: true }),
+    ])
+    const created = await createLogGenesis({
+      creator: { publicKey: devA.identity.publicKey, wrapKey: devA.wrapKey.publicKey, reader: true, writer: true, administrator: true },
+      members: [{ publicKey: devB.identity.publicKey, wrapKey: devB.wrapKey.publicKey, reader: true, writer: true }],
+      privateLog: true,
+      imports: { 'app/notes': `export default {
+        reduce(state, tx) { const list = Array.isArray(state) ? state : []; return { ok: true, state: list.concat([tx.payload.text]) }; },
+        query(state) { return Array.isArray(state) ? state : []; },
+      };` },
+      topics: { notes: { module: 'app/notes' } },
+    })
+    const epochKeys = new Map<number, Uint8Array>([[0, created.epoch0Key!]])
+    const a = await createApplicationSession({ device: devA, genesis: created.genesisBytes, casNodes: created.casNodes, epochKeys })
+    const b = await createApplicationSession({ device: devB, genesis: created.genesisBytes, casNodes: created.casNodes, epochKeys })
+    const linkA = connectHttpSync(a, { baseUrl: srv.baseUrl, intervalMs: 0 })
+    const linkB = connectHttpSync(b, { baseUrl: srv.baseUrl, intervalMs: 0 })
+    try {
+      for (let i = 0; i < 3; i++) await (await a.submit({ updates: [{ topic: 'notes', input: { text: `a${i}` } }] })).materialized()
+      const pushed = await linkA.synchronize()
+      expect(pushed.control.converged).toBe(true)
+      expect(pushed.mailbox?.converged).toBe(true)
+      expect(stores.mailbox.size).toBe(3)
+      const pulled = await linkB.synchronize()
+      expect(pulled.mailbox?.converged).toBe(true)
+      expect(b.topic('notes')).toEqual(['a0', 'a1', 'a2'])
+      await (await b.submit({ updates: [{ topic: 'notes', input: { text: 'b0' } }] })).materialized()
+      await linkB.synchronize()
+      await linkA.synchronize()
+      expect(a.topic('notes')).toEqual(b.topic('notes'))
+    } finally {
+      linkA.close(); linkB.close()
+      await Promise.all([a.close(), b.close(), srv.close()])
     }
   })
 
@@ -205,22 +305,15 @@ describe('Binary CBOR HTTP sync-v3, Ephemeral Hosted Runner & Native Supervisor'
     }
   })
 
-  it('enforces acquireAtomicLock, openExclusiveSqliteFence, and length-prefixed native IPC', async () => {
+  it('enforces openExclusiveSqliteFence and length-prefixed native IPC', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'chronolog-native-sup-'))
     try {
-      const lock = acquireAtomicLock(dir)
-      expect(() => acquireAtomicLock(dir)).toThrow(/OWNER_BUSY|held by active PID/u)
-      lock.release()
-      const lock2 = acquireAtomicLock(dir)
-      lock2.release()
-
       const fence = openExclusiveSqliteFence(join(dir, 'owner.sqlite'))
-      fence.close()
-
       const sockPath = join(dir, 'ipc.sock')
       const received: string[] = []
       const srv = await startNativeIpcServer({
         socketPath: sockPath,
+        fence,
         onConnection: conn => {
           conn.onFrame(frame => {
             const msg = new TextDecoder().decode(frame)
@@ -240,6 +333,7 @@ describe('Binary CBOR HTTP sync-v3, Ephemeral Hosted Runner & Native Supervisor'
         client.close()
       } finally {
         await srv.close()
+        fence.close()
       }
     } finally {
       rmSync(dir, { recursive: true, force: true })

@@ -1,5 +1,5 @@
 import { bytesToHex, hexToBytes, sha256Sync, utf8 } from '@chronolog/canonical'
-import { canonicalEventPayload, canonicalJson, type EventPayload, type JsonValue } from '@chronolog/protocol'
+import { canonicalEventPayload, canonicalJson, verifyEd25519, type JsonValue } from '@chronolog/protocol'
 import { hex, recordDigest, signRecord, verifyRecord, type Signed, type SigningIdentity } from './codec.js'
 
 export interface AdmissionInclusion {
@@ -19,6 +19,8 @@ export interface AdmissionCheckpointPayload {
   readonly includedSetDigest: string
   readonly historyDigest: string
   readonly stateRoot: string
+  /** CAS root of the scoped idempotency set `(visibility, author, operationId)` at the checkpoint. */
+  readonly seenOpsRoot: string
   readonly inclusions: readonly AdmissionInclusion[]
 }
 
@@ -111,6 +113,7 @@ export function checkpointPayloadToJson(payload: AdmissionCheckpointPayload): Js
     includedSetDigest: payload.includedSetDigest,
     historyDigest: payload.historyDigest,
     stateRoot: payload.stateRoot,
+    seenOpsRoot: payload.seenOpsRoot,
     inclusions: payload.inclusions.map(i => ({
       opId: i.opId,
       authorTimestampMs: Number(i.authorTimestampMs),
@@ -120,6 +123,10 @@ export function checkpointPayloadToJson(payload: AdmissionCheckpointPayload): Js
 }
 
 export function canonicalAdmissionCheckpointMessage(payload: AdmissionCheckpointPayload): string {
+  hex(payload.logId)
+  hex(payload.stateRoot)
+  hex(payload.historyDigest)
+  hex(payload.seenOpsRoot)
   return canonicalJson(['chronolog/admission-checkpoint/v1', checkpointPayloadToJson(payload)])
 }
 
@@ -169,6 +176,8 @@ export async function evaluateAdmission(options: {
     readonly authorTimestampMs: bigint
     readonly visibility: 'public' | 'encrypted'
   }[]
+  /** Visible operation facts supplied to the policy on a private log. Closure still applies to all held ops. */
+  readonly policyOps?: AdmissionEvaluatorInput['ops']
   readonly evidence: readonly AdmissionEvidence[]
   readonly pinnedFrontier?: PinnedFrontier | null
   readonly evaluator?: AdmissionEvaluator | null
@@ -177,7 +186,7 @@ export async function evaluateAdmission(options: {
   const raw = options.evaluator
     ? await options.evaluator({
         logId: options.logId,
-        ops: options.ops,
+        ops: options.policyOps ?? options.ops,
         evidence: options.evidence,
         pinnedFrontier: options.pinnedFrontier ?? null,
       })
@@ -187,28 +196,42 @@ export async function evaluateAdmission(options: {
   const includedOpIds = new Set<string>(raw?.includedOpIds ?? [])
   const excludedOpIds = new Set<string>(raw?.excludedOpIds ?? [])
   const verifiedEvidence: AdmissionEvidence[] = []
+  const verifiedIndices = new Set<number>()
   if (Array.isArray(raw?.verifiedEvidenceIndices)) {
-    for (const idx of raw.verifiedEvidenceIndices) {
-      if (typeof idx === 'number' && Number.isSafeInteger(idx) && idx >= 0 && idx < options.evidence.length) {
+    for (const idx of raw.verifiedEvidenceIndices as readonly unknown[]) {
+      if (typeof idx === 'number' && Number.isSafeInteger(idx) && idx >= 0 && idx < options.evidence.length && !verifiedIndices.has(idx)) {
+        verifiedIndices.add(idx)
         verifiedEvidence.push(options.evidence[idx]!)
       }
     }
   }
   const latestCheckpoint =
     typeof raw?.latestCheckpointIndex === 'number' &&
-    raw.latestCheckpointIndex >= 0 &&
-    raw.latestCheckpointIndex < options.evidence.length
+    verifiedIndices.has(raw.latestCheckpointIndex)
       ? options.evidence[raw.latestCheckpointIndex]!
       : (verifiedEvidence.length > 0 ? verifiedEvidence[verifiedEvidence.length - 1]! : null)
 
   // Always honor a locally pinned frontier (surgical descent / non-rewinding checkpoint)
   if (options.pinnedFrontier !== undefined && options.pinnedFrontier !== null) {
     const pf = options.pinnedFrontier
-    for (const id of pf.includedOpIds) includedOpIds.add(id)
+    const pinnedIds = new Set(pf.includedOpIds)
+    for (const op of options.ops) {
+      if (op.authorTimestampMs <= pf.closedThroughMs && !pinnedIds.has(op.opId)) {
+        includedOpIds.delete(op.opId)
+        excludedOpIds.add(op.opId)
+      }
+    }
+    for (const id of pinnedIds) {
+      includedOpIds.add(id)
+      excludedOpIds.delete(id)
+    }
     if (closedThroughMs === null || pf.closedThroughMs > closedThroughMs) {
       closedThroughMs = pf.closedThroughMs
     }
   }
+
+  // An excluded fact cannot also enter the finalized view.
+  for (const id of excludedOpIds) includedOpIds.delete(id)
 
   // Enforce universal closed-time exclusion invariant: any op <= closedThroughMs not included is excluded
   if (closedThroughMs !== null) {
@@ -229,24 +252,57 @@ export async function evaluateAdmission(options: {
   }
 }
 
-/** Pure host-attestation helper matching `chronolog/admission`'s Ed25519 verification format. */
-export async function signHostAttestationV2<T extends EventPayload>(
+/** Domain tag of host attestations verified by `chronolog/admission` (`setMember` with `attestation`). */
+export const HOST_ATTESTATION_DOMAIN = 'chronolog/host-attestation/v2'
+
+/**
+ * Fields every host attestation must carry: the attested device key, the log it may join, and an
+ * expiry. `chronolog/admission` rejects an attestation whose `logId` is not the materializing log or
+ * whose `expiresAtMs` is not after the admitting operation's `authorTimestampMs`.
+ */
+export interface HostAttestationPayload {
+  readonly logId: string
+  readonly publicKey: string
+  readonly expiresAtMs: number
+  readonly [field: string]: JsonValue
+}
+
+function hostAttestationMessage(payload: HostAttestationPayload): Uint8Array {
+  hex(payload.logId)
+  hex(payload.publicKey)
+  if (!Number.isSafeInteger(payload.expiresAtMs) || payload.expiresAtMs <= 0) {
+    throw Object.assign(new Error('HOST_ATTESTATION_EXPIRY_INVALID'), { code: 'HOST_ATTESTATION_EXPIRY_INVALID' })
+  }
+  return utf8(canonicalEventPayload([HOST_ATTESTATION_DOMAIN, payload]))
+}
+
+/** Sign a host attestation in the canonical `chronolog/host-attestation/v2` format verified by `chronolog/admission`. */
+export async function signHostAttestationV2<T extends HostAttestationPayload>(
   payload: T,
   hostIdentity: SigningIdentity,
 ): Promise<{ readonly payload: T; readonly signature: string }> {
-  const msg = utf8(canonicalEventPayload(['chronolog/host-attestation/v1', payload]))
+  const captured = structuredClone(payload)
+  const msg = hostAttestationMessage(captured)
   const sig = new Uint8Array(await crypto.subtle.sign('Ed25519', hostIdentity.privateKey, Uint8Array.from(msg).buffer))
-  return { payload: structuredClone(payload), signature: bytesToHex(sig) }
+  return { payload: captured, signature: bytesToHex(sig) }
 }
 
-export async function verifyHostAttestationV2<T extends EventPayload>(
+/**
+ * Verify a host attestation exactly as `chronolog/admission` does: signature under `hostPublicKeyHex`,
+ * `payload.logId === expected.logId`, and `payload.expiresAtMs > expected.atMs`.
+ */
+export async function verifyHostAttestationV2<T extends HostAttestationPayload>(
   attestation: { readonly payload: T; readonly signature: string },
   hostPublicKeyHex: string,
+  expected: { readonly logId: string; readonly atMs: number },
 ): Promise<boolean> {
   if (!/^[0-9a-f]{64}$/u.test(hostPublicKeyHex) || !/^[0-9a-f]{128}$/u.test(attestation.signature)) return false
-  const key = await crypto.subtle.importKey('raw', Uint8Array.from(hexToBytes(hostPublicKeyHex)).buffer, 'Ed25519', false, ['verify'])
-  const msg = utf8(canonicalEventPayload(['chronolog/host-attestation/v1', attestation.payload]))
-  return crypto.subtle.verify('Ed25519', key, Uint8Array.from(hexToBytes(attestation.signature)).buffer, Uint8Array.from(msg).buffer)
+  const p = attestation.payload
+  if (p === null || typeof p !== 'object' || p.logId !== expected.logId) return false
+  if (!Number.isSafeInteger(p.expiresAtMs) || !(p.expiresAtMs > expected.atMs)) return false
+  let msg: Uint8Array
+  try { msg = hostAttestationMessage(p) } catch { return false }
+  return verifyEd25519(hexToBytes(hostPublicKeyHex), msg, hexToBytes(attestation.signature))
 }
 
 /** Verify a signed CBOR record (helper re-exported for host/client consumers). */

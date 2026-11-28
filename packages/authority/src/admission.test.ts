@@ -28,6 +28,7 @@ describe('@chronolog/authority admission', () => {
       includedSetDigest: computeIncludedSetDigest([opIncluded]),
       historyDigest: HIST_A,
       stateRoot: ROOT_A,
+      seenOpsRoot: '3'.repeat(64),
       inclusions: [{ opId: opIncluded, authorTimestampMs: 50n, author: signer.publicKey }],
     }
     const sig = await signAdmissionCheckpoint(payload, signer)
@@ -55,14 +56,15 @@ describe('@chronolog/authority admission', () => {
     expect(decision.excludedOpIds.has(opAfter)).toBe(false)
     expect(decision.verifiedEvidence).toHaveLength(1)
 
-    // Pinned frontier strictly excludes backdated ops even without external evidence
+    // Later evidence cannot add an operation behind the locally pinned frontier.
     const pinnedDecision = await evaluateAdmission({
       logId: LOG_ID,
       ops: [
         { opId: opIncluded, author: signer.publicKey, authorTimestampMs: 50n, visibility: 'public' },
         { opId: opLateBackdated, author: signer.publicKey, authorTimestampMs: 75n, visibility: 'public' },
       ],
-      evidence: [],
+      evidence: [ev],
+      evaluator: () => ({ closedThroughMs: 120, includedOpIds: [opLateBackdated], latestCheckpointIndex: 0 }),
       pinnedFrontier: {
         closedThroughMs: 100n,
         stateRoot: ROOT_A,
@@ -70,16 +72,24 @@ describe('@chronolog/authority admission', () => {
         includedOpIds: [opIncluded],
       },
     })
-    expect(pinnedDecision.closedThroughMs).toBe(100n)
+    expect(pinnedDecision.closedThroughMs).toBe(120n)
     expect(pinnedDecision.includedOpIds.has(opIncluded)).toBe(true)
+    expect(pinnedDecision.includedOpIds.has(opLateBackdated)).toBe(false)
     expect(pinnedDecision.excludedOpIds.has(opLateBackdated)).toBe(true)
+    expect(pinnedDecision.latestCheckpoint).toBeNull()
   })
 
-  it('signs and verifies host attestations in the canonical chronolog/host-attestation/v1 format', async () => {
+  it('signs and verifies host attestations bound to a log and an expiry (chronolog/host-attestation/v2)', async () => {
     const host = await createSigningIdentity()
-    const att = await signHostAttestationV2({ publicKey: 'f'.repeat(64), accountId: 'acct-1' }, host)
-    expect(await verifyHostAttestationV2(att, host.publicKey)).toBe(true)
+    const att = await signHostAttestationV2({ logId: LOG_ID, publicKey: 'f'.repeat(64), expiresAtMs: 1_000, accountId: 'acct-1' }, host)
+    expect(await verifyHostAttestationV2(att, host.publicKey, { logId: LOG_ID, atMs: 999 })).toBe(true)
     const other = await createSigningIdentity()
-    expect(await verifyHostAttestationV2(att, other.publicKey)).toBe(false)
+    expect(await verifyHostAttestationV2(att, other.publicKey, { logId: LOG_ID, atMs: 999 })).toBe(false)
+    // Replay into another log or after expiry is rejected.
+    expect(await verifyHostAttestationV2(att, host.publicKey, { logId: 'b'.repeat(64), atMs: 999 })).toBe(false)
+    expect(await verifyHostAttestationV2(att, host.publicKey, { logId: LOG_ID, atMs: 1_000 })).toBe(false)
+    // Unbound payloads cannot be signed at all.
+    await expect(signHostAttestationV2({ logId: LOG_ID, publicKey: 'f'.repeat(64), expiresAtMs: 0 }, host)).rejects.toThrow('HOST_ATTESTATION_EXPIRY_INVALID')
+    await expect(signHostAttestationV2({ logId: 'nope', publicKey: 'f'.repeat(64), expiresAtMs: 5 }, host)).rejects.toThrow()
   })
 })

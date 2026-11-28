@@ -112,7 +112,7 @@ try {
   nativeDevice = await openNativeDevice({ path: join(directory, 'native.sqlite'), create: true })
   const key = crypto.getRandomValues(new Uint8Array(32))
   const created = await createLogGenesis({
-    creator: { publicKey: identity.publicKey, reader: true, writer: true, administrator: true, finalizer: true },
+    creator: { publicKey: identity.publicKey, reader: true, writer: true, administrator: true },
     members: [{ publicKey: nativeDevice.identity.publicKey, wrapKey: nativeDevice.wrapKey.publicKey, reader: true, writer: true }],
     privateLog: true,
     imports: { 'app/messages': RTC_MESSAGES_REDUCER },
@@ -227,7 +227,7 @@ try {
   phase = 'browser-only-finality'
   const finalized = await page.evaluate(() => (globalThis as unknown as TestWindow).authoredRtcTest.finalize())
   assert.equal(finalized.signer, identity.publicKey); assert.notEqual(finalized.closedThroughMs, null); assert.deepEqual(finalized.events, reopened.events); assert.equal(finalized.revision.view, 'final')
-  passed('browser-owned-finalizer-closes-authored-time-with-native-absent')
+  passed('browser-owned-checkpoint-closes-authored-time-with-native-absent')
   assert.deepEqual(host, hostBefore); assert.deepEqual(browserRequests, requestsBefore); assert.equal(host.introductions, 2)
   assert.deepEqual(errors, [])
   passed('host-http-and-signaling-remain-idle')

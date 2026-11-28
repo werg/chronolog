@@ -74,6 +74,7 @@ describe('Reusable WinterCG CAS Mirror, Trusted Derivation Caching & Blind-Host 
       store: mirrorStore,
       basePath: '/_mirror',
       allowWrites: true,
+      isServableTree: () => true,
     })
     const srv = await startMirrorServer(handler)
     try {

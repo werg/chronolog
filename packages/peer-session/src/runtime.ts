@@ -23,7 +23,7 @@ export interface CreateApplicationSessionOptions<D extends ApplicationDefinition
   readonly casMirrors?: readonly string[]
 }
 
-/** Opens a Chronolog v2 local-first ApplicationSession on the claimed device. */
+/** Opens a local-first ApplicationSession on the claimed device. */
 export async function createApplicationSession<const D extends ApplicationDefinition = ApplicationDefinition>(
   options: CreateApplicationSessionOptions<D>,
 ): Promise<ApplicationSession<D>> {

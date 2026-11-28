@@ -34,7 +34,7 @@ function normalizeSeals(state) {
 }
 
 function validTopicName(topic) {
-  return typeof topic === 'string' && topic.length > 0 && topic.length <= 128 && topic !== '$seals';
+  return typeof topic === 'string' && topic.length > 0 && topic.length <= 128;
 }
 
 function validPathName(path) {

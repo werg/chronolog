@@ -1,6 +1,6 @@
-# Design Brief: CRDT-Native Sub-Linear Group Key Rotation (`$keys` v2.1)
+# CRDT-Native Sub-Linear Group Key Rotation (`chronolog-keytree-dag/v1`)
 
-> **Status:** Planned next cryptography milestone (schema hooks already prepared in Chronolog v2.0 `$keys`).
+> **Status:** Implemented (`chronolog-keytree-dag/v1` / `chronolog-keytree-subtree/v1` via `@chronolog/crypto`, `chronolog/keys:rotateTreeEpoch`, `$keys.policy.distribution: 'tree'`, and `session.rotateTreeEpoch()`).
 > **Goal:** Reduce member-removal / epoch-rotation overhead from $O(N)$ HPKE lockboxes per rotation to $O(\log N)$ while preserving Chronolog's leaderless flat-CRDT convergence, blind-host verifiability, and hybrid post-quantum (`X-Wing`) security.
 
 ---
@@ -29,16 +29,16 @@ Therefore, sub-linear rotation in Chronolog must be **CRDT-native**, **determini
 
 ---
 
-## 3. Proposed Architecture: Epoch-Tree HPKE + Causal-TreeKEM over CAS (`hpke-tree-v1`)
+## 3. Architecture: Key-Tagged TreeKEM over Structural-Sharing CAS Merkle-DAG
 
-We already prepared `$keys` in v2.0 so `EncryptedOperationEnvelope` and `TopicKernel` are completely decoupled from how epoch keys are distributed:
+`EncryptedOperationEnvelope` and `TopicKernel` are completely decoupled from how epoch keys are distributed:
 
 - Envelopes only reference `(ring, epoch)` and authenticate against `mailboxVerifyKey`.
 - `$keys` is a normal reducer topic (`chronolog/keys`) whose state is plain JSON referencing content-addressed CAS nodes.
 
-### 3.1 Core Data Structure: Content-Addressed Binary Ratchet Tree (`chronolog-keytree/v1`)
+### 3.1 Core Data Structure: Structural-Sharing Binary Ratchet Tree (`chronolog-keytree-dag/v1`)
 
-Instead of storing an inline `boxes: { [pk]: Box }` map of size $O(N)$ in `$keys`, a `hpke-tree-v1` epoch stores:
+Instead of storing an inline `boxes: { [pk]: Box }` map of size $O(N)$ in `$keys`, a tree epoch stores:
 
 ```json
 {
@@ -46,27 +46,29 @@ Instead of storing an inline `boxes: { [pk]: Box }` map of size $O(N)$ in `$keys
   "suite": "hpke-tree-xwing-aes256gcm",
   "keyCommitment": "<sha256>",
   "mailboxVerifyKey": "<ed25519-pub>",
-  "treeRoot": "cas:sha256-...",
-  "leafCount": 4096
+  "treeRef": "cas:sha256-...",
+  "leafCount": 4096,
+  "activeMembers": ["..."],
+  "boxes": {}
 }
 ```
 
-The tree itself is stored as a **Merkle-DAG of public CAS nodes** (4-ary or binary tree, immutable nodes, automatic structural sharing across epochs!):
+The tree itself is stored as a **structural-sharing binary Merkle-DAG of public CAS nodes** (`writeKeyTreeToCas` / `readKeyTreeFromCas` in `@chronolog/crypto`):
 
-- **Leaves** hold each active member's `(publicKey, wrapKey / pqWrapKey)` and leaf index.
-- **Internal nodes** hold a deterministic node public key derived from a seed `nodeSeed` (using `xwingPublicKeyFromSeed` or X25519 scalar clamping), plus an optional `parentHash` commitment.
-- **Structural sharing:** Updating a member's direct path from leaf $\ell$ to root only allocates $\lceil \log_2 N \rceil$ new CAS nodes (~12 nodes for 4,096 members = ~16 KiB even with X-Wing!). Unchanged subtrees keep their exact CAS hashes, so peers and blind hosts sync only the $O(\log N)$ delta nodes.
+- **Root manifest (`chronolog-keytree-dag/v1`):** Holds `suite`, `epoch`, `leafCount`, `treeRootRef`, and `copathBoxes` ($O(\log N)$ sibling boxes plus 1 self-box for the updater's own leaf so cold boot and 1-member groups recover statelessly).
+- **Subtree nodes (`chronolog-keytree-subtree/v1`):** Subtrees of height $\le 2$ pack inline ($\le 7$ nodes, always $< 24\text{ KiB}$ even with 1,216-byte X-Wing keys); higher internal nodes store their own `KeyTreeNodePublic` plus `leftRef`/`rightRef` with explicit `CasNode.links`.
+- **Structural sharing & P2P pull:** Updating a member's direct path from leaf $\ell$ to root writes only $\lceil \log_2 N \rceil$ small CAS nodes. Unchanged subtrees keep identical `cas:sha256-...` hashes, `missingCasDependencies()` reports missing `treeRef`/subtree hashes to `sync-v3` (`cas-want` `{ subgraph: true }`) and HTTP `casMirrors`, and `collectControlReferencedCasHashes()` keeps active tree DAGs pinned across GC.
 
 ### 3.2 Member Removal (Forward Secrecy & PCS) in $O(\log N)$
 
 When an admin removes member at leaf $\ell$:
 1. Blank leaf $\ell$ and every node along its direct path to the root.
-2. Pick a fresh random `pathSeed` for the admin's own leaf (or a fresh root secret for `epoch + 1`).
-3. Walk up the direct path, deriving each parent's `(seed, pubKey)` via `HKDF(childSeed, "chronolog/tree-parent/v1")` and HPKE-sealing each new parent seed **strictly to the copath resolution** (at most $\log_2 N$ sibling subtrees!).
-4. Derive `epochKey = HKDF(rootSeed, "chronolog/epoch-key/v3:" + logId + ":" + epoch)` and `mailboxVerifyKey = deriveEpochMailboxKeyPair(epochKey).publicKey`.
+2. Pick a fresh random `pathSeed` for the updater's own leaf.
+3. Walk up the direct path, deriving each parent's `(seed, pubKey)` via `HKDF(childSeed, "chronolog/tree-parent/v1")` and HPKE-sealing each new parent seed **strictly to the copath resolution** (at most $\log_2 N$ sibling subtrees, plus 1 self-box for the updater's leaf).
+4. Derive `epochKey = HKDF(rootSeed, "chronolog/tree-epoch-key/v1:" + scope + ":" + epoch)` and `mailboxVerifyKey = deriveEpochMailboxKeyPair(epochKey).publicKey`.
 5. Publish the $O(\log N)$ new CAS nodes + one compact `$keys` `rotateTreeEpoch` op!
 
-Every remaining member holds the private seed for at least one node in the copath resolution, decrypts the single box for their ancestor, hashes up to `rootSeed`, and obtains `epochKey` in $O(\log N)$ symmetric operations.
+Every remaining member holds the private seed for at least one node in the copath resolution, decrypts the single box for their ancestor, verifies each derived intermediate `pubKeyHash` against the tree up to `rootSeed`, and obtains `epochKey` in $O(\log N)$ symmetric operations.
 
 ### 3.3 Chronolog-Style Undo-Do-Redo for TreeKEM: Key-Tagged TreeKEM (No Delivery Service, No Fork State Machine)
 
@@ -97,20 +99,10 @@ Standard MLS breaks under undo-do-redo because:
 
 ---
 
-## 4. Compatibility & Preparation Already Landed in v2.0
+## 4. Implementation Summary
 
-The v2.0 crypto pass intentionally prepared all four clean seams needed for `hpke-tree-v1`:
+All components are live in `@chronolog/crypto`, `@chronolog/materializer`, and `@chronolog/peer-session`:
 
-1. **Suite agility in `$keys`:** `policy.minSuite` and per-epoch `suite` already gate acceptable key-distribution suites (`SUITE_RANK` in `chronolog/keys`), so adding `'hpke-tree-x25519-aes256gcm'` and `'hpke-tree-xwing-aes256gcm'` is an additive reducer upgrade.
-2. **Envelope decoupling:** `EncryptedOperationEnvelope` uses `(epoch, ring, suite: 'hkdf-aes-256-gcm', mailboxTag)` and never cares whether `epochKey` arrived via a flat HPKE box or a Merkle ratchet tree.
-3. **Blind-host parity:** Blind hosts only read `$keys` `{ kind: 'mailboxKeys' }` (for `mailboxVerifyKey` verification) and `collectControlReferencedCasHashes()` (which already walks `cas:sha256-...` refs in `$keys` and transitive `CasNode.links` for exact GC!).
-4. **Deterministic PQ KEM seeds:** `generateXWingKeyPair(seed)` and `xwingPublicKeyFromSeed(seed)` in `@chronolog/crypto` already derive full 1,216-byte X-Wing public keys deterministically from a 32-byte seed — the exact primitive required for internal ratchet-tree nodes!
-
----
-
-## 5. Rollout Plan (Next Milestone)
-
-1. Add `chronolog-keytree/v1` CBOR CAS node codec + tree path derivation/resolution in `@chronolog/crypto` and `@chronolog/records`.
-2. Add `hpkeTreeEpochs` (or extend `hpkeEpochs` with `rotateTreeEpoch` + `grantHistoryBundle`) in `chronolog/keys`.
-3. Auto-switch or opt-in via `$keys.policy.distribution: 'flat' | 'tree'` (default `'flat'` below 64 members, `'tree'` for larger groups).
-4. Add property-based fuzz tests verifying convergence under arbitrary concurrent offline joins, removals, and network partitions.
+1. **Structural-sharing CAS Merkle-DAG (`@chronolog/crypto`):** `buildTreeEpochUpdate()`, `openTreeEpoch()`, `writeKeyTreeToCas()`, and `readKeyTreeFromCas()` support both `hpke-tree-x25519-aes256gcm` and hybrid PQ `hpke-tree-xwing-aes256gcm` (including mixed PQ + X25519 member rosters) with explicit `CasNode.links` and updater self-recovery boxes.
+2. **On-log `$keys` support (`chronolog/keys`):** `policy.distribution: 'flat' | 'tree'`, `rotateTreeEpoch`, `needsRotation` (checking `activeMembers ∪ boxes`), and `query({ member })`.
+3. **Unified session API (`@chronolog/peer-session`):** `session.rotateTreeEpoch()`, `session.rotateEpoch()` / `session.removeMember()` / `session.admitMember()` respecting `policy.distribution`, `session.keysNeedsRotation()` (covering both stale members and `policy.maxOpsPerEpoch`), automatic `missingCasDependencies()` + P2P/mirror pull of `treeRef` DAGs, and blind-host `mailboxVerifyKeys` + GC parity.

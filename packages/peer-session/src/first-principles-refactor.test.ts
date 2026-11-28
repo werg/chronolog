@@ -196,7 +196,7 @@ describe('First-principles Chronolog refactor verification', () => {
         awaitMaterialized: true,
         updates: [{
           topic: '$admission',
-          input: { action: 'setMember', member: { publicKey: devC.identity.publicKey, wrapKey: devC.wrapKey.publicKey, reader: true, writer: true, administrator: false, publisher: false, finalizer: false } },
+          input: { action: 'setMember', member: { publicKey: devC.identity.publicKey, wrapKey: devC.wrapKey.publicKey, reader: true, writer: true, administrator: false, publisher: false } },
         }],
       })
       const pub1 = await sessA.exportPublicControlFacts()

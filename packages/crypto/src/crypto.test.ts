@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { p256 } from '@noble/curves/nist.js'
+import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js'
 import { bytesToHex, utf8 } from '@chronolog/protocol'
 import {
   decryptEpochPayload,
   deriveEpochMailboxKeyPair,
+  ed25519PublicKeyFromSeedSync,
+  hpkeBaseKeySchedule,
   encryptEpochPayload,
   exportX25519PrivateKey,
   generateX25519KeyPair,
@@ -120,7 +123,7 @@ describe('epoch payload encryption', () => {
     const expected = Uint8Array.from(plaintext)
     const aad = Buffer.from('visible header')
     const encrypted = await encryptEpochPayload(key, 12n, plaintext, aad)
-    expect(encrypted.ciphertext.byteLength).toBe(expected.byteLength + 16)
+    expect(encrypted.ciphertext.byteLength).toBe(1 + expected.byteLength + 16)
     const opened = await decryptEpochPayload(key, {
       ...encrypted, nonce: Buffer.from(encrypted.nonce), ciphertext: Buffer.from(encrypted.ciphertext),
     }, aad)
@@ -137,14 +140,13 @@ describe('epoch payload encryption', () => {
     await expect(decryptEpochPayload(key, { ...encrypted, epoch: 13n }, utf8('visible header'))).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
   })
 
-  it('supports hkdf-aes-256-gcm (192-bit salt) with power-of-two bucket padding', async () => {
+  it('uses hkdf-aes-256-gcm (192-bit salt) with power-of-two bucket padding', async () => {
     const key = bytes(0x33)
     const aad = utf8('log/op/anon')
     const shortMsg = utf8('hi')
     const medMsg = utf8('a slightly longer message inside the same bucket')
-    const enc1 = await encryptEpochPayload(key, 3n, shortMsg, aad, undefined, { suite: 'hkdf-aes-256-gcm', paddingBucketBytes: 256 })
-    const enc2 = await encryptEpochPayload(key, 3n, medMsg, aad, undefined, { suite: 'hkdf-aes-256-gcm', paddingBucketBytes: 256 })
-    expect(enc1.suite).toBe('hkdf-aes-256-gcm')
+    const enc1 = await encryptEpochPayload(key, 3n, shortMsg, aad, undefined, { paddingBucketBytes: 256 })
+    const enc2 = await encryptEpochPayload(key, 3n, medMsg, aad, undefined, { paddingBucketBytes: 256 })
     expect(enc1.nonce).toHaveLength(24)
     expect(enc1.ciphertext.byteLength).toBe(256 + 16)
     expect(enc2.ciphertext.byteLength).toBe(256 + 16)
@@ -156,6 +158,16 @@ describe('epoch payload encryption', () => {
     expect(unpadPlaintext(padded)).toEqual(shortMsg)
     padded[127] = 1
     expect(() => unpadPlaintext(padded)).toThrow()
+  })
+
+  it('has exactly one suite: rejects 12-byte nonces and applies padding by default path', async () => {
+    const key = bytes(0x34)
+    const aad = utf8('aad')
+    await expect(encryptEpochPayload(key, 1n, utf8('x'), aad, new Uint8Array(12))).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
+    const enc = await encryptEpochPayload(key, 1n, utf8('x'), aad, undefined, { paddingBucketBytes: 64 })
+    expect(enc.nonce).toHaveLength(24)
+    expect(enc.ciphertext.byteLength).toBe(64 + 16)
+    await expect(decryptEpochPayload(key, { ...enc, nonce: enc.nonce.subarray(0, 12) }, aad)).rejects.toMatchObject({ code: 'SCHEMA_INVALID' })
   })
 })
 
@@ -179,6 +191,19 @@ describe('hybrid post-quantum X-Wing HPKE, P-256, HMAC, and mailbox derivation',
     await expect(xwingOpenBase(other.secretKey, sealed.encapsulatedKey, sealed.ciphertext, info, aad)).rejects.toMatchObject({ code: 'INVALID_SIGNATURE' })
   })
 
+  it('uses the RFC 9180 mode_base key schedule with X-Wing KEM 0x647a', async () => {
+    const kp = generateXWingKeyPair(bytes(0x43, 32))
+    const plaintext = utf8('rfc9180 xwing')
+    const info = utf8('info'), aad = utf8('aad')
+    const sealed = await xwingSealBase(kp.publicKey, plaintext, info, aad)
+    const sharedSecret = ml_kem768_x25519.decapsulate(sealed.encapsulatedKey, kp.secretKey)
+    const suiteId = Uint8Array.of(0x48, 0x50, 0x4b, 0x45, 0x64, 0x7a, 0x00, 0x01, 0x00, 0x02)
+    const ks = await hpkeBaseKeySchedule(suiteId, sharedSecret, info)
+    const k = await crypto.subtle.importKey('raw', Uint8Array.from(ks.key), 'AES-GCM', false, ['decrypt'])
+    const opened = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Uint8Array.from(ks.nonce), additionalData: Uint8Array.from(aad) }, k, Uint8Array.from(sealed.ciphertext)))
+    expect(opened).toEqual(plaintext)
+  })
+
   it('verifies NIST P-256 WebAuthn compact & DER signatures, HMAC-SHA256, and epoch mailbox keys', () => {
     // RFC 4231 test case 2 for HMAC-SHA256
     const mac = hmacSha256Sync(utf8('Jefe'), utf8('what do ya want for nothing?'))
@@ -190,9 +215,22 @@ describe('hybrid post-quantum X-Wing HPKE, P-256, HMAC, and mailbox derivation',
     const msg = utf8('webauthn-challenge-payload')
     const compactSig = p256.sign(msg, priv, { format: 'compact' })
     const derSig = p256.sign(msg, priv, { format: 'der' })
-    expect(verifyP256Sync(pubUncompressed, msg, compactSig)).toBe(true)
-    expect(verifyP256Sync(pubCompressed, msg, derSig)).toBe(true)
-    expect(verifyP256Sync(pubUncompressed, utf8('tampered'), derSig)).toBe(false)
+    expect(verifyP256Sync(pubUncompressed, msg, compactSig, 'compact')).toBe(true)
+    expect(verifyP256Sync(pubCompressed, msg, derSig, 'der')).toBe(true)
+    expect(verifyP256Sync(pubUncompressed, utf8('tampered'), derSig, 'der')).toBe(false)
+    // Format is explicit: a DER signature is never accepted as compact and vice versa.
+    expect(verifyP256Sync(pubUncompressed, msg, derSig, 'compact')).toBe(false)
+    expect(verifyP256Sync(pubUncompressed, msg, compactSig, 'der')).toBe(false)
+
+    // Regression: a 64-byte compact signature whose r starts with 0x30 used to be misparsed as DER.
+    let found: { readonly m: Uint8Array; readonly sig: Uint8Array } | null = null
+    for (let i = 0; i < 20_000 && found === null; i++) {
+      const m = utf8(`webauthn-r30-${i}`)
+      const sig = p256.sign(m, priv, { format: 'compact' })
+      if (sig[0] === 0x30) found = { m, sig }
+    }
+    expect(found).not.toBeNull()
+    expect(verifyP256Sync(pubUncompressed, found!.m, found!.sig, 'compact')).toBe(true)
 
     const epochKey = bytes(0x77, 32)
     const mb = deriveEpochMailboxKeyPair(epochKey)
@@ -200,5 +238,32 @@ describe('hybrid post-quantum X-Wing HPKE, P-256, HMAC, and mailbox derivation',
     const tag = signEd25519Sync(mb.seed, utf8('envelope-header'))
     expect(verifyEd25519Sync(mb.publicKey, utf8('envelope-header'), tag)).toBe(true)
     expect(verifyEd25519Sync(mb.publicKey, utf8('other'), tag)).toBe(false)
+  })
+
+  it('verifies Ed25519 under one strict rule set (non-canonical S and small-order keys rejected)', () => {
+    const seed = bytes(0x42, 32)
+    const pub = ed25519PublicKeyFromSeedSync(seed)
+    const msg = utf8('strict-ed25519')
+    const sig = signEd25519Sync(seed, msg)
+    expect(verifyEd25519Sync(pub, msg, sig)).toBe(true)
+
+    // S + L (non-canonical scalar) must be rejected.
+    const L = (1n << 252n) + 27742317777372353535851937790883648493n
+    let s = 0n
+    for (let i = 63; i >= 32; i--) s = (s << 8n) | BigInt(sig[i]!)
+    const sPlusL = s + L
+    if (sPlusL < (1n << 256n)) {
+      const malleated = sig.slice()
+      let v = sPlusL
+      for (let i = 32; i < 64; i++) { malleated[i] = Number(v & 0xffn); v >>= 8n }
+      expect(verifyEd25519Sync(pub, msg, malleated)).toBe(false)
+    }
+
+    // Small-order public key (identity point) with identity R and S = 0 verifies under ZIP-215 but not here.
+    const identity = new Uint8Array(32)
+    identity[0] = 1
+    const forged = new Uint8Array(64)
+    forged[0] = 1
+    expect(verifyEd25519Sync(identity, msg, forged)).toBe(false)
   })
 })

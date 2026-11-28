@@ -94,23 +94,36 @@ export async function signDomain(
   }
 }
 
+/**
+ * The protocol's single Ed25519 verification entry point (operation signatures, host attestations,
+ * authority records). Every other verifier must agree with it bit-for-bit on acceptance.
+ *
+ * NOTE: this still delegates to WebCrypto, while `@chronolog/crypto`'s `verifyEd25519Sync`
+ * (reducers, blind hosts) uses noble strict mode (`zip215: false`). They agree on every honestly
+ * produced signature but may disagree on adversarial edge cases (small-order components, cofactored
+ * vs cofactorless equation). Unifying requires `@noble/ed25519` as a dependency of this package.
+ */
+export async function verifyEd25519(
+  publicKey: CryptoKey | Uint8Array,
+  message: Uint8Array,
+  signature: Uint8Array,
+): Promise<boolean> {
+  if (signature.length !== 64) return false
+  if (publicKey instanceof Uint8Array && publicKey.length !== 32) return false
+  perfCount('ed25519.verify')
+  try {
+    const key = publicKey instanceof Uint8Array ? await cachedPublicKey(publicKey) : publicKey
+    return await globalThis.crypto.subtle.verify(ED25519, key, bufferSource(signature), bufferSource(message))
+  } catch {
+    return false
+  }
+}
+
 export async function verifyDomain(
   domain: ProtocolDomain,
   payload: Uint8Array,
   signature: Uint8Array,
   publicKey: CryptoKey | Uint8Array,
 ): Promise<boolean> {
-  if (signature.length !== 64) return false
-  perfCount('ed25519.verify')
-  try {
-    const key = publicKey instanceof Uint8Array ? await cachedPublicKey(publicKey) : publicKey
-    return await globalThis.crypto.subtle.verify(
-      ED25519,
-      key,
-      bufferSource(signature),
-      bufferSource(domainSeparatedBytes(domain, payload)),
-    )
-  } catch {
-    return false
-  }
+  return verifyEd25519(publicKey, domainSeparatedBytes(domain, payload), signature)
 }

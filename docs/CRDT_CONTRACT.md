@@ -30,8 +30,8 @@ On chains with `privateLog: true`:
 - `topics`: map of topic names to `{ module, export?, config? }` (accepting either an import alias or a direct `cas:sha256-<64-hex>` reference).
 
 Execution invariants:
-- Fresh `QuickJSContext` per `reduce()`, `query()`, `describe()`, `onConflict()`, and `derive()` invocation (zero cross-call state leakage).
-- Non-deterministic globals (`Date`, `performance`, `Math.random`, `Intl`) are removed (contexts are created without the Date intrinsic, which in quickjs-ng also supplies the `performance` clock), and deterministic fuel metering (`limits.maxFuel`) rejects runaway loops uniformly as `vm:fuel_exhausted`.
+- Fresh `QuickJSContext` per `reduce()`, `query()`, `describe()`, `authorize()`, `verify()`, `admit()`, `onConflict()`, and `derive()` invocation (zero cross-call state leakage) with deep-frozen inputs (`state`, `tx`, `ctx.config`, `ctx.topic()`).
+- Non-deterministic globals (`Date`, `performance`, `Math.random`, `Intl`, `WeakRef`, `FinalizationRegistry`) are stripped in the determinism prelude (while preserving `BigInt`), and deterministic fuel metering (`limits.maxFuel`) rejects runaway loops uniformly as `vm:fuel_exhausted`.
 - `chronolog-pkg/v1` packages enforce scoped dependency resolution (eliminating diamond conflicts), package-local `./`/`../` relative imports, and per-package `builtins` capability attenuation.
 - Pure WASM reducers (`runtime: 'wasm-pure'`, `chronolog-wasm/v1` ABI) and `chronolog:wasm` libraries reject non-`chronolog` host imports and cache compiled `WebAssembly.Module` instances per `cas:sha256-...` hash.
 - Missing CAS chunks, modules, packages, or SQLite pages trigger an **uncatchable host-level `MissingDependencyError`** that user JS `try/catch` cannot swallow; replay halts cleanly before that operation until the missing dependency arrives (via `cas-want` subgraph pull or `casMirrors`).
@@ -49,26 +49,28 @@ After each operation:
 
 Checkpoints and snapshots carry `topics`, `seenOpsRoot` and `historyDigest`; restoring them and replaying the suffix produces the exact same `stateRoot` AND `revision.digest` as a cold replay from genesis. Per-operation cost is O(changed state), not O(history): no per-op seen-set node, no whole-state clone, no whole-map state hash.
 
-## 5. Keys, Hybrid Post-Quantum HPKE, Anonymous Envelopes & Reconnect Rewrapping (`$keys`)
+## 5. Keys, Hybrid Post-Quantum HPKE, Key-Tagged TreeKEM, Private Vaults & Anonymous Envelopes (`$keys`, `chronolog/vaults`)
 
 - Each device holds a persistent Ed25519 signing identity, a persistent X25519 `wrapKey`, and a persistent hybrid post-quantum X-Wing (`ML-KEM-768 + X25519`) `pqWrapKey`.
-- `$keys` stores per-epoch `suite` (`hpke-x25519-aes256gcm` or hybrid PQ `hpke-xwing-aes256gcm`), `keyCommitment`, one-way derived `mailboxVerifyKey`, write-once per-member HPKE lockboxes, compartment `rings`/`topicRings` (enforced fail-closed by `TopicKernel`), and on-log `$keys.policy` (`rotateOnRemove`, `maxOpsPerEpoch`, `minSuite`, `paddingBucketBytes`, `hideEnvelopeAuthor`).
+- `$keys` stores per-epoch `suite` (`hpke-x25519-aes256gcm`, hybrid PQ `hpke-xwing-aes256gcm`, or Key-Tagged TreeKEM `hpke-tree-x25519-aes256gcm` / `hpke-tree-xwing-aes256gcm`), `keyCommitment`, one-way derived `mailboxVerifyKey`, write-once per-member HPKE lockboxes or structural-sharing `treeRef` Merkle-DAGs, compartment `rings`/`topicRings` (enforced fail-closed by `TopicKernel`), and on-log `$keys.policy` (`rotateOnRemove`, `maxOpsPerEpoch`, `minSuite`, `distribution: 'flat' | 'tree'`, `paddingBucketBytes`, `hideEnvelopeAuthor`).
 - Encrypted envelopes use 192-bit HKDF-SHA256 per-operation AES-256-GCM subkeys (`hkdf-aes-256-gcm`) with optional power-of-2 bucket padding. When `hideEnvelopeAuthor` is enabled, outer `envelope.author` is zeroed (`ANONYMOUS_AUTHOR`) and authenticated via `mailboxTag` signed by the epoch's derived Ed25519 mailbox key so blind hosts reject unauthorized uploads without learning writer identity or payload length.
-- Admitting a fresh device on a chain with rotated epochs atomically updates `$admission` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history. Members can self-rotate wrap keys via `$admission.rotateWrapKey` and seal selective per-recipient payloads via `session.sealFor()` / `session.unseal()`.
+- Sub-linear $O(\log N)$ **Key-Tagged TreeKEM** (`rotateTreeEpoch`, `chronolog-keytree-dag/v1` + `chronolog-keytree-subtree/v1`) uses decoupled per-epoch roots, `targetPubKeyHash`-tagged copath boxes, an updater self-box, and deterministic `keysNeedsRotation()` healing so concurrent offline removals converge cleanly under flat undo-do-redo. See [Sub-Linear Group Key Rotation](SUBLINEAR_GROUP_ROTATION.md).
+- **Private Capability Vaults (`chronolog/vaults` + `session.vaults`)** live inside the encrypted application partition (invisible to blind hosts) and provide fine-grained project/row/folder keys with $O(1)$ member adds, per-vault forward-secret removals, `$keys.policy.minSuite` enforcement, and `session.vaults.unsealRows()`. Selective per-recipient sealing is provided by `session.sealFor()` / `session.unseal()`.
+- Admitting a fresh device on a chain with rotated epochs atomically updates `$admission` and grants HPKE lockboxes for retained historical epochs (`grantBoxes`) so the fresh device can decrypt and replay history. Members can self-rotate wrap keys via `$admission.rotateWrapKey`.
 - Encrypted envelopes are reconciled by `encryptedEnvelopeDigest` (not `opId` alone). When an offline device reconnects after an epoch rotation, it re-encrypts its exact original signed operation bytes under the newest epoch while preserving `opId`, `authorTimestampMs`, and signature.
-- Under `open` history admission, membership and key grants are provisional until all earlier operations are known; post-revocation confidentiality applies to epochs rotated after revocation whose ciphertext is not distributed to revoked peers. See [Sub-Linear Group Key Rotation Design Brief](SUBLINEAR_GROUP_ROTATION.md) for the planned `O(log N)` tree-based `$keys` upgrade.
+- Under `open` history admission, membership and key grants are provisional until all earlier operations are known; post-revocation confidentiality applies to epochs rotated after revocation whose ciphertext is not distributed to revoked peers.
 
 ## 6. Deterministic SQLite-CAS Profile & Write RLS (`chronolog:sqlite`, `chronolog/rls`)
 
 `chronolog:sqlite` runs stock SQLite + FTS5 + `sqlite-vec` on a 4 KiB Merkle-paged `CAS` VFS (64-way fanout):
-- `actor()`, `op_id()`, and `op_time()` are bound directly by the host kernel per operation.
+- `actor()`, `op_id()`, `operation_id()`, `op_time()`, `tx_visibility()`, `chronolog_can()`, `chronolog_topic()`, `chronolog_topic_last_op()`, `chronolog_op()`, `chronolog_author_last_op()`, and `chronolog_topic_query()` plus read-only eponymous virtual tables `chronolog_tx`, `chronolog_topics`, and query-only `chronolog_history` are bound directly by the host kernel per operation.
 - `random()` and `randomblob()` are disabled; `datetime('now')` and `localtime` modifiers resolve deterministically to UTC `op_time()`; `changes()` and `last_insert_rowid()` reset at every `openDb()` boundary.
 - `PRAGMA recursive_triggers = ON` is always active.
 - Three execution modes enforced by SQLite's C authorizer:
   - `mode: 'admin'` — DDL, DML, and trigger management (trusted reducer logic).
   - `mode: 'user'` — DML (`INSERT`/`UPDATE`/`DELETE`/`SELECT`) plus optional `ddl` allowlist (`createTable`, `alterTable`, `dropTable`, `indexOn`, `createView`, `dropView`). Never allowed to touch `_*` internal tables or `_rls_*` triggers.
   - `mode: 'readonly'` — pure `SELECT` queries and `validateExpr()`.
-- `chronolog/rls` (`applyRls`) validates every user write predicate through SQLite's `mode: 'readonly'` parser (forbidding semicolons, sub-writes, and injection) before wrapping it in `BEFORE INSERT/UPDATE/DELETE` triggers with `RAISE(ABORT, ...)`.
+- `chronolog/rls` (`applyRls`, `sealRecipientsPolicy`, `vaultBoxPolicy`) validates every user write predicate through SQLite's `mode: 'readonly'` parser (forbidding semicolons, sub-writes, and injection) before wrapping it in `BEFORE INSERT/UPDATE/DELETE` triggers with `RAISE(ABORT, ...)`.
 
 ## 7. Unified Admission (`$admission`) & Kernel-Enforced Immutability (`$seals`)
 

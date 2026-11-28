@@ -1,9 +1,11 @@
 import {
   assertCanonicalCbor,
+  bytesToHex,
   DEFAULT_DECODE_LIMITS,
   encodeCanonicalCbor,
   equalBytes,
   hexToBytes,
+  sha256Sync,
   utf8,
   type CborMapKey,
   type CborValue,
@@ -21,7 +23,7 @@ import {
   parseCasRef,
   tryParseCasRef,
   type BytesStore,
-  type CasPartition,
+  type BytesStoreEntry,
   type ContentAddressedStore,
 } from '@chronolog/records'
 
@@ -188,10 +190,79 @@ export function resolveTrustedBuildOutput(
   return null
 }
 
-/** Back a `CasMirrorStore` with any Chronolog `BytesStore` (Memory, node:sqlite, DO SQLite, IndexedDB). */
-export function createBytesStoreCasMirrorStore(store: BytesStore, prefix = 'mirror/'): CasMirrorStore {
+/** Default upper bound on attestations retained and listed per derivation / package hash. */
+export const DEFAULT_MAX_MIRROR_ATTESTATIONS_PER_SUBJECT = 64
+
+/** Thrown by `putAttestation` / `putAudit` when a subject already holds the maximum number of attestations. */
+export const MIRROR_ATTESTATION_LIMIT = 'MIRROR_ATTESTATION_LIMIT'
+
+export interface BytesStoreCasMirrorStoreOptions {
+  /** Key prefix for every mirror record (default `mirror/`). */
+  readonly prefix?: string
+  /** Upper bound on distinct attestations kept per derivation / package hash (default 64). */
+  readonly maxAttestationsPerSubject?: number
+}
+
+function attestationSlot(signer: string, discriminator: JsonValue): string {
+  return `${signer}.${bytesToHex(sha256Sync(utf8(canonicalJson(discriminator))))}`
+}
+
+/**
+ * Back a `CasMirrorStore` with any Chronolog `BytesStore` (Memory, node:sqlite, DO SQLite, IndexedDB).
+ *
+ * Every attestation lives under its own key, `<prefix>drv/<drvHash>/<signer>.<digest>` (or
+ * `<prefix>audit/<pkgHash>/...`), where the digest covers the fields that distinguish two
+ * attestations from the same signer. Concurrent writers never overwrite each other's records,
+ * re-publishing the same attestation is idempotent, and listing enumerates the subject's key
+ * prefix in key order, truncated to `maxAttestationsPerSubject`. Writes beyond the bound throw
+ * `MIRROR_ATTESTATION_LIMIT` (concurrent writers can overshoot it by at most their own count;
+ * listings never do).
+ *
+ * Attestation listing needs `iteratePrefix` or `iterateEntries` on the store; without either,
+ * the returned mirror store serves CAS nodes only.
+ */
+export function createBytesStoreCasMirrorStore(store: BytesStore, options: BytesStoreCasMirrorStoreOptions = {}): CasMirrorStore {
+  const prefix = options.prefix ?? 'mirror/'
+  const maxPerSubject = Math.max(1, Math.floor(options.maxAttestationsPerSubject ?? DEFAULT_MAX_MIRROR_ATTESTATIONS_PER_SUBJECT))
   const dec = new TextDecoder()
-  return {
+
+  const scan: ((keyPrefix: string) => AsyncIterable<BytesStoreEntry>) | null = store.iteratePrefix !== undefined
+    ? keyPrefix => store.iteratePrefix!(keyPrefix)
+    : store.iterateEntries !== undefined
+      ? async function* (keyPrefix: string) {
+        for await (const entry of store.iterateEntries!()) if (entry.key.startsWith(keyPrefix)) yield entry
+      }
+      : null
+
+  const listSubject = async <T>(subjectPrefix: string, verify: (value: unknown) => value is T): Promise<T[]> => {
+    const entries: BytesStoreEntry[] = []
+    for await (const entry of scan!(subjectPrefix)) {
+      if (entry.key.startsWith(subjectPrefix)) entries.push(entry)
+    }
+    entries.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    const out: T[] = []
+    for (const entry of entries) {
+      if (out.length >= maxPerSubject) break
+      try {
+        const parsed = JSON.parse(dec.decode(entry.value)) as unknown
+        if (verify(parsed)) out.push(parsed)
+      } catch { /* skip corrupt record */ }
+    }
+    return out
+  }
+
+  const putSubject = async (subjectPrefix: string, slot: string, value: unknown): Promise<void> => {
+    const key = `${subjectPrefix}${slot}`
+    if ((await store.get(key)) !== null) return
+    let count = 0
+    for await (const entry of scan!(subjectPrefix)) {
+      if (entry.key.startsWith(subjectPrefix)) count += 1
+      if (count >= maxPerSubject) throw new Error(MIRROR_ATTESTATION_LIMIT)
+    }
+    await store.put(key, utf8(JSON.stringify(value)))
+  }
+
+  const nodes: CasMirrorStore = {
     async getNode(hash: string): Promise<Uint8Array | null> {
       return store.get(`${prefix}cas/${hash}`)
     },
@@ -201,67 +272,46 @@ export function createBytesStoreCasMirrorStore(store: BytesStore, prefix = 'mirr
     async putNode(hash: string, encodedNode: Uint8Array): Promise<void> {
       await store.put(`${prefix}cas/${hash}`, encodedNode)
     },
-    async listAttestations(drvHash: string): Promise<readonly MirrorBuildAttestation[]> {
-      const raw = await store.get(`${prefix}drv/${drvHash}`)
-      if (raw === null) return []
-      try {
-        const parsed = JSON.parse(dec.decode(raw)) as unknown
-        return Array.isArray(parsed) ? parsed.filter(verifyMirrorBuildAttestation) : []
-      } catch {
-        return []
-      }
-    },
-    async putAttestation(drvHash: string, attestation: MirrorBuildAttestation): Promise<void> {
-      const existing = await this.listAttestations!(drvHash)
-      const dup = existing.some(a =>
-        a.signer === attestation.signer &&
-        a.payload.outputRef === attestation.payload.outputRef &&
-        a.payload.runtime === attestation.payload.runtime,
-      )
-      if (dup) return
-      const next = [...existing, attestation]
-      await store.put(`${prefix}drv/${drvHash}`, utf8(JSON.stringify(next)))
-    },
-    async listAudits(pkgHash: string): Promise<readonly MirrorAuditAttestation[]> {
-      const raw = await store.get(`${prefix}audit/${pkgHash}`)
-      if (raw === null) return []
-      try {
-        const parsed = JSON.parse(dec.decode(raw)) as unknown
-        return Array.isArray(parsed) ? parsed.filter(verifyMirrorAuditAttestation) : []
-      } catch {
-        return []
-      }
-    },
-    async putAudit(pkgHash: string, audit: MirrorAuditAttestation): Promise<void> {
-      const existing = await this.listAudits!(pkgHash)
-      const dup = existing.some(a =>
-        a.signer === audit.signer &&
-        a.payload.verdict === audit.payload.verdict &&
-        (a.payload.notes ?? '') === (audit.payload.notes ?? ''),
-      )
-      if (dup) return
-      const next = [...existing, audit]
-      await store.put(`${prefix}audit/${pkgHash}`, utf8(JSON.stringify(next)))
-    },
+  }
+  if (scan === null) return nodes
+  return {
+    ...nodes,
+    listAttestations: drvHash => listSubject(`${prefix}drv/${drvHash}/`, verifyMirrorBuildAttestation),
+    putAttestation: (drvHash, attestation) => putSubject(
+      `${prefix}drv/${drvHash}/`,
+      attestationSlot(attestation.signer, { outputRef: attestation.payload.outputRef, runtime: attestation.payload.runtime }),
+      attestation,
+    ),
+    listAudits: pkgHash => listSubject(`${prefix}audit/${pkgHash}/`, verifyMirrorAuditAttestation),
+    putAudit: (pkgHash, audit) => putSubject(
+      `${prefix}audit/${pkgHash}/`,
+      attestationSlot(audit.signer, { notes: audit.payload.notes ?? '', verdict: audit.payload.verdict }),
+      audit,
+    ),
   }
 }
 
-/** Expose an existing `ContentAddressedStore` directly as a `CasMirrorStore`. */
+/**
+ * Expose the **public** partition of an existing `ContentAddressedStore` as a `CasMirrorStore`.
+ * The private partition is never reachable through a mirror: mirrors are public HTTP surfaces.
+ */
 export function createCasAdapterMirrorStore(
   cas: ContentAddressedStore,
-  options: { readonly partition?: CasPartition; readonly attestationStore?: BytesStore; readonly prefix?: string } = {},
+  options: { readonly attestationStore?: BytesStore } & BytesStoreCasMirrorStoreOptions = {},
 ): CasMirrorStore {
-  const partition: CasPartition = options.partition ?? 'public'
   const attStore = options.attestationStore !== undefined
-    ? createBytesStoreCasMirrorStore(options.attestationStore, options.prefix ?? 'mirror/')
+    ? createBytesStoreCasMirrorStore(options.attestationStore, {
+      ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
+      ...(options.maxAttestationsPerSubject === undefined ? {} : { maxAttestationsPerSubject: options.maxAttestationsPerSubject }),
+    })
     : undefined
   return {
-    getNode: hash => cas.getRaw(hash, partition),
-    hasNode: async hash => cas.hasSync(hash, partition) || (await cas.getRaw(hash, partition)) !== null,
+    getNode: hash => cas.getRaw(hash, 'public'),
+    hasNode: async hash => cas.hasSync(hash, 'public') || (await cas.getRaw(hash, 'public')) !== null,
     putNode: async (hash, encodedNode) => {
-      await cas.putRaw(hash, encodedNode, partition)
+      await cas.putRaw(hash, encodedNode, 'public')
     },
-    ...(attStore === undefined ? {} : {
+    ...(attStore?.listAttestations === undefined ? {} : {
       listAttestations: drvHash => attStore.listAttestations!(drvHash),
       putAttestation: (drvHash, att) => attStore.putAttestation!(drvHash, att),
       listAudits: pkgHash => attStore.listAudits!(pkgHash),
@@ -377,7 +427,16 @@ export interface CasMirrorHandlerOptions {
   readonly allowWrites?: boolean
   /** Optional write authorization hook for PUT /cas/:hash, POST /cas/batch, PUT /derivations/:drvHash, PUT /audits/:pkgHash. */
   readonly authorizeWrite?: (request: Request, kind: 'cas' | 'derivation' | 'audit') => boolean | Promise<boolean>
-  /** Optional custom media-type resolver for `/trees/:treeHash/*path`. */
+  /**
+   * Allowlist for rendering `/trees/:treeHash/*path` files as web content. Only trees for which this
+   * returns true are served with their resolved media type and an immutable cache policy. Every
+   * other tree (and every tree when the predicate is omitted) is served inert: `application/octet-stream`,
+   * `Content-Disposition: attachment`, `Content-Security-Policy: sandbox`, `Cache-Control: no-store`,
+   * so a writer who can PUT CAS nodes cannot obtain same-origin script execution.
+   * Allowlisted responses are cached `immutable`; keep allowlist decisions permanent per hash.
+   */
+  readonly isServableTree?: (treeHash: string, request: Request) => boolean | Promise<boolean>
+  /** Optional custom media-type resolver for files of allowlisted (`isServableTree`) trees. */
   readonly resolveMediaType?: (path: string) => string
   readonly maxNodeBytes?: number
   readonly maxSubgraphNodes?: number
@@ -552,7 +611,14 @@ export function createCasMirrorHandler(options: CasMirrorHandlerOptions): (reque
         if (!verifyMirrorBuildAttestation(body) || body.payload.drvRef !== drvRef) {
           return jsonResponse({ error: 'invalid_attestation' }, 400, options.headers)
         }
-        await options.store.putAttestation(drvHash, body)
+        try {
+          await options.store.putAttestation(drvHash, body)
+        } catch (err) {
+          if (err instanceof Error && err.message === MIRROR_ATTESTATION_LIMIT) {
+            return jsonResponse({ error: 'attestation_limit' }, 507, options.headers)
+          }
+          throw err
+        }
         return jsonResponse({ ok: true, drvRef, outputRef: body.payload.outputRef, signer: body.signer }, 201, options.headers)
       }
 
@@ -591,7 +657,14 @@ export function createCasMirrorHandler(options: CasMirrorHandlerOptions): (reque
         if (!verifyMirrorAuditAttestation(body) || body.payload.pkgRef !== pkgRef) {
           return jsonResponse({ error: 'invalid_audit' }, 400, options.headers)
         }
-        await options.store.putAudit(pkgHash, body)
+        try {
+          await options.store.putAudit(pkgHash, body)
+        } catch (err) {
+          if (err instanceof Error && err.message === MIRROR_ATTESTATION_LIMIT) {
+            return jsonResponse({ error: 'attestation_limit' }, 507, options.headers)
+          }
+          throw err
+        }
         return jsonResponse({ ok: true, pkgRef, verdict: body.payload.verdict, signer: body.signer }, 201, options.headers)
       }
 
@@ -633,25 +706,32 @@ export function createCasMirrorHandler(options: CasMirrorHandlerOptions): (reque
       if (targetRef === undefined) return jsonResponse({ error: 'not_found' }, 404, options.headers)
       const targetHash = parseCasRef(targetRef)
       const etag = `"${targetHash}"`
-      const mediaType = options.resolveMediaType !== undefined ? options.resolveMediaType(filePath) : guessMediaType(filePath)
-
-      if (etagMatches(request.headers.get('If-None-Match'), etag)) {
+      const servable = options.isServableTree !== undefined && (await options.isServableTree(treeHash, request)) === true
+      const treeFileHeaders = (): Headers => {
         const headers = new Headers(options.headers)
         headers.set('ETag', etag)
-        headers.set('Content-Type', mediaType)
-        headers.set('Cache-Control', 'public, max-age=31536000, immutable')
         headers.set('X-Content-Type-Options', 'nosniff')
-        return new Response(null, { status: 304, headers })
+        if (servable) {
+          headers.set('Content-Type', options.resolveMediaType !== undefined ? options.resolveMediaType(filePath) : guessMediaType(filePath))
+          headers.set('Cache-Control', 'public, max-age=31536000, immutable')
+        } else {
+          const name = filePath.slice(filePath.lastIndexOf('/') + 1).replace(/[^A-Za-z0-9._-]/gu, '_') || 'file'
+          headers.set('Content-Type', 'application/octet-stream')
+          headers.set('Content-Disposition', `attachment; filename="${name}"`)
+          headers.set('Content-Security-Policy', "sandbox; default-src 'none'")
+          headers.set('Cache-Control', 'no-store')
+        }
+        return headers
+      }
+
+      if (etagMatches(request.headers.get('If-None-Match'), etag)) {
+        return new Response(null, { status: 304, headers: treeFileHeaders() })
       }
 
       const fileBytes = await readBlobBytesFromMirrorStore(options.store, targetHash, maxTreeFileBytes)
       if (fileBytes === null) return jsonResponse({ error: 'not_found' }, 404, options.headers)
 
-      const headers = new Headers(options.headers)
-      headers.set('Content-Type', mediaType)
-      headers.set('ETag', etag)
-      headers.set('Cache-Control', 'public, max-age=31536000, immutable')
-      headers.set('X-Content-Type-Options', 'nosniff')
+      const headers = treeFileHeaders()
       if (request.method === 'HEAD') {
         headers.set('Content-Length', String(fileBytes.byteLength))
         return new Response(null, { status: 200, headers })

@@ -28,6 +28,7 @@ export type {
   AdmissionRoster,
   KeysTopicState,
   SealedRecipientBox,
+  VaultSealedBox,
   CheckpointBootstrapSnapshot,
 } from './session.js'
 export type * from './session-types.js'
@@ -86,7 +87,8 @@ export * from './tools.js'
 export * from './ergonomics.js'
 export * from './guarded-tx.js'
 export type * from './content.js'
-export { createApplicationBackend } from './tendriller.js'
+export { createApplicationBackend } from './application-backend.js'
+export { connectHttpSync, httpSyncFactId, HTTP_SYNC_SOURCE, type HttpSyncLink, type HttpSyncLinkOptions, type HttpSyncLinkResult } from './http-sync-link.js'
 export { createApplicationOwner } from './session-owner.js'
 export type * from './owner-types.js'
 export {
@@ -113,6 +115,16 @@ export {
   combineShares,
   deriveEpochMailboxKeyPair,
   verifyEd25519Sync,
+  KEY_TREE_SUITE_X25519,
+  KEY_TREE_SUITE_XWING,
+  buildTreeEpochUpdate,
+  openTreeEpoch,
+  writeKeyTreeToCas,
+  readKeyTreeFromCas,
+  type KeyTreeSuite,
+  type KeyTreeEpochPayload,
+  type KeyTreeDagRootNode,
+  type KeyTreeSubtreeNode,
   type ShamirShare,
 } from '@chronolog/crypto'
 

@@ -67,7 +67,7 @@ it('rederives effective event sets, retracts late-rejected proposals, exports in
   const earlierSigned = await signOperationCore(earlierCore, f.identities[0]!.privateKey)
   const earlierBytes = encodeSignedOperation(earlierSigned)
   const opIdBytes = operationIdDigest(earlierSigned.coreBytes)
-  const enc = await encryptEpochPayload(f.epochKey, 0n, earlierBytes, envelopeAad(logIdBytes, opIdBytes, authorBytes))
+  const enc = await encryptEpochPayload(f.epochKey, 0n, earlierBytes, envelopeAad(logIdBytes, opIdBytes, authorBytes, 'default'))
   const envBytes = encodeEncryptedEnvelope({
     version: 1,
     logId: logIdBytes,

@@ -2,24 +2,30 @@ import { hkdf } from '@noble/hashes/hkdf'
 import { sha256 } from '@noble/hashes/sha256'
 import {
   ProtocolError,
+  bytesToHex,
+  concatBytes,
   encodeCanonicalCbor,
   integerMap,
   protocolInvariant,
   utf8,
-  type EnvelopeSuite,
 } from '@chronolog/protocol'
 
-export type { EnvelopeSuite }
+/** Bytes of the per-payload random HKDF salt (192 bits; also the envelope `nonce`). */
+export const EPOCH_PAYLOAD_SALT_BYTES = 24
 
+/**
+ * An epoch-key encrypted payload. The only suite is `hkdf-aes-256-gcm`: a per-payload AES-256-GCM
+ * subkey and IV are derived with HKDF-SHA256 from the epoch key and a random 192-bit salt (`nonce`),
+ * and the plaintext is framed by `padPlaintext`.
+ */
 export interface EncryptedEpochPayload {
   readonly epoch: bigint
+  /** 24-byte HKDF salt. */
   readonly nonce: Uint8Array
   readonly ciphertext: Uint8Array
-  readonly suite?: EnvelopeSuite
 }
 
 export interface EncryptEpochOptions {
-  readonly suite?: EnvelopeSuite
   /** Optional bucket padding in bytes (e.g. 256 -> power-of-2 buckets starting at 256 B). */
   readonly paddingBucketBytes?: number
 }
@@ -29,19 +35,12 @@ function source(value: Uint8Array): ArrayBuffer {
   return Uint8Array.from(value).buffer
 }
 
-/** Imported AES-GCM keys per raw epoch key (imports are async and comparatively expensive). */
-const aesKeys = new Map<string, Promise<CryptoKey>>()
-function aesKey(contentKey: Uint8Array): Promise<CryptoKey> {
-  let id = ''
-  for (const byte of contentKey) id += byte.toString(16).padStart(2, '0')
-  let key = aesKeys.get(id)
-  if (key === undefined) {
-    if (aesKeys.size >= 256) aesKeys.clear()
-    key = globalThis.crypto.subtle.importKey('raw', source(contentKey), 'AES-GCM', false, ['encrypt', 'decrypt'])
-    aesKeys.set(id, key)
-    key.catch(() => aesKeys.delete(id))
-  }
-  return key
+const EPOCH_KEY_COMMITMENT_PREFIX = utf8('chronolog/epoch-key-commitment/v2:')
+
+/** Public `$keys` commitment to a 32-byte epoch key: hex SHA-256(`chronolog/epoch-key-commitment/v2:` || key). */
+export function epochKeyCommitment(epochKey: Uint8Array): string {
+  protocolInvariant(epochKey.length === 32, 'INVALID_KEY', 'Epoch key must contain 32 bytes')
+  return bytesToHex(sha256(concatBytes(EPOCH_KEY_COMMITMENT_PREFIX, epochKey)))
 }
 
 function payloadAad(epoch: bigint, associatedData: Uint8Array): Uint8Array {
@@ -104,47 +103,28 @@ export async function encryptEpochPayload(
   options: EncryptEpochOptions = {},
 ): Promise<EncryptedEpochPayload> {
   protocolInvariant(contentKey.length === 32, 'INVALID_KEY', 'Epoch content key must contain 32 bytes')
-  const suite: EnvelopeSuite = options.suite ?? (explicitNonce?.length === 24 ? 'hkdf-aes-256-gcm' : 'aes-256-gcm')
-  const aad = payloadAad(epoch, associatedData)
-
-  if (suite === 'hkdf-aes-256-gcm') {
-    let nonce: Uint8Array
-    if (explicitNonce !== undefined) {
-      protocolInvariant(explicitNonce.length === 24, 'SCHEMA_INVALID', 'HKDF-AES-GCM salt must contain 24 bytes')
-      nonce = explicitNonce.slice()
-    } else {
-      nonce = globalThis.crypto.getRandomValues(new Uint8Array(24))
-    }
-    const { key: subkey, iv } = deriveSubkeyAndIv(contentKey, epoch, nonce)
-    const framed = padPlaintext(plaintext, options.paddingBucketBytes ?? 0)
-    try {
-      const cryptoKey = await globalThis.crypto.subtle.importKey('raw', source(subkey), 'AES-GCM', false, ['encrypt'])
-      const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: source(iv), additionalData: source(aad), tagLength: 128 },
-        cryptoKey,
-        source(framed),
-      ))
-      return { epoch, nonce, ciphertext, suite }
-    } finally {
-      subkey.fill(0)
-      iv.fill(0)
-    }
-  }
-
-  const key = await aesKey(contentKey)
   let nonce: Uint8Array
   if (explicitNonce !== undefined) {
-    protocolInvariant(explicitNonce.length === 12, 'SCHEMA_INVALID', 'Epoch payload nonce must contain 12 bytes')
+    protocolInvariant(explicitNonce.length === EPOCH_PAYLOAD_SALT_BYTES, 'SCHEMA_INVALID', 'Epoch payload salt must contain 24 bytes')
     nonce = explicitNonce.slice()
   } else {
-    nonce = globalThis.crypto.getRandomValues(new Uint8Array(12))
+    nonce = globalThis.crypto.getRandomValues(new Uint8Array(EPOCH_PAYLOAD_SALT_BYTES))
   }
-  const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: source(nonce), additionalData: source(aad), tagLength: 128 },
-    key,
-    source(plaintext),
-  ))
-  return { epoch, nonce, ciphertext, suite }
+  const aad = payloadAad(epoch, associatedData)
+  const { key: subkey, iv } = deriveSubkeyAndIv(contentKey, epoch, nonce)
+  const framed = padPlaintext(plaintext, options.paddingBucketBytes ?? 0)
+  try {
+    const cryptoKey = await globalThis.crypto.subtle.importKey('raw', source(subkey), 'AES-GCM', false, ['encrypt'])
+    const ciphertext = new Uint8Array(await globalThis.crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: source(iv), additionalData: source(aad), tagLength: 128 },
+      cryptoKey,
+      source(framed),
+    ))
+    return { epoch, nonce, ciphertext }
+  } finally {
+    subkey.fill(0)
+    iv.fill(0)
+  }
 }
 
 export async function decryptEpochPayload(
@@ -153,37 +133,22 @@ export async function decryptEpochPayload(
   associatedData: Uint8Array,
 ): Promise<Uint8Array> {
   protocolInvariant(contentKey.length === 32, 'INVALID_KEY', 'Epoch content key must contain 32 bytes')
-  const suite: EnvelopeSuite = payload.suite ?? (payload.nonce.length === 24 ? 'hkdf-aes-256-gcm' : 'aes-256-gcm')
+  protocolInvariant(payload.nonce.length === EPOCH_PAYLOAD_SALT_BYTES, 'SCHEMA_INVALID', 'Epoch payload salt must contain 24 bytes')
   const aad = payloadAad(payload.epoch, associatedData)
-
-  if (suite === 'hkdf-aes-256-gcm') {
-    protocolInvariant(payload.nonce.length === 24, 'SCHEMA_INVALID', 'HKDF-AES-GCM salt must contain 24 bytes')
-    const { key: subkey, iv } = deriveSubkeyAndIv(contentKey, payload.epoch, payload.nonce)
-    try {
-      const cryptoKey = await globalThis.crypto.subtle.importKey('raw', source(subkey), 'AES-GCM', false, ['decrypt'])
-      const framed = new Uint8Array(await globalThis.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: source(iv), additionalData: source(aad), tagLength: 128 },
-        cryptoKey,
-        source(payload.ciphertext),
-      ))
-      return unpadPlaintext(framed)
-    } catch {
-      throw new ProtocolError('INVALID_SIGNATURE', 'Epoch payload authentication failed')
-    } finally {
-      subkey.fill(0)
-      iv.fill(0)
-    }
-  }
-
-  protocolInvariant(payload.nonce.length === 12, 'SCHEMA_INVALID', 'Epoch payload nonce must contain 12 bytes')
+  const { key: subkey, iv } = deriveSubkeyAndIv(contentKey, payload.epoch, payload.nonce)
   try {
-    const key = await aesKey(contentKey)
-    return new Uint8Array(await globalThis.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: source(payload.nonce), additionalData: source(aad), tagLength: 128 },
-      key,
+    const cryptoKey = await globalThis.crypto.subtle.importKey('raw', source(subkey), 'AES-GCM', false, ['decrypt'])
+    const framed = new Uint8Array(await globalThis.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: source(iv), additionalData: source(aad), tagLength: 128 },
+      cryptoKey,
       source(payload.ciphertext),
     ))
-  } catch {
+    return unpadPlaintext(framed)
+  } catch (error) {
+    if (error instanceof ProtocolError) throw error
     throw new ProtocolError('INVALID_SIGNATURE', 'Epoch payload authentication failed')
+  } finally {
+    subkey.fill(0)
+    iv.fill(0)
   }
 }

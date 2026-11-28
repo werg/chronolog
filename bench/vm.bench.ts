@@ -53,8 +53,8 @@ async function measure(title: string, cases: readonly Case[], n = N): Promise<vo
 }
 
 const base = {
-  builtins: {}, exportName: 'default', topics: {}, cas, casPartition: 'private' as const, readOnly: false,
-  maxMemoryBytes: 64 * 1024 * 1024,
+  builtins: {}, exportName: 'default', logId: 'ab'.repeat(32), topics: {}, cas, casPartition: 'private' as const, readOnly: false,
+  maxMemoryBytes: 64 * 1024 * 1024, maxFuel: 200_000,
   tx: { opId: '0'.repeat(64), author: '1'.repeat(64), authorTimestampMs: 1, operationId: 'x' },
 }
 const kvInput: ReducerInvocationInput = {

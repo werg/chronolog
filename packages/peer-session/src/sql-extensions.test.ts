@@ -16,7 +16,6 @@ describe('Phase 3 P2P Merkle-paged SQL extensions', () => {
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {
@@ -156,7 +155,6 @@ describe('Phase 3 P2P Merkle-paged SQL extensions', () => {
           writer: true,
           administrator: true,
           publisher: true,
-          finalizer: true,
         },
         privateLog: true,
         topics: {

@@ -69,7 +69,6 @@ export async function sessionFixture(options: {
     writer: true,
     administrator: i === 0,
     publisher: i === 0,
-    finalizer: i === 0,
   }))
   const created = await createLogGenesis({
     creator: members[0]!,

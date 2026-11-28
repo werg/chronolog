@@ -100,35 +100,42 @@ Because rollback-and-replay applies to any deterministic reducer over CAS, a ful
 }
 ```
 
-- **Row-level write policies (`chronolog/rls`) and user-owned DDL:** Combines SQLite's C-level authorizer (`admin`, `user`, `readonly`) with statically validated `BEFORE INSERT/UPDATE/DELETE` triggers using `NEW.*`, `OLD.*`, `actor()`, `op_id()`, `op_time()`, and arbitrary read-only subqueries.
+- **Row-level write policies (`chronolog/rls`) and user-owned DDL:** Combines SQLite's C-level authorizer (`admin`, `user`, `readonly`) with statically validated `BEFORE INSERT/UPDATE/DELETE` triggers using `NEW.*`, `OLD.*`, `actor()`, `op_id()`, `op_time()`, `chronolog_can()`, `chronolog_topic_query()`, crypto policy helpers (`sealRecipientsPolicy`, `vaultBoxPolicy`), and arbitrary read-only subqueries.
 
 ---
 
 ## Security, Blind Hosting, Finality & Reactive UI
 
-- **Strict Public/Encrypted Partition & Reusable Blind Host (`@chronolog/peer-session/kernel`):** On `privateLog: true`, `$*` control topics (`$reducers`, `$admission`, `$seals`, `$keys`, `$publications`, `$mounts`, `$builders`) are mutated ONLY by `public` ops (which can read only `$*` topics and `public` CAS). Application topics are mutated ONLY by `encrypted` ops. Untrusted edge servers (such as Cloudflare Workers) call `replayBlindHostControl()` (`TopicKernel({ blindHostMode: true })`) with zero decryption keys and derive bit-for-bit identical control state and reachable public CAS sets (`collectControlReferencedCasHashes`).
-- **End-to-End Encryption & Offline Reconnect Rewrapping (`$keys`):** Persistent Ed25519 signing + X25519 wrapping identities; HPKE (`DHKEM(X25519)/HKDF-SHA256/AES-256-GCM`) epoch lockboxes. Reconnecting offline peers re-encrypt their exact original signed operation bytes under the newest epoch—preserving original `opId`, `authorTimestampMs`, and signature.
+- **Strict Public/Encrypted Partition & Reusable Blind Host (`@chronolog/peer-session/kernel`):** On `privateLog: true`, `$*` control topics (`$reducers`, `$admission`, `$seals`, `$keys`, `$publications`, `$mounts`, `$builders`) are mutated ONLY by `public` ops (which can read only `$*` topics and `public` CAS). Application topics are mutated ONLY by `encrypted` ops. Untrusted edge servers (such as Cloudflare Workers) call `replayBlindHostControl()` (`TopicKernel({ blindHostMode: true })`) with zero decryption keys and derive bit-for-bit identical control state, `mailboxVerifyKeys`, and reachable public CAS sets (`collectControlReferencedCasHashes`).
+- **Hybrid Post-Quantum E2EE, Key-Tagged TreeKEM, Private Vaults & Anonymous Padded Envelopes (`$keys`, `chronolog/vaults`):**
+  - Devices hold persistent Ed25519 signing + X25519 `wrapKey` + hybrid post-quantum X-Wing (`ML-KEM-768 + X25519`) `pqWrapKey` identities, with self-service wrap-key rotation (`rotateWrapKey`) and write-once HPKE lockboxes.
+  - `$keys.policy` governs `minSuite` (`hpke-x25519-aes256gcm` | `hpke-xwing-aes256gcm`), `distribution` (`'flat'` | `'tree'`), `paddingBucketBytes`, `hideEnvelopeAuthor`, `rotateOnRemove`, and `maxOpsPerEpoch`.
+  - Encrypted envelopes derive 192-bit HKDF-SHA256 per-operation AES-256-GCM subkeys (`hkdf-aes-256-gcm`) with power-of-2 bucket padding and optional `ANONYMOUS_AUTHOR` + `mailboxTag` verification against derived per-epoch `mailboxVerifyKey`s.
+  - Sub-linear $O(\log N)$ **Key-Tagged TreeKEM** (`rotateTreeEpoch()` / structural-sharing `chronolog-keytree-dag/v1` CAS Merkle-DAG + `keysNeedsRotation()` healing) scales large groups under flat leaderless undo-do-redo.
+  - `TopicKernel` enforces compartment isolation (`$keys.topicRings`) fail-closed; **Private Capability Vaults** (`chronolog/vaults` + `session.vaults`) and selective `session.sealFor()`/`unseal()` provide fine-grained row/project encryption inside the encrypted partition with $O(1)$ adds, forward-secret removals, and `unsealRows()`.
+  - Reconnecting offline peers re-encrypt their exact original signed operation bytes under the newest epoch—preserving original `opId`, `authorTimestampMs`, and signature.
 - **Unified State-Defined Admission (`$admission`):** `attestedAdmission` (host-attested membership + guardian M-of-N recovery), `multisigAdmission` (zero-host M-of-N governance), `openAdmission` (public logs with blocking/vouching), or custom `createAdmission({ authorize, verify, admit })`. `TopicKernel` enforces fail-closed global `$admission.authorize(state, tx, ctx)` before every topic reducer (monotonic per-topic attenuation), optional cross-topic post-conditions via `$admission.verify(before, after, tx, ctx)`, and consensus-agnostic history admission via `$admission.admit(state, { logId, ops, evidence, pinnedFrontier }, ctx)` supporting `open`, `signed-frontier`, `threshold-quorum`, `member-quorum`, `optimistic-challenge`, `merkle-anchor`, `pinned-checkpoint`, and surgical non-rewinding `pinnedFrontier` descent across peers and blind hosts.
-- **Kernel-Enforced Monotonic Immutability (`$seals`):** Plain-JSON ratchet table checked by `TopicKernel` before every commit. Admins (or genesis) can irreversibly pin individual topic reducer CAS hashes (`reducers[topic]: true`) and freeze or make append-only specific JSON paths (`paths[topic][path]: 'frozen' | 'append-only'`)—for example locking `$admission.schedule` forever while keeping `$admission.members` mutable.
+- **Kernel-Enforced Monotonic Immutability (`$seals`):** Plain-JSON ratchet table checked by `TopicKernel` before every commit. Admins (or genesis) can irreversibly pin individual topic reducer CAS hashes + transitive imports (`reducers[topic]: true`) and freeze or make append-only specific JSON paths (`paths[topic][path]: 'frozen' | 'append-only'`)—for example locking `$admission.schedule` forever while keeping `$admission.members` mutable.
 - **Reactive Views, Event Forwarding & Ephemeral Signals:** `createLiveView` (coherent snapshots with topic/SQL-table invalidation), `forwardSessionEvents` (with explicit retraction callbacks on suffix rewind), `createViewStore` (local drafts), and `@chronolog/signals` (signed bounded ephemeral live lane governed by `$admission` signals policy).
 
 ---
 
 ## Standard Modules
 
-Chronolog pins a suite of audited ES Modules into public CAS at genesis:
+Chronolog pins a suite of 23 audited ES Modules into public CAS at genesis:
 
 | Category | Module | Purpose |
 | --- | --- | --- |
 | **Control Plane** | `chronolog/admission` | Unified `$admission`: `attestedAdmission`, `multisigAdmission`, `openAdmission`, `createAdmission`, and `adminOnlyReducers`. |
 | | `chronolog/seals` | `monotonicSeals` — plain-data irreversible reducer hash locks and `frozen`/`append-only` JSON path seals enforced by `TopicKernel`. |
 | | `chronolog/reducer` | `defineReducer` — self-describing declarative reducer builder with schema validation, capability/scope checks, pre/post hooks, and auto `describe()`. |
-| | `chronolog/keys` | HPKE epoch key lockboxes, epoch rotation, and historical epoch grants. |
+| | `chronolog/keys` | Hybrid PQ X-Wing / X25519 HPKE epochs, Key-Tagged TreeKEM (`rotateTreeEpoch`), compartment `rings`/`topicRings`, `$keys.policy`, recovery vault, and `needsRotation`. |
 | | `chronolog/publications` | Signed static application releases referencing public CAS hashes and `chronolog-tree/v1` `treeRoot`. |
 | | `chronolog/mounts` | `verifiedMounts` — Ed25519-signed snapshots of external Chronolog logs queryable via `ctx.mountQuery()`. |
 | | `chronolog/builders` | `attestedBuilders` & `attestedReducers` — M-of-N builder/auditor governance for derivations and reducer upgrades. |
+| **Privacy & Vaults** | `chronolog/vaults` | `privateVaults` — encrypted-partition Private Capability Vaults with $O(1)$ adds, forward-secret per-vault removals, and `$keys.policy.minSuite` enforcement. |
 | **Relational SQL** | `chronolog/sql` | First-class SQLite-CAS topic reducer with migrations, preconditions/postconditions, write RLS, and user-owned DDL. |
-| | `chronolog/rls` | Static `readonly` validation and trigger generation (`applyRls`, `stampRowOp`, `enableAuditLog`) for row-level write policies. |
+| | `chronolog/rls` | Static `readonly` validation, trigger generation (`applyRls`, `stampRowOp`, `enableAuditLog`), and write-time crypto policies (`sealRecipientsPolicy`, `vaultBoxPolicy`). |
 | | `chronolog/sqlite-helpers` | Helpers (`defineSqlReducer`, `withDb`, `rowsToObjects`) for custom SQLite-backed reducers. |
 | **Guards & Patterns** | `chronolog/guards` | Composable JS & SQL pre/post condition helpers (`guardReducer`, `requireAuthorChain`, `requireTopicVersion`, `sqlBasedOnRow`, `sqlRequireAuthorLastOp`). |
 | | `chronolog/quotas` | Deterministic per-author token-bucket rate limits & quotas driven by `tx.authorTimestampMs`. |
@@ -247,7 +254,7 @@ Signed Operations (flat set ordered by authorTimestampMs, author, opId)
         │        ├── chronolog/sql        (declarative SQL, preconditions, RLS)
         │        ├── chronolog:sqlite     (SQLite + FTS5 + sqlite-vec on 4 KiB Merkle CAS)
         │        ├── chronolog:wasm       (invoke pure deterministic WASM modules)
-        │        ├── chronolog:crypto     (sha256, verifyEd25519, canonicalJson)
+        │        ├── chronolog:crypto     (crypto@2: sha256, hmacSha256, verifyEd25519, verifyP256, canonicalJson)
         │        ├── chronolog:cas        (explicit-link content-addressed put/get)
         │        └── ctx.mountQuery()     (verified cross-log $mounts)
         └──► WasmSandbox (standalone runtime: 'wasm-pure', cached WebAssembly.Module)
@@ -270,11 +277,11 @@ Chronolog requires **Node.js >= 22.15** and has **zero native C/C++ build depend
 | Package | Responsibility |
 | --- | --- |
 | `@chronolog/canonical` | Deterministic CBOR encoding, hashing, and canonical serialization. |
-| `@chronolog/crypto` | Ed25519 signing/cached verification, X25519 key agreement, HPKE, and cached AES-256-GCM primitives. |
+| `@chronolog/crypto` | Ed25519 signing/cached verification, NIST P-256 & HMAC-SHA256, X25519 & hybrid PQ X-Wing (`ML-KEM-768 + X25519`) HPKE, Key-Tagged TreeKEM (`chronolog-keytree-dag/v1`), Shamir Secret Sharing, and HKDF per-op AES-256-GCM primitives. |
 | `@chronolog/protocol` | Genesis, operation, encrypted envelope, and wire format definitions. |
 | `@chronolog/records` | `BytesStore` implementations, unified Merkle-DAG `ContentAddressedStore` (`pkg`/`tree`/`blob`/`enc-blob`/`drv` codecs & subgraph traversal), and framed channels. |
 | `@chronolog/authority` | Portable signed records, input schemas, and protocol-agnostic `$admission` evidence evaluation (zero runtime/SQL imports). |
-| `@chronolog/materializer` | `TopicKernel` (O(changed) `state/v3`), `QuickJsSandbox` (scoped packages + fuel), `WasmSandbox` (pure WASM), `evaluateDerivation`, attestations, and all 15 standard ES modules. |
+| `@chronolog/materializer` | `TopicKernel` (O(changed) `state/v3`), `QuickJsSandbox` (scoped packages + fuel + `deepFreeze` + `ctx.can`/`ctx.reject`), `WasmSandbox` (pure WASM), `evaluateDerivation`, attestations, and all 23 standard ES modules. |
 | `chronolog-db` | Deterministic SQLite + FTS5 + `sqlite-vec` WASM driver over a 4 KiB Merkle-paged CAS VFS. |
 | `@chronolog/signals` | Signed, bounded ephemeral live-lane messaging. |
 | `@chronolog/transport-webrtc` | Direct WebRTC data-channel and media transport with in-band negotiation. |
@@ -300,7 +307,8 @@ pnpm package:session     # Universal zero-native-build @chronolog/peer-session t
 
 ## Documentation
 
-- [Chronolog CRDT Contract](docs/CRDT_CONTRACT.md) — formal invariants for ordering, `state/v3`, public/encrypted partitioning, QuickJS-NG & pure WASM reducers, deterministic SQLite-CAS, write RLS, keys, finality, mounts, builders, and signals.
+- [Chronolog CRDT Contract](docs/CRDT_CONTRACT.md) — formal invariants for ordering, `state/v3`, public/encrypted partitioning, QuickJS-NG & pure WASM reducers, deterministic SQLite-CAS, write RLS, keys, TreeKEM, vaults, admission, seals, mounts, builders, and signals.
+- [Sub-Linear Group Key Rotation (`chronolog-keytree-dag/v1`)](docs/SUBLINEAR_GROUP_ROTATION.md) — CRDT-native $O(\log N)$ Key-Tagged TreeKEM over structural-sharing CAS Merkle-DAGs.
 - [Unified CAS, Packages, Derivations & Registry](docs/PACKAGES_AND_DERIVATIONS.md) — `chronolog-pkg/v1`, `chronolog-tree/v1`, `chronolog-blob/v1`, `chronolog-enc-blob/v1`, `chronolog-drv/v1`, pure WASM, `$mounts`, `$builders`, HTTP CAS mirrors, `@chronolog/pack`, and the dogfooded Registry Chronolog.
 - [Authored Operation-Set Guide](docs/authored-operation-set.md) — operation lifecycle, offline authoring, reconnect rewrapping, reactive views, and checkpoint bootstrap.
 - [Browser Storage Architecture](docs/browser-storage.md) — OPFS, IndexedDB, capability probing, and single-owner worker isolation.

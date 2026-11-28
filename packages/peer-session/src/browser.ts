@@ -8,13 +8,15 @@ export * from './event-forwarder.js'
 export * from './ergonomics.js'
 export * from './tools.js'
 export * from './definition.js'
-export { createApplicationBackend } from './tendriller.js'
+export { createApplicationBackend } from './application-backend.js'
 export {
   TAB_OWNER_PROTOCOL,
   requestPersistentStorage,
   coordinateNetworkLeader,
   connectTabWorkerOwner,
+  createTabWorkerIdentity,
   type NetworkLeaderOptions,
   type ConnectTabWorkerOwnerOptions,
   type TabWorkerAttachment,
+  type TabWorkerServicesHandle,
 } from './browser-tab-owner.js'

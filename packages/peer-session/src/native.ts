@@ -6,18 +6,16 @@ import type { SigningIdentity } from '@chronolog/authority'
 import { MemoryBytesStore } from '@chronolog/records'
 import { NativeBytesStore, type NativeBytesStoreOptions } from '@chronolog/records/native'
 
-import { openApplicationDevice, type ApplicationDevice, type DeviceWrapKey } from './device.js'
+import { openApplicationDevice, type ApplicationDevice, type DevicePqWrapKey, type DeviceWrapKey } from './device.js'
 import { registerExitCleanup } from './exit-cleanup.js'
 export { createApplicationSession } from './index.js'
 export type { CreateApplicationSessionOptions } from './runtime.js'
 export { NativeBytesStore } from '@chronolog/records/native'
 export {
   ensurePrivateDirectory,
-  acquireAtomicLock,
   openExclusiveSqliteFence,
   startNativeIpcServer,
   connectNativeIpc,
-  type AtomicLockHandle,
   type ExclusiveSqliteFence,
   type NativeIpcConnection,
 } from './native-supervisor.js'
@@ -44,6 +42,7 @@ export async function openNativeDevice(options: {
   readonly create?: true
   readonly managedSigner?: SigningIdentity
   readonly managedWrapKey?: DeviceWrapKey
+  readonly managedPqWrapKey?: DevicePqWrapKey
   readonly quotaBytes?: number
   readonly maxValueBytes?: number
 }): Promise<ApplicationDevice> {
@@ -57,6 +56,7 @@ export async function openNativeDevice(options: {
       ...(options.create === undefined ? {} : { create: options.create }),
       ...(options.managedSigner === undefined ? {} : { managedSigner: options.managedSigner }),
       ...(options.managedWrapKey === undefined ? {} : { managedWrapKey: options.managedWrapKey }),
+      ...(options.managedPqWrapKey === undefined ? {} : { managedPqWrapKey: options.managedPqWrapKey }),
       close: () => store.close() })
   }
   catch (error) { await store.close(); throw error }
@@ -71,12 +71,14 @@ export async function openDisposableNativeDevice(options: {
   readonly sql?: boolean
   readonly managedSigner?: SigningIdentity
   readonly managedWrapKey?: DeviceWrapKey
+  readonly managedPqWrapKey?: DevicePqWrapKey
   readonly quotaBytes?: number
   readonly maxValueBytes?: number
 } = {}): Promise<DisposableNativeDevice> {
   const signer = {
     ...(options.managedSigner === undefined ? {} : { managedSigner: options.managedSigner }),
     ...(options.managedWrapKey === undefined ? {} : { managedWrapKey: options.managedWrapKey }),
+    ...(options.managedPqWrapKey === undefined ? {} : { managedPqWrapKey: options.managedPqWrapKey }),
   }
   if (options.sql !== true) {
     const store = new MemoryBytesStore(options)

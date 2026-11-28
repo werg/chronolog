@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { bytesToHex, hexToBytes } from '@chronolog/canonical'
 import { MemoryBytesStore } from '@chronolog/records'
-import { createLogGenesis, hpkeSealEpochKey, epochKeyCommitmentV2 } from './genesis.js'
+import { epochKeyCommitment } from '@chronolog/crypto'
+import { createLogGenesis, hpkeSealEpochKey } from './genesis.js'
 import { openApplicationDevice } from './device.js'
 import { createApplicationSession } from './runtime.js'
 import type { ApplicationSession, SessionFacts } from './session.js'
@@ -136,7 +137,7 @@ describe('Chronolog v2 Multi-Replica Chaos Suite', () => {
           input: {
             action: 'rotateEpoch',
             epoch: 0,
-            keyCommitment: epochKeyCommitmentV2(epoch0),
+            keyCommitment: epochKeyCommitment(epoch0),
             boxes: epoch0Boxes,
           },
         }],

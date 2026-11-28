@@ -15,7 +15,6 @@ describe('Phase 2 standard reducers: crdt, text, ledger, workflow, fs', () => {
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {
@@ -93,7 +92,6 @@ describe('Phase 2 standard reducers: crdt, text, ledger, workflow, fs', () => {
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {
@@ -205,7 +203,6 @@ describe('Phase 2 standard reducers: crdt, text, ledger, workflow, fs', () => {
         writer: true,
         administrator: true,
         publisher: true,
-        finalizer: true,
       },
       privateLog: false,
       topics: {
